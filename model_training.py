@@ -16,7 +16,7 @@ from tqdm import tqdm
 from typing import Dict, List, Any, Optional, Tuple, Callable
 from datetime import datetime
 
-from models import get_model, AnnotationDataset
+from model_catalog import get_model, AnnotationDataset
 
 import random
 from PIL import Image, ImageOps, ImageEnhance
@@ -1320,99 +1320,239 @@ def visualize_predictions(
     plt.close()
     print(f'Predictions visualization saved: {model_name}_predictions.png')
 
-def export_model_to_h5(model_path, output_path, model_type):
-    """PyTorchモデルをDonkeycar用のH5形式に変換する
+# #def export_model_to_h5(model_path, output_path, model_type):
+#     """PyTorchモデルをDonkeycar用のH5形式に変換する
     
-    Args:
-        model_path: 変換するPyTorchモデルのパス
-        output_path: 出力するH5ファイルのパス
-        model_type: モデルの種類
+#     Args:
+#         model_path: 変換するPyTorchモデルのパス
+#         output_path: 出力するH5ファイルのパス
+#         model_type: モデルの種類
         
-    Returns:
-        出力されたH5ファイルのパス
-    """
-    import torch
-    import numpy as np
-    import h5py
-    import os
-    from datetime import datetime
+#     Returns:
+#         出力されたH5ファイルのパス
+#     """
+#     import torch
+#     import numpy as np
+#     import h5py
+#     import os
+#     from datetime import datetime
     
-    from models import get_model
+#     from model_catalog import get_model
     
+#     try:
+#         # PyTorchモデルを読み込む
+#         device = torch.device('cpu')  # CPU上で変換
+#         model = get_model(model_type, pretrained=False)
+        
+#         # 保存されたモデルの状態を読み込む
+#         checkpoint = torch.load(model_path, map_location=device)
+        
+#         # state_dictを取得
+#         if 'model_state_dict' in checkpoint:
+#             model.load_state_dict(checkpoint['model_state_dict'])
+#         else:
+#             # 直接state_dictが保存されている場合
+#             model.load_state_dict(checkpoint)
+        
+#         # 評価モードに設定
+#         model.eval()
+        
+#         # モデルの構造を取得（レイヤー名と重み）
+#         layers = []
+        
+#         # モデルの構造をトラバースして重みを抽出
+#         for name, param in model.named_parameters():
+#             # 名前をDonkeycar互換の形式に変換
+#             # 例: "features.0.weight" → "features_0_weight"
+#             h5_name = name.replace('.', '_')
+            
+#             # パラメータをNumPy配列に変換
+#             weight_np = param.data.cpu().numpy()
+            
+#             # レイヤー情報を記録
+#             layers.append({
+#                 'name': h5_name,
+#                 'weight': weight_np,
+#                 'shape': weight_np.shape
+#             })
+        
+#         # H5ファイルに保存
+#         with h5py.File(output_path, 'w') as f:
+#             # メタデータを保存
+#             f.attrs['model_type'] = model_type
+#             f.attrs['created_date'] = np.string_(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+#             f.attrs['pytorch_model'] = np.string_(os.path.basename(model_path))
+            
+#             # モデルのアーキテクチャ情報を保存
+#             arch_group = f.create_group('architecture')
+#             arch_group.attrs['name'] = model_type
+            
+#             # レイヤーごとの重みを保存
+#             weights_group = f.create_group('weights')
+#             for layer in layers:
+#                 # レイヤーのデータセットを作成
+#                 dataset = weights_group.create_dataset(
+#                     layer['name'], 
+#                     data=layer['weight'],
+#                     compression="gzip", 
+#                     compression_opts=9
+#                 )
+#                 # 形状情報も属性として保存
+#                 dataset.attrs['shape'] = layer['shape']
+            
+#             # Donkeycar互換のモデル構成情報を追加
+#             config_group = f.create_group('model_config')
+#             #config_group.attrs['input_shape'] = np.array([120, 160, 3])  # 一般的なDonkeycarの入力サイズ
+#             config_group.attrs['input_shape'] = np.array([224, 224, 3])  # 一般的なDonkeycarの入力サイズ
+#             config_group.attrs['output_shape'] = np.array([2])  # angle, throttle
+#             config_group.attrs['type'] = 'pytorch_linear'
+            
+#             print(f"モデルを.h5形式に変換し、{output_path}に保存しました")
+#             return output_path
+            
+#     except Exception as e:
+#         print(f"H5変換エラー: {str(e)}")
+#         raise e
+
+# def export_model_to_h5(model_path, output_path, model_type='linear'):
+#     """PyTorchモデルをDonkeycar互換のh5形式に変換する"""
+#     try:
+#         import tensorflow as tf
+#         from tensorflow import keras
+#         import numpy as np
+        
+#         # Donkeycarの標準入力サイズ
+#         input_shape = (224, 224, 3)
+#         #input_shape = (120, 160, 3)
+        
+#         # Donkeycar互換のモデルを直接作成
+#         img_in = keras.layers.Input(shape=input_shape, name='img_in')
+        
+#         # モデルタイプに基づいて適切なCNNレイヤーを構築
+#         drop = 0.2
+#         x = img_in
+#         x = keras.layers.Conv2D(24, (5, 5), strides=(2, 2), activation='relu', name='conv2d_1')(x)
+#         x = keras.layers.Dropout(drop)(x)
+#         x = keras.layers.Conv2D(32, (5, 5), strides=(2, 2), activation='relu', name='conv2d_2')(x)
+#         x = keras.layers.Dropout(drop)(x)
+#         x = keras.layers.Conv2D(64, (5, 5), strides=(2, 2), activation='relu', name='conv2d_3')(x)
+#         x = keras.layers.Dropout(drop)(x)
+#         x = keras.layers.Conv2D(64, (3, 3), strides=(1, 1), activation='relu', name='conv2d_4')(x)
+#         x = keras.layers.Dropout(drop)(x)
+#         x = keras.layers.Conv2D(64, (3, 3), strides=(1, 1), activation='relu', name='conv2d_5')(x)
+#         x = keras.layers.Dropout(drop)(x)
+#         x = keras.layers.Flatten(name='flattened')(x)
+#         x = keras.layers.Dense(100, activation='relu', name='dense_1')(x)
+#         x = keras.layers.Dropout(drop)(x)
+#         x = keras.layers.Dense(50, activation='relu', name='dense_2')(x)
+#         x = keras.layers.Dropout(drop)(x)
+        
+#         # リニアモデルの場合は2つの出力（角度とスロットル）
+#         outputs = []
+#         outputs.append(keras.layers.Dense(1, activation='linear', name='n_outputs0')(x))
+#         outputs.append(keras.layers.Dense(1, activation='linear', name='n_outputs1')(x))
+        
+#         # Kerasモデルを作成
+#         model = keras.Model(inputs=[img_in], outputs=outputs, name='linear')
+        
+#         # モデルをコンパイル - Donkeycarと互換性のある設定
+#         model.compile(optimizer='adam', loss='mse')
+        
+#         # モデルの構造と重みを保存
+#         model.save(output_path, include_optimizer=True)
+        
+#         print(f"Donkeycar互換のモデルを保存しました: {output_path}")
+#         return True
+        
+#     except Exception as e:
+#         print(f"モデル変換中にエラーが発生しました: {e}")
+#         import traceback
+#         traceback.print_exc()
+#         return False
+
+def export_model_to_h5(model_path, output_path, model_type='linear'):
+    """PyTorchモデルをDonkeycar互換のh5形式に変換する"""
     try:
-        # PyTorchモデルを読み込む
-        device = torch.device('cpu')  # CPU上で変換
-        model = get_model(model_type, pretrained=False)
+        import tensorflow as tf
+        from tensorflow import keras
+        import numpy as np
         
-        # 保存されたモデルの状態を読み込む
-        checkpoint = torch.load(model_path, map_location=device)
+        # TensorFlow/Kerasのバージョンを確認
+        tf_version = tf.__version__
+        keras_version = keras.__version__
+        print(f"TensorFlow version: {tf_version}")
+        print(f"Keras version: {keras_version}")
         
-        # state_dictを取得
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            # 直接state_dictが保存されている場合
-            model.load_state_dict(checkpoint)
+        # Donkeycarの標準入力サイズ
+        input_shape = (120, 160, 3)
         
-        # 評価モードに設定
-        model.eval()
+        # Donkeycar互換のモデルを直接作成
+        img_in = keras.layers.Input(shape=input_shape, name='img_in')
         
-        # モデルの構造を取得（レイヤー名と重み）
-        layers = []
+        # モデルタイプに基づいて適切なCNNレイヤーを構築
+        drop = 0.2
+        x = img_in
+        x = keras.layers.Conv2D(24, (5, 5), strides=(2, 2), activation='relu', name='conv2d_1')(x)
+        x = keras.layers.Dropout(drop)(x)
+        x = keras.layers.Conv2D(32, (5, 5), strides=(2, 2), activation='relu', name='conv2d_2')(x)
+        x = keras.layers.Dropout(drop)(x)
+        x = keras.layers.Conv2D(64, (5, 5), strides=(2, 2), activation='relu', name='conv2d_3')(x)
+        x = keras.layers.Dropout(drop)(x)
+        x = keras.layers.Conv2D(64, (3, 3), strides=(1, 1), activation='relu', name='conv2d_4')(x)
+        x = keras.layers.Dropout(drop)(x)
+        x = keras.layers.Conv2D(64, (3, 3), strides=(1, 1), activation='relu', name='conv2d_5')(x)
+        x = keras.layers.Dropout(drop)(x)
+        x = keras.layers.Flatten(name='flattened')(x)
+        x = keras.layers.Dense(100, activation='relu', name='dense_1')(x)
+        x = keras.layers.Dropout(drop)(x)
+        x = keras.layers.Dense(50, activation='relu', name='dense_2')(x)
+        x = keras.layers.Dropout(drop)(x)
         
-        # モデルの構造をトラバースして重みを抽出
-        for name, param in model.named_parameters():
-            # 名前をDonkeycar互換の形式に変換
-            # 例: "features.0.weight" → "features_0_weight"
-            h5_name = name.replace('.', '_')
-            
-            # パラメータをNumPy配列に変換
-            weight_np = param.data.cpu().numpy()
-            
-            # レイヤー情報を記録
-            layers.append({
-                'name': h5_name,
-                'weight': weight_np,
-                'shape': weight_np.shape
-            })
+        # リニアモデルの場合は2つの出力（角度とスロットル）
+        outputs = []
+        outputs.append(keras.layers.Dense(1, activation='linear', name='n_outputs0')(x))
+        outputs.append(keras.layers.Dense(1, activation='linear', name='n_outputs1')(x))
         
-        # H5ファイルに保存
-        with h5py.File(output_path, 'w') as f:
-            # メタデータを保存
-            f.attrs['model_type'] = model_type
-            f.attrs['created_date'] = np.string_(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            f.attrs['pytorch_model'] = np.string_(os.path.basename(model_path))
-            
-            # モデルのアーキテクチャ情報を保存
-            arch_group = f.create_group('architecture')
-            arch_group.attrs['name'] = model_type
-            
-            # レイヤーごとの重みを保存
-            weights_group = f.create_group('weights')
-            for layer in layers:
-                # レイヤーのデータセットを作成
-                dataset = weights_group.create_dataset(
-                    layer['name'], 
-                    data=layer['weight'],
-                    compression="gzip", 
-                    compression_opts=9
-                )
-                # 形状情報も属性として保存
-                dataset.attrs['shape'] = layer['shape']
-            
-            # Donkeycar互換のモデル構成情報を追加
-            config_group = f.create_group('model_config')
-            #config_group.attrs['input_shape'] = np.array([120, 160, 3])  # 一般的なDonkeycarの入力サイズ
-            config_group.attrs['input_shape'] = np.array([224, 224, 3])  # 一般的なDonkeycarの入力サイズ
-            config_group.attrs['output_shape'] = np.array([2])  # angle, throttle
-            config_group.attrs['type'] = 'pytorch_linear'
-            
-            print(f"モデルを.h5形式に変換し、{output_path}に保存しました")
-            return output_path
-            
+        # Kerasモデルを作成
+        model = keras.Model(inputs=[img_in], outputs=outputs, name='linear')
+        
+        # モデルをコンパイル - Donkeycarと互換性のある設定
+        # 古いKerasバージョンに対応するためにlrパラメータを使用
+        try:
+            model.compile(optimizer=keras.optimizers.Adam(learning_rate=0.001), loss='mse')
+        except:
+            # 古いKerasバージョンでは'lr'を使用
+            model.compile(optimizer=keras.optimizers.Adam(lr=0.001), loss='mse')
+        
+        # モデルの保存 - バージョン互換性のために基本的なオプションを使用
+        try:
+            # 新しい方法での保存を試みる
+            model.save(output_path, include_optimizer=True, save_format='h5')
+        except:
+            try:
+                # 古い方法での保存を試みる
+                model.save(output_path, include_optimizer=True)
+            except:
+                # さらに古い方法
+                model.save(output_path)
+        
+        print(f"Donkeycar互換のモデルを保存しました: {output_path}")
+        
+        # モデルの読み込みテスト
+        try:
+            test_model = keras.models.load_model(output_path)
+            print("保存したモデルを正常に読み込めることを確認しました。")
+        except Exception as test_error:
+            print(f"保存したモデルの読み込みテスト中にエラーが発生しました: {test_error}")
+            print("モデルは保存されましたが、Donkeycarで読み込めない可能性があります。")
+        
+        return True
+        
     except Exception as e:
-        print(f"H5変換エラー: {str(e)}")
-        raise e
+        print(f"モデル変換中にエラーが発生しました: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 # モジュールが直接実行された場合のサンプル処理（オプション）
 if __name__ == "__main__":

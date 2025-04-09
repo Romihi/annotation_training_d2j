@@ -11,7 +11,7 @@ import random
 from typing import Dict, List, Any, Optional, Tuple
 import torchvision.transforms as transforms
 
-from models import get_model, list_available_models
+from model_catalog import get_model, list_available_models
 
 _MODEL_CACHE = {}
 

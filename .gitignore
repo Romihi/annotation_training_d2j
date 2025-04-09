@@ -1,6 +1,10 @@
 # my stuff
 old/
 annotation_tool/
+sessions/
+models/
+runs/
+utils/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

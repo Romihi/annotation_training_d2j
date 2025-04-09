@@ -299,6 +299,136 @@ def export_to_jetracer(
     
     return catalog_path
 
+def export_to_yolo(
+    folder_path: str,
+    bbox_annotations: Dict[str, List[Dict[str, Any]]],
+    output_subfolder: str = "yolo_annotations"
+) -> str:
+    """バウンディングボックスアノテーションをYOLO形式でエクスポートする
+
+    Args:
+        folder_path: 出力先のフォルダパス
+        bbox_annotations: バウンディングボックスアノテーション辞書
+        output_subfolder: 出力先のサブフォルダ名（デフォルト: "yolo_annotations"）
+
+    Returns:
+        作成されたデータセット設定ファイル（dataset.yaml）のパス
+    """
+    import os
+    import shutil
+    import json
+    
+    # YOLO形式のアノテーション用フォルダを作成
+    yolo_folder = os.path.join(folder_path, output_subfolder)
+    os.makedirs(yolo_folder, exist_ok=True)
+    
+    # 画像とラベルのフォルダを作成
+    images_folder = os.path.join(yolo_folder, "images")
+    labels_folder = os.path.join(yolo_folder, "labels")
+    os.makedirs(images_folder, exist_ok=True)
+    os.makedirs(labels_folder, exist_ok=True)
+    
+    # クラスリストを取得
+    all_classes = set()
+    for bboxes in bbox_annotations.values():
+        for bbox in bboxes:
+            all_classes.add(bbox.get('class', 'unknown'))
+    
+    class_list = sorted(list(all_classes))
+    
+    # クラス名ファイルを作成
+    class_file_path = os.path.join(yolo_folder, "classes.txt")
+    with open(class_file_path, 'w') as f:
+        for cls in class_list:
+            f.write(f"{cls}\n")
+    
+    # データセット設定用のYAMLファイルを作成
+    yaml_content = f"""
+# YOLO形式のデータセット設定
+path: {yolo_folder}  # データセットのルートディレクトリ
+train: images  # 訓練用画像の相対パス
+val: images    # 検証用画像の相対パス
+
+nc: {len(class_list)}  # クラス数
+names: {class_list}  # クラス名
+"""
+    
+    yaml_file_path = os.path.join(yolo_folder, "dataset.yaml")
+    with open(yaml_file_path, 'w') as f:
+        f.write(yaml_content)
+    
+    # 各画像のアノテーションを処理
+    processed_count = 0
+    total_bboxes = 0
+    
+    for img_path, bboxes in bbox_annotations.items():
+        if not bboxes:
+            continue
+            
+        # 画像ファイル名を取得
+        img_filename = os.path.basename(img_path)
+        img_basename = os.path.splitext(img_filename)[0]
+        
+        # 画像をコピー
+        dst_img_path = os.path.join(images_folder, img_filename)
+        shutil.copy2(img_path, dst_img_path)
+        
+        # YOLOフォーマットのラベルファイルを作成
+        label_path = os.path.join(labels_folder, f"{img_basename}.txt")
+        
+        with open(label_path, 'w') as f:
+            for bbox in bboxes:
+                # クラスIDを取得
+                class_name = bbox.get('class', 'unknown')
+                class_id = class_list.index(class_name)
+                
+                # バウンディングボックスの座標を取得
+                x1 = bbox['x1']
+                y1 = bbox['y1']
+                x2 = bbox['x2']
+                y2 = bbox['y2']
+                
+                # YOLO形式に変換（中心x, 中心y, 幅, 高さ）
+                x_center = (x1 + x2) / 2
+                y_center = (y1 + y2) / 2
+                width = x2 - x1
+                height = y2 - y1
+                
+                # YOLOフォーマットでファイルに書き込み
+                f.write(f"{class_id} {x_center} {y_center} {width} {height}\n")
+                total_bboxes += 1
+        
+        processed_count += 1
+    
+    # README.txtファイルを作成して使用方法を説明
+    readme_content = f"""# YOLO形式アノテーションデータ
+
+このフォルダには、YOLO形式でエクスポートされたアノテーションデータが含まれています。
+
+## フォルダ構成
+- images/: アノテーション付き画像
+- labels/: YOLOフォーマットのアノテーションファイル（各画像に対応）
+- classes.txt: クラス名のリスト
+- dataset.yaml: YOLOv5/v8用のデータセット設定ファイル
+
+## クラス情報
+検出クラス数: {len(class_list)}
+クラス: {', '.join(class_list)}
+
+## 統計情報
+アノテーション画像数: {processed_count}
+合計バウンディングボックス数: {total_bboxes}
+
+## YOLOフォーマット
+各行の形式: <class_id> <x_center> <y_center> <width> <height>
+※すべての座標値は画像サイズで正規化されています（0～1の範囲）
+"""
+    
+    with open(os.path.join(yolo_folder, "README.txt"), 'w') as f:
+        f.write(readme_content)
+    
+    return yaml_file_path
+
 def export_to_video(
     annotations: Dict[str, Dict[str, Any]], 
     inference_results: Dict[str, Dict[str, Any]], 

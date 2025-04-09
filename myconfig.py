@@ -370,7 +370,7 @@ DEFAULT_AI_FRAMEWORK = 'pytorch' #'tensorflow'
 # # tensorflow models: (linear|categorical|tflite_linear|tensorrt_linear)
 # # pytorch models: (resnet18)
 #DEFAULT_MODEL_TYPE = 'linear'
-DEFAULT_MODEL_TYPE = 'resnet18'
+DEFAULT_MODEL_TYPE = 'donkey'
 #DEFAULT_MODEL_TYPE = 'custom_cnn'
 #DEFAULT_MODEL_TYPE = '3d' #'resnet18' #'linear'
 # BATCH_SIZE = 128                #how many records to use when doing one pass of gradient decent. Use a smaller number if your gpu is running out of memory.
