@@ -23,8 +23,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                             QLabel, QPushButton, QListWidget, QFileDialog, QMessageBox,
                             QScrollArea, QGridLayout, QFrame, QLineEdit, QProgressDialog,
                             QCheckBox, QSpinBox, QComboBox, QSlider, QInputDialog, 
-                            QDoubleSpinBox, QGraphicsOpacityEffect,QDialog,QDialogButtonBox,
-                            QGroupBox,QRadioButton,QTabWidget)  
+                            QDoubleSpinBox, QGraphicsOpacityEffect, QDialog, QDialogButtonBox,
+                            QGroupBox, QRadioButton, QTabWidget, QListView, QTreeView, QAbstractItemView)
 from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont
 from PyQt5.QtCore import Qt, QSize, QRect, QPoint, QTimer, QEvent
 
@@ -933,6 +933,8 @@ class ImageAnnotationTool(QMainWindow):
         
         # Initialize state
         self.folder_path = ""
+        self.folder_paths = []       
+        self.image_folders = []      
         self.images = []
         self.current_index = 0
         self.annotations = {}
@@ -942,6 +944,7 @@ class ImageAnnotationTool(QMainWindow):
         self.current_mode = 0
         self.last_selected_bbox_class = None  # 前回選択した物体検知クラス
         self.last_bbox = None  # 前回作成したバウンディングボックスの情報
+        self.last_bboxes = []  # 前回の画像の全てのバウンディングボックスを保存するリスト（新規追加）
         self.auto_apply_last_bbox = False  # 前回のバウンディングボックスを自動適用するかどうか
 
         # 削除インデックス
@@ -981,81 +984,6 @@ class ImageAnnotationTool(QMainWindow):
         self.add_session_check_to_init_ui()
 
         QApplication.instance().installEventFilter(self)
-
-    # # YOLOモデルの自動読み込みメソッドを追加
-    # def auto_load_yolo_model(self):
-    #     """起動時にYOLOモデルを自動的に読み込む（非同期処理）"""
-    #     # まだ画像が読み込まれていない場合は、先に画像を読み込むよう促す
-    #     if not hasattr(self, 'images') or not self.images:
-    #         print("画像がまだ読み込まれていません。先に画像を読み込んでからYOLOモデルを手動で読み込んでください。")
-    #         return
-        
-    #     # モデルディレクトリを確認
-    #     models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
-    #     if not os.path.exists(models_dir):
-    #         os.makedirs(models_dir, exist_ok=True)
-    #         print("モデルフォルダを作成しました。YOLOモデルの自動読み込みをスキップします。")
-    #         return
-        
-    #     try:
-    #         # YOLOモデルのリストを取得
-    #         yolo_model_files = [f for f in os.listdir(models_dir) if f.endswith('.pt') and 'yolo' in f.lower()]
-            
-    #         if not yolo_model_files:
-    #             print("YOLOモデルファイルが見つかりません。")
-    #             # YOLOモデルのリストを更新しておく
-    #             if hasattr(self, 'refresh_yolo_model_list'):
-    #                 self.refresh_yolo_model_list()
-    #             return
-            
-    #         # 日付順にソート（ファイル名が日付を含むと仮定）
-    #         yolo_model_files.sort(reverse=True)  # 最新のモデルが先頭に来るようにソート
-            
-    #         # 最新のモデルを選択
-    #         latest_model = yolo_model_files[0]
-    #         print(f"最新のYOLOモデルを発見: {latest_model}")
-            
-    #         # YOLOモデルコンボボックスにモデルをロード
-    #         if hasattr(self, 'yolo_saved_model_combo') and hasattr(self, 'refresh_yolo_model_list'):
-    #             # まずリストを更新
-    #             self.refresh_yolo_model_list()
-                
-    #             # 最新のモデルを選択
-    #             for i in range(self.yolo_saved_model_combo.count()):
-    #                 if self.yolo_saved_model_combo.itemText(i) == latest_model:
-    #                     self.yolo_saved_model_combo.setCurrentIndex(i)
-    #                     break
-            
-    #         # 自動的にモデルをロードするかの確認ダイアログを表示
-    #         # この処理は、アプリケーションの初期化が完了した後に実行する
-    #         def show_load_dialog():
-    #             # アプリケーションの状態を確認（すでに閉じられていないか）
-    #             if not self.isVisible():
-    #                 return
-                    
-    #             reply = QMessageBox.question(
-    #                 self, 
-    #                 "YOLOモデル自動読み込み", 
-    #                 f"最新のYOLOモデル '{latest_model}' が見つかりました。\n\n読み込みますか？",
-    #                 QMessageBox.Yes | QMessageBox.No,
-    #                 QMessageBox.Yes
-    #             )
-                
-    #             if reply == QMessageBox.Yes:
-    #                 # モデルパスを構築
-    #                 model_path = os.path.join(models_dir, latest_model)
-                    
-    #                 # モデルを読み込む
-    #                 self.load_yolo_model_from_path(model_path)
-            
-    #         # UIが完全に表示された後にダイアログを表示
-    #         QTimer.singleShot(1000, show_load_dialog)
-        
-    #     except Exception as e:
-    #         print(f"YOLOモデルの自動読み込み中にエラーが発生しました: {e}")
-    #         import traceback
-    #         traceback.print_exc()
-
 
     # YOLOモデルをパスから読み込むヘルパーメソッド
     def load_yolo_model_from_path(self, model_path):
@@ -1241,7 +1169,6 @@ class ImageAnnotationTool(QMainWindow):
         
         try:
             # annotation/mlruns ディレクトリを使用
-            #mlflow_dir = os.path.join(self.folder_path, "annotation", "mlruns")
             mlflow_dir = os.path.join(self.folder_path, "mlruns")
             os.makedirs(mlflow_dir, exist_ok=True)
             
@@ -1480,7 +1407,53 @@ class ImageAnnotationTool(QMainWindow):
             print(f"セッション情報を保存しました: {session_file}")
         except Exception as e:
             print(f"セッション情報の保存に失敗: {e}")
+    #m
+    def save_session_info(self):
+        """現在の作業セッション情報を保存する"""
+        try:
+            # セッション情報を保存するためのディレクトリ
+            session_dir = os.path.join(APP_DIR_PATH, SESSION_DIR_NAME)
+            os.makedirs(session_dir, exist_ok=True)
+            
+            # 保存する情報
+            session_info = {
+                "last_folder_path": self.folder_path if hasattr(self, 'folder_path') else "",
+                "last_folder_paths": self.folder_paths if hasattr(self, 'folder_paths') else [],
+                "last_model_arch": self.auto_method_combo.currentText() if hasattr(self, 'auto_method_combo') else "",
+                "last_model_name": self.model_combo.currentText() if hasattr(self, 'model_combo') else "",
+                "timestamp": int(time.time())
+            }
+            
+            # ファイルに保存
+            session_file = os.path.join(session_dir, "session.json")
+            with open(session_file, 'w') as f:
+                json.dump(session_info, f)
+                
+            print(f"セッション情報を保存しました: {session_file}")
+        except Exception as e:
+            print(f"セッション情報の保存に失敗: {e}")
 
+    def load_session_info(self):
+        """保存されたセッション情報を読み込む"""
+        try:
+            # セッション情報ファイルのパス
+            session_dir = os.path.join(APP_DIR_PATH, SESSION_DIR_NAME)
+            session_file = os.path.join(session_dir, "session.json")
+            
+            # ファイルが存在しない場合は空の情報を返す
+            if not os.path.exists(session_file):
+                return {}
+            
+            # ファイルから読み込み
+            with open(session_file, 'r') as f:
+                session_info = json.load(f)
+                
+            print(f"セッション情報を読み込みました: {session_file}")
+            return session_info
+        except Exception as e:
+            print(f"セッション情報の読み込みに失敗: {e}")
+            return {}
+    #m
     def load_session_info(self):
         """保存されたセッション情報を読み込む"""
         try:
@@ -1860,6 +1833,7 @@ class ImageAnnotationTool(QMainWindow):
         
         folder_layout = QHBoxLayout()
         self.folder_input = QLineEdit()
+        self.folder_input.setPlaceholderText("フォルダパスを入力または参照ボタンで複数選択可能")
         self.folder_input.textChanged.connect(self.on_folder_path_changed)
         folder_layout.addWidget(self.folder_input)
         
@@ -1895,12 +1869,12 @@ class ImageAnnotationTool(QMainWindow):
         export_layout = QHBoxLayout()
         
         # donkey保存
-        donkey_btn = QPushButton("Donkeycar形式")
+        donkey_btn = QPushButton("Donkey形式")
         donkey_btn.clicked.connect(self.export_to_donkey)
         export_layout.addWidget(donkey_btn)
 
         # jetracer保存保存
-        jetracer_btn = QPushButton("Jetracer形式")
+        jetracer_btn = QPushButton("Jetracr形式")
         jetracer_btn.clicked.connect(self.export_to_jetracer)
         export_layout.addWidget(jetracer_btn)
 
@@ -1961,12 +1935,12 @@ class ImageAnnotationTool(QMainWindow):
         self.model_load_button.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")
         model_buttons_layout.addWidget(self.model_load_button)
 
+        pilot_layout.addLayout(model_buttons_layout)
+
         # モデル学習ボタン（自動運転用）
         train_model_button = QPushButton("学習・保存")
         train_model_button.clicked.connect(self.train_and_save_model)
-        model_buttons_layout.addWidget(train_model_button)
-        
-        pilot_layout.addLayout(model_buttons_layout)
+        pilot_layout.addWidget(train_model_button)  
 
         # 推論結果表示オプション
         inference_layout = QHBoxLayout()
@@ -3611,73 +3585,12 @@ class ImageAnnotationTool(QMainWindow):
         # バウンディングボックスを追加
         self.bbox_annotations[current_img_path].append(bbox)
         
-        # 統計情報更新
-        self.update_bbox_stats()
-        
-        # 画面更新
-        self.main_image_view.update()
-        
-        # 追加: 左パネルのアノテーション情報を更新
-        # この部分は enhanced_annotations.py が適用されている場合のみ実行される
-        if hasattr(self, 'update_annotation_info_label'):
-            # 物体検知アノテーション情報を取得
-            bbox_info = self.update_annotation_info_label()
-            
-            # 既存のアノテーション情報と結合
-            if current_img_path in self.annotations and self.annotations[current_img_path]:
-                # 自動運転アノテーションがある場合
-                anno = self.annotations[current_img_path]
-                
-                # 基本的なアノテーション情報
-                annotation_text = f"<b>運転アノテーション情報:</b><br>"
-                annotation_text += f"angle = <span style='color: #FF6666;'>{anno['angle']:.4f}</span><br>"
-                annotation_text += f"throttle = <span style='color: #FF6666;'>{anno['throttle']:.4f}</span>"
-                
-                # 位置情報があれば追加
-                if 'loc' in anno:
-                    loc_value = anno['loc']
-                    loc_color = get_location_color(loc_value)
-                    
-                    annotation_text += f"<br><div style='margin-top: 10px;'>"
-                    annotation_text += f"<div style='display: inline-block; background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 5px; border-radius: 5px;'>"
-                    annotation_text += f"位置 {loc_value}</div></div>"
-                
-                # 物体検知情報を追加
-                if bbox_info:
-                    annotation_text += f"<br><br>{bbox_info}"
-                
-                self.annotation_info_label.setText(annotation_text)
-                self.annotation_info_label.setTextFormat(Qt.RichText)
-            else:
-                # 自動運転アノテーションがない場合は物体検知情報のみ表示
-                if bbox_info:
-                    self.annotation_info_label.setText(bbox_info)
-                    self.annotation_info_label.setTextFormat(Qt.RichText)
-        
-        # 追加: ギャラリーを更新
-        self.update_gallery()
-        
-        # 追加: メッセージ表示
-        class_name = bbox.get('class', 'unknown')
-        self.statusBar().showMessage(f"'{class_name}' のバウンディングボックスを追加しました", 3000)
-    #m
-    def add_bbox_annotation(self, bbox):
-        """バウンディングボックスアノテーションを追加"""
-        if not self.images:
-            return
-        
-        current_img_path = self.images[self.current_index]
-        
-        # 既存のアノテーションを取得または新規作成
-        if current_img_path not in self.bbox_annotations:
-            self.bbox_annotations[current_img_path] = []
-        
-        # バウンディングボックスを追加
-        self.bbox_annotations[current_img_path].append(bbox)
-        
         # 前回のバウンディングボックスとして保存
         self.last_bbox = bbox.copy()
-        
+            
+        # 現在のすべてのバウンディングボックスを保存
+        self.last_bboxes = [box.copy() for box in self.bbox_annotations[current_img_path]]
+    
         # 統計情報更新
         self.update_bbox_stats()
         
@@ -3727,14 +3640,43 @@ class ImageAnnotationTool(QMainWindow):
         class_name = bbox.get('class', 'unknown')
         self.statusBar().showMessage(f"'{class_name}' のバウンディングボックスを追加しました", 3000)
 
-
     def add_session_check_to_init_ui(self):
         """init_uiメソッドの最後に追加する初期セッション確認コード"""
         # 保存されたセッション情報を読み込む
         session_info = self.load_session_info()
         
-        # 前回のフォルダパスがあるか確認
-        if session_info and "last_folder_path" in session_info and session_info["last_folder_path"]:
+        # 複数フォルダを優先的に使用
+        has_folders = False
+        
+        # 前回の複数フォルダパスがあるか確認
+        if session_info and "last_folder_paths" in session_info and session_info["last_folder_paths"]:
+            folder_paths = session_info["last_folder_paths"]
+            
+            # フォルダが存在するか確認
+            valid_paths = [path for path in folder_paths if os.path.exists(path)]
+            
+            if valid_paths:
+                # 確認ダイアログを表示
+                reply = QMessageBox.question(
+                    self, 
+                    "前回のセッションを復元", 
+                    f"前回の作業フォルダ（{len(valid_paths)}個）を読み込みますか？\n\n"
+                    f"最初のフォルダ: {valid_paths[0]}\n" +
+                    (f"他 {len(valid_paths)-1} フォルダ" if len(valid_paths) > 1 else ""),
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                
+                if reply == QMessageBox.Yes:
+                    # フォルダパスを設定し、画像を読み込む
+                    self.folder_input.setText(";".join(valid_paths))
+                    has_folders = True
+                    
+                    # UIが完全に初期化された後で画像読み込みを実行するために遅延実行
+                    QTimer.singleShot(100, self.load_images)
+        
+        # 複数フォルダが見つからなかった場合は単一フォルダを使用
+        if not has_folders and session_info and "last_folder_path" in session_info and session_info["last_folder_path"]:
             last_folder = session_info["last_folder_path"]
             
             # フォルダが存在するか確認
@@ -3763,8 +3705,6 @@ class ImageAnnotationTool(QMainWindow):
             self.model_load_button,            # モデル読込ボタン
             self.model_refresh_button,         # モデル一覧更新ボタン
             self.inference_checkbox,           # 推論結果表示チェックボックス
-            # self.augmentation_checkbox 行を削除または以下のようにコメントアウト
-            # self.augmentation_checkbox,        # データオーグメンテーションチェックボックス
         ]
         
         # 検索してボタン追加（UIから見つける方法）
@@ -3810,8 +3750,6 @@ class ImageAnnotationTool(QMainWindow):
             return
         
         # モデルのパスを取得
-        #annotation_folder = os.path.join(self.folder_path, "annotation")
-        #models_dir = os.path.join(annotation_folder, "annotation_models")
         models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
         model_path = os.path.join(models_dir, selected_model)
         
@@ -3968,10 +3906,10 @@ class ImageAnnotationTool(QMainWindow):
                 f"モデル読み込み中にエラーが発生しました: {str(e)}"
             )
             
-    def toggle_augmentation_options(self):
-        """データオーグメンテーションのオプションの有効/無効を切り替える"""
-        enabled = self.augmentation_checkbox.isChecked()
-        self.aug_options_container.setEnabled(enabled)
+    # def toggle_augmentation_options(self):
+    #     """データオーグメンテーションのオプションの有効/無効を切り替える"""
+    #     enabled = self.augmentation_checkbox.isChecked()
+    #     self.aug_options_container.setEnabled(enabled)
 
     def set_clip_start_to_current(self):
         """現在のインデックスをクリップ開始位置に設定する"""
@@ -4179,12 +4117,15 @@ class ImageAnnotationTool(QMainWindow):
 
     def load_sibling_annotations(self):
         """選択したフォルダと同じ階層にあるアノテーションデータを読み込む"""
-        if not self.folder_path or not self.images:
+        if not self.folder_paths or not self.images:
             QMessageBox.warning(self, "警告", "先に画像フォルダを選択して画像を読み込んでください。")
             return
         
-        # 現在のフォルダの親ディレクトリを取得
-        parent_dir = os.path.dirname(self.folder_path)
+        # 各フォルダの親ディレクトリを取得
+        parent_dirs = [os.path.dirname(folder_path) for folder_path in self.folder_paths]
+        
+        # 重複を除去
+        parent_dirs = list(set(parent_dirs))
         
         # アノテーションデータの検索と読み込みを実行
         annotations_loaded = False
@@ -4194,89 +4135,69 @@ class ImageAnnotationTool(QMainWindow):
             if self.annotations:
                 self.clear_annotations()
                 
-            # 親ディレクトリ自体がDonkeycar形式かどうか確認する
-            # マニフェストファイルを確認
-            manifest_path = os.path.join(parent_dir, "manifest.json")
-            if os.path.exists(manifest_path):
-                # マニフェストベースの読み込み（複数カタログ対応）
-                if self.load_catalog_annotations(parent_dir):
-                    annotations_loaded = True
-                    QMessageBox.information(
-                        self, 
-                        "読み込み成功", 
-                        f"同階層から{len(self.annotations)}個のアノテーションを読み込みました。"
-                    )
-            else:
-                # 単一カタログファイルの確認
-                catalog_files = [f for f in os.listdir(parent_dir) if f.endswith('.catalog')]
-                if catalog_files:
-                    catalog_path = os.path.join(parent_dir, catalog_files[0])
-                    if self.load_catalog_annotations(os.path.dirname(catalog_path)):
+            for parent_dir in parent_dirs:
+                # 親ディレクトリ自体がDonkeycar形式かどうか確認する
+                # マニフェストファイルを確認
+                manifest_path = os.path.join(parent_dir, "manifest.json")
+                if os.path.exists(manifest_path):
+                    # マニフェストベースの読み込み（複数カタログ対応）
+                    if self.load_catalog_annotations(parent_dir):
                         annotations_loaded = True
-                        QMessageBox.information(
-                            self, 
-                            "読み込み成功", 
-                            f"同階層から{len(self.annotations)}個のアノテーションを読み込みました。"
-                        )
-            
-            # 親ディレクトリ内のannotationフォルダも確認する
-            if not annotations_loaded:
-                annotation_folder = os.path.join(parent_dir, "annotation")
-                if os.path.exists(annotation_folder):
-                    # Donkeycar形式のデータを確認 (data_donkey)
-                    donkey_folder = os.path.join(annotation_folder, DATA_DONKEY_DIR_NAME)
-                    if os.path.exists(donkey_folder):
-                        # マニフェストファイルを確認
-                        manifest_path = os.path.join(donkey_folder, "manifest.json")
-                        if os.path.exists(manifest_path):
-                            # マニフェストベースの読み込み（複数カタログ対応）
-                            if self.load_catalog_annotations(donkey_folder):
-                                annotations_loaded = True
-                                QMessageBox.information(
-                                    self, 
-                                    "読み込み成功", 
-                                    f"同階層のDonkeycar形式から{len(self.annotations)}個のアノテーションを読み込みました。"
-                                )
-                        else:
-                            # 従来の単一カタログファイルの確認
-                            catalog_files = [f for f in os.listdir(donkey_folder) if f.endswith('.catalog')]
-                            if catalog_files:
-                                catalog_path = os.path.join(donkey_folder, catalog_files[0])
-                                if self.load_catalog_annotations(os.path.dirname(catalog_path)):
+                        print(f"親ディレクトリ {parent_dir} からアノテーションを読み込みました")
+                else:
+                    # 単一カタログファイルの確認
+                    catalog_files = [f for f in os.listdir(parent_dir) if f.endswith('.catalog')]
+                    if catalog_files:
+                        catalog_path = os.path.join(parent_dir, catalog_files[0])
+                        if self.load_catalog_annotations(os.path.dirname(catalog_path)):
+                            annotations_loaded = True
+                            print(f"親ディレクトリ {parent_dir} からアノテーションを読み込みました")
+                
+                # 親ディレクトリ内のannotationフォルダも確認する
+                if not annotations_loaded:
+                    annotation_folder = os.path.join(parent_dir, "annotation")
+                    if os.path.exists(annotation_folder):
+                        # Donkeycar形式のデータを確認 (data_donkey)
+                        donkey_folder = os.path.join(annotation_folder, DATA_DONKEY_DIR_NAME)
+                        if os.path.exists(donkey_folder):
+                            # マニフェストファイルを確認
+                            manifest_path = os.path.join(donkey_folder, "manifest.json")
+                            if os.path.exists(manifest_path):
+                                # マニフェストベースの読み込み（複数カタログ対応）
+                                if self.load_catalog_annotations(donkey_folder):
                                     annotations_loaded = True
-                                    QMessageBox.information(
-                                        self, 
-                                        "読み込み成功", 
-                                        f"同階層のDonkeycar形式から{len(self.annotations)}個のアノテーションを読み込みました。"
-                                    )
-                    
-                    # Jetracer形式のデータを確認 (data_jetracer)
-                    if not annotations_loaded:
-                        jetracer_folder = os.path.join(annotation_folder, DATA_JETRACER_DIR_NAME)
-                        if os.path.exists(jetracer_folder):
-                            # Jetracerのアノテーションファイルを確認
-                            annotation_files = [f for f in os.listdir(jetracer_folder) if f.endswith('.json')]
-                            if annotation_files:
-                                # TODO: Jetracer形式の読み込み処理を実装
-                                # 現在のコードではDonkeycar形式のみ実装済み
-                                pass
+                                    print(f"親ディレクトリ {parent_dir} の donkey フォルダからアノテーションを読み込みました")
+                            else:
+                                # 従来の単一カタログファイルの確認
+                                catalog_files = [f for f in os.listdir(donkey_folder) if f.endswith('.catalog')]
+                                if catalog_files:
+                                    catalog_path = os.path.join(donkey_folder, catalog_files[0])
+                                    if self.load_catalog_annotations(os.path.dirname(catalog_path)):
+                                        annotations_loaded = True
+                                        print(f"親ディレクトリ {parent_dir} の donkey フォルダからアノテーションを読み込みました")
             
-            if not annotations_loaded:
+            if annotations_loaded:
+                # Update UI
+                self.update_stats()
+                self.display_current_image()
+                self.update_gallery()
+                
+                # 位置ボタンのカウント表示を更新
+                self.update_location_button_counts()
+                
+                QMessageBox.information(
+                    self, 
+                    "読み込み成功", 
+                    f"同階層から{len(self.annotations)}個のアノテーションを読み込みました。"
+                )
+            else:
                 QMessageBox.warning(
                     self, 
                     "警告", 
                     "選択したフォルダと同じ階層から読み込めるアノテーションデータがありませんでした。"
                 )
                 return
-            
-            # Update UI
-            self.update_stats()
-            self.display_current_image()
-            self.update_gallery()
-            
-            # 位置ボタンのカウント表示を更新
-            self.update_location_button_counts()
-            
+                
             print(f"同階層アノテーション読み込み完了: {len(self.annotations)}個のアノテーション")
             
         except Exception as e:
@@ -4285,7 +4206,7 @@ class ImageAnnotationTool(QMainWindow):
                 "エラー", 
                 f"同階層アノテーションの読み込み中にエラーが発生しました: {str(e)}"
             )
-            
+
     def update_skip_button_labels(self, value):
         """スキップボタンのラベルを更新する"""
         self.prev_multi_button.setText(f"◀◀ -{value}")
@@ -4385,8 +4306,6 @@ class ImageAnnotationTool(QMainWindow):
         if hasattr(self, 'model_combo') and self.model_combo.currentText() not in ["モデルが見つかりません", "フォルダを選択してください"] and "が見つかりません" not in self.model_combo.currentText():
             # アノテーションフォルダ内のモデルのフルパスを作成
             selected_model = self.model_combo.currentText()
-            #annotation_folder = os.path.join(self.folder_path, "annotation")
-            #models_dir = os.path.join(annotation_folder, "annotation_models")
             models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
             model_path = os.path.join(models_dir, selected_model)
             
@@ -4562,10 +4481,35 @@ class ImageAnnotationTool(QMainWindow):
         return False  # キーが処理されなかったことを示す
 
     def browse_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "画像フォルダを選択")
-        if folder:
-            self.folder_input.setText(folder)
-
+        """
+        画像フォルダを選択するダイアログを表示
+        選択されたフォルダの下のimagesフォルダを画像フォルダとして取り扱う
+        """
+        # 必要なインポートを確認
+        from PyQt5.QtWidgets import QListView, QTreeView, QAbstractItemView
+        
+        # 複数フォルダ選択が可能なダイアログを表示
+        dialog = QFileDialog(self)
+        dialog.setFileMode(QFileDialog.DirectoryOnly)
+        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+        
+        # QFileDialogのリストビューを取得して複数選択を可能にする
+        listView = dialog.findChild(QListView, "listView")
+        if listView:
+            listView.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        
+        treeView = dialog.findChild(QTreeView)
+        if treeView:
+            treeView.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        
+        # 選択されたフォルダを取得
+        if dialog.exec_():
+            selected_folders = dialog.selectedFiles()
+            
+            # 複数のフォルダを選択した場合は、セミコロン区切りでテキストフィールドに表示
+            if selected_folders:
+                self.folder_input.setText(";".join(selected_folders))
+        
         # 少し遅延させてから画像読み込みを実行（UIが更新される時間を確保）
         QTimer.singleShot(100, self.load_images)
 
@@ -4687,10 +4631,291 @@ class ImageAnnotationTool(QMainWindow):
         if reply == QMessageBox.Yes:
             # アノテーションデータ読み込みメソッドを呼び出す
             self.load_annotations()
+    #m
+    def load_images(self):
+        """複数の画像フォルダから画像のみを読み込む（アノテーション読み込みはしない）"""
+        folder_paths_text = self.folder_input.text()
+        
+        # セミコロン区切りでフォルダパスを取得
+        folder_paths = folder_paths_text.split(";")
+        
+        # 有効なフォルダパスをチェック
+        valid_paths = []
+        for folder_path in folder_paths:
+            folder_path = folder_path.strip()
+            if os.path.exists(folder_path):
+                valid_paths.append(folder_path)
+            else:
+                QMessageBox.warning(self, "エラー", f"フォルダが存在しません: {folder_path}")
+        
+        if not valid_paths:
+            return
+        
+        # 全フォルダの画像を集める
+        all_images = []
+        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.gif']
+        
+        print(f"{len(valid_paths)}個のフォルダを検索中...")
+        
+        for folder_path in valid_paths:
+            print(f"画像フォルダを検索中: {folder_path}")
+            
+            # 直接フォルダ内の画像を検索
+            for file in os.listdir(folder_path):
+                if any(file.lower().endswith(ext) for ext in image_extensions):
+                    all_images.append(os.path.join(folder_path, file))
+            
+            # サブフォルダも検索（imagesフォルダなど）
+            images_folder = os.path.join(folder_path, "images")
+            if os.path.exists(images_folder):
+                for file in os.listdir(images_folder):
+                    if any(file.lower().endswith(ext) for ext in image_extensions):
+                        all_images.append(os.path.join(images_folder, file))
+        
+        if not all_images:
+            QMessageBox.warning(self, "エラー", "選択されたフォルダに画像ファイルがありません。")
+            return
+        
+        print(f"{len(all_images)}枚の画像が見つかりました")
+        
+        # ファイル名からインデックスを抽出してソート
+        image_with_indices = []
+        for img_path in all_images:
+            basename = os.path.basename(img_path)
+            # ファイル名からインデックスを抽出（例: 10900_cam_image_array_.jpg -> 10900）
+            try:
+                import re
+                match = re.match(r'^(\d+)_', basename)
+                if match:
+                    index = int(match.group(1))
+                    image_with_indices.append((img_path, index))
+                else:
+                    # インデックスが抽出できない場合は、高い値（後ろに配置）
+                    image_with_indices.append((img_path, float('inf')))
+            except Exception as e:
+                print(f"ファイル名からインデックス抽出エラー: {basename} - {e}")
+                # エラーの場合も高い値で後ろに配置
+                image_with_indices.append((img_path, float('inf')))
+        
+        # インデックスでソート
+        image_with_indices.sort(key=lambda x: x[1])
+        
+        # ソート後の画像パスリストを作成
+        images = [img_path for img_path, _ in image_with_indices]
+                
+        # Reset state - メインフォルダを最初のフォルダに設定
+        self.folder_path = valid_paths[0]  # 最初のフォルダをメインフォルダとして設定
+        self.folder_paths = valid_paths    # すべての有効なフォルダパスを保存
+        self.images = images
+        self.current_index = 0
+        self.annotations = {}
+        self.annotation_history = []
+        self.annotated_count = 0
+        self.annotation_timestamps = {}
+        self.inference_results = {}
+        self.location_annotations = {}
+        
+        if hasattr(self, 'deleted_indexes'):
+            self.deleted_indexes = []
+
+        # スライダーの設定を更新
+        if images:
+            self.image_slider.setMaximum(len(images) - 1)
+            self.image_slider.setValue(0)
+            self.slider_value_label.setText(f"1/{len(images)}")
+        else:
+            self.image_slider.setMaximum(0)
+            self.image_slider.setValue(0)
+            self.slider_value_label.setText("0/0")
+        
+        # Update UI
+        self.update_stats()
+        self.display_current_image()
+        self.update_gallery()
+        
+        # モデルリストを更新
+        self.refresh_model_list()
+        if use_yolo:
+            self.refresh_yolo_model_list()
+
+        # 位置ボタンのカウント表示を更新
+        self.update_location_button_counts()
+        
+        # アノテーション関連ボタンをアクティブ化
+        self.set_annotation_buttons_enabled(True)
+        
+        QMessageBox.information(
+            self, 
+            "読み込み完了", 
+            f"{len(valid_paths)}個のフォルダから合計{len(self.images)}枚の画像を読み込みました。\nアノテーションデータは読み込まれていません。"
+        )
+        
+        print(f"画像読み込み完了: {len(self.images)}枚の画像")
+        
+        # 自動的にアノテーションデータ読み込みを促す確認ダイアログ
+        reply = QMessageBox.question(
+            self, 
+            "アノテーションデータ読み込み", 
+            "画像読み込みが完了しました。\n"
+            "続けてアノテーションデータを読み込みますか？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+        
+        if reply == QMessageBox.Yes:
+            # アノテーションデータ読み込みメソッドを呼び出す
+            self.load_annotations()
+    #m
+    def load_images(self):
+        """
+        選択した各フォルダの下のimagesフォルダから画像を読み込む
+        アノテーションは自動では読み込まない
+        """
+        folder_paths_text = self.folder_input.text()
+        
+        # セミコロン区切りでフォルダパスを取得
+        folder_paths = folder_paths_text.split(";")
+        
+        # 有効なフォルダパスをチェック
+        valid_paths = []
+        image_folders = []  # 実際の画像フォルダ（各フォルダ下のimagesフォルダ）
+        
+        for folder_path in folder_paths:
+            folder_path = folder_path.strip()
+            if not os.path.exists(folder_path):
+                QMessageBox.warning(self, "エラー", f"フォルダが存在しません: {folder_path}")
+                continue
+                
+            # imagesフォルダのパスを取得
+            images_folder = os.path.join(folder_path, "images")
+            if os.path.exists(images_folder) and os.path.isdir(images_folder):
+                # imagesフォルダが存在する場合
+                valid_paths.append(folder_path)  # 親フォルダを有効パスとして記録
+                image_folders.append(images_folder)  # 実際の画像フォルダを記録
+            else:
+                QMessageBox.warning(self, "エラー", f"フォルダの下にimagesフォルダが見つかりません: {folder_path}")
+        
+        if not valid_paths or not image_folders:
+            return
+        
+        # 全画像フォルダの画像を集める
+        all_images = []
+        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.gif']
+        
+        print(f"{len(image_folders)}個のimagesフォルダを検索中...")
+        
+        for img_folder in image_folders:
+            print(f"画像フォルダを検索中: {img_folder}")
+            
+            # imagesフォルダ内の画像を検索
+            try:
+                for file in os.listdir(img_folder):
+                    if any(file.lower().endswith(ext) for ext in image_extensions):
+                        all_images.append(os.path.join(img_folder, file))
+            except Exception as e:
+                print(f"画像フォルダ {img_folder} の読み込みエラー: {e}")
+        
+        if not all_images:
+            QMessageBox.warning(self, "エラー", "選択されたフォルダ内のimagesフォルダに画像ファイルがありません。")
+            return
+        
+        print(f"{len(all_images)}枚の画像が見つかりました")
+        
+        # ファイル名からインデックスを抽出してソート
+        image_with_indices = []
+        for img_path in all_images:
+            basename = os.path.basename(img_path)
+            # ファイル名からインデックスを抽出（例: 10900_cam_image_array_.jpg -> 10900）
+            try:
+                import re
+                match = re.match(r'^(\d+)_', basename)
+                if match:
+                    index = int(match.group(1))
+                    image_with_indices.append((img_path, index))
+                else:
+                    # インデックスが抽出できない場合は、高い値（後ろに配置）
+                    image_with_indices.append((img_path, float('inf')))
+            except Exception as e:
+                print(f"ファイル名からインデックス抽出エラー: {basename} - {e}")
+                # エラーの場合も高い値で後ろに配置
+                image_with_indices.append((img_path, float('inf')))
+        
+        # インデックスでソート
+        image_with_indices.sort(key=lambda x: x[1])
+        
+        # ソート後の画像パスリストを作成
+        images = [img_path for img_path, _ in image_with_indices]
+                
+        # Reset state
+        self.folder_path = valid_paths[0]  # 最初の親フォルダをメインフォルダとして設定
+        self.folder_paths = valid_paths    # すべての有効な親フォルダパスを保存
+        self.image_folders = image_folders # すべての画像フォルダパス（imagesフォルダ）を保存
+        self.images = images
+        self.current_index = 0
+        self.annotations = {}
+        self.annotation_history = []
+        self.annotated_count = 0
+        self.annotation_timestamps = {}
+        self.inference_results = {}
+        self.location_annotations = {}
+        
+        if hasattr(self, 'deleted_indexes'):
+            self.deleted_indexes = []
+
+        # スライダーの設定を更新
+        if images:
+            self.image_slider.setMaximum(len(images) - 1)
+            self.image_slider.setValue(0)
+            self.slider_value_label.setText(f"1/{len(images)}")
+        else:
+            self.image_slider.setMaximum(0)
+            self.image_slider.setValue(0)
+            self.slider_value_label.setText("0/0")
+        
+        # Update UI
+        self.update_stats()
+        self.display_current_image()
+        self.update_gallery()
+        
+        # モデルリストを更新
+        self.refresh_model_list()
+        if use_yolo:
+            self.refresh_yolo_model_list()
+
+        # 位置ボタンのカウント表示を更新
+        self.update_location_button_counts()
+        
+        # アノテーション関連ボタンをアクティブ化
+        self.set_annotation_buttons_enabled(True)
+        
+        QMessageBox.information(
+            self, 
+            "読み込み完了", 
+            f"{len(valid_paths)}個のフォルダから合計{len(self.images)}枚の画像を読み込みました。\nアノテーションデータは読み込まれていません。"
+        )
+        
+        print(f"画像読み込み完了: {len(self.images)}枚の画像")
+        
+        # 自動的にアノテーションデータ読み込みを促す確認ダイアログ
+        reply = QMessageBox.question(
+            self, 
+            "アノテーションデータ読み込み", 
+            "画像読み込みが完了しました。\n"
+            "続けてアノテーションデータを読み込みますか？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+        
+        if reply == QMessageBox.Yes:
+            # アノテーションデータ読み込みメソッドを呼び出す
+            self.load_annotations()
 
     def load_annotations(self):
-        """アノテーションデータを読み込む（同じ階層または下の階層から選択）"""
-        if not self.folder_path or not self.images:
+        """
+        アノテーションデータを読み込む
+        画像フォルダ（imagesフォルダ）と同じ階層にあるアノテーションデータを読み込む
+        """
+        if not hasattr(self, 'folder_paths') or not self.folder_paths or not self.images:
             QMessageBox.warning(self, "警告", "先に画像フォルダを選択して画像を読み込んでください。")
             return
         
@@ -4710,27 +4935,496 @@ class ImageAnnotationTool(QMainWindow):
             elif reply == QMessageBox.Yes:
                 self.clear_annotations()
         
-        # 読み込み方法の選択
-        options = ["選択したフォルダと同じ階層から直接読み込む", "現在のフォルダの下の階層から読み込む"]
-        choice, ok = QInputDialog.getItem(
-            self, 
-            "アノテーション読み込み方法", 
-            "アノテーションデータの読み込み方法を選択してください：",
-            options, 
-            0, 
-            False
-        )
+        # この時点で、self.folder_pathsには親フォルダのパスが入っている
+        # 各親フォルダにはimagesフォルダがあり、アノテーションもその親フォルダ内にある
         
-        if not ok or not choice:
+        # 進捗ダイアログを表示
+        progress = QProgressDialog(
+            f"{len(self.folder_paths)}個のフォルダからアノテーションを検索中...", 
+            "キャンセル", 0, len(self.folder_paths), self
+        )
+        progress.setWindowTitle("アノテーション読み込み")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QApplication.processEvents()
+        
+        # アノテーションデータの検索と読み込みを実行
+        annotations_loaded = False
+        loaded_count = 0
+        annotations_by_dir = {}  # 各ディレクトリから読み込まれたアノテーション数
+        
+        try:
+            for idx, parent_dir in enumerate(self.folder_paths):
+                progress.setValue(idx)
+                progress.setLabelText(f"フォルダ {idx+1}/{len(self.folder_paths)} を処理中...\n{parent_dir}")
+                QApplication.processEvents()
+                
+                if progress.wasCanceled():
+                    break
+                
+                # parent_dirがルートフォルダなので、このディレクトリ内にアノテーションとimagesフォルダがある
+                
+                # 1. parent_dir自体がDonkeycar形式かどうか確認する
+                # マニフェストファイルを確認
+                annotations_before = len(self.annotations)
+                
+                manifest_path = os.path.join(parent_dir, "manifest.json")
+                if os.path.exists(manifest_path):
+                    # マニフェストベースの読み込み（複数カタログ対応）
+                    if self.load_catalog_annotations(parent_dir):
+                        annotations_loaded = True
+                        loaded_in_dir = len(self.annotations) - annotations_before
+                        annotations_by_dir[parent_dir] = loaded_in_dir
+                        loaded_count += loaded_in_dir
+                        print(f"親ディレクトリ {parent_dir} から {loaded_in_dir} 個のアノテーションを読み込みました")
+                else:
+                    # 単一カタログファイルの確認
+                    try:
+                        catalog_files = [f for f in os.listdir(parent_dir) if f.endswith('.catalog')]
+                        if catalog_files:
+                            catalog_path = os.path.join(parent_dir, catalog_files[0])
+                            if self.load_catalog_annotations(os.path.dirname(catalog_path)):
+                                annotations_loaded = True
+                                loaded_in_dir = len(self.annotations) - annotations_before
+                                annotations_by_dir[parent_dir] = loaded_in_dir
+                                loaded_count += loaded_in_dir
+                                print(f"親ディレクトリ {parent_dir} から {loaded_in_dir} 個のアノテーションを読み込みました")
+                    except Exception as e:
+                        print(f"カタログファイル検索エラー {parent_dir}: {e}")
+                
+                # 2. 親ディレクトリ内のannotationフォルダも確認する
+                annotation_folder = os.path.join(parent_dir, "annotation")
+                annotations_before_subdir = len(self.annotations)
+                
+                if os.path.exists(annotation_folder):
+                    sub_progress_text = f"フォルダ {idx+1}/{len(self.folder_paths)} の annotation フォルダを確認中..."
+                    progress.setLabelText(sub_progress_text)
+                    QApplication.processEvents()
+                    
+                    # Donkeycar形式のデータを確認 (data_donkey)
+                    donkey_folder = os.path.join(annotation_folder, DATA_DONKEY_DIR_NAME)
+                    if os.path.exists(donkey_folder):
+                        # マニフェストファイルを確認
+                        manifest_path = os.path.join(donkey_folder, "manifest.json")
+                        if os.path.exists(manifest_path):
+                            # マニフェストベースの読み込み（複数カタログ対応）
+                            if self.load_catalog_annotations(donkey_folder):
+                                annotations_loaded = True
+                                loaded_in_subdir = len(self.annotations) - annotations_before_subdir
+                                annotations_by_dir[donkey_folder] = loaded_in_subdir
+                                loaded_count += loaded_in_subdir
+                                print(f"フォルダ {donkey_folder} から {loaded_in_subdir} 個のアノテーションを読み込みました")
+                        else:
+                            # 従来の単一カタログファイルの確認
+                            try:
+                                catalog_files = [f for f in os.listdir(donkey_folder) if f.endswith('.catalog')]
+                                if catalog_files:
+                                    catalog_path = os.path.join(donkey_folder, catalog_files[0])
+                                    if self.load_catalog_annotations(os.path.dirname(catalog_path)):
+                                        annotations_loaded = True
+                                        loaded_in_subdir = len(self.annotations) - annotations_before_subdir
+                                        annotations_by_dir[donkey_folder] = loaded_in_subdir
+                                        loaded_count += loaded_in_subdir
+                                        print(f"フォルダ {donkey_folder} から {loaded_in_subdir} 個のアノテーションを読み込みました")
+                            except Exception as e:
+                                print(f"Donkeycarカタログファイル検索エラー {donkey_folder}: {e}")
+                    
+                    # Jetracer形式のデータを確認 (data_jetracer)
+                    jetracer_folder = os.path.join(annotation_folder, DATA_JETRACER_DIR_NAME)
+                    if os.path.exists(jetracer_folder):
+                        # Jetracerのアノテーションファイルを確認
+                        try:
+                            annotation_files = [f for f in os.listdir(jetracer_folder) if f.endswith('.json')]
+                            if annotation_files:
+                                # TODO: Jetracer形式の読み込み処理を実装
+                                pass
+                        except Exception as e:
+                            print(f"Jetracerアノテーションファイル検索エラー {jetracer_folder}: {e}")
+                
+                # 3. data_donkeyフォルダが親ディレクトリ直下にある場合も確認
+                donkey_direct_folder = os.path.join(parent_dir, DATA_DONKEY_DIR_NAME)
+                if os.path.exists(donkey_direct_folder):
+                    sub_progress_text = f"フォルダ {idx+1}/{len(self.folder_paths)} の data_donkey フォルダを確認中..."
+                    progress.setLabelText(sub_progress_text)
+                    QApplication.processEvents()
+                    
+                    annotations_before_direct = len(self.annotations)
+                    
+                    # マニフェストファイルを確認
+                    manifest_path = os.path.join(donkey_direct_folder, "manifest.json")
+                    if os.path.exists(manifest_path):
+                        # マニフェストベースの読み込み（複数カタログ対応）
+                        if self.load_catalog_annotations(donkey_direct_folder):
+                            annotations_loaded = True
+                            loaded_in_direct = len(self.annotations) - annotations_before_direct
+                            annotations_by_dir[donkey_direct_folder] = loaded_in_direct
+                            loaded_count += loaded_in_direct
+                            print(f"フォルダ {donkey_direct_folder} から {loaded_in_direct} 個のアノテーションを読み込みました")
+                    else:
+                        # 従来の単一カタログファイルの確認
+                        try:
+                            catalog_files = [f for f in os.listdir(donkey_direct_folder) if f.endswith('.catalog')]
+                            if catalog_files:
+                                catalog_path = os.path.join(donkey_direct_folder, catalog_files[0])
+                                if self.load_catalog_annotations(os.path.dirname(catalog_path)):
+                                    annotations_loaded = True
+                                    loaded_in_direct = len(self.annotations) - annotations_before_direct
+                                    annotations_by_dir[donkey_direct_folder] = loaded_in_direct
+                                    loaded_count += loaded_in_direct
+                                    print(f"フォルダ {donkey_direct_folder} から {loaded_in_direct} 個のアノテーションを読み込みました")
+                        except Exception as e:
+                            print(f"直接のdata_donkeyカタログファイル検索エラー {donkey_direct_folder}: {e}")
+            
+            progress.setValue(len(self.folder_paths))
+            progress.close()
+            
+            if annotations_loaded:
+                # Update UI
+                self.update_stats()
+                self.display_current_image()
+                self.update_gallery()
+                
+                # 位置ボタンのカウント表示を更新
+                self.update_location_button_counts()
+                
+                # 詳細情報を生成
+                details = ""
+                if len(annotations_by_dir) > 0:
+                    details = "\n\n詳細:\n"
+                    for dir_path, count in annotations_by_dir.items():
+                        if count > 0:
+                            dir_name = os.path.basename(dir_path)
+                            parent_name = os.path.basename(os.path.dirname(dir_path))
+                            details += f"• {parent_name}/{dir_name}: {count}個\n"
+                
+                QMessageBox.information(
+                    self, 
+                    "読み込み成功", 
+                    f"{len(self.folder_paths)}個のフォルダから合計{loaded_count}個のアノテーションを読み込みました。{details}"
+                )
+            else:
+                QMessageBox.warning(
+                    self, 
+                    "警告", 
+                    "選択したフォルダからアノテーションデータが見つかりませんでした。"
+                )
+                return
+                
+            print(f"複数フォルダからのアノテーション読み込み完了: {loaded_count}個のアノテーション")
+            
+        except Exception as e:
+            if 'progress' in locals():
+                progress.close()
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"アノテーションの読み込み中にエラーが発生しました: {str(e)}"
+            )
+
+    def load_sibling_annotations_multi(self):
+        """すべての画像フォルダと同じ階層にあるアノテーションデータを読み込む"""
+        if not hasattr(self, 'folder_paths') or not self.folder_paths or not self.images:
+            QMessageBox.warning(self, "警告", "先に画像フォルダを選択して画像を読み込んでください。")
             return
         
-        if choice == options[0]:
-            # 同階層から直接読み込む
-            self.load_sibling_annotations()
-        else:
-            # 現在のフォルダの下の階層から読み込む
-            self.load_subfolder_annotations()
+        # 各フォルダの親ディレクトリを取得
+        parent_dirs = []
+        for folder_path in self.folder_paths:
+            parent_dir = os.path.dirname(folder_path)
+            if parent_dir not in parent_dirs:  # 重複を避ける
+                parent_dirs.append(parent_dir)
+        
+        # 進捗ダイアログを表示
+        progress = QProgressDialog(
+            f"{len(parent_dirs)}個のフォルダの親階層からアノテーションを検索中...", 
+            "キャンセル", 0, len(parent_dirs), self
+        )
+        progress.setWindowTitle("アノテーション読み込み")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QApplication.processEvents()
+        
+        # アノテーションデータの検索と読み込みを実行
+        annotations_loaded = False
+        loaded_count = 0
+        annotations_by_dir = {}  # 各ディレクトリから読み込まれたアノテーション数
+        
+        try:
+            for idx, parent_dir in enumerate(parent_dirs):
+                progress.setValue(idx)
+                progress.setLabelText(f"フォルダ {idx+1}/{len(parent_dirs)} を処理中...\n{parent_dir}")
+                QApplication.processEvents()
+                
+                if progress.wasCanceled():
+                    break
+                
+                # 親ディレクトリ自体がDonkeycar形式かどうか確認する
+                # マニフェストファイルを確認
+                manifest_path = os.path.join(parent_dir, "manifest.json")
+                annotations_before = len(self.annotations)
+                
+                if os.path.exists(manifest_path):
+                    # マニフェストベースの読み込み（複数カタログ対応）
+                    if self.load_catalog_annotations(parent_dir):
+                        annotations_loaded = True
+                        loaded_in_dir = len(self.annotations) - annotations_before
+                        annotations_by_dir[parent_dir] = loaded_in_dir
+                        loaded_count += loaded_in_dir
+                        print(f"親ディレクトリ {parent_dir} から {loaded_in_dir} 個のアノテーションを読み込みました")
+                else:
+                    # 単一カタログファイルの確認
+                    catalog_files = [f for f in os.listdir(parent_dir) if f.endswith('.catalog')]
+                    if catalog_files:
+                        catalog_path = os.path.join(parent_dir, catalog_files[0])
+                        if self.load_catalog_annotations(os.path.dirname(catalog_path)):
+                            annotations_loaded = True
+                            loaded_in_dir = len(self.annotations) - annotations_before
+                            annotations_by_dir[parent_dir] = loaded_in_dir
+                            loaded_count += loaded_in_dir
+                            print(f"親ディレクトリ {parent_dir} から {loaded_in_dir} 個のアノテーションを読み込みました")
+                
+                # 親ディレクトリ内のannotationフォルダも確認する
+                annotation_folder = os.path.join(parent_dir, "annotation")
+                annotations_before_subdir = len(self.annotations)
+                
+                if os.path.exists(annotation_folder):
+                    sub_progress_text = f"フォルダ {idx+1}/{len(parent_dirs)} の annotation フォルダを確認中..."
+                    progress.setLabelText(sub_progress_text)
+                    QApplication.processEvents()
+                    
+                    # Donkeycar形式のデータを確認 (data_donkey)
+                    donkey_folder = os.path.join(annotation_folder, DATA_DONKEY_DIR_NAME)
+                    if os.path.exists(donkey_folder):
+                        # マニフェストファイルを確認
+                        manifest_path = os.path.join(donkey_folder, "manifest.json")
+                        if os.path.exists(manifest_path):
+                            # マニフェストベースの読み込み（複数カタログ対応）
+                            if self.load_catalog_annotations(donkey_folder):
+                                annotations_loaded = True
+                                loaded_in_subdir = len(self.annotations) - annotations_before_subdir
+                                annotations_by_dir[donkey_folder] = loaded_in_subdir
+                                loaded_count += loaded_in_subdir
+                                print(f"フォルダ {donkey_folder} から {loaded_in_subdir} 個のアノテーションを読み込みました")
+                        else:
+                            # 従来の単一カタログファイルの確認
+                            catalog_files = [f for f in os.listdir(donkey_folder) if f.endswith('.catalog')]
+                            if catalog_files:
+                                catalog_path = os.path.join(donkey_folder, catalog_files[0])
+                                if self.load_catalog_annotations(os.path.dirname(catalog_path)):
+                                    annotations_loaded = True
+                                    loaded_in_subdir = len(self.annotations) - annotations_before_subdir
+                                    annotations_by_dir[donkey_folder] = loaded_in_subdir
+                                    loaded_count += loaded_in_subdir
+                                    print(f"フォルダ {donkey_folder} から {loaded_in_subdir} 個のアノテーションを読み込みました")
+                    
+                    # Jetracer形式のデータを確認 (data_jetracer)
+                    jetracer_folder = os.path.join(annotation_folder, DATA_JETRACER_DIR_NAME)
+                    if os.path.exists(jetracer_folder):
+                        # Jetracerのアノテーションファイルを確認
+                        annotation_files = [f for f in os.listdir(jetracer_folder) if f.endswith('.json')]
+                        if annotation_files:
+                            # TODO: Jetracer形式の読み込み処理を実装
+                            pass
             
+            progress.setValue(len(parent_dirs))
+            progress.close()
+            
+            if annotations_loaded:
+                # Update UI
+                self.update_stats()
+                self.display_current_image()
+                self.update_gallery()
+                
+                # 位置ボタンのカウント表示を更新
+                self.update_location_button_counts()
+                
+                # 詳細情報を生成
+                details = ""
+                if len(annotations_by_dir) > 0:
+                    details = "\n\n詳細:\n"
+                    for dir_path, count in annotations_by_dir.items():
+                        if count > 0:
+                            dir_name = os.path.basename(dir_path)
+                            details += f"• {dir_name}: {count}個\n"
+                
+                QMessageBox.information(
+                    self, 
+                    "読み込み成功", 
+                    f"{len(parent_dirs)}個のフォルダの親階層から合計{loaded_count}個のアノテーションを読み込みました。{details}"
+                )
+            else:
+                QMessageBox.warning(
+                    self, 
+                    "警告", 
+                    "選択したフォルダの親階層から読み込めるアノテーションデータがありませんでした。"
+                )
+                return
+                
+            print(f"複数フォルダからのアノテーション読み込み完了: {loaded_count}個のアノテーション")
+            
+        except Exception as e:
+            if 'progress' in locals():
+                progress.close()
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"アノテーションの読み込み中にエラーが発生しました: {str(e)}"
+            )
+
+    def load_subfolder_annotations_multi(self):
+        """すべての画像フォルダの下の階層からアノテーションデータを読み込む"""
+        if not hasattr(self, 'folder_paths') or not self.folder_paths or not self.images:
+            QMessageBox.warning(self, "警告", "先に画像フォルダを選択して画像を読み込んでください。")
+            return
+        
+        # 進捗ダイアログを表示
+        progress = QProgressDialog(
+            f"{len(self.folder_paths)}個のフォルダのサブフォルダからアノテーションを検索中...", 
+            "キャンセル", 0, len(self.folder_paths), self
+        )
+        progress.setWindowTitle("アノテーション読み込み")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QApplication.processEvents()
+        
+        # アノテーションデータの検索と読み込みを実行
+        annotations_loaded = False
+        loaded_count = 0
+        annotations_by_dir = {}  # 各ディレクトリから読み込まれたアノテーション数
+        
+        try:
+            for idx, folder_path in enumerate(self.folder_paths):
+                progress.setValue(idx)
+                progress.setLabelText(f"フォルダ {idx+1}/{len(self.folder_paths)} を処理中...\n{folder_path}")
+                QApplication.processEvents()
+                
+                if progress.wasCanceled():
+                    break
+                
+                # 現在のフォルダ内のサブフォルダを探す
+                sub_dirs = []
+                try:
+                    for item in os.listdir(folder_path):
+                        full_path = os.path.join(folder_path, item)
+                        if os.path.isdir(full_path):
+                            sub_dirs.append(full_path)
+                except Exception as e:
+                    print(f"フォルダ {folder_path} の読み込み中にエラー: {e}")
+                    continue
+                
+                if not sub_dirs:
+                    print(f"警告: フォルダ {folder_path} 内にサブフォルダが見つかりません。")
+                    continue
+                
+                # 各サブフォルダをチェック
+                for subdir_idx, subdir in enumerate(sub_dirs):
+                    subdir_name = os.path.basename(subdir)
+                    progress.setLabelText(f"フォルダ {idx+1}/{len(self.folder_paths)} のサブフォルダ {subdir_idx+1}/{len(sub_dirs)} を処理中...\n{subdir_name}")
+                    QApplication.processEvents()
+                    
+                    if progress.wasCanceled():
+                        break
+                    
+                    # アノテーション読込前のカウントを保存
+                    annotations_before = len(self.annotations)
+                    
+                    # サブフォルダ自体がDonkeycar形式かどうか確認
+                    manifest_path = os.path.join(subdir, "manifest.json")
+                    if os.path.exists(manifest_path):
+                        # マニフェストベースの読み込み（複数カタログ対応）
+                        if self.load_catalog_annotations(subdir):
+                            annotations_loaded = True
+                            loaded_in_subdir = len(self.annotations) - annotations_before
+                            annotations_by_dir[subdir] = loaded_in_subdir
+                            loaded_count += loaded_in_subdir
+                            print(f"サブフォルダ {subdir} から {loaded_in_subdir} 個のアノテーションを読み込みました")
+                    else:
+                        # 単一カタログファイルの確認
+                        catalog_files = [f for f in os.listdir(subdir) if f.endswith('.catalog')]
+                        if catalog_files:
+                            catalog_path = os.path.join(subdir, catalog_files[0])
+                            if self.load_catalog_annotations(os.path.dirname(catalog_path)):
+                                annotations_loaded = True
+                                loaded_in_subdir = len(self.annotations) - annotations_before
+                                annotations_by_dir[subdir] = loaded_in_subdir
+                                loaded_count += loaded_in_subdir
+                                print(f"サブフォルダ {subdir} から {loaded_in_subdir} 個のアノテーションを読み込みました")
+                    
+                    # サブフォルダ内のdata_donkeyフォルダも確認する
+                    donkey_folder = os.path.join(subdir, DATA_DONKEY_DIR_NAME)
+                    if os.path.exists(donkey_folder):
+                        # マニフェストファイルを確認
+                        manifest_path = os.path.join(donkey_folder, "manifest.json")
+                        if os.path.exists(manifest_path):
+                            # マニフェストベースの読み込み（複数カタログ対応）
+                            if self.load_catalog_annotations(donkey_folder):
+                                annotations_loaded = True
+                                loaded_in_donkey = len(self.annotations) - annotations_before
+                                annotations_by_dir[donkey_folder] = loaded_in_donkey
+                                loaded_count += loaded_in_donkey
+                                print(f"サブフォルダ {donkey_folder} から {loaded_in_donkey} 個のアノテーションを読み込みました")
+                        else:
+                            # 従来の単一カタログファイルの確認
+                            catalog_files = [f for f in os.listdir(donkey_folder) if f.endswith('.catalog')]
+                            if catalog_files:
+                                catalog_path = os.path.join(donkey_folder, catalog_files[0])
+                                if self.load_catalog_annotations(os.path.dirname(catalog_path)):
+                                    annotations_loaded = True
+                                    loaded_in_donkey = len(self.annotations) - annotations_before
+                                    annotations_by_dir[donkey_folder] = loaded_in_donkey
+                                    loaded_count += loaded_in_donkey
+                                    print(f"サブフォルダ {donkey_folder} から {loaded_in_donkey} 個のアノテーションを読み込みました")
+            
+            progress.setValue(len(self.folder_paths))
+            progress.close()
+            
+            if annotations_loaded:
+                # Update UI
+                self.update_stats()
+                self.display_current_image()
+                self.update_gallery()
+                
+                # 位置ボタンのカウント表示を更新
+                self.update_location_button_counts()
+                
+                # 詳細情報を生成
+                details = ""
+                if len(annotations_by_dir) > 0:
+                    details = "\n\n詳細:\n"
+                    for dir_path, count in annotations_by_dir.items():
+                        if count > 0:
+                            dir_name = os.path.basename(dir_path)
+                            details += f"• {dir_name}: {count}個\n"
+                
+                QMessageBox.information(
+                    self, 
+                    "読み込み成功", 
+                    f"{len(self.folder_paths)}個のフォルダのサブフォルダから合計{loaded_count}個のアノテーションを読み込みました。{details}"
+                )
+            else:
+                QMessageBox.warning(
+                    self, 
+                    "警告", 
+                    "選択したフォルダのサブフォルダから読み込めるアノテーションデータがありませんでした。"
+                )
+                return
+                
+            print(f"複数フォルダのサブフォルダからのアノテーション読み込み完了: {loaded_count}個のアノテーション")
+            
+        except Exception as e:
+            if 'progress' in locals():
+                progress.close()
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"サブフォルダアノテーションの読み込み中にエラーが発生しました: {str(e)}"
+            )
+
     def clear_annotations(self):
         """既存のアノテーションデータをクリアする"""
         self.annotations = {}
@@ -4918,8 +5612,6 @@ class ImageAnnotationTool(QMainWindow):
             return
         
         # モデルのパスを取得
-        #annotation_folder = os.path.join(self.folder_path, "annotation")
-        #models_dir = os.path.join(annotation_folder, "annotation_models")
         models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
         model_path = os.path.join(models_dir, selected_model)
         
@@ -5740,17 +6432,18 @@ class ImageAnnotationTool(QMainWindow):
         self.update_gallery()
         
         # 前回のバウンディングボックスを自動適用（もし実装されていれば）
-        if hasattr(self, 'auto_apply_last_bbox') and hasattr(self, 'last_bbox'):
+        if hasattr(self, 'auto_apply_last_bbox') and hasattr(self, 'last_bboxes'):
             if (not is_deleted and 
                 self.auto_apply_last_bbox and 
-                self.last_bbox is not None and 
+                self.last_bboxes and  # リストが空でないことを確認
                 (current_img_path not in self.bbox_annotations or not self.bbox_annotations[current_img_path])):
-                # 前回のバウンディングボックスを適用
-                self.add_bbox_annotation(self.last_bbox.copy())
+                # 前回の全てのバウンディングボックスを適用
+                for bbox in self.last_bboxes:
+                    self.add_bbox_annotation(bbox.copy())
                 
                 # ステータスバーに表示
-                self.statusBar().showMessage(f"前回の '{self.last_bbox['class']}' バウンディングボックスを適用しました", 3000)
-        
+                self.statusBar().showMessage(f"{len(self.last_bboxes)}個の前回のバウンディングボックスを適用しました", 3000)
+
     def get_normalized_coordinates(self, click_x, click_y, img_width, img_height):
         """Convert pixel coordinates to normalized coordinates"""
         # Convert x from pixels to -1 (left) to 1 (right)
@@ -5984,8 +6677,6 @@ class ImageAnnotationTool(QMainWindow):
         # モデルのパスを取得
         model_path = None
         if hasattr(self, 'model_combo') and selected_model not in ["モデルが見つかりません", "フォルダを選択してください"] and "が見つかりません" not in selected_model:
-            #annotation_folder = os.path.join(self.folder_path, "annotation")
-            #models_dir = os.path.join(annotation_folder, "annotation_models")
             models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
             model_path = os.path.join(models_dir, selected_model)
             
@@ -6813,7 +7504,16 @@ class ImageAnnotationTool(QMainWindow):
                 use_augmentation=augmentation_params if augmentation_params['enabled'] else False,
                 batch_size=batch_size  # バッチサイズを追加
             )
-            
+
+            # 最初の画像から実際のサイズを取得
+            sample_img_path = image_paths[0]
+            sample_img = Image.open(sample_img_path)
+            input_size = (sample_img.height, sample_img.width)  # 高さ、幅の順
+
+            progress.setLabelText(f"入力サイズ: {input_size} で学習準備中...")
+            progress.setValue(10)
+            QApplication.processEvents()
+
             # モデルの学習 - 事前学習済み重みをロードするかどうかのフラグを追加
             training_results = train_model(
                 model_name=model_type,
@@ -6845,7 +7545,8 @@ class ImageAnnotationTool(QMainWindow):
                     "used_samples": len(image_paths),
                     "train_samples": len(train_loader.dataset),
                     "val_samples": len(val_loader.dataset),
-                    "input_shape": dataset_info.get('actual_image_size', (0, 0))
+                    "input_shape": dataset_info.get('actual_image_size', input_size)  # 実際の画像サイズを使用
+                    #"input_shape": dataset_info.get('actual_image_size', (0, 0))
                 }
                 
                 # メトリクス情報を定義（先に定義する）
@@ -6918,75 +7619,26 @@ class ImageAnnotationTool(QMainWindow):
                 import traceback
                 traceback.print_exc()  # スタックトレースを出力して詳細を確認
                 mlflow_info = f"MLflowへの記録中にエラーが発生しました: {str(e)}"
-
-            # .h5形式でのエクスポートをするか確認
-            # h5_reply = QMessageBox.question(
-            #     self, 
-            #     "Donkeycar形式でのエクスポート", 
-            #     "トレーニングしたモデルをDonkeycar用の.h5形式でエクスポートしますか？\n"
-            #     "これにより、Donkeycarフレームワークでモデルをそのまま使用できます。",
-            #     QMessageBox.Yes | QMessageBox.No, 
-            #     QMessageBox.Yes
-            # )
-            
-            # # .h5形式でのエクスポート処理
-            # if h5_reply == QMessageBox.Yes:
-            #     try:
-            #         # .h5エクスポート用のディレクトリ
-            #         h5_dir = os.path.join(models_dir, "h5_models")
-            #         os.makedirs(h5_dir, exist_ok=True)
-                    
-            #         # タイムスタンプを使用してファイル名を生成
-            #         from datetime import datetime
-            #         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            #         h5_filename = f"{model_type}_model_{timestamp}.h5"
-            #         h5_path = os.path.join(h5_dir, h5_filename)
-                    
-            #         # model_training モジュールから変換関数をインポート
-            #         from model_training import export_model_to_h5
-                    
-            #         # 最良のモデルを.h5形式でエクスポート
-            #         export_model_to_h5(
-            #             model_path=training_results['best_model_path'],
-            #             output_path=h5_path,
-            #             model_type=model_type
-            #         )
-                    
-            #         QMessageBox.information(
-            #             self,
-            #             "エクスポート成功",
-            #             f"モデルを.h5形式で保存しました。\n保存先: {h5_path}"
-            #         )
-            #     except Exception as e:
-            #         QMessageBox.critical(
-            #             self,
-            #             "エクスポートエラー",
-            #             f".h5形式へのエクスポート中にエラーが発生しました: {str(e)}"
-            #         )
             
             # オーグメンテーション情報を取得
             aug_details = ""
-            if self.augmentation_checkbox.isChecked():
-                aug_params = self.get_augmentation_params()
-                if isinstance(aug_params, dict) and aug_params['enabled']:
-                    aug_details = "データオーグメンテーション: 有効\n"
-                    if aug_params['use_flip']:
-                        aug_details += f"  - 水平反転 (確率: {aug_params['flip_prob']})\n"
-                    if aug_params['use_color']:
-                        aug_details += f"  - 色調整 (明るさ: ±{aug_params['brightness']}, "
-                        aug_details += f"コントラスト: ±{aug_params['contrast']}, "
-                        aug_details += f"彩度: ±{aug_params['saturation']})\n"
-                    if aug_params['use_geometry']:
-                        aug_details += f"  - 幾何変換 (回転: ±{aug_params['rotation_degrees']}度, "
-                        aug_details += f"平行移動: ±{aug_params['translate_ratio']})\n"
-                    if aug_params['use_erase']:
-                        aug_details += f"  - ランダムイレース (確率: {aug_params['erase_prob']}, "
-                        aug_details += f"範囲: {aug_params['erase_min_ratio']}～{aug_params['erase_max_ratio']})\n"
-                else:
-                    aug_details = "データオーグメンテーション: 有効（標準設定）\n"
+            if augmentation_params['enabled']:
+                aug_details = "データオーグメンテーション: 有効\n"
+                if augmentation_params['use_flip']:
+                    aug_details += f"  - 水平反転 (確率: {augmentation_params['flip_prob']})\n"
+                if augmentation_params['use_color']:
+                    aug_details += f"  - 色調整 (明るさ: ±{augmentation_params['brightness']}, "
+                    aug_details += f"コントラスト: ±{augmentation_params['contrast']}, "
+                    aug_details += f"彩度: ±{augmentation_params['saturation']})\n"
+                if augmentation_params['use_geometry']:
+                    aug_details += f"  - 幾何変換 (回転: ±{augmentation_params['rotation_degrees']}度, "
+                    aug_details += f"平行移動: ±{augmentation_params['translate_ratio']})\n"
+                if augmentation_params['use_erase']:
+                    aug_details += f"  - ランダムイレース (確率: {augmentation_params['erase_prob']}, "
+                    aug_details += f"範囲: {augmentation_params['erase_min_ratio']}～{augmentation_params['erase_max_ratio']})\n"
             else:
                 aug_details = "データオーグメンテーション: 無効\n"
-            
+
             # 初期重みの情報を追加
             weights_info = ""
             if load_weights:
@@ -7002,6 +7654,9 @@ class ImageAnnotationTool(QMainWindow):
                 else:
                     early_stopping_info = f"Early Stopping: 発動せず (忍耐値: {patience})\n"
             
+            # 入力サイズ情報を追加
+            input_size_info = f"入力サイズ: {input_size[0]}x{input_size[1]} (H x W)\n"
+
             # 成功メッセージを表示
             QMessageBox.information(
                 self, 
@@ -7011,6 +7666,7 @@ class ImageAnnotationTool(QMainWindow):
                 f"実施エポック数: {training_results.get('completed_epochs', num_epochs)}/{num_epochs}\n" +
                 early_stopping_info +
                 f"学習データ数: {len(image_paths)}枚 {sampling_info}\n" +
+                input_size_info + 
                 weights_info +
                 f"学習率: {learning_rate}\n" +
                 f"バッチサイズ: {batch_size}\n" +
@@ -7221,130 +7877,6 @@ class ImageAnnotationTool(QMainWindow):
             'erase_min_ratio': self.aug_erase_min_ratio.value(),
             'erase_max_ratio': self.aug_erase_max_ratio.value()
         }
-
-    def show_augmentation_preview(self):
-        """オーグメンテーションのプレビューを表示する"""
-        if not self.images or not self.augmentation_checkbox.isChecked():
-            QMessageBox.warning(self, "警告", "プレビュー対象の画像がないか、オーグメンテーションが無効です。")
-            return
-        
-        # 現在表示中の画像を取得
-        current_img_path = self.images[self.current_index]
-        
-        # 現在の設定を取得
-        aug_params = self.get_augmentation_params()
-        
-        try:
-            # モジュールのインポートをここで行う（UI初期化時には必要ない）
-            from model_training import generate_augmentation_samples
-            
-            # オーグメンテーションサンプルを生成
-            samples = generate_augmentation_samples(
-                current_img_path,
-                num_samples=5,  # オリジナル含め5枚表示
-                use_flip=aug_params['use_flip'],
-                flip_prob=aug_params['flip_prob'],
-                use_color=aug_params['use_color'],
-                brightness=aug_params['brightness'],
-                contrast=aug_params['contrast'],
-                saturation=aug_params['saturation'],
-                use_geometry=aug_params['use_geometry'],
-                rotation_degrees=aug_params['rotation_degrees'],
-                translate_ratio=aug_params['translate_ratio'],
-                use_erase=aug_params['use_erase'],
-                erase_prob=aug_params['erase_prob'],
-                erase_min_ratio=aug_params['erase_min_ratio'],
-                erase_max_ratio=aug_params['erase_max_ratio']
-            )
-            
-            # プレビューダイアログを作成
-            preview_dialog = QDialog(self)
-            preview_dialog.setWindowTitle("オーグメンテーションプレビュー")
-            preview_dialog.setMinimumWidth(800)
-            preview_dialog.setMinimumHeight(500)
-            
-            preview_layout = QVBoxLayout(preview_dialog)
-            
-            # タイトルラベル
-            title_label = QLabel("オーグメンテーションプレビュー")
-            title_label.setStyleSheet("font-size: 16px; font-weight: bold;")
-            title_label.setAlignment(Qt.AlignCenter)
-            preview_layout.addWidget(title_label)
-            
-            # 適用中の設定を表示
-            settings_text = "適用中の設定:\n"
-            if aug_params['use_flip']:
-                settings_text += f"・水平反転 (確率: {aug_params['flip_prob']})\n"
-            if aug_params['use_color']:
-                settings_text += f"・色調整 (明るさ: ±{aug_params['brightness']}, "
-                settings_text += f"コントラスト: ±{aug_params['contrast']}, "
-                settings_text += f"彩度: ±{aug_params['saturation']})\n"
-            if aug_params['use_geometry']:
-                settings_text += f"・幾何変換 (回転: ±{aug_params['rotation_degrees']}度, "
-                settings_text += f"平行移動: ±{aug_params['translate_ratio']})\n"
-            if aug_params['use_erase']:
-                settings_text += f"・ランダムイレース (確率: {aug_params['erase_prob']}, "
-                settings_text += f"範囲: {aug_params['erase_min_ratio']}～{aug_params['erase_max_ratio']})\n"
-                
-            settings_label = QLabel(settings_text)
-            settings_label.setStyleSheet("font-size: 12px;")
-            preview_layout.addWidget(settings_label)
-            
-            # 画像表示用のグリッドレイアウト
-            images_widget = QWidget()
-            images_layout = QGridLayout(images_widget)
-            images_layout.setContentsMargins(10, 10, 10, 10)
-            images_layout.setSpacing(10)
-            
-            # 画像を配置（最初はオリジナル）
-            original_img = samples[0]
-            original_label = QLabel()
-            original_pixmap = QPixmap.fromImage(self.pil_to_qimage(original_img))
-            original_label.setPixmap(original_pixmap.scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            original_label.setAlignment(Qt.AlignCenter)
-            
-            label_text = QLabel("オリジナル画像")
-            label_text.setAlignment(Qt.AlignCenter)
-            
-            # オリジナルを配置
-            images_layout.addWidget(original_label, 0, 0)
-            images_layout.addWidget(label_text, 1, 0)
-            
-            # オーグメンテーションサンプルを配置
-            for i, sample in enumerate(samples[1:], 1):
-                img, description = sample
-                sample_label = QLabel()
-                sample_pixmap = QPixmap.fromImage(self.pil_to_qimage(img))
-                sample_label.setPixmap(sample_pixmap.scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                sample_label.setAlignment(Qt.AlignCenter)
-                
-                # 説明ラベル（適用された変換）
-                desc_label = QLabel(description)
-                desc_label.setAlignment(Qt.AlignCenter)
-                desc_label.setWordWrap(True)
-                
-                col = i % 2
-                row = (i // 2) * 2
-                
-                images_layout.addWidget(sample_label, row, col)
-                images_layout.addWidget(desc_label, row + 1, col)
-            
-            # スクロールエリアに配置
-            scroll_area = QScrollArea()
-            scroll_area.setWidgetResizable(True)
-            scroll_area.setWidget(images_widget)
-            preview_layout.addWidget(scroll_area)
-            
-            # 閉じるボタン
-            close_button = QPushButton("閉じる")
-            close_button.clicked.connect(preview_dialog.accept)
-            preview_layout.addWidget(close_button)
-            
-            # ダイアログを表示
-            preview_dialog.exec_()
-        
-        except Exception as e:
-            QMessageBox.critical(self, "エラー", f"プレビュー生成中にエラーが発生しました: {str(e)}")
 
     def pil_to_qimage(self, pil_image):
         """PIL Imageをqtで使用可能なQImageに変換する"""
