@@ -8,6 +8,11 @@ import time
 import random
 from datetime import datetime
 
+import matplotlib
+import numpy as np
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+import io
+
 import torch
 torch.set_num_threads(2)  # スレッド数を制限
 # マルチプロセッシングのコンテキストが設定されていない場合のみ設定する
@@ -25,7 +30,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                             QScrollArea, QGridLayout, QFrame, QLineEdit, QProgressDialog,
                             QCheckBox, QSpinBox, QComboBox, QSlider, QInputDialog, 
                             QDoubleSpinBox, QGraphicsOpacityEffect, QDialog, QDialogButtonBox,
-                            QGroupBox, QRadioButton, QTabWidget, QListView, QTreeView, QAbstractItemView)
+                            QGroupBox, QRadioButton, QTabWidget, QSizePolicy)
 from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont
 from PyQt5.QtCore import Qt, QSize, QRect, QPoint, QTimer, QEvent
 
@@ -854,6 +859,14 @@ class ThumbnailWidget(QWidget):
         #     loc_only_label.setStyleSheet("color: #338833; font-size: 11px;font-weight: bold;")
         #     info_layout.addWidget(loc_only_label)
         
+
+        # 分布グラフ用ラベルを追加 (info_layoutに追加)
+        self.distribution_label = QLabel("アノテーションがありません")
+        self.distribution_label.setAlignment(Qt.AlignCenter)
+        self.distribution_label.setMinimumHeight(300)  # 高さを確保
+        self.distribution_label.setStyleSheet("background-color: #f5f5f5; border: 1px solid #dddddd;")
+        info_layout.addWidget(self.distribution_label)
+
         # 残りのスペースを埋めるスペーサー
         info_layout.addStretch()
         
@@ -1024,6 +1037,125 @@ class ImageAnnotationTool(QMainWindow):
         self.add_session_check_to_init_ui()
 
         QApplication.instance().installEventFilter(self)
+
+    def update_distribution_graph(self):
+        """アノテーションの角度とスロットル値の分布を縦並びのヒストグラムで表示"""
+        import matplotlib
+        matplotlib.use('Agg')  # GUIバックエンドを使用しない設定
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import io
+        from PyQt5.QtGui import QPixmap, QImage
+        
+        if not self.annotations:
+            # アノテーションがない場合は空のグラフを表示
+            self.distribution_label.clear()
+            self.distribution_label.setText("アノテーションがありません")
+            return
+        
+        # 既存のアノテーションからangleとthrottleの値を抽出
+        angles = []
+        throttles = []
+        
+        for img_path, anno in self.annotations.items():
+            if 'angle' in anno and 'throttle' in anno:
+                angles.append(anno['angle'])
+                throttles.append(anno['throttle'])
+        
+        # データがない場合は終了
+        if not angles or not throttles:
+            self.distribution_label.clear()
+            self.distribution_label.setText("有効なアノテーションがありません")
+            return
+        
+        # グラフ作成
+        try:
+            # 情報パネルの幅に合わせてグラフサイズを調整
+            panel_width = self.info_panel_width - self.info_panel_margin
+            # 縦に2つのグラフを配置（縦長）
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(panel_width/100, 4))
+            
+            # カラーマップとヒストグラムの設定
+            cm = plt.cm.get_cmap('viridis')
+            bins = 20
+            
+            # angle分布をヒストグラムで表示
+            n1, bins1, patches1 = ax1.hist(angles, bins=bins, alpha=0.7, color='skyblue')
+            # 度数に応じた色付け
+            bin_centers1 = 0.5 * (bins1[:-1] + bins1[1:])
+            col1 = bin_centers1 - min(bin_centers1)
+            col1 = col1 / max(col1) if max(col1) > 0 else col1
+            for c, p in zip(col1, patches1):
+                plt.setp(p, 'facecolor', cm(c))
+            
+            # スタイル設定
+            ax1.set_title('Angle dist', fontsize=10)
+            # ax1.set_xlabel('Angle値 (-1.0～1.0)', fontsize=8)
+            # ax1.set_ylabel('頻度', fontsize=8)
+            ax1.tick_params(axis='both', which='major', labelsize=7)
+            ax1.grid(True, alpha=0.3)
+            ax1.set_xlim(-1.05, 1.05)
+            
+            # 統計情報を追加
+            angle_mean = np.mean(angles)
+            angle_std = np.std(angles)
+            # ax1.text(0.05, 0.95, f'平均: {angle_mean:.3f}\n標準偏差: {angle_std:.3f}', 
+            #         transform=ax1.transAxes, fontsize=7, 
+            #         verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            
+            # throttle分布をヒストグラムで表示
+            n2, bins2, patches2 = ax2.hist(throttles, bins=bins, alpha=0.7, color='salmon')
+            # 度数に応じた色付け
+            bin_centers2 = 0.5 * (bins2[:-1] + bins2[1:])
+            col2 = bin_centers2 - min(bin_centers2)
+            col2 = col2 / max(col2) if max(col2) > 0 else col2
+            for c, p in zip(col2, patches2):
+                plt.setp(p, 'facecolor', cm(c))
+            
+            # スタイル設定
+            ax2.set_title('Throttle dist', fontsize=10)
+            # ax2.set_xlabel('Throttle値 (-1.0～1.0)', fontsize=8)
+            # ax2.set_ylabel('頻度', fontsize=8)
+            ax2.tick_params(axis='both', which='major', labelsize=7)
+            ax2.grid(True, alpha=0.3)
+            ax2.set_xlim(-1.05, 1.05)
+            
+            # 統計情報を追加
+            throttle_mean = np.mean(throttles)
+            throttle_std = np.std(throttles)
+            # ax2.text(0.05, 0.95, f'平均: {throttle_mean:.3f}\n標準偏差: {throttle_std:.3f}', 
+            #         transform=ax2.transAxes, fontsize=7, 
+            #         verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            
+            # # データ数を右上に表示
+            # fig.text(0.95, 0.98, f'n = {len(angles)}', 
+            #         horizontalalignment='right', verticalalignment='top', 
+            #         fontsize=8, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            
+            # レイアウト調整
+            plt.tight_layout(pad=1.0)
+            
+            # メモリ上にグラフを保存
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+            buf.seek(0)
+            
+            # QImageに変換してQPixmapに設定
+            image = QImage.fromData(buf.getvalue())
+            pixmap = QPixmap.fromImage(image)
+            
+            # ラベルにセット
+            self.distribution_label.setPixmap(pixmap)
+            self.distribution_label.setScaledContents(True)
+            
+            # 後始末
+            plt.close(fig)
+            
+        except Exception as e:
+            print(f"分布グラフ作成中にエラー: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            self.distribution_label.setText(f"グラフ作成エラー: {str(e)}")
 
     # ONNXへの変換機能
     def convert_to_onnx(self):
@@ -2313,17 +2445,16 @@ class ImageAnnotationTool(QMainWindow):
         mlflow_compare_button = QPushButton("モデルのパラメータと性能を比較")
         mlflow_compare_button.setStyleSheet("""
             QPushButton {
-                background-color: #0194E2; 
+                background-color: #B7410E; 
                 color: white; 
                 font-weight: bold;
                 padding: 6px 12px;
-                border-radius: 4px;
             }
             QPushButton:hover {
-                background-color: #0077c2;
+                background-color: #9C3A11;
             }
             QPushButton:pressed {
-                background-color: #00569b;
+                background-color: #7F2E0D;
             }
         """)
         mlflow_compare_button.clicked.connect(self.compare_models_mlflow)
@@ -2403,6 +2534,7 @@ class ImageAnnotationTool(QMainWindow):
         info_panel.setObjectName("info_panel")  # スタイルシート適用用
         info_panel.setStyleSheet("#info_panel { background-color: rgba(0, 0, 0, 0.1); border-radius: 5px; }")
         info_layout = QVBoxLayout(info_panel)
+        info_layout.setSpacing(8)  # スペーシングを調整
         
         # 情報パネルの内容
         self.current_image_info = QLabel("画像情報")
@@ -2425,10 +2557,42 @@ class ImageAnnotationTool(QMainWindow):
         info_layout.addWidget(self.detection_inference_info_label)
         
         # 空白を下に追加
-        info_layout.addStretch()
+        # info_layout.addStretch()
+
+        # 上部のウィジェットと分布グラフの間にスペーサーを入れる
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        info_layout.addWidget(spacer)
+
+        # 分布タイトルラベル
+        graph_title = QLabel("運転アノテーション分布")
+        graph_title.setStyleSheet("font-weight: bold; color: #333333;")
+        graph_title.setAlignment(Qt.AlignCenter)
+        info_layout.addWidget(graph_title)
+
+        # 分布グラフ用ラベル - 固定サイズで配置
+        self.distribution_label = QLabel()
+        self.distribution_label.setAlignment(Qt.AlignCenter)
+        self.distribution_label.setFixedHeight(400)  # 高さを固定
+        self.distribution_label.setStyleSheet("background-color: #f8f8f8; border: 1px solid #dddddd; border-radius: 4px;")
+
+        # 初期表示テキストの設定
+        no_data_font = QFont()
+        no_data_font.setPointSize(10)
+        self.distribution_label.setFont(no_data_font)
+        self.distribution_label.setText("アノテーションがありません")
+
+        info_layout.addWidget(self.distribution_label)
+
+        # パネルのサイズ設定を記録（グラフ作成時に使用）
+        self.info_panel_width = 200  # 基本の幅
+        self.info_panel_margin = 0  # パネル周りの余白（左右合計）
+
+        # パネルの最小幅を設定
+        info_panel.setMinimumWidth(self.info_panel_width)
         
         # パネルのサイズ設定
-        info_panel.setMinimumWidth(200)  # 最小幅
+        # info_panel.setMinimumWidth(200)  # 最小幅
         main_panel_layout.addWidget(info_panel, 1)  # 比率1
         
         # 2. 中央の画像パネル - 既存のmain_image_containerをそのまま利用
@@ -2509,13 +2673,11 @@ class ImageAnnotationTool(QMainWindow):
         # 復元ボタンを追加
         restore_button = QPushButton("削除状態を復元")
         restore_button.clicked.connect(self.restore_deleted_annotation)
-        restore_button.setStyleSheet("QPushButton { background-color: #5CB85C; color: white; }")
         delete_layout.addWidget(restore_button)
 
         # 全ての削除状態を復元するボタンを追加
         restore_all_button = QPushButton("全ての削除状態を復元")
         restore_all_button.clicked.connect(self.restore_all_deleted_annotations)
-        restore_all_button.setStyleSheet("QPushButton { background-color: #5BC0DE; color: white; }")
         delete_layout.addWidget(restore_all_button)
 
         nav_container_layout.addLayout(delete_layout)
@@ -4869,8 +5031,8 @@ class ImageAnnotationTool(QMainWindow):
         
         # ボタンのスタイルを変更
         if has_path:
-            self.load_button.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; }")
-            self.load_annotation_button.setStyleSheet("QPushButton { background-color: #2196F3; color: white; font-weight: bold; }")
+            self.load_button.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")
+            self.load_annotation_button.setStyleSheet("QPushButton { background-color: #2196F3; color: white; }")
         else:
             self.load_button.setStyleSheet("QPushButton:disabled { color: #aaaaaa; }")
             self.load_annotation_button.setStyleSheet("QPushButton:disabled { color: #aaaaaa; }")
@@ -5499,6 +5661,7 @@ class ImageAnnotationTool(QMainWindow):
                 self.update_stats()
                 self.display_current_image()
                 self.update_gallery()
+                self.update_distribution_graph()  # 追加：分布グラフを更新
                 
                 # 位置ボタンのカウント表示を更新
                 self.update_location_button_counts()
@@ -5799,6 +5962,11 @@ class ImageAnnotationTool(QMainWindow):
         # 位置ボタンのカウント表示を更新
         self.update_location_button_counts()
         
+        # 分布グラフを更新
+        if hasattr(self, 'distribution_label'):
+            self.distribution_label.clear()
+            self.distribution_label.setText("アノテーションがありません")
+
         print("アノテーションデータをクリアしました")
 
     def load_subfolder_annotations(self):
@@ -6404,6 +6572,13 @@ class ImageAnnotationTool(QMainWindow):
             progress.setValue(100)
             QApplication.processEvents()
             progress.close()
+
+            # 分布グラフを更新
+            if self.annotated_count > 0:
+                try:
+                    self.update_distribution_graph()
+                except Exception as graph_error:
+                    print(f"分布グラフ更新時にエラー: {graph_error}")
             
             print(f"読み込み完了: {loaded_count}個のアノテーションを読み込みました")
             print(f"削除済みインデックス数: {len(deleted_indexes)}")
@@ -6454,9 +6629,9 @@ class ImageAnnotationTool(QMainWindow):
         
         # 削除済みの場合は赤字で表示
         if is_deleted:
-            self.current_image_info.setStyleSheet("color: #FF5555; font-weight: bold;")
+            self.current_image_info.setStyleSheet("color: #FF5555; ")
         else:
-            self.current_image_info.setStyleSheet("color: #333333; font-weight: bold;")
+            self.current_image_info.setStyleSheet("color: #333333; ")
         
         # アノテーション情報の表示
         if current_img_path in self.annotations and self.annotations[current_img_path] and not is_deleted:
@@ -6881,7 +7056,10 @@ class ImageAnnotationTool(QMainWindow):
         self.display_current_image()
         print("アノテーション実行")
         self.update_gallery()
-        
+
+        # 分布グラフを更新
+        self.update_distribution_graph()
+
     def restore_deleted_annotation(self):
         """現在表示中の削除済みの画像を復元する（削除状態を解除する）"""
         if not self.images or not hasattr(self, 'deleted_indexes'):
@@ -7193,7 +7371,13 @@ class ImageAnnotationTool(QMainWindow):
                 self.update_stats()
                 self.display_current_image()
                 self.update_gallery()
-                
+
+                # 分布グラフを更新
+                progress.setLabelText("分布グラフを更新中...")
+                progress.setValue(99)
+                QApplication.processEvents()
+                self.update_distribution_graph()
+
                 # 完了表示
                 progress.setLabelText(f"完了: {success_count}枚の画像にオートアノテーションを適用しました")
                 progress.setValue(100)
