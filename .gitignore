@@ -3,7 +3,7 @@ old/
 annotation_tool/
 sessions/
 models/
-runs/
+mlruns/
 utils/
 
 # Byte-compiled / optimized / DLL files
