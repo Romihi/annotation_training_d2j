@@ -15,9 +15,10 @@ try:
     torch.multiprocessing.set_start_method('spawn')
 except RuntimeError:
     pass  # すでに設定されている場合は無視
-
 # メモリ管理の最適化
 torch.cuda.empty_cache()
+
+import mlflow
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                             QLabel, QPushButton, QListWidget, QFileDialog, QMessageBox,
@@ -75,7 +76,7 @@ def get_location_color(location_value):
     return colors[color_index]
 
 # グローバル設定変数
-# アプリケーション関連のパス設定
+## アプリケーション関連のパス設定
 APP_DIR_PATH = os.path.dirname(os.path.abspath(__file__))  # スクリプトのあるディレクトリを基準
 SESSION_DIR_NAME = "sessions"  # セッション情報の保存フォルダ名
 MODELS_DIR_NAME = "models"     # モデル保存用のフォルダ名
@@ -200,277 +201,6 @@ class ImageLabel(QLabel):
             # 通常のカーソルに戻す
             self.setCursor(Qt.ArrowCursor)
             self.update()
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        
-        if not self.pixmap():
-            painter = QPainter(self)
-            painter.setPen(QPen(QColor(100, 100, 100), 1))
-            painter.setFont(QFont("Arial", 14))
-            painter.drawText(self.rect(), Qt.AlignCenter, "フォルダを選択し、読込ボタンを押してください")
-            painter.end()
-            return
-
-        painter = QPainter(self)
-        
-        # 元の画像のサイズ
-        pix_width = self.pixmap().width()
-        pix_height = self.pixmap().height()
-        
-        # ズーム係数を使用して拡大後のサイズを計算
-        scaled_width = int(pix_width * self.zoom_factor)
-        scaled_height = int(pix_height * self.zoom_factor)
-        
-        # 中央に配置するための座標計算
-        x = (self.width() - scaled_width) // 2
-        y = (self.height() - scaled_height) // 2
-        
-        # 削除済みの場合は赤い枠を表示
-        if self.is_deleted:
-            painter.setPen(QPen(QColor(255, 85, 85), 6))  # 赤い枠線
-            border_rect = QRect(x-6, y-6, scaled_width+12, scaled_height+12)
-            painter.drawRect(border_rect)
-            
-            # 削除済みバッジを表示
-            badge_rect = QRect(x - 100, y, 80, 40)
-            painter.fillRect(badge_rect, QColor(255, 85, 85))
-            painter.setPen(QPen(Qt.white, 2))
-            painter.setFont(QFont("Arial", 12, QFont.Bold))
-            painter.drawText(badge_rect, Qt.AlignCenter, "削除済み")
-        # 画像の位置情報があれば、その色で枠を描画
-        elif self.main_window and hasattr(self.main_window, 'current_location') and self.main_window.current_location is not None:
-            loc_value = self.main_window.current_location
-            loc_color = get_location_color(loc_value)
-            
-            # 太い枠線を描画
-            painter.setPen(QPen(loc_color, 6))
-            border_rect = QRect(x-3, y-3, scaled_width+6, scaled_height+6)
-            painter.drawRect(border_rect)
-            
-            # 位置番号を左側に表示する枠を描画
-            badge_size = 40
-            badge_rect = QRect(x - badge_size - 10, y, badge_size, badge_size)
-            painter.fillRect(badge_rect, loc_color)
-            painter.setPen(QPen(Qt.white, 2))
-            painter.setFont(QFont("Arial", 16, QFont.Bold))
-            painter.drawText(badge_rect, Qt.AlignCenter, str(loc_value))
-        
-        # 画像を拡大して描画
-        target_rect = QRect(x, y, scaled_width, scaled_height)
-        painter.drawPixmap(target_rect, self.pixmap())
-        
-        # グリッド表示
-        if self.show_grid:
-            painter.setPen(QPen(QColor(100, 100, 100, 100), 1))  # 半透明グレー
-            
-            # 横線（X座標のグリッド）
-            step_x = target_rect.width() / self.grid_size
-            for i in range(1, self.grid_size):
-                x_pos = target_rect.x() + i * step_x
-                painter.drawLine(int(x_pos), target_rect.y(), int(x_pos), target_rect.y() + target_rect.height())
-                
-            # 縦線（Y座標のグリッド）
-            step_y = target_rect.height() / self.grid_size
-            for i in range(1, self.grid_size):
-                y_pos = target_rect.y() + i * step_y
-                painter.drawLine(target_rect.x(), int(y_pos), target_rect.x() + target_rect.width(), int(y_pos))
-            
-            # 中央の十字線（より目立たせる）
-            painter.setPen(QPen(QColor(200, 200, 200, 150), 2))
-            mid_x = target_rect.x() + target_rect.width() / 2
-            mid_y = target_rect.y() + target_rect.height() / 2
-            painter.drawLine(int(mid_x), target_rect.y(), int(mid_x), target_rect.y() + target_rect.height())
-            painter.drawLine(target_rect.x(), int(mid_y), target_rect.x() + target_rect.width(), int(mid_y))
-        
-        # 削除済みでない場合のみアノテーションや推論を表示
-        if not self.is_deleted:
-            # 常にバウンディングボックスを表示（モードに関わらず）
-            if self.main_window and hasattr(self.main_window, 'bbox_annotations'):
-                current_img_path = self.main_window.images[self.main_window.current_index]
-                if current_img_path in self.main_window.bbox_annotations:
-                    bboxes = self.main_window.bbox_annotations[current_img_path]
-                    
-                    for i, bbox in enumerate(bboxes):
-                        # クラスに応じた色を設定
-                        class_name = bbox.get('class', 'unknown')
-                        class_colors = {
-                            'car': QColor(255, 0, 0, 180),     # 赤
-                            'person': QColor(0, 255, 0, 180),  # 緑
-                            'sign': QColor(0, 0, 255, 180),    # 青
-                            'cone': QColor(255, 255, 0, 180),  # 黄
-                            'unknown': QColor(128, 128, 128, 180) # グレー
-                        }
-                        color = class_colors.get(class_name, QColor(255, 0, 0, 180))
-                        
-                        # 選択またはホバーされているバウンディングボックスかどうかで線の太さを変更
-                        is_selected = i == self.selected_bbox_index
-                        is_hovered = i == self.hovering_bbox_index
-                        
-                        pen_width = 3 if is_selected else (2.5 if is_hovered else 2)
-                        pen_style = Qt.DashLine if is_selected else (Qt.DashDotLine if is_hovered else Qt.SolidLine)
-                        
-                        # 正規化された座標を画面座標に変換
-                        x1 = int(target_rect.x() + bbox['x1'] * target_rect.width())
-                        y1 = int(target_rect.y() + bbox['y1'] * target_rect.height())
-                        x2 = int(target_rect.x() + bbox['x2'] * target_rect.width())
-                        y2 = int(target_rect.y() + bbox['y2'] * target_rect.height())
-                        
-                        # バウンディングボックスを描画
-                        painter.setPen(QPen(color, pen_width, pen_style))
-                        
-                        # ホバー中のバウンディングボックスは半透明の塗りつぶしを追加
-                        if is_hovered or is_selected:
-                            highlight_color = QColor(color)
-                            highlight_color.setAlpha(40)  # 非常に透明に
-                            painter.setBrush(QBrush(highlight_color))
-                        else:
-                            painter.setBrush(QBrush())  # 透明ブラシ
-                        
-                        painter.drawRect(QRect(x1, y1, x2-x1, y2-y1))
-                        
-                        # 選択されているバウンディングボックスには角にハンドルを表示
-                        if is_selected:
-                            handle_size = 6
-                            painter.setBrush(QBrush(color))
-                            painter.drawRect(QRect(x1-handle_size//2, y1-handle_size//2, handle_size, handle_size))
-                            painter.drawRect(QRect(x2-handle_size//2, y1-handle_size//2, handle_size, handle_size))
-                            painter.drawRect(QRect(x1-handle_size//2, y2-handle_size//2, handle_size, handle_size))
-                            painter.drawRect(QRect(x2-handle_size//2, y2-handle_size//2, handle_size, handle_size))
-                        
-                        # ラベルテキストを作成（信頼度情報がある場合は追加）
-                        label_text = class_name
-                        if 'confidence' in bbox:
-                            label_text += f" {bbox['confidence']:.2f}"
-                        
-                        # クラスラベルの背景を描画
-                        label_rect = QRect(x1, y1-20, len(label_text)*8+10, 20)
-                        painter.fillRect(label_rect, color)
-                        
-                        # クラス名を描画
-                        painter.setPen(QPen(Qt.white, 1))
-                        painter.setFont(QFont("Arial", 10, QFont.Bold))
-                        painter.drawText(label_rect, Qt.AlignCenter, label_text)
-                
-                # 描画中のバウンディングボックスがあれば表示
-                if self.is_drawing_bbox and self.bbox_start and self.bbox_end:
-                    # バウンディングボックスの座標を計算
-                    start_rel_x = self.bbox_start.x() / pix_width
-                    start_rel_y = self.bbox_start.y() / pix_height
-                    end_rel_x = self.bbox_end.x() / pix_width
-                    end_rel_y = self.bbox_end.y() / pix_height
-                    
-                    start_x = int(target_rect.x() + start_rel_x * target_rect.width())
-                    start_y = int(target_rect.y() + start_rel_y * target_rect.height())
-                    end_x = int(target_rect.x() + end_rel_x * target_rect.width())
-                    end_y = int(target_rect.y() + end_rel_y * target_rect.height())
-                    
-                    # 半透明の黄色でドラッグ中のボックスを描画
-                    painter.setPen(QPen(QColor(255, 255, 0, 180), 2, Qt.DashLine))
-                    painter.setBrush(QBrush(QColor(255, 255, 0, 40)))
-                    painter.drawRect(QRect(
-                        min(start_x, end_x),
-                        min(start_y, end_y),
-                        abs(end_x - start_x),
-                        abs(end_y - start_y)
-                    ))
-                
-                # アノテーションポイントの描画（運転制御アノテーション）
-                if self.annotation_point:
-                    rel_x = self.annotation_point.x() / self.pixmap().width()
-                    rel_y = self.annotation_point.y() / self.pixmap().height()
-                    
-                    scaled_x = int(target_rect.x() + rel_x * target_rect.width())
-                    scaled_y = int(target_rect.y() + rel_y * target_rect.height())
-                    
-                    # 赤い円の描画 - より大きく太く
-                    painter.setPen(QPen(QColor(255, 0, 0), 4))  # 太さを4に増加
-                    circle_size = 15  # 円のサイズを大きく(元は10)
-                    painter.drawEllipse(scaled_x - circle_size, scaled_y - circle_size, circle_size*2, circle_size*2)
-                
-                # 推論ポイントの描画
-                if self.show_inference and self.inference_point:
-                    rel_x = self.inference_point.x() / self.pixmap().width()
-                    rel_y = self.inference_point.y() / self.pixmap().height()
-                    
-                    scaled_x = int(target_rect.x() + rel_x * target_rect.width())
-                    scaled_y = int(target_rect.y() + rel_y * target_rect.height())
-                    
-                    # 青い円の描画 - より大きく太く
-                    painter.setPen(QPen(QColor(0, 0, 255), 4))  # 太さを4に増加
-                    circle_size = 15  # 円のサイズを大きく(元は10)
-                    painter.drawEllipse(scaled_x - circle_size, scaled_y - circle_size, circle_size*2, circle_size*2)
-            
-                # ここから物体検知推論結果表示の追加部分
-                # 推論結果表示チェックがオンで、detection_inference_resultsデータがある場合に表示
-                if (not self.is_deleted and 
-                    self.main_window and 
-                    hasattr(self.main_window, 'show_detection_inference') and 
-                    self.main_window.show_detection_inference and
-                    hasattr(self.main_window, 'detection_inference_results')):
-                    
-                    current_img_path = self.main_window.images[self.main_window.current_index]
-                    if current_img_path in self.main_window.detection_inference_results:
-                        inference_bboxes = self.main_window.detection_inference_results[current_img_path]
-                        
-                        for i, bbox in enumerate(inference_bboxes):
-                            # クラスに応じた色を設定 (推論結果は別の透明度で表示)
-                            class_name = bbox.get('class', 'unknown')
-                            class_colors = {
-                                'car': QColor(255, 0, 0, 120),     # 赤 (半透明)
-                                'person': QColor(0, 255, 0, 120),  # 緑 (半透明)
-                                'sign': QColor(0, 0, 255, 120),    # 青 (半透明)
-                                'cone': QColor(255, 255, 0, 120),  # 黄 (半透明)
-                                'unknown': QColor(128, 128, 128, 120) # グレー (半透明)
-                            }
-                            color = class_colors.get(class_name, QColor(255, 0, 0, 120))
-                            
-                            # 推論結果は点線で表示
-                            pen_width = 2
-                            pen_style = Qt.DashLine
-                            
-                            # 正規化された座標を画面座標に変換
-                            x1 = int(target_rect.x() + bbox['x1'] * target_rect.width())
-                            y1 = int(target_rect.y() + bbox['y1'] * target_rect.height())
-                            x2 = int(target_rect.x() + bbox['x2'] * target_rect.width())
-                            y2 = int(target_rect.y() + bbox['y2'] * target_rect.height())
-                            
-                            # バウンディングボックスを描画
-                            painter.setPen(QPen(color, pen_width, pen_style))
-                            painter.drawRect(QRect(x1, y1, x2-x1, y2-y1))
-                            
-                            # ラベルテキストを作成（信頼度情報がある場合は追加）
-                            label_text = f"推論:{class_name}"
-                            if 'confidence' in bbox:
-                                label_text += f" {bbox['confidence']:.2f}"
-                            
-                            # クラスラベルの背景を描画
-                            label_rect = QRect(x1, y1-20, len(label_text)*8+10, 20)
-                            painter.fillRect(label_rect, color)
-                            
-                            # クラス名を描画
-                            painter.setPen(QPen(Qt.white, 1))
-                            painter.setFont(QFont("Arial", 10, QFont.Bold))
-                            painter.drawText(label_rect, Qt.AlignCenter, label_text)
-
-            # 削除済みの場合は半透明の赤オーバーレイを表示
-            if self.is_deleted:
-                painter.setOpacity(0.25)  # 75%透明
-                painter.fillRect(target_rect, QColor(255, 0, 0))
-                
-                # 中央に削除済みテキストを表示
-                painter.setOpacity(1.0)  # 不透明に戻す
-                painter.setPen(QPen(Qt.white, 2))
-                painter.setFont(QFont("Arial", 24, QFont.Bold))
-                
-                painter.drawText(
-                    target_rect, 
-                    Qt.AlignCenter, 
-                    "削除済み\nクリックで再アノテーション"
-                )
-            
-            painter.end()
-    #m
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -1291,6 +1021,212 @@ class ImageAnnotationTool(QMainWindow):
 
         QApplication.instance().installEventFilter(self)
 
+    # ONNXへの変換機能
+    def convert_to_onnx(self):
+        """現在読み込まれているPyTorchモデルをONNX形式に変換する"""
+        if not self.images:
+            QMessageBox.warning(self, "警告", "画像が読み込まれていません。")
+            return
+        
+        # モデル情報を取得
+        model_type = self.auto_method_combo.currentText()
+        selected_model = self.model_combo.currentText()
+        
+        if selected_model == "モデルが見つかりません" or selected_model == "フォルダを選択してください" or "が見つかりません" in selected_model:
+            QMessageBox.warning(self, "警告", "有効なモデルが選択されていません。まずモデルを読み込んでください。")
+            return
+        
+        # モデルのパスを取得
+        models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+        model_path = os.path.join(models_dir, selected_model)
+        
+        # モデルが存在するか確認
+        if not os.path.exists(model_path):
+            QMessageBox.warning(self, "警告", f"選択されたモデルが見つかりません: {selected_model}")
+            return
+        
+        # 出力パスと設定を取得するためのダイアログを表示
+        onnx_settings = QDialog(self)
+        onnx_settings.setWindowTitle("ONNXモデル変換設定")
+        onnx_settings.setMinimumWidth(400)
+        
+        settings_layout = QVBoxLayout(onnx_settings)
+        
+        # 入力サイズ設定
+        size_layout = QHBoxLayout()
+        size_layout.addWidget(QLabel("入力サイズ:"))
+        
+        width_layout = QHBoxLayout()
+        width_layout.addWidget(QLabel("幅:"))
+        width_spin = QSpinBox()
+        width_spin.setRange(1, 1024)
+        width_spin.setValue(224)
+        width_layout.addWidget(width_spin)
+        
+        height_layout = QHBoxLayout()
+        height_layout.addWidget(QLabel("高さ:"))
+        height_spin = QSpinBox()
+        height_spin.setRange(1, 1024)
+        height_spin.setValue(224)
+        height_layout.addWidget(height_spin)
+        
+        size_layout.addLayout(width_layout)
+        size_layout.addLayout(height_layout)
+        settings_layout.addLayout(size_layout)
+        
+        # 動的バッチサイズと単純化の設定
+        options_layout = QVBoxLayout()
+        
+        dynamic_batch = QCheckBox("動的バッチサイズを有効にする")
+        dynamic_batch.setChecked(True)
+        options_layout.addWidget(dynamic_batch)
+        
+        simplify_model = QCheckBox("ONNXモデルを単純化する")
+        simplify_model.setChecked(True)
+        options_layout.addWidget(simplify_model)
+        
+        settings_layout.addLayout(options_layout)
+        
+        # opsetバージョン設定
+        opset_layout = QHBoxLayout()
+        opset_layout.addWidget(QLabel("ONNX Opsetバージョン:"))
+        opset_combo = QComboBox()
+        opset_combo.addItems(["12", "13", "14", "15", "16"])
+        opset_combo.setCurrentText("12")
+        opset_layout.addWidget(opset_combo)
+        settings_layout.addLayout(opset_layout)
+        
+        # 説明ラベル
+        info_label = QLabel("注意: ONNX変換には、onnx、onnxruntime、onnx-simplifierパッケージが必要です。")
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: #666666; font-style: italic;")
+        settings_layout.addWidget(info_label)
+        
+        # ボタンの配置
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(onnx_settings.accept)
+        button_box.rejected.connect(onnx_settings.reject)
+        settings_layout.addWidget(button_box)
+        
+        # ダイアログを表示
+        if not onnx_settings.exec_():
+            return
+        
+        # 設定値の取得
+        input_width = width_spin.value()
+        input_height = height_spin.value()
+        use_dynamic_axes = dynamic_batch.isChecked()
+        use_simplify = simplify_model.isChecked()
+        opset_version = int(opset_combo.currentText())
+        
+        # 出力ファイル名を選択
+        base_name = os.path.splitext(selected_model)[0]
+        default_output = os.path.join(models_dir, f"{base_name}.onnx")
+        
+        output_path, _ = QFileDialog.getSaveFileName(
+            self, "ONNXモデルの保存先を選択", 
+            default_output,
+            "ONNX Models (*.onnx)"
+        )
+        
+        if not output_path:
+            return
+        
+        # 進捗ダイアログを表示
+        progress = QProgressDialog(
+            f"モデル '{model_type} ({selected_model})' をONNX形式に変換中...", 
+            "キャンセル", 0, 100, self
+        )
+        progress.setWindowTitle("ONNX変換")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+        
+        try:
+            # pytorch_to_onnx モジュールのインポート
+            progress.setLabelText("ONNX変換モジュールを読み込み中...")
+            progress.setValue(10)
+            QApplication.processEvents()
+            
+            # 現在のディレクトリを取得
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            
+            # これが呼び出し元のファイルと同じディレクトリにあるか確認
+            pytorch_to_onnx_path = os.path.join(current_dir, "pytorch_to_onnx.py")
+            
+            if os.path.exists(pytorch_to_onnx_path):
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("pytorch_to_onnx", pytorch_to_onnx_path)
+                pytorch_to_onnx = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(pytorch_to_onnx)
+                
+                progress.setLabelText(f"モデル {model_type} をONNX形式に変換しています...")
+                progress.setValue(20)
+                QApplication.processEvents()
+                
+                # 変換関数の実行
+                # 進捗表示のためのコールバック関数
+                def progress_callback(current, total, message=None):
+                    if message:
+                        progress.setLabelText(message)
+                    value = 20 + int(current * 70 / total)  # 20%～90%の範囲で進捗を表示
+                    progress.setValue(value)
+                    QApplication.processEvents()
+                    return not progress.wasCanceled()
+                
+                # 変換実行
+                onnx_model_path = pytorch_to_onnx.convert_pytorch_to_onnx(
+                    model_path=model_path,
+                    model_type=model_type,
+                    output_path=output_path,
+                    input_size=(input_height, input_width),
+                    dynamic_axes=use_dynamic_axes,
+                    simplify=use_simplify,
+                    opset_version=opset_version
+                )
+                
+                progress.setValue(100)
+                progress.close()
+                
+                if onnx_model_path:
+                    QMessageBox.information(
+                        self,
+                        "変換成功",
+                        f"PyTorchモデル '{selected_model}' がONNX形式に変換されました。\n"
+                        f"出力パス: {onnx_model_path}\n\n"
+                        f"入力サイズ: {input_width}x{input_height}\n"
+                        f"動的バッチサイズ: {'有効' if use_dynamic_axes else '無効'}\n"
+                        f"モデル単純化: {'有効' if use_simplify else '無効'}\n"
+                        f"Opsetバージョン: {opset_version}"
+                    )
+                else:
+                    QMessageBox.critical(
+                        self,
+                        "変換エラー",
+                        "ONNX変換中にエラーが発生しました。詳細はコンソール出力を確認してください。"
+                    )
+            else:
+                progress.close()
+                QMessageBox.critical(
+                    self,
+                    "ファイルエラー",
+                    f"pytorch_to_onnx.py ファイルが見つかりません。\n"
+                    f"検索したパス: {pytorch_to_onnx_path}\n\n"
+                    f"このファイルがアプリケーションと同じディレクトリにあることを確認してください。"
+                )
+                
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(
+                self,
+                "エラー",
+                f"ONNX変換中にエラーが発生しました: {str(e)}"
+            )
+            import traceback
+            traceback.print_exc()
+
     # YOLOモデルをパスから読み込むヘルパーメソッド
     def load_yolo_model_from_path(self, model_path):
         """指定されたパスからYOLOモデルを読み込む"""
@@ -1464,7 +1400,6 @@ class ImageAnnotationTool(QMainWindow):
     
     def initialize_mlflow(self):
         """MLflowの初期化と設定を行う - Windows環境対応（修正版）"""
-        import mlflow
         import os
         import sys
         
@@ -1570,7 +1505,6 @@ class ImageAnnotationTool(QMainWindow):
 
     def log_model_to_mlflow(self, model_path, model_type, training_params, metrics, dataset_info):
         """モデル情報をMLflowに記録する - Windows環境対応"""
-        import mlflow
         import mlflow.pytorch
         import torch
         import sys
@@ -2237,6 +2171,14 @@ class ImageAnnotationTool(QMainWindow):
 
         left_layout.addWidget(self.pilot_container)
 
+        # ONNX変換ボタン
+        # ONNXモデル変換ボタン
+        self.onnx_convert_button = QPushButton("ONNXモデルに変換")
+        self.onnx_convert_button.clicked.connect(self.convert_to_onnx)
+        self.onnx_convert_button.setStyleSheet("QPushButton { background-color: #8A2BE2; color: white; }")
+
+        left_layout.addWidget(self.onnx_convert_button)
+                    
         # 物体検知推論結果表示フラグの初期化
         self.show_detection_inference = False
 
@@ -2278,6 +2220,7 @@ class ImageAnnotationTool(QMainWindow):
         # YOLOアノテーション読み込みボタン
         load_yolo_btn = QPushButton("YOLOアノテーション読込")
         load_yolo_btn.clicked.connect(self.load_yolo_annotations)
+        load_yolo_btn.setStyleSheet("QPushButton { background-color: #2196F3; color: white; font-weight: bold; }")
         obj_detection_layout.addWidget(load_yolo_btn)
 
         # クラス設定
@@ -2332,6 +2275,12 @@ class ImageAnnotationTool(QMainWindow):
         detection_inference_layout.addWidget(self.detection_inference_checkbox)
         obj_detection_layout.addLayout(detection_inference_layout)
 
+        # ONNXモデル変換ボタン
+        self.yolo_onnx_convert_button = QPushButton("YOLOモデルをONNXに変換")
+        self.yolo_onnx_convert_button.clicked.connect(self.convert_yolo_to_onnx)
+        self.yolo_onnx_convert_button.setStyleSheet("QPushButton { background-color: #8A2BE2; color: white; }")
+        obj_detection_layout.addWidget(self.yolo_onnx_convert_button)
+        
         # 一括推論ボタン
         ## disabled
         # batch_inference_button = QPushButton("一括推論実行")
@@ -2353,18 +2302,6 @@ class ImageAnnotationTool(QMainWindow):
         mlflow_compare_button.clicked.connect(self.compare_models_mlflow)
         mlflow_compare_button.setToolTip("MLflowを使ってモデルのパラメータと性能を比較")
         mlflow_layout.addWidget(mlflow_compare_button)
-
-        # MLflowインストール状態を確認
-        try:
-            import mlflow
-            has_mlflow = True
-        except ImportError:
-            has_mlflow = False
-
-        # MLflowがインストールされていない場合は警告を表示
-        if not has_mlflow:
-            mlflow_compare_button.setEnabled(False)
-            mlflow_compare_button.setToolTip("MLflowがインストールされていません。pip install mlflow でインストールしてください。")
 
         left_layout.addLayout(mlflow_layout)
 
@@ -2977,6 +2914,7 @@ class ImageAnnotationTool(QMainWindow):
         # UI更新
         self.main_image_view.update()
 
+    # yolo 関数
     def export_to_yolo(self):
         """バウンディングボックスアノテーションをYOLO形式でエクスポートする"""
         if not hasattr(self, 'bbox_annotations') or not self.bbox_annotations:
@@ -3084,12 +3022,11 @@ class ImageAnnotationTool(QMainWindow):
                     # 確認メッセージ
                     self.statusBar().showMessage(f"'{class_name}' のバウンディングボックスを削除しました", 3000)
 
-    # yolo 関数
     def refresh_yolo_model_list(self):
-        """保存されているYOLOモデルのリストを更新"""
+        """保存されているYOLOモデルのリストを更新 - サブフォルダとweightsフォルダ内も検索し、直下のモデルも含める"""
         if not hasattr(self, 'yolo_saved_model_combo'):
             return
-            
+                
         self.yolo_saved_model_combo.clear()
         
         # 更新開始のメッセージを表示
@@ -3109,49 +3046,107 @@ class ImageAnnotationTool(QMainWindow):
             self.statusBar().clearMessage()
             return
         
-        # YOLOモデルファイルを検索
-        yolo_model_files = [f for f in os.listdir(models_dir) if f.endswith('.pt') and 'yolo' in f.lower()]
+        # YOLOモデルファイルを検索 - サブフォルダも含めて
+        yolo_model_files = []
+        
+        # 1. まず直下の.ptファイルを検索
+        for file in os.listdir(models_dir):
+            if file.endswith('.pt') and ('yolo' in file.lower()):
+                # ファイルのフルパスを取得
+                full_path = os.path.join(models_dir, file)
+                
+                # 各ファイルに関する情報をまとめる
+                model_info = {
+                    'path': file,  # 直下のファイルは相対パスとしてファイル名のみ
+                    'parent': 'root',  # 直下のファイルは親フォルダを'root'として識別
+                    'type': 'model',  # 通常のモデルファイル
+                    'date': ''  # 日付情報なし
+                }
+                yolo_model_files.append(model_info)
+        
+        # 2. サブフォルダを含めて再帰的に検索（既存の処理）
+        for root, dirs, files in os.walk(models_dir):
+            if root == models_dir:
+                continue  # 直下のファイルは上で既に処理したのでスキップ
+                
+            for file in files:
+                if file.endswith('.pt') and ('best' in file.lower() or 'last' in file.lower()):
+                    # ファイルのフルパスを取得
+                    full_path = os.path.join(root, file)
+                    # models_dir からの相対パスに変換
+                    rel_path = os.path.relpath(full_path, models_dir)
+                    
+                    # サブフォルダの親名を確認し、yolov8などの文字列が含まれているか検証
+                    parent_folder = os.path.dirname(os.path.dirname(rel_path))
+                    if 'yolo' in parent_folder.lower() or 'yolo' in os.path.basename(os.path.dirname(rel_path)).lower():
+                        # パス情報と一緒にモデル種類と日時情報を保持
+                        model_info = {
+                            'path': rel_path,
+                            'parent': parent_folder,
+                            'type': 'best' if 'best' in file.lower() else 'last',
+                            # 日時情報を抽出 (yolov8n_20250411_183737 から 20250411_183737を取得)
+                            'date': parent_folder.split('_', 1)[1] if '_' in parent_folder else ''
+                        }
+                        yolo_model_files.append(model_info)
         
         if not yolo_model_files:
             self.yolo_saved_model_combo.addItem("YOLOモデルが見つかりません")
             self.statusBar().showMessage("YOLOモデルが見つかりません。モデルを学習してください", 3000)
             return
         
-        # モデルファイルを日付順にソート（新しいものが上）
-        yolo_model_files.sort(reverse=True)
+        # モデルファイルをソート - 直下のモデルを最初に、次に日付が新しいもの順にソート
+        def sort_key(model_info):
+            if model_info['parent'] == 'root':
+                return ('0', '')  # 直下のファイルを最初に
+            else:
+                return ('1', model_info['date'])  # 次に日付の新しい順
+        
+        yolo_model_files.sort(key=sort_key, reverse=False)  # 直下のファイルを先頭に
         
         # コンボボックスに追加
-        for model_file in yolo_model_files:
-            self.yolo_saved_model_combo.addItem(model_file)
+        for model_info in yolo_model_files:
+            if model_info['parent'] == 'root':
+                # 直下のファイルの表示名: "yolov8n.pt"
+                model_name = f"{model_info['path']} "
+            else:
+                # サブフォルダ内のファイルの表示名: "yolov8n [20250411_183737] (best)"
+                model_name = f"{model_info['parent'].split('_')[0]} [{model_info['date']}] ({model_info['type']})"
+            
+            # コンボボックスにアイテムを追加し、ユーザーデータとして相対パスを設定
+            self.yolo_saved_model_combo.addItem(model_name, model_info['path'])
         
         # 更新完了メッセージ
         self.statusBar().showMessage(f"{len(yolo_model_files)}個のYOLOモデルを読み込みました", 3000)
 
     def load_yolo_model(self):
-        """選択されたYOLOモデルを読み込む"""
+        """選択されたYOLOモデルを読み込む - サブフォルダ対応版"""
         if not self.images:
             QMessageBox.warning(self, "警告", "画像が読み込まれていません。")
             return
         
-        # モデル情報を取得
-        selected_model = self.yolo_saved_model_combo.currentText()
+        # モデル情報を取得 - 表示名と実際のパス
+        current_index = self.yolo_saved_model_combo.currentIndex()
+        selected_model_display = self.yolo_saved_model_combo.currentText()
         
-        if selected_model == "YOLOモデルが見つかりません" or selected_model == "フォルダを選択してください":
+        # ユーザーデータからパスを取得（相対パス）
+        relative_path = self.yolo_saved_model_combo.itemData(current_index)
+        
+        if not relative_path or selected_model_display == "YOLOモデルが見つかりません" or selected_model_display == "フォルダを選択してください":
             QMessageBox.warning(self, "警告", "有効なYOLOモデルが選択されていません。")
             return
         
-        # モデルのパスを取得
+        # モデルのパスを取得 - 相対パスからフルパスに変換
         models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
-        model_path = os.path.join(models_dir, selected_model)
+        model_path = os.path.join(models_dir, relative_path)
         
         # モデルが存在するか確認
         if not os.path.exists(model_path):
-            QMessageBox.warning(self, "警告", f"選択されたモデルが見つかりません: {selected_model}")
+            QMessageBox.warning(self, "警告", f"選択されたモデルが見つかりません: {model_path}")
             return
-        
+            
         # 進捗ダイアログを表示
         progress = QProgressDialog(
-            f"YOLOモデル '{selected_model}' を読み込み中...", 
+            f"YOLOモデル '{selected_model_display}' を読み込み中...",
             "キャンセル", 0, 100, self
         )
         progress.setWindowTitle("モデル読み込み")
@@ -3191,7 +3186,7 @@ class ImageAnnotationTool(QMainWindow):
             QApplication.processEvents()
             
             # モデルをロード
-            progress.setLabelText(f"モデル '{selected_model}' をメモリに読み込み中...")
+            progress.setLabelText(f"モデル '{selected_model_display}' をメモリに読み込み中...")
             progress.setValue(50)
             QApplication.processEvents()
             
@@ -3410,102 +3405,6 @@ class ImageAnnotationTool(QMainWindow):
                 "エラー",
                 f"YOLOアノテーションの読み込み中にエラーが発生しました: {str(e)}"
             )
-    #m
-    # def run_yolo_inference(self):
-    #     """YOLOモデルをロードして現在の画像のみ推論を実行する"""
-    #     if not self.images:
-    #         QMessageBox.warning(self, "警告", "画像が読み込まれていません。")
-    #         return
-        
-    #     # YOLOモデルを選択
-    #     model_file, _ = QFileDialog.getOpenFileName(
-    #         self, "YOLOモデルを選択", 
-    #         os.path.join(self.folder_path, "models"),
-    #         "YOLOモデル (*.pt)"
-    #     )
-        
-    #     if not model_file:
-    #         return
-        
-    #     try:
-    #         # YOLOライブラリをインポート
-    #         try:
-    #             from ultralytics import YOLO
-    #         except ImportError:
-    #             QMessageBox.critical(
-    #                 self, 
-    #                 "エラー", 
-    #                 "Ultralytics YOLOパッケージがインストールされていません。\npip install ultralytics でインストールしてください。"
-    #             )
-    #             return
-            
-    #         # 信頼度閾値の設定
-    #         confidence, ok = QInputDialog.getDouble(
-    #             self, 
-    #             "検出閾値", 
-    #             "検出信頼度閾値 (0.0-1.0):",
-    #             0.25, 0.01, 1.0, 2
-    #         )
-            
-    #         if not ok:
-    #             return
-            
-    #         # 進捗ダイアログ
-    #         progress = QProgressDialog("YOLOモデルを読み込み中...", "キャンセル", 0, 100, self)
-    #         progress.setWindowTitle("モデル読み込み中")
-    #         progress.setWindowModality(Qt.WindowModal)
-    #         progress.show()
-            
-    #         # モデルをロード
-    #         progress.setValue(30)
-    #         QApplication.processEvents()
-            
-    #         try:
-    #             # モデルをロードして保存
-    #             self.yolo_model = YOLO(model_file)
-    #             self.yolo_confidence_threshold = confidence
-                
-    #             # モデル情報を保存
-    #             self.yolo_model_file = model_file
-                
-    #             progress.setValue(70)
-    #             QApplication.processEvents()
-                
-    #             # 現在の画像に対してのみ推論を実行
-    #             self.run_single_yolo_inference()
-                
-    #             progress.setValue(100)
-    #             progress.close()
-
-    #             # 推論結果表示チェックボックスを自動的にオンにする
-    #             if hasattr(self, 'detection_inference_checkbox'):
-    #                 self.detection_inference_checkbox.setChecked(True)
-                
-                
-    #             # 成功メッセージ
-    #             model_name = os.path.basename(model_file)
-    #             QMessageBox.information(
-    #                 self,
-    #                 "モデル読み込み完了",
-    #                 f"YOLOモデル「{model_name}」を読み込みました。\n"
-    #                 f"検出閾値: {confidence}\n\n"
-    #                 f"画像送りごとに自動的に推論が実行されます。"
-    #             )
-                
-    #         except Exception as e:
-    #             progress.close()
-    #             QMessageBox.critical(
-    #                 self,
-    #                 "エラー",
-    #                 f"YOLOモデルの読み込み中にエラーが発生しました: {str(e)}"
-    #             )
-        
-    #     except Exception as e:
-    #         QMessageBox.critical(
-    #             self,
-    #             "エラー",
-    #             f"YOLO推論の準備中にエラーが発生しました: {str(e)}"
-    #         )
 
     def run_single_yolo_inference(self):
         """現在表示中の画像に対してYOLO推論を実行"""
@@ -3573,6 +3472,199 @@ class ImageAnnotationTool(QMainWindow):
             print(f"単一画像YOLO推論エラー: {e}")
             return False
 
+    def convert_yolo_to_onnx(self):
+        """現在読み込まれているYOLOモデルをONNX形式に変換する"""
+        if not self.images:
+            QMessageBox.warning(self, "警告", "画像が読み込まれていません。")
+            return
+        
+        # モデル情報を取得 - 表示名と実際のパス
+        current_index = self.yolo_saved_model_combo.currentIndex()
+        selected_model_display = self.yolo_saved_model_combo.currentText()
+        
+        # ユーザーデータからパスを取得（相対パス）
+        relative_path = self.yolo_saved_model_combo.itemData(current_index)
+        
+        if not relative_path or selected_model_display == "YOLOモデルが見つかりません" or selected_model_display == "フォルダを選択してください":
+            QMessageBox.warning(self, "警告", "有効なYOLOモデルが選択されていません。まずYOLOモデルを読み込んでください。")
+            return
+        
+        # モデルのパスを取得 - 相対パスからフルパスに変換
+        models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+        model_path = os.path.join(models_dir, relative_path)
+        
+        # モデルが存在するか確認
+        if not os.path.exists(model_path):
+            QMessageBox.warning(self, "警告", f"選択されたYOLOモデルが見つかりません: {model_path}")
+            return
+        
+        # 出力パスと設定を取得するためのダイアログを表示
+        onnx_settings = QDialog(self)
+        onnx_settings.setWindowTitle("YOLO-ONNX変換設定")
+        onnx_settings.setMinimumWidth(400)
+        
+        settings_layout = QVBoxLayout(onnx_settings)
+        
+        # 入力サイズ設定
+        size_layout = QHBoxLayout()
+        size_layout.addWidget(QLabel("入力サイズ:"))
+        
+        width_layout = QHBoxLayout()
+        width_layout.addWidget(QLabel("幅:"))
+        width_spin = QSpinBox()
+        width_spin.setRange(32, 1920)
+        width_spin.setValue(640)  # YOLOではデフォルト640がよく使われる
+        width_layout.addWidget(width_spin)
+        
+        height_layout = QHBoxLayout()
+        height_layout.addWidget(QLabel("高さ:"))
+        height_spin = QSpinBox()
+        height_spin.setRange(32, 1920)
+        height_spin.setValue(640)  # YOLOではデフォルト640がよく使われる
+        height_layout.addWidget(height_spin)
+        
+        size_layout.addLayout(width_layout)
+        size_layout.addLayout(height_layout)
+        settings_layout.addLayout(size_layout)
+        
+        # 追加オプション設定
+        options_layout = QVBoxLayout()
+        
+        dynamic_batch = QCheckBox("動的バッチサイズを有効にする")
+        dynamic_batch.setChecked(True)
+        options_layout.addWidget(dynamic_batch)
+        
+        half_precision = QCheckBox("FP16（半精度）を使用する")
+        half_precision.setChecked(False)
+        options_layout.addWidget(half_precision)
+        
+        settings_layout.addLayout(options_layout)
+        
+        # 説明ラベル
+        info_label = QLabel("注意: YOLO-ONNX変換には、ultralytics パッケージが必要です。")
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: #666666; font-style: italic;")
+        settings_layout.addWidget(info_label)
+        
+        # ボタンの配置
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(onnx_settings.accept)
+        button_box.rejected.connect(onnx_settings.reject)
+        settings_layout.addWidget(button_box)
+        
+        # ダイアログを表示
+        if not onnx_settings.exec_():
+            return
+        
+        # 設定値の取得
+        input_width = width_spin.value()
+        input_height = height_spin.value()
+        use_dynamic_axes = dynamic_batch.isChecked()
+        use_half_precision = half_precision.isChecked()
+        
+        # 出力ファイル名を選択
+        base_name = os.path.splitext(os.path.basename(model_path))[0]
+        model_dir = os.path.dirname(model_path)
+        default_output = os.path.join(model_dir, f"{base_name}.onnx")
+        
+        output_path, _ = QFileDialog.getSaveFileName(
+            self, "YOLO-ONNXモデルの保存先を選択", 
+            default_output,
+            "ONNX Models (*.onnx)"
+        )
+        
+        if not output_path:
+            return
+        
+        # 進捗ダイアログを表示
+        progress = QProgressDialog(
+            f"YOLOモデル '{selected_model_display}' をONNX形式に変換中...", 
+            "キャンセル", 0, 100, self
+        )
+        progress.setWindowTitle("YOLO-ONNX変換")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+        
+        try:
+            # Ultralyticsのインポート
+            progress.setLabelText("Ultralytics YOLOモジュールを読み込み中...")
+            progress.setValue(10)
+            QApplication.processEvents()
+            
+            try:
+                from ultralytics import YOLO
+            except ImportError:
+                progress.close()
+                QMessageBox.critical(
+                    self, 
+                    "エラー", 
+                    "Ultralytics YOLOパッケージがインストールされていません。\n"
+                    "pip install ultralytics でインストールしてください。"
+                )
+                return
+            
+            progress.setLabelText("YOLOモデルを読み込み中...")
+            progress.setValue(20)
+            QApplication.processEvents()
+            
+            # YOLOモデルをロード
+            model = YOLO(model_path)
+            
+            progress.setLabelText("ONNX形式に変換中...")
+            progress.setValue(30)
+            QApplication.processEvents()
+            
+            # ONNX変換を実行
+            success = model.export(
+                format="onnx",
+                imgsz=[input_height, input_width],
+                dynamic=use_dynamic_axes,
+                half=use_half_precision,
+                simplify=True,
+                opset=12,
+                verbose=False
+            )
+            
+            # 標準の出力先と指定された出力先が異なる場合はファイルをコピー
+            default_onnx_path = model_path.replace('.pt', '.onnx')
+            if default_onnx_path != output_path and os.path.exists(default_onnx_path):
+                import shutil
+                shutil.copy2(default_onnx_path, output_path)
+            
+            progress.setValue(100)
+            progress.close()
+            
+            if os.path.exists(output_path):
+                QMessageBox.information(
+                    self,
+                    "変換成功",
+                    f"YOLOモデル '{selected_model_display}' がONNX形式に変換されました。\n"
+                    f"出力パス: {output_path}\n\n"
+                    f"入力サイズ: {input_width}x{input_height}\n"
+                    f"動的バッチサイズ: {'有効' if use_dynamic_axes else '無効'}\n"
+                    f"FP16（半精度）: {'有効' if use_half_precision else '無効'}"
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "変換警告",
+                    f"変換処理は完了しましたが、出力ファイルが見つかりません: {output_path}\n"
+                    f"デフォルトの出力先を確認してください: {default_onnx_path}"
+                )
+                
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(
+                self,
+                "エラー",
+                f"YOLO-ONNX変換中にエラーが発生しました: {str(e)}"
+            )
+            import traceback
+            traceback.print_exc()
+
     # 5. 情報パネルに物体検知推論結果を表示する処理の追加
     def update_detection_inference_display(self):
         """物体検知推論結果の表示を更新"""
@@ -3635,9 +3727,12 @@ class ImageAnnotationTool(QMainWindow):
             # 推論結果がない場合は表示をクリア
             if hasattr(self, 'detection_inference_info_label'):
                 self.detection_inference_info_label.setText("")
-                
+
     def train_and_save_yolo_model(self):
         """Ultralytics YOLOモデルを学習し保存する"""
+        import os
+        from datetime import datetime
+        
         if not self.bbox_annotations:
             QMessageBox.warning(self, "警告", "物体検知アノテーションがありません。")
             return
@@ -3649,6 +3744,286 @@ class ImageAnnotationTool(QMainWindow):
         if not classes:
             QMessageBox.warning(self, "警告", "検知クラスを最低1つ設定してください。")
             return
+        
+        # 学習設定ダイアログを表示
+        training_settings = QDialog(self)
+        training_settings.setWindowTitle("YOLOモデル学習設定")
+        training_settings.setMinimumWidth(500)
+        training_settings.setMinimumHeight(600)
+        
+        settings_layout = QVBoxLayout(training_settings)
+        
+        # タブウィジェットを作成
+        tabs = QTabWidget()
+        
+        # 基本設定タブ
+        basic_tab = QWidget()
+        basic_layout = QVBoxLayout(basic_tab)
+        
+        # モデル初期化設定
+        init_group = QGroupBox("モデル初期化設定")
+        init_layout = QVBoxLayout(init_group)
+        
+        # 初期重みの選択
+        weights_radio_pretrained = QRadioButton("事前学習済みの重みを使用 (推奨)")
+        weights_radio_pretrained.setChecked(True)  # デフォルト選択
+        init_layout.addWidget(weights_radio_pretrained)
+        
+        # 現在のモデルを選択
+        weights_radio_current = QRadioButton("現在読み込まれているモデルの重みを使用")
+        init_layout.addWidget(weights_radio_current)
+        
+        # 現在読み込まれているモデルの情報を表示
+        current_model_info = QLabel("現在のモデル: なし")
+        if hasattr(self, 'yolo_model') and hasattr(self, 'yolo_model_file'):
+            model_name = os.path.basename(self.yolo_model_file) if hasattr(self, 'yolo_model_file') else "Unknown"
+            current_model_info.setText(f"現在のモデル: {model_name}")
+            weights_radio_current.setEnabled(True)
+        else:
+            weights_radio_current.setEnabled(False)
+            current_model_info.setText("現在のモデル: なし（先にモデルを読み込んでください）")
+        
+        init_layout.addWidget(current_model_info)
+        basic_layout.addWidget(init_group)
+        
+        # エポック数設定
+        epoch_layout = QHBoxLayout()
+        epoch_layout.addWidget(QLabel("学習エポック数:"))
+        epoch_spin = QSpinBox()
+        epoch_spin.setRange(1, 1000)
+        epoch_spin.setValue(30)  # デフォルト: 30エポック
+        epoch_layout.addWidget(epoch_spin)
+        basic_layout.addLayout(epoch_layout)
+        
+        # バッチサイズ設定
+        batch_layout = QHBoxLayout()
+        batch_layout.addWidget(QLabel("バッチサイズ:"))
+        batch_spin = QSpinBox()
+        batch_spin.setRange(1, 128)
+        batch_spin.setValue(16)  # デフォルト: 16
+        batch_layout.addWidget(batch_spin)
+        basic_layout.addLayout(batch_layout)
+        
+        # 入力サイズ設定
+        size_layout = QHBoxLayout()
+        size_layout.addWidget(QLabel("入力画像サイズ:"))
+        size_combo = QComboBox()
+        size_options = [str(self.original_image_size),"320", "416", "512", "640", "768", "896", "1024"]
+        default_index = 4  # デフォルトは640
+
+        # 説明ラベルを追加
+        size_layout.addWidget(QLabel(f"元画像: {self.original_image_width}×{self.original_image_height}"))
+
+        size_combo.addItems(size_options)
+        size_combo.setCurrentIndex(default_index)
+        size_layout.addWidget(size_combo)
+        basic_layout.addLayout(size_layout)
+
+        # 注意書き
+        size_note = QLabel("注: 640以外のサイズを選択すると精度や速度に影響します")
+        size_note.setStyleSheet("color: #888; font-style: italic;")
+        basic_layout.addWidget(size_note)
+
+        # Early Stopping設定
+        early_stopping_check = QCheckBox("Early Stopping を有効にする")
+        early_stopping_check.setChecked(True)
+        basic_layout.addWidget(early_stopping_check)
+        
+        patience_layout = QHBoxLayout()
+        patience_layout.addWidget(QLabel("忍耐エポック数:"))
+        patience_spin = QSpinBox()
+        patience_spin.setRange(1, 20)
+        patience_spin.setValue(10)
+        patience_spin.setEnabled(True)
+        patience_layout.addWidget(patience_spin)
+        basic_layout.addLayout(patience_layout)
+        
+        # 学習率設定
+        lr_layout = QHBoxLayout()
+        lr_layout.addWidget(QLabel("学習率:"))
+        
+        lr_combo = QComboBox()
+        learning_rates = ["0.01", "0.005", "0.001", "0.0005", "0.0001"]
+        lr_combo.addItems(learning_rates)
+        lr_combo.setCurrentIndex(2)  # デフォルト: 0.001
+        lr_layout.addWidget(lr_combo)
+        basic_layout.addLayout(lr_layout)
+        
+        # タブに追加
+        tabs.addTab(basic_tab, "基本設定")
+        
+        # データオーグメンテーションタブ
+        aug_tab = QWidget()
+        aug_layout = QVBoxLayout(aug_tab)
+        
+        # データオーグメンテーション有効化チェックボックス
+        aug_enable_check = QCheckBox("データオーグメンテーションを有効にする")
+        aug_enable_check.setChecked(True)
+        aug_layout.addWidget(aug_enable_check)
+        
+        # オーグメンテーション設定のスクロールエリア
+        aug_scroll = QScrollArea()
+        aug_scroll.setWidgetResizable(True)
+        aug_scroll.setFrameShape(QFrame.NoFrame)
+        
+        aug_scroll_content = QWidget()
+        aug_options_layout = QVBoxLayout(aug_scroll_content)
+        
+        # モザイク
+        mosaic_layout = QHBoxLayout()
+        aug_mosaic_checkbox = QCheckBox("モザイク")
+        aug_mosaic_checkbox.setChecked(True)
+        aug_mosaic_proba_label = QLabel("確率:")
+        aug_mosaic_proba = QDoubleSpinBox()
+        aug_mosaic_proba.setRange(0.0, 1.0)
+        aug_mosaic_proba.setSingleStep(0.1)
+        aug_mosaic_proba.setValue(1.0)
+        mosaic_layout.addWidget(aug_mosaic_checkbox)
+        mosaic_layout.addWidget(aug_mosaic_proba_label)
+        mosaic_layout.addWidget(aug_mosaic_proba)
+        mosaic_layout.addStretch()
+        aug_options_layout.addLayout(mosaic_layout)
+        
+        # 水平反転
+        flip_layout = QHBoxLayout()
+        aug_flip_checkbox = QCheckBox("水平反転")
+        aug_flip_checkbox.setChecked(True)
+        aug_flip_proba_label = QLabel("確率:")
+        aug_flip_proba = QDoubleSpinBox()
+        aug_flip_proba.setRange(0.0, 1.0)
+        aug_flip_proba.setSingleStep(0.1)
+        aug_flip_proba.setValue(0.5)
+        flip_layout.addWidget(aug_flip_checkbox)
+        flip_layout.addWidget(aug_flip_proba_label)
+        flip_layout.addWidget(aug_flip_proba)
+        flip_layout.addStretch()
+        aug_options_layout.addLayout(flip_layout)
+        
+        # HSV調整
+        hsv_layout = QHBoxLayout()
+        aug_hsv_checkbox = QCheckBox("HSV調整")
+        aug_hsv_checkbox.setChecked(True)
+        hsv_layout.addWidget(aug_hsv_checkbox)
+        hsv_layout.addStretch()
+        aug_options_layout.addLayout(hsv_layout)
+        
+        # HSVの詳細設定
+        hsv_details_layout = QGridLayout()
+        hsv_details_layout.setContentsMargins(20, 0, 0, 0)
+        
+        hsv_details_layout.addWidget(QLabel("色相 (H):"), 0, 0)
+        aug_hsv_h = QDoubleSpinBox()
+        aug_hsv_h.setRange(0.0, 0.1)
+        aug_hsv_h.setSingleStep(0.005)
+        aug_hsv_h.setValue(0.015)
+        hsv_details_layout.addWidget(aug_hsv_h, 0, 1)
+        
+        hsv_details_layout.addWidget(QLabel("彩度 (S):"), 1, 0)
+        aug_hsv_s = QDoubleSpinBox()
+        aug_hsv_s.setRange(0.0, 1.0)
+        aug_hsv_s.setSingleStep(0.1)
+        aug_hsv_s.setValue(0.7)
+        hsv_details_layout.addWidget(aug_hsv_s, 1, 1)
+        
+        hsv_details_layout.addWidget(QLabel("明度 (V):"), 2, 0)
+        aug_hsv_v = QDoubleSpinBox()
+        aug_hsv_v.setRange(0.0, 1.0)
+        aug_hsv_v.setSingleStep(0.1)
+        aug_hsv_v.setValue(0.4)
+        hsv_details_layout.addWidget(aug_hsv_v, 2, 1)
+        
+        aug_options_layout.addLayout(hsv_details_layout)
+        
+        # 幾何変換
+        geometry_layout = QHBoxLayout()
+        aug_geometry_checkbox = QCheckBox("幾何変換")
+        aug_geometry_checkbox.setChecked(True)
+        geometry_layout.addWidget(aug_geometry_checkbox)
+        geometry_layout.addStretch()
+        aug_options_layout.addLayout(geometry_layout)
+        
+        # 幾何変換の詳細設定
+        geometry_details_layout = QGridLayout()
+        geometry_details_layout.setContentsMargins(20, 0, 0, 0)
+        
+        geometry_details_layout.addWidget(QLabel("平行移動:"), 0, 0)
+        aug_translate = QDoubleSpinBox()
+        aug_translate.setRange(0.0, 0.5)
+        aug_translate.setSingleStep(0.05)
+        aug_translate.setValue(0.1)
+        geometry_details_layout.addWidget(aug_translate, 0, 1)
+        
+        geometry_details_layout.addWidget(QLabel("スケール:"), 1, 0)
+        aug_scale = QDoubleSpinBox()
+        aug_scale.setRange(0.0, 1.0)
+        aug_scale.setSingleStep(0.05)
+        aug_scale.setValue(0.5)
+        geometry_details_layout.addWidget(aug_scale, 1, 1)
+        
+        aug_options_layout.addLayout(geometry_details_layout)
+        
+        # RandomErase
+        erase_layout = QHBoxLayout()
+        aug_erase_checkbox = QCheckBox("ランダムイレース")
+        aug_erase_checkbox.setChecked(True)
+        aug_erase_proba_label = QLabel("確率:")
+        aug_erase_proba = QDoubleSpinBox()
+        aug_erase_proba.setRange(0.0, 1.0)
+        aug_erase_proba.setSingleStep(0.1)
+        aug_erase_proba.setValue(0.4)
+        erase_layout.addWidget(aug_erase_checkbox)
+        erase_layout.addWidget(aug_erase_proba_label)
+        erase_layout.addWidget(aug_erase_proba)
+        erase_layout.addStretch()
+        aug_options_layout.addLayout(erase_layout)
+        
+        # オプションの有効/無効を連動させる
+        def toggle_aug_options(checked):
+            for w in aug_scroll_content.findChildren(QWidget):
+                if w != aug_enable_check:
+                    w.setEnabled(checked)
+        
+        aug_enable_check.toggled.connect(toggle_aug_options)
+        
+        # スクロールエリアに設定
+        aug_scroll.setWidget(aug_scroll_content)
+        aug_layout.addWidget(aug_scroll)
+        
+        # タブに追加
+        tabs.addTab(aug_tab, "データオーグメンテーション")
+        
+        # タブをレイアウトに追加
+        settings_layout.addWidget(tabs)
+        
+        # ボタンの配置
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(training_settings.accept)
+        button_box.rejected.connect(training_settings.reject)
+        settings_layout.addWidget(button_box)
+        
+        # ダイアログを表示
+        if not training_settings.exec_():
+            return
+        
+        # 設定値の取得
+        use_pretrained = weights_radio_pretrained.isChecked()
+        num_epochs = epoch_spin.value()
+        batch_size = batch_spin.value()
+        img_size = int(size_combo.currentText())
+        use_early_stopping = early_stopping_check.isChecked()
+        patience = patience_spin.value() if use_early_stopping else 0
+        learning_rate = float(lr_combo.currentText())
+        
+        # オーグメンテーション設定の取得
+        augmentation_enabled = aug_enable_check.isChecked()
+        mosaic = aug_mosaic_proba.value() if aug_mosaic_checkbox.isChecked() and augmentation_enabled else 0.0
+        fliplr = aug_flip_proba.value() if aug_flip_checkbox.isChecked() and augmentation_enabled else 0.0
+        hsv_h = aug_hsv_h.value() if aug_hsv_checkbox.isChecked() and augmentation_enabled else 0.0
+        hsv_s = aug_hsv_s.value() if aug_hsv_checkbox.isChecked() and augmentation_enabled else 0.0
+        hsv_v = aug_hsv_v.value() if aug_hsv_checkbox.isChecked() and augmentation_enabled else 0.0
+        translate = aug_translate.value() if aug_geometry_checkbox.isChecked() and augmentation_enabled else 0.0
+        scale = aug_scale.value() if aug_geometry_checkbox.isChecked() and augmentation_enabled else 0.0
+        erasing = aug_erase_proba.value() if aug_erase_checkbox.isChecked() and augmentation_enabled else 0.0
         
         # YOLOフォーマット用のデータを生成（YOLO用ディレクトリ構造を作成）
         try:
@@ -3687,12 +4062,17 @@ class ImageAnnotationTool(QMainWindow):
             # アノテーションデータのエクスポート
             self.export_annotations_to_yolo(train_dir, val_dir, classes)
             
-            # Ultralytics YOLOモデルのインポート
+            # Ultralytics YOLOモデルとMLflowのインポート
             try:
                 from ultralytics import YOLO
+                from ultralytics import settings
+                settings.update({"mlflow": True})
                 import torch
-            except ImportError:
-                QMessageBox.critical(self, "エラー", "Ultralytics YOLOパッケージがインストールされていません。\npip install ultralytics でインストールしてください。")
+                import mlflow
+                import os
+            except ImportError as e:
+                missing_package = "ultralytics" if "ultralytics" in str(e) else "mlflow" if "mlflow" in str(e) else "依存パッケージ"
+                QMessageBox.critical(self, "エラー", f"{missing_package}パッケージがインストールされていません。\npip install {missing_package} でインストールしてください。")
                 return
             
             # デバイスの選択
@@ -3705,44 +4085,112 @@ class ImageAnnotationTool(QMainWindow):
             progress.setWindowModality(Qt.WindowModal)
             progress.show()
             
-            # 学習パラメータと実行
-            num_epochs = 30
-            batch_size = 16
+            # MLflowの設定を行う
+            mlflow_dir = os.path.join(APP_DIR_PATH, "mlruns")
+            os.makedirs(mlflow_dir, exist_ok=True)
+            
+            # パスの正規化 - すべてのバックスラッシュをフォワードスラッシュに変換
+            mlflow_dir = mlflow_dir.replace("\\", "/")
+            
+            # Windows環境での正しいURI形式を構築
+            import sys
+            if sys.platform.startswith('win'):
+                tracking_uri = f"file:///{mlflow_dir}"
+            else:
+                tracking_uri = f"file://{mlflow_dir}"
+            
+            print(f"YOLOトレーニング用MLflowトラッキングURI: {tracking_uri}")
+                                    
+            # 重要: 実験名を固定の文字列に設定
+            experiment_name = "yolo_training"
+            
+            # 実験が存在するか確認し、なければ作成
+            experiment = mlflow.get_experiment_by_name(experiment_name)
+            if experiment is None:
+                mlflow.create_experiment(experiment_name)
+            
+            # YOLOの設定は環境変数から読み込みになる
+            os.environ["MLFLOW_TRACKING_URI"] = tracking_uri
+            os.environ["MLFLOW_EXPERIMENT_NAME"] = experiment_name
             
             # モデルの保存パス
             models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
             os.makedirs(models_dir, exist_ok=True)
             
             # トレーニング設定のカスタマイズ
-            #run_name = f"yolo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             run_name = f"{model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             
+            progress.setLabelText("YOLOモデルを初期化中...")
+            progress.setValue(10)
+            QApplication.processEvents()
+                        
             # 分離プロセスで学習を実行
             try:
-                # モデルの読み込みと学習
-                model = YOLO(f"{model_type}.pt")
+                # モデルの読み込み - 選択に基づいて初期重みを設定
+                if use_pretrained:
+                    # 事前学習済みモデルを使用
+                    model = YOLO(f"{model_type}.pt")
+                    pretrained_info = "事前学習済みの重み"
+                else:
+                    # 現在読み込まれているモデルを使用
+                    if hasattr(self, 'yolo_model_file') and os.path.exists(self.yolo_model_file):
+                        model = YOLO(self.yolo_model_file)
+                        pretrained_info = f"現在のモデル重み: {os.path.basename(self.yolo_model_file)}"
+                    else:
+                        # モデルが見つからない場合は事前学習済みモデルにフォールバック
+                        model = YOLO(f"{model_type}.pt")
+                        pretrained_info = "事前学習済みの重み (現在のモデルが見つからないため)"
+                
+                progress.setLabelText("学習開始...")
+                progress.setValue(20)
+                QApplication.processEvents()
                 
                 # 学習設定
                 results = model.train(
                     data=yaml_file,
                     epochs=num_epochs,
                     batch=batch_size,
-                    imgsz=640,
+                    imgsz=img_size,
                     project=models_dir,
                     name=run_name,
-                    device=device.type,  # デバイスを明示的に指定
-                    workers=0,  # マルチプロセスのワーカー数を制限
-                    close_mosaic=10,  # エポック10以降でモザイクを無効化（安定性向上）
-                    patience=10,  # Early stopping patience
+                    device=device.type,
+                    workers=0,
+                    close_mosaic=10 if mosaic > 0 else 0,
+                    patience=patience,
+                    exist_ok=True,
+                    lr0=learning_rate,
+                    lrf=learning_rate / 10,
+                    # オーグメンテーション設定
+                    mosaic=mosaic,
+                    fliplr=fliplr,
+                    hsv_h=hsv_h,
+                    hsv_s=hsv_s,
+                    hsv_v=hsv_v,
+                    translate=translate,
+                    scale=scale,
+                    erasing=erasing
                 )
                 
+                progress.setValue(95)
+                QApplication.processEvents()
+                
+                # モデルリストを更新
+                if hasattr(self, 'refresh_yolo_model_list'):
+                    self.refresh_yolo_model_list()
+                
+                progress.setValue(100)
                 progress.close()
                 
                 # 学習結果を表示
                 QMessageBox.information(
                     self,
                     "学習完了",
-                    f"YOLOモデルの学習が完了しました。\n最終mAP: {results.maps}\n使用デバイス: {device}"
+                    f"YOLOモデルの学習が完了しました。\n"
+                    f"最終mAP: {results.maps}\n"
+                    f"使用デバイス: {device}\n"
+                    f"初期化: {pretrained_info}\n\n"
+                    f"モデル保存先: {os.path.join(models_dir, run_name, 'weights')}\n"
+                    f"MLflow実験名: {experiment_name}"
                 )
             
             except Exception as inner_e:
@@ -3757,6 +4205,8 @@ class ImageAnnotationTool(QMainWindow):
         except Exception as e:
             if 'progress' in locals():
                 progress.close()
+            import traceback
+            traceback.print_exc()
             QMessageBox.critical(
                 self,
                 "エラー",
@@ -4853,6 +5303,16 @@ class ImageAnnotationTool(QMainWindow):
         
         # ソート後の画像パスリストを作成
         images = [img_path for img_path, _ in image_with_indices]
+
+        # 画像ファイルのリストを取得後、最初の画像サイズを取得
+        if images:
+            try:
+                first_image = Image.open(images[0])
+                self.original_image_width, self.original_image_height = first_image.size
+                self.original_image_size = max(self.original_image_width, self.original_image_height)
+                print(f"元の画像サイズ: {self.original_image_width}x{self.original_image_height}")
+            except Exception as e:
+                print(f"画像サイズの取得エラー: {e}")        
                 
         # Reset state
         self.folder_path = valid_paths[0]  # 最初の親フォルダをメインフォルダとして設定
@@ -6238,7 +6698,7 @@ class ImageAnnotationTool(QMainWindow):
                 QTimer.singleShot(300, lambda: self.skip_images(skip_count))
 
     def skip_images(self, count):
-        """指定した数だけ画像をスキップする（ギャラリー表示の問題を修正）"""
+        """指定した数だけ画像をスキップする - 複数のバウンディングボックスをすべて引き継ぐ"""
         new_index = self.current_index + count
         
         # Ensure the new index is within bounds
@@ -6250,6 +6710,18 @@ class ImageAnnotationTool(QMainWindow):
         # インデックスが変わらない場合は何もしない
         if new_index == self.current_index:
             return
+        
+        # スキップ前に現在の画像のバウンディングボックス情報を確認し、すべてのボックスを記録
+        if hasattr(self, 'bbox_annotations') and len(self.images) > 0:
+            current_img_path = self.images[self.current_index]
+            if current_img_path in self.bbox_annotations and self.bbox_annotations[current_img_path]:
+                # すべてのバウンディングボックスをリストとして保存
+                self.last_bboxes = [bbox.copy() for bbox in self.bbox_annotations[current_img_path]]
+                print(f"スキップ時にバウンディングボックス情報を更新: {len(self.last_bboxes)}個のボックス")
+                
+                # 互換性のため、最後のボックスも個別に保存
+                if self.last_bboxes:
+                    self.last_bbox = self.last_bboxes[-1].copy()
         
         # 自動位置設定をする前の現在の位置情報を保存
         old_current_location = self.current_location
@@ -6269,18 +6741,15 @@ class ImageAnnotationTool(QMainWindow):
         
         # 削除されていない場合のみ位置情報の処理
         if not is_deleted:
-            # 新しい画像に位置情報が既にある場合は、それを使用
+            # 位置情報の処理（既存の処理と同じ）
             if current_img_path in self.location_annotations:
                 self.current_location = self.location_annotations[current_img_path]
             elif current_img_path in self.annotations and 'loc' in self.annotations[current_img_path]:
                 self.current_location = self.annotations[current_img_path]['loc']
-            # 新しい画像に位置情報がなく、自動適用が有効な場合
             elif self.auto_apply_location and old_current_location is not None:
-                # この時点ではUIを更新せず、後で一括して更新する
-                # 現在の位置情報を保持
                 self.current_location = old_current_location
         
-        # 画像表示を更新（位置情報は手動で設定する必要あり）
+        # 画像表示を更新
         self.display_current_image()
         
         # 推論表示チェックボックスがONの場合、推論結果がなければ実行
@@ -6296,17 +6765,22 @@ class ImageAnnotationTool(QMainWindow):
         self.update_gallery()
         
         # 前回のバウンディングボックスを自動適用（もし実装されていれば）
-        if hasattr(self, 'auto_apply_last_bbox') and hasattr(self, 'last_bboxes'):
-            if (not is_deleted and 
-                self.auto_apply_last_bbox and 
-                self.last_bboxes and  # リストが空でないことを確認
-                (current_img_path not in self.bbox_annotations or not self.bbox_annotations[current_img_path])):
-                # 前回の全てのバウンディングボックスを適用
-                for bbox in self.last_bboxes:
-                    self.add_bbox_annotation(bbox.copy())
+        if hasattr(self, 'auto_apply_last_bbox') and not is_deleted and self.auto_apply_last_bbox:
+            # 現在の画像にボックスがない場合に適用
+            if current_img_path not in self.bbox_annotations or not self.bbox_annotations[current_img_path]:
+                # last_bboxesが存在すればそれを使用、なければlast_bboxを使用
+                if hasattr(self, 'last_bboxes') and self.last_bboxes:
+                    # すべてのボックスを適用
+                    for bbox in self.last_bboxes:
+                        self.add_bbox_annotation(bbox.copy())
+                    
+                    # ステータスバーに表示
+                    self.statusBar().showMessage(f"前回の {len(self.last_bboxes)}個のバウンディングボックスを適用しました", 3000)
                 
-                # ステータスバーに表示
-                self.statusBar().showMessage(f"{len(self.last_bboxes)}個の前回のバウンディングボックスを適用しました", 3000)
+                elif hasattr(self, 'last_bbox') and self.last_bbox is not None:
+                    # 後方互換性のため、単一ボックスの場合も処理
+                    self.add_bbox_annotation(self.last_bbox.copy())
+                    self.statusBar().showMessage(f"前回の '{self.last_bbox['class']}' バウンディングボックスを適用しました", 3000)
 
     def get_normalized_coordinates(self, click_x, click_y, img_width, img_height):
         """Convert pixel coordinates to normalized coordinates"""
@@ -7397,8 +7871,6 @@ class ImageAnnotationTool(QMainWindow):
 
             # MLflowに結果を記録
             try:
-                import mlflow
-                
                 # MLflowが初期化されていない場合は初期化
                 if not hasattr(self, 'mlflow_tracking_uri'):
                     self.initialize_mlflow()
