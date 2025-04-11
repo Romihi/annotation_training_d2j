@@ -470,6 +470,313 @@ class ImageLabel(QLabel):
                 )
             
             painter.end()
+    #m
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        
+        if not self.pixmap():
+            painter = QPainter(self)
+            painter.setPen(QPen(QColor(100, 100, 100), 1))
+            painter.setFont(QFont("Arial", 14))
+            painter.drawText(self.rect(), Qt.AlignCenter, "フォルダを選択し、読込ボタンを押してください")
+            painter.end()
+            return
+
+        painter = QPainter(self)
+        
+        # 元の画像のサイズ
+        pix_width = self.pixmap().width()
+        pix_height = self.pixmap().height()
+        
+        # ズーム係数を使用して拡大後のサイズを計算
+        scaled_width = int(pix_width * self.zoom_factor)
+        scaled_height = int(pix_height * self.zoom_factor)
+        
+        # 中央に配置するための座標計算
+        x = (self.width() - scaled_width) // 2
+        y = (self.height() - scaled_height) // 2
+        
+        # 削除済みの場合は赤い枠を表示
+        if self.is_deleted:
+            painter.setPen(QPen(QColor(255, 85, 85), 6))  # 赤い枠線
+            border_rect = QRect(x-6, y-6, scaled_width+12, scaled_height+12)
+            painter.drawRect(border_rect)
+            
+            # 削除済みバッジを表示
+            badge_rect = QRect(x - 100, y, 80, 40)
+            painter.fillRect(badge_rect, QColor(255, 85, 85))
+            painter.setPen(QPen(Qt.white, 2))
+            painter.setFont(QFont("Arial", 12, QFont.Bold))
+            painter.drawText(badge_rect, Qt.AlignCenter, "削除済み")
+        # 画像の位置情報があれば、その色で枠を描画
+        elif self.main_window and hasattr(self.main_window, 'current_location') and self.main_window.current_location is not None:
+            loc_value = self.main_window.current_location
+            loc_color = get_location_color(loc_value)
+            
+            # 太い枠線を描画
+            painter.setPen(QPen(loc_color, 6))
+            border_rect = QRect(x-3, y-3, scaled_width+6, scaled_height+6)
+            painter.drawRect(border_rect)
+            
+            # 位置番号を左側に表示する枠を描画
+            badge_size = 40
+            badge_rect = QRect(x - badge_size - 10, y, badge_size, badge_size)
+            painter.fillRect(badge_rect, loc_color)
+            painter.setPen(QPen(Qt.white, 2))
+            painter.setFont(QFont("Arial", 16, QFont.Bold))
+            painter.drawText(badge_rect, Qt.AlignCenter, str(loc_value))
+        
+        # 画像を拡大して描画
+        target_rect = QRect(x, y, scaled_width, scaled_height)
+        painter.drawPixmap(target_rect, self.pixmap())
+        
+        # グリッド表示
+        if self.show_grid:
+            painter.setPen(QPen(QColor(100, 100, 100, 100), 1))  # 半透明グレー
+            
+            # 横線（X座標のグリッド）
+            step_x = target_rect.width() / self.grid_size
+            for i in range(1, self.grid_size):
+                x_pos = target_rect.x() + i * step_x
+                painter.drawLine(int(x_pos), target_rect.y(), int(x_pos), target_rect.y() + target_rect.height())
+                
+            # 縦線（Y座標のグリッド）
+            step_y = target_rect.height() / self.grid_size
+            for i in range(1, self.grid_size):
+                y_pos = target_rect.y() + i * step_y
+                painter.drawLine(target_rect.x(), int(y_pos), target_rect.x() + target_rect.width(), int(y_pos))
+            
+            # 中央の十字線（より目立たせる）
+            painter.setPen(QPen(QColor(200, 200, 200, 150), 2))
+            mid_x = target_rect.x() + target_rect.width() / 2
+            mid_y = target_rect.y() + target_rect.height() / 2
+            painter.drawLine(int(mid_x), target_rect.y(), int(mid_x), target_rect.y() + target_rect.height())
+            painter.drawLine(target_rect.x(), int(mid_y), target_rect.x() + target_rect.width(), int(mid_y))
+
+            # 目盛り表示
+            # フォント設定
+            painter.setFont(QFont("Arial", 10))
+            
+            # 軸の色を設定
+            painter.setPen(QPen(QColor(80, 80, 80, 200), 1))
+            
+            # X軸の目盛り表示（上側の水平線）
+            painter.drawText(target_rect.x() - 25, target_rect.y() - 5, "-1")  # 左端 (-1)
+            painter.drawText(target_rect.x() + target_rect.width() + 5, target_rect.y() - 5, "1")  # 右端 (1)
+            
+            # 中間の目盛り (X軸)
+            for i in range(1, self.grid_size):
+                value = -1 + (2.0 * i / self.grid_size)
+                x_pos = target_rect.x() + i * (target_rect.width() / self.grid_size)
+                # 0の場合は特別に表示
+                if abs(value) < 0.1:  # ほぼ0
+                    painter.drawText(int(x_pos) - 5, target_rect.y() - 5, "0")
+                elif i % 2 == 0:  # 偶数の目盛りのみ値を表示
+                    painter.drawText(int(x_pos) - 15, target_rect.y() - 5, f"{value:.1f}")
+            
+            # Y軸の目盛り表示（左側の垂直線）
+            painter.drawText(target_rect.x() - 35, target_rect.y() + 15, "-1")  # 上端 (-1)
+            painter.drawText(target_rect.x() - 35, target_rect.y() + target_rect.height(), "1")  # 下端 (1)
+            
+            # 中間の目盛り (Y軸)
+            for i in range(1, self.grid_size):
+                value = -1 + (2.0 * i / self.grid_size)
+                y_pos = target_rect.y() + i * (target_rect.height() / self.grid_size)
+                # 0の場合は特別に表示
+                if abs(value) < 0.1:  # ほぼ0
+                    painter.drawText(target_rect.x() - 35, int(y_pos) + 5, "0")
+                elif i % 2 == 0:  # 偶数の目盛りのみ値を表示
+                    painter.drawText(target_rect.x() - 35, int(y_pos) + 5, f"{value:.1f}")
+
+
+        # 削除済みでない場合のみアノテーションや推論を表示
+        if not self.is_deleted:
+            # 常にバウンディングボックスを表示（モードに関わらず）
+            if self.main_window and hasattr(self.main_window, 'bbox_annotations'):
+                current_img_path = self.main_window.images[self.main_window.current_index]
+                if current_img_path in self.main_window.bbox_annotations:
+                    bboxes = self.main_window.bbox_annotations[current_img_path]
+                    
+                    for i, bbox in enumerate(bboxes):
+                        # クラスに応じた色を設定
+                        class_name = bbox.get('class', 'unknown')
+                        class_colors = {
+                            'car': QColor(255, 0, 0, 180),     # 赤
+                            'person': QColor(0, 255, 0, 180),  # 緑
+                            'sign': QColor(0, 0, 255, 180),    # 青
+                            'cone': QColor(255, 255, 0, 180),  # 黄
+                            'unknown': QColor(128, 128, 128, 180) # グレー
+                        }
+                        color = class_colors.get(class_name, QColor(255, 0, 0, 180))
+                        
+                        # 選択またはホバーされているバウンディングボックスかどうかで線の太さを変更
+                        is_selected = i == self.selected_bbox_index
+                        is_hovered = i == self.hovering_bbox_index
+                        
+                        pen_width = 3 if is_selected else (2.5 if is_hovered else 2)
+                        pen_style = Qt.DashLine if is_selected else (Qt.DashDotLine if is_hovered else Qt.SolidLine)
+                        
+                        # 正規化された座標を画面座標に変換
+                        x1 = int(target_rect.x() + bbox['x1'] * target_rect.width())
+                        y1 = int(target_rect.y() + bbox['y1'] * target_rect.height())
+                        x2 = int(target_rect.x() + bbox['x2'] * target_rect.width())
+                        y2 = int(target_rect.y() + bbox['y2'] * target_rect.height())
+                        
+                        # バウンディングボックスを描画
+                        painter.setPen(QPen(color, pen_width, pen_style))
+                        
+                        # ホバー中のバウンディングボックスは半透明の塗りつぶしを追加
+                        if is_hovered or is_selected:
+                            highlight_color = QColor(color)
+                            highlight_color.setAlpha(40)  # 非常に透明に
+                            painter.setBrush(QBrush(highlight_color))
+                        else:
+                            painter.setBrush(QBrush())  # 透明ブラシ
+                        
+                        painter.drawRect(QRect(x1, y1, x2-x1, y2-y1))
+                        
+                        # 選択されているバウンディングボックスには角にハンドルを表示
+                        if is_selected:
+                            handle_size = 6
+                            painter.setBrush(QBrush(color))
+                            painter.drawRect(QRect(x1-handle_size//2, y1-handle_size//2, handle_size, handle_size))
+                            painter.drawRect(QRect(x2-handle_size//2, y1-handle_size//2, handle_size, handle_size))
+                            painter.drawRect(QRect(x1-handle_size//2, y2-handle_size//2, handle_size, handle_size))
+                            painter.drawRect(QRect(x2-handle_size//2, y2-handle_size//2, handle_size, handle_size))
+                        
+                        # ラベルテキストを作成（信頼度情報がある場合は追加）
+                        label_text = class_name
+                        if 'confidence' in bbox:
+                            label_text += f" {bbox['confidence']:.2f}"
+                        
+                        # クラスラベルの背景を描画
+                        label_rect = QRect(x1, y1-20, len(label_text)*8+10, 20)
+                        painter.fillRect(label_rect, color)
+                        
+                        # クラス名を描画
+                        painter.setPen(QPen(Qt.white, 1))
+                        painter.setFont(QFont("Arial", 10, QFont.Bold))
+                        painter.drawText(label_rect, Qt.AlignCenter, label_text)
+                
+                # 描画中のバウンディングボックスがあれば表示
+                if self.is_drawing_bbox and self.bbox_start and self.bbox_end:
+                    # バウンディングボックスの座標を計算
+                    start_rel_x = self.bbox_start.x() / pix_width
+                    start_rel_y = self.bbox_start.y() / pix_height
+                    end_rel_x = self.bbox_end.x() / pix_width
+                    end_rel_y = self.bbox_end.y() / pix_height
+                    
+                    start_x = int(target_rect.x() + start_rel_x * target_rect.width())
+                    start_y = int(target_rect.y() + start_rel_y * target_rect.height())
+                    end_x = int(target_rect.x() + end_rel_x * target_rect.width())
+                    end_y = int(target_rect.y() + end_rel_y * target_rect.height())
+                    
+                    # 半透明の黄色でドラッグ中のボックスを描画
+                    painter.setPen(QPen(QColor(255, 255, 0, 180), 2, Qt.DashLine))
+                    painter.setBrush(QBrush(QColor(255, 255, 0, 40)))
+                    painter.drawRect(QRect(
+                        min(start_x, end_x),
+                        min(start_y, end_y),
+                        abs(end_x - start_x),
+                        abs(end_y - start_y)
+                    ))
+                
+                # アノテーションポイントの描画（運転制御アノテーション）
+                if self.annotation_point:
+                    rel_x = self.annotation_point.x() / self.pixmap().width()
+                    rel_y = self.annotation_point.y() / self.pixmap().height()
+                    
+                    scaled_x = int(target_rect.x() + rel_x * target_rect.width())
+                    scaled_y = int(target_rect.y() + rel_y * target_rect.height())
+                    
+                    # 赤い円の描画 - より大きく太く
+                    painter.setPen(QPen(QColor(255, 0, 0), 4))  # 太さを4に増加
+                    circle_size = 15  # 円のサイズを大きく(元は10)
+                    painter.drawEllipse(scaled_x - circle_size, scaled_y - circle_size, circle_size*2, circle_size*2)
+                
+                # 推論ポイントの描画
+                if self.show_inference and self.inference_point:
+                    rel_x = self.inference_point.x() / self.pixmap().width()
+                    rel_y = self.inference_point.y() / self.pixmap().height()
+                    
+                    scaled_x = int(target_rect.x() + rel_x * target_rect.width())
+                    scaled_y = int(target_rect.y() + rel_y * target_rect.height())
+                    
+                    # 青い円の描画 - より大きく太く
+                    painter.setPen(QPen(QColor(0, 0, 255), 4))  # 太さを4に増加
+                    circle_size = 15  # 円のサイズを大きく(元は10)
+                    painter.drawEllipse(scaled_x - circle_size, scaled_y - circle_size, circle_size*2, circle_size*2)
+            
+                # ここから物体検知推論結果表示の追加部分
+                # 推論結果表示チェックがオンで、detection_inference_resultsデータがある場合に表示
+                if (not self.is_deleted and 
+                    self.main_window and 
+                    hasattr(self.main_window, 'show_detection_inference') and 
+                    self.main_window.show_detection_inference and
+                    hasattr(self.main_window, 'detection_inference_results')):
+                    
+                    current_img_path = self.main_window.images[self.main_window.current_index]
+                    if current_img_path in self.main_window.detection_inference_results:
+                        inference_bboxes = self.main_window.detection_inference_results[current_img_path]
+                        
+                        for i, bbox in enumerate(inference_bboxes):
+                            # クラスに応じた色を設定 (推論結果は別の透明度で表示)
+                            class_name = bbox.get('class', 'unknown')
+                            class_colors = {
+                                'car': QColor(255, 0, 0, 120),     # 赤 (半透明)
+                                'person': QColor(0, 255, 0, 120),  # 緑 (半透明)
+                                'sign': QColor(0, 0, 255, 120),    # 青 (半透明)
+                                'cone': QColor(255, 255, 0, 120),  # 黄 (半透明)
+                                'unknown': QColor(128, 128, 128, 120) # グレー (半透明)
+                            }
+                            color = class_colors.get(class_name, QColor(255, 0, 0, 120))
+                            
+                            # 推論結果は点線で表示
+                            pen_width = 2
+                            pen_style = Qt.DashLine
+                            
+                            # 正規化された座標を画面座標に変換
+                            x1 = int(target_rect.x() + bbox['x1'] * target_rect.width())
+                            y1 = int(target_rect.y() + bbox['y1'] * target_rect.height())
+                            x2 = int(target_rect.x() + bbox['x2'] * target_rect.width())
+                            y2 = int(target_rect.y() + bbox['y2'] * target_rect.height())
+                            
+                            # バウンディングボックスを描画
+                            painter.setPen(QPen(color, pen_width, pen_style))
+                            painter.drawRect(QRect(x1, y1, x2-x1, y2-y1))
+                            
+                            # ラベルテキストを作成（信頼度情報がある場合は追加）
+                            label_text = f"推論:{class_name}"
+                            if 'confidence' in bbox:
+                                label_text += f" {bbox['confidence']:.2f}"
+                            
+                            # クラスラベルの背景を描画
+                            label_rect = QRect(x1, y1-20, len(label_text)*8+10, 20)
+                            painter.fillRect(label_rect, color)
+                            
+                            # クラス名を描画
+                            painter.setPen(QPen(Qt.white, 1))
+                            painter.setFont(QFont("Arial", 10, QFont.Bold))
+                            painter.drawText(label_rect, Qt.AlignCenter, label_text)
+
+            # 削除済みの場合は半透明の赤オーバーレイを表示
+            if self.is_deleted:
+                painter.setOpacity(0.25)  # 75%透明
+                painter.fillRect(target_rect, QColor(255, 0, 0))
+                
+                # 中央に削除済みテキストを表示
+                painter.setOpacity(1.0)  # 不透明に戻す
+                painter.setPen(QPen(Qt.white, 2))
+                painter.setFont(QFont("Arial", 24, QFont.Bold))
+                
+                painter.drawText(
+                    target_rect, 
+                    Qt.AlignCenter, 
+                    "削除済み\nクリックで再アノテーション"
+                )
+            
+            painter.end()
 
 
     def mousePressEvent(self, event):
