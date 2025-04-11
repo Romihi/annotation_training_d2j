@@ -795,11 +795,15 @@ class ThumbnailWidget(QWidget):
         info_layout = QVBoxLayout(info_panel)
         info_layout.setContentsMargins(0, 0, 0, 0)
         info_layout.setSpacing(1)
-        
+
+        # ラベル
+        info_panel_label = QLabel("情報パネル:")
+        info_panel_label.setStyleSheet("font-weight: bold;")
+        info_layout.addWidget(info_panel_label)
+
         # インデックス番号
         self.idx_label = QLabel(f"{index + 1}")
         self.idx_label.setAlignment(Qt.AlignCenter)
-        self.idx_label.setStyleSheet("font-weight: bold;")
         info_layout.addWidget(self.idx_label)
         
         # 削除済みバッジ（削除されている場合）
@@ -2083,7 +2087,9 @@ class ImageAnnotationTool(QMainWindow):
         left_layout.addWidget(self.stats_label)
                 
         # エクスポートセクション
-        left_layout.addWidget(QLabel("保存:"))
+        save_label = QLabel("保存:")
+        save_label.setStyleSheet("font-weight: bold;")  # 太文字にするスタイルを追加
+        left_layout.addWidget(save_label)
 
         export_layout = QHBoxLayout()
         
@@ -2114,7 +2120,7 @@ class ImageAnnotationTool(QMainWindow):
         self.pilot_container = QWidget()
         pilot_layout = QVBoxLayout(self.pilot_container)
 
-        # 学習モード切り替えトグル
+        # 学習モード
         pilot_label = QLabel("自動運転:")
         pilot_label.setStyleSheet("font-weight: bold;")  # 太文字にするスタイルを追加
         pilot_layout.addWidget(pilot_label)
@@ -2150,6 +2156,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # モデル明示的読み込みボタン
         self.model_load_button = QPushButton("モデル読込")
+        self.model_load_button.setToolTip("modelsフォルダのモデルを読込む")
         self.model_load_button.clicked.connect(self.load_selected_model)
         self.model_load_button.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")
         model_buttons_layout.addWidget(self.model_load_button)
@@ -2256,6 +2263,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # モデル読み込みボタン
         self.yolo_load_button = QPushButton("モデル読込")
+        self.yolo_load_button.setToolTip("modelsフォルダのモデルを読込む")
         self.yolo_load_button.clicked.connect(self.load_yolo_model)
         self.yolo_load_button.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")
         yolo_model_buttons_layout.addWidget(self.yolo_load_button)
@@ -2295,12 +2303,30 @@ class ImageAnnotationTool(QMainWindow):
         #self.refresh_yolo_model_list()
 
         # --- MLflow関連ボタンを追加 ---
-        mlflow_layout = QHBoxLayout()
+        mlflow_layout = QVBoxLayout()
+
+        mlflow_label = QLabel("MLflow:")
+        mlflow_label.setStyleSheet("font-weight: bold;")  # 太文字にするスタイルを追加
+        mlflow_layout.addWidget(mlflow_label)
 
         # MLflow比較ボタン
-        mlflow_compare_button = QPushButton("MLflow: 学習済みモデルの確認")
+        mlflow_compare_button = QPushButton("モデルのパラメータと性能を比較")
+        mlflow_compare_button.setStyleSheet("""
+            QPushButton {
+                background-color: #0194E2; 
+                color: white; 
+                font-weight: bold;
+                padding: 6px 12px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #0077c2;
+            }
+            QPushButton:pressed {
+                background-color: #00569b;
+            }
+        """)
         mlflow_compare_button.clicked.connect(self.compare_models_mlflow)
-        mlflow_compare_button.setToolTip("MLflowを使ってモデルのパラメータと性能を比較")
         mlflow_layout.addWidget(mlflow_compare_button)
 
         left_layout.addLayout(mlflow_layout)
@@ -2316,7 +2342,9 @@ class ImageAnnotationTool(QMainWindow):
 
         # 説明文を左パネルの最後に移動し、スクロール可能にする
         #left_layout.addWidget(QLabel(""))  # セパレーター用の空行
-        left_layout.addWidget(QLabel("使用方法:"))
+        instructions_label = QLabel("使用方法:")
+        instructions_label.setStyleSheet("font-weight: bold;")
+        left_layout.addWidget(instructions_label)
 
         # アノテーション関連ボタンの初期状態を非アクティブに設定
         self.set_annotation_buttons_enabled(False)
@@ -2542,11 +2570,13 @@ class ImageAnnotationTool(QMainWindow):
         location_layout = QVBoxLayout(location_panel)
         location_layout.setSpacing(5)
         
-        #mmm
+        mode_layout_label = QLabel("アノテーションモード:")
+        mode_layout_label.setStyleSheet("font-weight: bold;")
+        location_layout.addWidget(mode_layout_label)
+
         # アノテーションモード切替ボタン
         mode_layout = QHBoxLayout()
-        mode_layout.addWidget(QLabel("アノテモード:").setStyleSheet("font-weight: bold;"))
-
+        
         self.auto_mode_button = QPushButton("自動運転")
         self.auto_mode_button.setCheckable(True)
         self.auto_mode_button.setChecked(True)  # デフォルトは自動運転モード
