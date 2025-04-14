@@ -506,6 +506,145 @@ class DonkeyModel_FCN(BaseModel):
             transforms.ToTensor(),
             #transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
+    
+# 2画像クラス
+class DualInputBaseModel(BaseModel):
+    def run(self, img_arr1: np.ndarray, img_arr2: np.ndarray):
+        if self._preprocess is None:
+            self._preprocess = self.get_preprocess()
+
+        img1 = self._preprocess(Image.fromarray(img_arr1)).unsqueeze(0).to(self.device)
+        img2 = self._preprocess(Image.fromarray(img_arr2)).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            result = self(img1, img2)
+
+        result = result.cpu().numpy().reshape(-1)
+        result = result * 2 - 1  # [-1,1]スケーリング（必要なら）
+        return result[0], result[1]
+
+class DonkeyDualConcatModel(DualInputBaseModel):
+    def __init__(self, input_size=(224, 224)):
+        super().__init__(name="donkey_dual_concat")
+        self.input_size = input_size
+        self.feature = DonkeyModel(input_size=input_size).features
+        self.dense = DonkeyModel(input_size=input_size).dense_layers
+        self.regressor = nn.Linear(50 * 2, 2)
+
+    def forward(self, x1, x2):
+        f1 = self.dense(self.feature(x1))
+        f2 = self.dense(self.feature(x2))
+        return self.regressor(torch.cat([f1, f2], dim=1))
+
+    def get_preprocess(self):
+        return transforms.Compose([
+            transforms.Resize(self.input_size),
+            transforms.ToTensor(),
+        ])
+
+class DonkeyDual6chModel(DualInputBaseModel):
+    def __init__(self, input_size=(224, 224)):
+        super().__init__(name="donkey_dual_6ch")
+        self.input_size = input_size
+        self.conv = nn.Sequential(
+            nn.Conv2d(6, 24, kernel_size=5, stride=2),
+            nn.ReLU(), nn.Dropout(0.2),
+            nn.Conv2d(24, 32, kernel_size=5, stride=2),
+            nn.ReLU(), nn.Dropout(0.2),
+            nn.Conv2d(32, 64, kernel_size=5, stride=2),
+            nn.ReLU(), nn.Dropout(0.2),
+            nn.Flatten()
+        )
+        dummy = torch.zeros(1, 6, *input_size)
+        out_dim = self.conv(dummy).shape[1]
+        self.regressor = nn.Sequential(
+            nn.Linear(out_dim, 100), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(100, 50), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(50, 2)
+        )
+
+    def forward(self, x1, x2):
+        x = torch.cat([x1, x2], dim=1)  # Channel方向に結合 → 6ch
+        return self.regressor(self.conv(x))
+
+    def get_preprocess(self):
+        return transforms.Compose([
+            transforms.Resize(self.input_size),
+            transforms.ToTensor(),
+        ])
+
+class SimpleCrossAttention(nn.Module):
+    def __init__(self, dim, heads=4):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=heads, batch_first=True)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, q, k):
+        out, _ = self.attn(q, k, k)
+        return self.norm(q + out)
+
+class DonkeyCrossAttentionModel(DualInputBaseModel):
+    def __init__(self, input_size=(224, 224)):
+        super().__init__(name="donkey_crossattn")
+        self.input_size = input_size
+        self.feature = DonkeyModel(input_size=input_size).features
+        dummy = self.feature(torch.zeros(1, 3, *input_size))
+        dim = dummy.shape[1]
+        self.cross_attn = SimpleCrossAttention(dim)
+        self.regressor = nn.Sequential(
+            nn.Linear(dim, 100),
+            nn.ReLU(),
+            nn.Linear(100, 2)
+        )
+
+    def forward(self, x1, x2):
+        f1 = self.feature(x1).unsqueeze(1)  # (B, 1, C)
+        f2 = self.feature(x2).unsqueeze(1)
+        fused = self.cross_attn(f1, f2).squeeze(1)
+        return self.regressor(fused)
+
+    def get_preprocess(self):
+        return transforms.Compose([
+            transforms.Resize(self.input_size),
+            transforms.ToTensor(),
+        ])
+
+class SimpleCrossAttention(nn.Module):
+    def __init__(self, dim, heads=4):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=heads, batch_first=True)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, q, k):
+        out, _ = self.attn(q, k, k)
+        return self.norm(q + out)
+
+class DonkeyCrossAttentionModel(DualInputBaseModel):
+    def __init__(self, input_size=(224, 224)):
+        super().__init__(name="donkey_crossattn")
+        self.input_size = input_size
+        self.feature = DonkeyModel(input_size=input_size).features
+        dummy = self.feature(torch.zeros(1, 3, *input_size))
+        dim = dummy.shape[1]
+        self.cross_attn = SimpleCrossAttention(dim)
+        self.regressor = nn.Sequential(
+            nn.Linear(dim, 100),
+            nn.ReLU(),
+            nn.Linear(100, 2)
+        )
+
+    def forward(self, x1, x2):
+        f1 = self.feature(x1).unsqueeze(1)  # (B, 1, C)
+        f2 = self.feature(x2).unsqueeze(1)
+        fused = self.cross_attn(f1, f2).squeeze(1)
+        return self.regressor(fused)
+
+    def get_preprocess(self):
+        return transforms.Compose([
+            transforms.Resize(self.input_size),
+            transforms.ToTensor(),
+        ])
+
 
 # 利用可能なすべてのモデルを登録する辞書
 MODEL_REGISTRY = {
@@ -560,6 +699,10 @@ MODEL_REGISTRY = {
     # EfficientFormer variants
     "efficientformer_l1": EfficientFormerL1Model,
     
+    # 2画像モデル
+    "donkey_dual_concat": DonkeyDualConcatModel,
+    "donkey_dual_6ch": DonkeyDual6chModel,
+    "donkey_crossattn": DonkeyCrossAttentionModel,
 }
 
 
@@ -647,3 +790,15 @@ class AnnotationDataset(torch.utils.data.Dataset):
         target = torch.tensor([annotation["angle"], annotation["throttle"]], dtype=torch.float)
         
         return img, target
+    
+class DualImageDataset(AnnotationDataset):
+    def __getitem__(self, idx):
+        idx_prev = max(0, idx - 1)
+        img1 = Image.open(self.image_paths[idx_prev]).convert('RGB')
+        img2 = Image.open(self.image_paths[idx]).convert('RGB')
+        if self.transform:
+            img1 = self.transform(img1)
+            img2 = self.transform(img2)
+        annotation = self.annotations[idx]
+        target = torch.tensor([annotation["angle"], annotation["throttle"]], dtype=torch.float)
+        return (img1, img2), target

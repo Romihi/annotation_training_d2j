@@ -7,11 +7,15 @@ import shutil
 import time
 import random
 from datetime import datetime
+import re
+import subprocess
 
 import matplotlib
+matplotlib.use('Agg')  # GUIバックエンドを使用しない設定
+import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 import io
+from PyQt5.QtGui import QPixmap, QImage
 
 import torch
 torch.set_num_threads(2)  # スレッド数を制限
@@ -26,13 +30,13 @@ torch.cuda.empty_cache()
 import mlflow
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                            QLabel, QPushButton, QListWidget, QFileDialog, QMessageBox,
+                            QLabel, QPushButton, QFileDialog, QMessageBox,
                             QScrollArea, QGridLayout, QFrame, QLineEdit, QProgressDialog,
                             QCheckBox, QSpinBox, QComboBox, QSlider, QInputDialog, 
                             QDoubleSpinBox, QGraphicsOpacityEffect, QDialog, QDialogButtonBox,
                             QGroupBox, QRadioButton, QTabWidget, QSizePolicy)
 from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont
-from PyQt5.QtCore import Qt, QSize, QRect, QPoint, QTimer, QEvent
+from PyQt5.QtCore import Qt, QRect, QPoint, QTimer, QEvent
 
 from PIL import Image, ImageDraw
 
@@ -103,6 +107,10 @@ class ImageLabel(QLabel):
         self.zoom_factor = 2.5  # デフォルトの拡大率（250%）
         self.is_deleted = False  # 削除状態フラグ
 
+        # 2画像目表示用の追加
+        self.second_image_pixmap = None  # 2画像目のピクスマップ
+        self.show_second_image = False  # 2画像目を表示するかどうか
+
         # バウンディングボックス関連
         self.bbox_start = None  # バウンディングボックスの開始点
         self.bbox_end = None    # バウンディングボックスの終了点
@@ -153,7 +161,6 @@ class ImageLabel(QLabel):
         if event.key() == Qt.Key_B:
             self.key_b_pressed = False
         super().keyReleaseEvent(event)
-
 
     def mouseReleaseEvent(self, event):
         if self.is_moving_bbox:
@@ -265,7 +272,7 @@ class ImageLabel(QLabel):
         # 画像を拡大して描画
         target_rect = QRect(x, y, scaled_width, scaled_height)
         painter.drawPixmap(target_rect, self.pixmap())
-        
+
         # グリッド表示
         if self.show_grid:
             painter.setPen(QPen(QColor(100, 100, 100, 100), 1))  # 半透明グレー
@@ -511,8 +518,8 @@ class ImageLabel(QLabel):
                     "削除済み\nクリックで再アノテーション"
                 )
             
-            painter.end()
-
+            #painter.end()
+        painter.end()
 
     def mousePressEvent(self, event):
         if self.pixmap() and self.main_window:
@@ -994,6 +1001,14 @@ class ImageAnnotationTool(QMainWindow):
         self.annotations = {}
         self.annotation_history = []
         self.annotated_count = 0
+
+        #m
+        self.check =  "check"
+        # 2画像目関連の状態を追加
+        self.second_images = []  # メイン画像パスをキー、2画像目パスを値とするマッピング
+        self.second_image_keys = []  # 2画像目のキー（例: 'lidar/image_array'）を保存するリスト
+        self.load_second_image_confirmed = False  # 2画像目読み込み確認の状態
+
         # 現在のアノテーションモード（0=自動運転、1=物体検知）
         self.current_mode = 0
         self.last_selected_bbox_class = None  # 前回選択した物体検知クラス
@@ -1040,12 +1055,6 @@ class ImageAnnotationTool(QMainWindow):
 
     def update_distribution_graph(self):
         """アノテーションの角度とスロットル値の分布を縦並びのヒストグラムで表示"""
-        import matplotlib
-        matplotlib.use('Agg')  # GUIバックエンドを使用しない設定
-        import matplotlib.pyplot as plt
-        import numpy as np
-        import io
-        from PyQt5.QtGui import QPixmap, QImage
         
         if not self.annotations:
             # アノテーションがない場合は空のグラフを表示
@@ -1095,14 +1104,7 @@ class ImageAnnotationTool(QMainWindow):
             ax1.tick_params(axis='both', which='major', labelsize=7)
             ax1.grid(True, alpha=0.3)
             ax1.set_xlim(-1.05, 1.05)
-            
-            # 統計情報を追加
-            angle_mean = np.mean(angles)
-            angle_std = np.std(angles)
-            # ax1.text(0.05, 0.95, f'平均: {angle_mean:.3f}\n標準偏差: {angle_std:.3f}', 
-            #         transform=ax1.transAxes, fontsize=7, 
-            #         verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-            
+                        
             # throttle分布をヒストグラムで表示
             n2, bins2, patches2 = ax2.hist(throttles, bins=bins, alpha=0.7, color='salmon')
             # 度数に応じた色付け
@@ -1119,19 +1121,7 @@ class ImageAnnotationTool(QMainWindow):
             ax2.tick_params(axis='both', which='major', labelsize=7)
             ax2.grid(True, alpha=0.3)
             ax2.set_xlim(-1.05, 1.05)
-            
-            # 統計情報を追加
-            throttle_mean = np.mean(throttles)
-            throttle_std = np.std(throttles)
-            # ax2.text(0.05, 0.95, f'平均: {throttle_mean:.3f}\n標準偏差: {throttle_std:.3f}', 
-            #         transform=ax2.transAxes, fontsize=7, 
-            #         verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-            
-            # # データ数を右上に表示
-            # fig.text(0.95, 0.98, f'n = {len(angles)}', 
-            #         horizontalalignment='right', verticalalignment='top', 
-            #         fontsize=8, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-            
+                        
             # レイアウト調整
             plt.tight_layout(pad=1.0)
             
@@ -1534,11 +1524,7 @@ class ImageAnnotationTool(QMainWindow):
         else:
             self.statusBar().showMessage("物体検知推論結果表示をオフにしました", 3000)
     
-    def initialize_mlflow(self):
-        """MLflowの初期化と設定を行う - Windows環境対応（修正版）"""
-        import os
-        import sys
-        
+    def initialize_mlflow(self):        
         # MLflowのトラッキングサーバーの設定
         if not hasattr(self, 'folder_path') or not self.folder_path:
             QMessageBox.warning(self, "警告", "画像フォルダが設定されていません。MLflowの初期化ができません。")
@@ -1589,11 +1575,7 @@ class ImageAnnotationTool(QMainWindow):
             return False
 
     def open_mlflow_ui(self):
-        """MLflow UIを開く - Windows環境対応（パス正規化）"""
-        import subprocess
-        import sys
-        import os
-        
+        """MLflow UIを開く - Windows環境対応（パス正規化）"""        
         if not hasattr(self, 'mlflow_tracking_uri'):
             if not self.initialize_mlflow():
                 return
@@ -1640,12 +1622,6 @@ class ImageAnnotationTool(QMainWindow):
             )
 
     def log_model_to_mlflow(self, model_path, model_type, training_params, metrics, dataset_info):
-        """モデル情報をMLflowに記録する - Windows環境対応"""
-        import mlflow.pytorch
-        import torch
-        import sys
-        import os
-        
         # MLflowが初期化されていない場合は初期化
         if not hasattr(self, 'mlflow_tracking_uri'):
             if not self.initialize_mlflow():
@@ -1759,30 +1735,6 @@ class ImageAnnotationTool(QMainWindow):
         
         # MLflow UIを開いて比較してもらう
         self.open_mlflow_ui()
-
-    def save_session_info(self):
-        """現在の作業セッション情報を保存する"""
-        try:
-            # セッション情報を保存するためのディレクトリ
-            session_dir = os.path.join(APP_DIR_PATH, SESSION_DIR_NAME)
-            os.makedirs(session_dir, exist_ok=True)
-            
-            # 保存する情報
-            session_info = {
-                "last_folder_path": self.folder_path if hasattr(self, 'folder_path') else "",
-                "last_model_arch": self.auto_method_combo.currentText() if hasattr(self, 'auto_method_combo') else "",
-                "last_model_name": self.model_combo.currentText() if hasattr(self, 'model_combo') else "",
-                "timestamp": int(time.time())
-            }
-            
-            # ファイルに保存
-            session_file = os.path.join(session_dir, "session.json")
-            with open(session_file, 'w') as f:
-                json.dump(session_info, f)
-                
-            print(f"セッション情報を保存しました: {session_file}")
-        except Exception as e:
-            print(f"セッション情報の保存に失敗: {e}")
 
     def save_session_info(self):
         """現在の作業セッション情報を保存する"""
@@ -2071,28 +2023,6 @@ class ImageAnnotationTool(QMainWindow):
         # 更新完了メッセージ
         self.statusBar().showMessage(f"{len(model_files)}個の{current_arch}モデルを読み込みました", 3000)
 
-    def change_zoom(self, value):
-        """ズーム係数を変更する（スピンボックスから）"""
-        self.main_image_view.zoom_factor = value
-        self.main_image_view.update()
-        
-        # スライダーの値も同期
-        # valueChanged信号の再帰的な呼び出しを防ぐため、blockSignalsを使用
-        self.zoom_slider.blockSignals(True)
-        self.zoom_slider.setValue(int(value * 10))
-        self.zoom_slider.blockSignals(False)
-
-    def slider_zoom_changed(self, value):
-        """ズーム係数を変更する（スライダーから）"""
-        zoom_value = value / 10.0
-        self.main_image_view.zoom_factor = zoom_value
-        self.main_image_view.update()
-        
-        # スピンボックスの値も同期
-        self.zoom_spinbox.blockSignals(True)
-        self.zoom_spinbox.setValue(zoom_value)
-        self.zoom_spinbox.blockSignals(False)
-
     def play_forward(self):
         """自動再生（順方向）"""
         # 再生中かどうかをチェック
@@ -2338,13 +2268,6 @@ class ImageAnnotationTool(QMainWindow):
         # left_layout.addWidget(auto_annotate_button)
         inference_button_layout.addWidget(auto_annotate_button)
 
-        # バッチ推論ボタン
-        ## disabled
-        # batch_inference_button = QPushButton("一括推論実行")
-        # batch_inference_button.clicked.connect(lambda: self.run_inference_check(True))
-        # left_layout.addWidget(batch_inference_button)
-        # inference_button_layout.addWidget(batch_inference_button)
-
         left_layout.addLayout(inference_button_layout)
 
         # 物体検知設定コンテナ
@@ -2421,13 +2344,6 @@ class ImageAnnotationTool(QMainWindow):
         self.yolo_onnx_convert_button.setStyleSheet("QPushButton { background-color: #8A2BE2; color: white; }")
         obj_detection_layout.addWidget(self.yolo_onnx_convert_button)
         
-        # 一括推論ボタン
-        ## disabled
-        # batch_inference_button = QPushButton("一括推論実行")
-        # batch_inference_button.clicked.connect(self.run_batch_yolo_inference)
-        # batch_inference_button.setToolTip("全画像に対してYOLO推論を一括実行します")
-        # detection_inference_layout.addWidget(batch_inference_button)
-
         # 物体検知コンテナ追加
         left_layout.addWidget(self.object_detection_container)
 
@@ -2472,7 +2388,6 @@ class ImageAnnotationTool(QMainWindow):
         self.statusBar().showMessage("Bキーを押しながらクリックすると、いつでもバウンディングボックスを作成できます。Deleteキーで選択したボックスを削除できます。", 10000)
 
         # 説明文を左パネルの最後に移動し、スクロール可能にする
-        #left_layout.addWidget(QLabel(""))  # セパレーター用の空行
         instructions_label = QLabel("使用方法:")
         instructions_label.setStyleSheet("font-weight: bold;")
         left_layout.addWidget(instructions_label)
@@ -2603,6 +2518,12 @@ class ImageAnnotationTool(QMainWindow):
         self.main_image_view = ImageLabel(main_window=self)
         self.main_image_view.setMinimumSize(800, 600)
         main_image_container.addWidget(self.main_image_view)
+
+        # ２画像目を小窓に表示
+        self.secondary_image_label = QLabel(self)
+        self.secondary_image_label.setFixedSize(100, 100)  # 例: 1280x960 の1/8サイズ
+        self.secondary_image_label.setStyleSheet("border: 1px solid gray; background-color: black;")
+        self.secondary_image_label.move(1250, 40)  # メイン画像の右上に配置
         
         # ナビゲーションコントロールをメイン画像の下に配置
         nav_container = QWidget()
@@ -2651,7 +2572,7 @@ class ImageAnnotationTool(QMainWindow):
         # 再生ボタンの配置
         play_layout = QHBoxLayout()
         
-        play_layout.addWidget(QLabel("再生:"))
+        play_layout.addWidget(QLabel("再生（スキップ数に依存）:"))
         reverse_play_button = QPushButton("◀️")
         reverse_play_button.clicked.connect(self.play_reverse)
         play_layout.addWidget(reverse_play_button)
@@ -4914,11 +4835,8 @@ class ImageAnnotationTool(QMainWindow):
             self.annotated_count = len(self.annotations)
             
             # UI更新
-            self.update_stats()
-            self.display_current_image()
-            self.update_gallery()
-            self.update_location_button_counts()
-            
+            self.update_ui()
+
             QMessageBox.information(
                 self, 
                 "削除完了", 
@@ -5009,11 +4927,8 @@ class ImageAnnotationTool(QMainWindow):
         self.annotated_count = len(self.annotations)
         
         # UI更新
-        self.update_stats()
-        self.display_current_image()
-        self.update_gallery()
-        self.update_location_button_counts()
-        
+        self.update_ui() 
+
         QMessageBox.information(
             self, 
             "範囲削除完了", 
@@ -5094,12 +5009,7 @@ class ImageAnnotationTool(QMainWindow):
                 return
             
             # Update UI
-            self.update_stats()
-            self.display_current_image()
-            self.update_gallery()
-            
-            # 位置ボタンのカウント表示を更新
-            self.update_location_button_counts()
+            self.update_ui()
             
             print(f"同階層アノテーション読み込み完了: {len(self.annotations)}個のアノテーション")
             
@@ -5128,7 +5038,7 @@ class ImageAnnotationTool(QMainWindow):
         """スライダーの値が変更されたときの処理"""
         if self.images and value != self.current_index:
             self.current_index = value
-            self.display_current_image()
+            #self.display_current_image()
             
             # 推論表示チェックボックスがONの場合、自動的に現在の画像の推論を実行
             if self.inference_checkbox.isChecked():
@@ -5144,7 +5054,8 @@ class ImageAnnotationTool(QMainWindow):
                 if current_img_path not in self.detection_inference_results:
                     self.update_detection_info_panel()
             
-            self.update_gallery()
+            self.update_ui()
+            #self.update_gallery()
 
     def toggle_inference_display(self, state):
         show_inference = (state == Qt.Checked)
@@ -5417,6 +5328,7 @@ class ImageAnnotationTool(QMainWindow):
         QTimer.singleShot(100, self.load_images)
 
     def load_images(self):
+        import re
         """
         選択した各フォルダの下のimagesフォルダから画像を読み込む
         アノテーションは自動では読み込まない
@@ -5451,17 +5363,35 @@ class ImageAnnotationTool(QMainWindow):
         # 全画像フォルダの画像を集める
         all_images = []
         image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.gif']
-        
+        lidar_images = []  # LIDAR画像用のリスト
+
+        #m
+        # カメラとLIDARの画像のパターンを定義
+        camera_pattern = re.compile(r'.*_cam.*\.(jpg|jpeg|png|bmp|gif)$', re.IGNORECASE)
+        lidar_pattern = re.compile(r'.*_lidar.*\.(jpg|jpeg|png|bmp|gif)$', re.IGNORECASE)
+
         print(f"{len(image_folders)}個のimagesフォルダを検索中...")
         
+        #m
         for img_folder in image_folders:
             print(f"画像フォルダを検索中: {img_folder}")
             
             # imagesフォルダ内の画像を検索
             try:
                 for file in os.listdir(img_folder):
+                    file_path = os.path.join(img_folder, file)
                     if any(file.lower().endswith(ext) for ext in image_extensions):
-                        all_images.append(os.path.join(img_folder, file))
+                        # パターンでマッチングして分類
+                        if camera_pattern.match(file):
+                            all_images.append(file_path)
+                            print(f"カメラ画像を追加: {file}")
+                        elif lidar_pattern.match(file):
+                            lidar_images.append(file_path)
+                            print(f"LIDAR画像を追加: {file}")
+                        else:
+                            # パターンにマッチしない場合はデフォルトでカメラ画像として扱う
+                            all_images.append(file_path)
+                            print(f"その他の画像を追加: {file}")
             except Exception as e:
                 print(f"画像フォルダ {img_folder} の読み込みエラー: {e}")
         
@@ -5469,8 +5399,8 @@ class ImageAnnotationTool(QMainWindow):
             QMessageBox.warning(self, "エラー", "選択されたフォルダ内のimagesフォルダに画像ファイルがありません。")
             return
         
-        print(f"{len(all_images)}枚の画像が見つかりました")
-        
+        print(f"{len(all_images)}枚のカメラ画像と{len(lidar_images)}枚のLIDAR画像が見つかりました")
+               
         # ファイル名からインデックスを抽出してソート
         image_with_indices = []
         for img_path in all_images:
@@ -5505,7 +5435,11 @@ class ImageAnnotationTool(QMainWindow):
                 print(f"元の画像サイズ: {self.original_image_width}x{self.original_image_height}")
             except Exception as e:
                 print(f"画像サイズの取得エラー: {e}")        
-                
+
+        #m
+        # リセット前にLIDAR画像のマッピングを作成
+        self.second_images = [item.replace('cam_image_array_', 'lidar_image_array_') for item in images]
+
         # Reset state
         self.folder_path = valid_paths[0]  # 最初の親フォルダをメインフォルダとして設定
         self.folder_paths = valid_paths    # すべての有効な親フォルダパスを保存
@@ -5533,29 +5467,27 @@ class ImageAnnotationTool(QMainWindow):
             self.slider_value_label.setText("0/0")
         
         # Update UI
-        self.update_stats()
-        self.display_current_image()
-        self.update_gallery()
+        self.update_ui()
         
         # モデルリストを更新
         self.refresh_model_list()
         if use_yolo:
             self.refresh_yolo_model_list()
-
-        # 位置ボタンのカウント表示を更新
-        self.update_location_button_counts()
         
         # アノテーション関連ボタンをアクティブ化
         self.set_annotation_buttons_enabled(True)
         
+        #m
+        # 読み込み完了メッセージを更新
         QMessageBox.information(
             self, 
             "読み込み完了", 
-            f"{len(valid_paths)}個のフォルダから合計{len(self.images)}枚の画像を読み込みました。\nアノテーションデータは読み込まれていません。"
+            f"{len(valid_paths)}個のフォルダから合計{len(self.images)}枚のカメラ画像と{len(self.second_images)}組のLIDAR画像を読み込みました。\nアノテーションデータは読み込まれていません。"
         )
         
-        print(f"画像読み込み完了: {len(self.images)}枚の画像")
-        
+        print(f"画像読み込み完了: {len(self.images)}枚のカメラ画像、{len(self.second_images)}組のLIDAR画像")
+
+
         # 自動的にアノテーションデータ読み込みを促す確認ダイアログ
         reply = QMessageBox.question(
             self, 
@@ -5658,13 +5590,7 @@ class ImageAnnotationTool(QMainWindow):
             
             if annotations_loaded:
                 # Update UI
-                self.update_stats()
-                self.display_current_image()
-                self.update_gallery()
-                self.update_distribution_graph()  # 追加：分布グラフを更新
-                
-                # 位置ボタンのカウント表示を更新
-                self.update_location_button_counts()
+                self.update_ui()
                 
                 # 詳細情報を生成
                 details = ""
@@ -5812,12 +5738,7 @@ class ImageAnnotationTool(QMainWindow):
             
             if annotations_loaded:
                 # Update UI
-                self.update_stats()
-                self.display_current_image()
-                self.update_gallery()
-                
-                # 位置ボタンのカウント表示を更新
-                self.update_location_button_counts()
+                self.update_ui()
                 
                 # 詳細情報を生成
                 details = ""
@@ -5926,12 +5847,7 @@ class ImageAnnotationTool(QMainWindow):
                 return
             
             # Update UI
-            self.update_stats()
-            self.display_current_image()
-            self.update_gallery()
-            
-            # 位置ボタンのカウント表示を更新
-            self.update_location_button_counts()
+            self.update_ui()
             
             print(f"サブフォルダアノテーション読み込み完了: {len(self.annotations)}個のアノテーション")
             
@@ -5955,12 +5871,7 @@ class ImageAnnotationTool(QMainWindow):
             self.deleted_indexes = []
         
         # UI更新
-        self.update_stats()
-        self.display_current_image()
-        self.update_gallery()
-        
-        # 位置ボタンのカウント表示を更新
-        self.update_location_button_counts()
+        self.update_ui()
         
         # 分布グラフを更新
         if hasattr(self, 'distribution_label'):
@@ -6103,12 +6014,7 @@ class ImageAnnotationTool(QMainWindow):
                 return
             
             # Update UI
-            self.update_stats()
-            self.display_current_image()
-            self.update_gallery()
-            
-            # 位置ボタンのカウント表示を更新
-            self.update_location_button_counts()
+            self.update_ui()
             
             print(f"サブフォルダアノテーション読み込み完了: {len(self.annotations)}個のアノテーション")
             
@@ -6290,6 +6196,7 @@ class ImageAnnotationTool(QMainWindow):
                 f"モデル読み込み中にエラーが発生しました: {str(e)}"
             )
   
+    
     def load_catalog_annotations(self, catalog_folder):
         """カタログファイルからアノテーションを読み込む - 進捗表示付き"""
         if not os.path.exists(catalog_folder):
@@ -6351,6 +6258,46 @@ class ImageAnnotationTool(QMainWindow):
                 print("manifest.jsonからカタログファイルを取得できませんでした")
                 progress.close()
                 return False
+            
+
+            #m
+            # ここから新しいコードの追加: 2画像目のキーについて最初に確認
+            self.second_image_keys = []
+            
+            # 最初のエントリを確認して2画像目のキーを特定
+            try:
+                catalog_path = os.path.join(catalog_folder, catalog_files[0])
+                with open(catalog_path, 'r') as f:
+                    first_line = f.readline()
+                    if first_line:
+                        entry = json.loads(first_line)
+                        # すべてのキーを確認
+                        for key in entry.keys():
+                            # image_arrayを含むキーで、cam/image_arrayではない
+                            if '/image_array' in key and key != 'cam/image_array':
+                                self.second_image_keys.append(key)
+                                print(f"2画像目のキーを検出: {key}")
+            except Exception as e:
+                print(f"2画像目のキー検出エラー: {e}")
+            
+            # 2画像目のキーが見つかった場合、ユーザーに確認
+            if self.second_image_keys:
+                # 進捗ダイアログを一時的に非表示
+                progress.hide()
+                
+                reply = QMessageBox.question(
+                    self,
+                    "2画像の検出",
+                    f"カタログに2つ目の画像キー {', '.join(self.second_image_keys)} が見つかりました。\n"
+                    "2画像目も表示しますか？",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                self.load_second_image_confirmed = (reply == QMessageBox.Yes)
+                
+                # 進捗ダイアログを再表示
+                progress.show()
+                # ここまで新しいコード      
             
             progress.setLabelText(f"{len(catalog_files)}個のカタログファイルを検出しました")
             progress.setValue(15)
@@ -6441,8 +6388,38 @@ class ImageAnnotationTool(QMainWindow):
                         
                         # 画像ファイル名を取得
                         img_name = entry.get('cam/image_array', '')
-                        if not img_name:
-                            continue
+                        # if not img_name:
+                        #     continue
+
+                        #m
+                        # 2画像目のキーを検索
+                        second_image_keys = []
+                        for key in entry.keys():
+                            if key != 'cam/image_array' and key.endswith('/image_array'):
+                                second_image_keys.append(key)
+                        
+                        # 2画像目が存在する場合の処理
+                        if second_image_keys and len(second_image_keys) > 0:
+                            # 初回の場合にユーザーに確認
+                            if not hasattr(self, 'load_second_image_confirmed'):
+                                reply = QMessageBox.question(
+                                    self,
+                                    "2画像の検出",
+                                    f"カタログに2つ目の画像キー {second_image_keys[0]} が見つかりました。\n"
+                                    "2画像目も読み込みますか？",
+                                    QMessageBox.Yes | QMessageBox.No,
+                                    QMessageBox.Yes
+                                )
+                                self.load_second_image_confirmed = (reply == QMessageBox.Yes)
+                            
+                            # 2画像目の読み込み処理
+                            if hasattr(self, 'load_second_image_confirmed') and self.load_second_image_confirmed:
+                                second_img_key = second_image_keys[0]  # 最初のキーを使用
+                                second_img_name = entry.get(second_img_key, '')
+                                # 2画像目の情報を記録（現段階では記録だけ）
+                                if second_img_name:
+                                    pass  # 次のステップで実装
+
                         
                         # 画像パスの処理 - 複数のパターンを試す
                         img_path = None
@@ -6606,9 +6583,325 @@ class ImageAnnotationTool(QMainWindow):
         self.add_location_button()
         return True
 
+    def update_ui(self):
+        self.update_stats()
+        self.display_current_image()
+        if self.load_second_image_confirmed:
+            self.display_current_second_image()
+        self.update_gallery()        
+        self.update_location_button_counts()
+        self.update_distribution_graph()
+
     def update_stats(self):
         self.stats_label.setText(f"アノテーション済み: {self.annotated_count} / {len(self.images)}")
     
+    # def display_current_second_image(self):
+    #     # ２画像目を表示
+    #     second_img_path = self.second_images[self.current_index]        
+    #     second_pixmap = QPixmap(second_img_path)
+    #     self.secondary_image_label.setPixmap(second_pixmap)
+    # #m
+    # def display_current_second_image(self):
+    #     """2画像目を表示する - 画像を適切に縮小して表示"""
+    #     if not self.images or not self.load_second_image_confirmed:
+    #         return
+            
+    #     # 2画像目のパスを取得
+    #     current_index = self.current_index
+    #     if current_index >= len(self.images) or current_index >= len(self.second_images):
+    #         return
+            
+    #     second_img_path = self.second_images[current_index]
+        
+    #     # 画像が存在するか確認
+    #     if not os.path.exists(second_img_path):
+    #         return
+        
+    #     try:
+    #         # 2画像目を読み込む
+    #         second_pixmap = QPixmap(second_img_path)
+    #         if second_pixmap.isNull():
+    #             return
+                
+    #         # メイン画像の表示領域を取得
+    #         main_view_width = self.main_image_view.width()
+    #         main_view_height = self.main_image_view.height()
+            
+    #         # 2画像目の表示サイズを計算（メイン画像の20%程度、最大サイズを制限）
+    #         max_width = min(int(main_view_width * 0.2), 300)
+    #         max_height = min(int(main_view_height * 0.2), 300)
+            
+    #         # アスペクト比を維持しながら縮小
+    #         scaled_pixmap = second_pixmap.scaled(
+    #             max_width, 
+    #             max_height, 
+    #             Qt.KeepAspectRatio, 
+    #             Qt.SmoothTransformation
+    #         )
+            
+    #         # 縮小した画像を表示
+    #         self.secondary_image_label.setPixmap(scaled_pixmap)
+            
+    #         # ラベルの表示サイズを調整
+    #         self.secondary_image_label.setFixedSize(scaled_pixmap.width(), scaled_pixmap.height())
+            
+    #         # 画面右上の固定位置に表示
+    #         x_position = self.width() - scaled_pixmap.width() - 20
+    #         y_position = 40  # 上部からのオフセット
+    #         self.secondary_image_label.move(x_position, y_position)
+            
+    #         # ラベルを見えるようにする
+    #         self.secondary_image_label.show()
+    #         self.secondary_image_label.raise_()  # 他のウィジェットの上に表示
+            
+    #     except Exception as e:
+    #         print(f"2画像目の表示エラー: {e}")
+    # #m
+    # def display_current_second_image(self):
+    #     """
+    #     2画像目をメイン画像の適切な位置に表示する
+    #     - ウィンドウサイズ変更に対応
+    #     - メイン画像と重ならないように配置
+    #     - 適切なサイズで表示
+    #     """
+    #     if not self.images or not hasattr(self, 'load_second_image_confirmed') or not self.load_second_image_confirmed:
+    #         return
+            
+    #     # 2画像目のパスを取得
+    #     current_index = self.current_index
+    #     if current_index >= len(self.images):
+    #         return
+            
+    #     current_img_path = self.images[current_index]
+        
+    #     # second_imagesが辞書型かリスト型かをチェック
+    #     if isinstance(self.second_images, dict):
+    #         # 辞書型の場合はキーで検索
+    #         if current_img_path not in self.second_images:
+    #             if hasattr(self, 'secondary_image_label'):
+    #                 self.secondary_image_label.hide()
+    #             return
+    #         second_img_path = self.second_images[current_img_path]
+    #     else:
+    #         # リスト型の場合はインデックスで参照
+    #         if current_index >= len(self.second_images):
+    #             if hasattr(self, 'secondary_image_label'):
+    #                 self.secondary_image_label.hide()
+    #             return
+    #         second_img_path = self.second_images[current_index]
+        
+    #     # 画像が存在するか確認
+    #     if not os.path.exists(second_img_path):
+    #         if hasattr(self, 'secondary_image_label'):
+    #             self.secondary_image_label.hide()
+    #         return
+        
+    #     try:
+    #         # 2画像目を読み込む
+    #         second_pixmap = QPixmap(second_img_path)
+    #         if second_pixmap.isNull():
+    #             if hasattr(self, 'secondary_image_label'):
+    #                 self.secondary_image_label.hide()
+    #             return
+                
+    #         # メイン画像表示エリアのジオメトリを取得
+    #         main_view = self.main_image_view
+            
+    #         # メイン画像のピクスマップを取得
+    #         main_pixmap = main_view.pixmap()
+    #         if main_pixmap is None:
+    #             if hasattr(self, 'secondary_image_label'):
+    #                 self.secondary_image_label.hide()
+    #             return
+                
+    #         # メイン画像の表示領域を計算
+    #         pix_width = main_pixmap.width()
+    #         pix_height = main_pixmap.height()
+            
+    #         # ズーム係数があれば適用（ない場合は1.0とする）
+    #         zoom_factor = getattr(main_view, 'zoom_factor', 1.0)
+            
+    #         # 拡大後のサイズを計算
+    #         scaled_width = int(pix_width * zoom_factor)
+    #         scaled_height = int(pix_height * zoom_factor)
+            
+    #         # 中央に配置するための座標計算
+    #         x = (main_view.width() - scaled_width) // 2
+    #         y = (main_view.height() - scaled_height) // 2
+            
+    #         # メイン画像の表示範囲
+    #         main_image_rect = QRect(x, y, scaled_width, scaled_height)
+            
+    #         # 2画像目の表示サイズを計算（メイン画像の15%程度、固定サイズに制限）
+    #         max_height = min(main_image_rect.height() * 0.15, 120)
+            
+    #         # アスペクト比を維持しながら縮小
+    #         scaled_pixmap = second_pixmap.scaled(
+    #             int(max_height * second_pixmap.width() / second_pixmap.height()), 
+    #             int(max_height), 
+    #             Qt.KeepAspectRatio, 
+    #             Qt.SmoothTransformation
+    #         )
+            
+    #         # 縮小した画像を表示
+    #         self.secondary_image_label.setPixmap(scaled_pixmap)
+            
+    #         # ラベルの表示サイズを調整
+    #         self.secondary_image_label.setFixedSize(scaled_pixmap.width(), scaled_pixmap.height())
+            
+    #         # メイン画像の右上隅付近に表示（メイン画像の内部だが、右上に寄せる）
+    #         x_position = main_image_rect.right() - scaled_pixmap.width() - 10  # 右端から10ピクセル内側
+    #         y_position = main_image_rect.top() + 10                          # 上端から10ピクセル下
+            
+    #         self.secondary_image_label.move(x_position, y_position)
+            
+    #         # ラベルを見えるようにする
+    #         self.secondary_image_label.show()
+    #         self.secondary_image_label.raise_()  # 他のウィジェットの上に表示
+            
+    #         # 黒い背景と緑色の枠線を付けて視認性を良くする
+    #         self.secondary_image_label.setStyleSheet("""
+    #             border: 2px solid #4CAF50; 
+    #             background-color: rgba(0, 0, 0, 100);
+    #         """)
+            
+    #     except Exception as e:
+    #         print(f"2画像目の表示エラー: {e}")
+    #         import traceback
+    #         traceback.print_exc()
+    #         if hasattr(self, 'secondary_image_label'):
+    #             self.secondary_image_label.hide()
+    # #m
+    def display_current_second_image(self):
+        """
+        2画像目をメイン画像の右側に適切に表示する
+        - メイン画像と重ならないように右側に配置
+        - 適切なサイズで表示
+        - ウィンドウサイズ変更にも対応
+        """
+        if not self.images or not hasattr(self, 'load_second_image_confirmed') or not self.load_second_image_confirmed:
+            return
+            
+        # 2画像目のパスを取得
+        current_index = self.current_index
+        if current_index >= len(self.images):
+            return
+            
+        current_img_path = self.images[current_index]
+        
+        # second_imagesが辞書型かリスト型かをチェック
+        if isinstance(self.second_images, dict):
+            # 辞書型の場合はキーで検索
+            if current_img_path not in self.second_images:
+                if hasattr(self, 'secondary_image_label'):
+                    self.secondary_image_label.hide()
+                return
+            second_img_path = self.second_images[current_img_path]
+        else:
+            # リスト型の場合はインデックスで参照
+            if current_index >= len(self.second_images):
+                if hasattr(self, 'secondary_image_label'):
+                    self.secondary_image_label.hide()
+                return
+            second_img_path = self.second_images[current_index]
+        
+        # 画像が存在するか確認
+        if not os.path.exists(second_img_path):
+            if hasattr(self, 'secondary_image_label'):
+                self.secondary_image_label.hide()
+            return
+        
+        try:
+            # 2画像目を読み込む
+            second_pixmap = QPixmap(second_img_path)
+            if second_pixmap.isNull():
+                if hasattr(self, 'secondary_image_label'):
+                    self.secondary_image_label.hide()
+                return
+            
+            # メイン画像ビューのジオメトリを取得
+            main_view = self.main_image_view
+            main_view_rect = main_view.geometry()
+            
+            # メインビューの右端の座標を取得
+            main_right = main_view_rect.right()
+            main_top = main_view_rect.top()
+            main_height = main_view_rect.height()
+            
+            # 2画像目のサイズを計算（メイン画像の高さの30%程度を目安に）
+            target_height = int(main_height * 0.1)
+            
+            # 最小・最大サイズを設定
+            min_size = 100
+            max_size = 400
+            if target_height < min_size:
+                target_height = min_size  # 最小サイズ
+            elif target_height > max_size:
+                target_height = max_size  # 最大サイズ
+            
+            # アスペクト比を維持しながら縮小
+            scaled_pixmap = second_pixmap.scaled(
+                int(target_height * second_pixmap.width() / second_pixmap.height()), 
+                target_height, 
+                Qt.KeepAspectRatio, 
+                Qt.SmoothTransformation
+            )
+            
+            # 縮小した画像を表示
+            self.secondary_image_label.setPixmap(scaled_pixmap)
+            
+            # ラベルの表示サイズを調整
+            self.secondary_image_label.setFixedSize(scaled_pixmap.width(), scaled_pixmap.height())
+            
+            # メイン画像の右側、上端を合わせる形で配置（間に20pxの余白）
+            x_position = main_right + scaled_pixmap.width() + 100
+ 
+            # ウィンドウの上部付近に合わせる
+            #y_position = main_top
+            
+            # メイン画像と高さを合わせる（中央揃え）
+            y_position = main_top + (main_height - scaled_pixmap.height()) // 2
+            
+            # 位置を設定
+            self.secondary_image_label.move(x_position, y_position)
+            
+            # ラベルを見えるようにする
+            self.secondary_image_label.show()
+            self.secondary_image_label.raise_()  # 他のウィジェットの上に表示
+            
+            # 枠線と背景を設定して視認性を向上
+            self.secondary_image_label.setStyleSheet("""
+                border: 3px solid #2196F3; 
+                background-color: black;
+            """)
+            
+        except Exception as e:
+            print(f"2画像目の表示エラー: {e}")
+            import traceback
+            traceback.print_exc()
+            if hasattr(self, 'secondary_image_label'):
+                self.secondary_image_label.hide()
+
+    def resizeEvent(self, event):
+        """ウィンドウサイズ変更時に2画像目の位置を調整する"""
+        # 親クラスのリサイズイベントを呼び出す
+        super().resizeEvent(event)
+        
+        # リサイズ後に2画像目の表示位置を更新する
+        # 少し遅延させて、メイン画像の描画が完了してから2画像目を配置する
+        QTimer.singleShot(100, self.display_current_second_image)
+
+    # def resizeEvent(self, event):
+    #     """ウィンドウサイズ変更時に2画像目の位置を調整する"""
+    #     # 親クラスのリサイズイベントを呼び出す
+    #     super().resizeEvent(event)
+        
+    #     # リサイズ後に2画像目の表示位置を更新する
+    #     # 少し遅延させて、メイン画像の描画が完了してから2画像目を配置する
+    #     QTimer.singleShot(50, self.display_current_second_image)
+
+       
+            
     def display_current_image(self):
         """現在の画像を表示する（削除状態も考慮）"""
         if not self.images:
@@ -6769,7 +7062,7 @@ class ImageAnnotationTool(QMainWindow):
         pixmap = QPixmap(current_img_path)
         if not pixmap.isNull():
             self.main_image_view.setPixmap(pixmap)
-            
+
             # アノテーションポイントの設定
             if not is_deleted and current_img_path in self.annotations and self.annotations[current_img_path]:
                 anno = self.annotations[current_img_path]
@@ -6955,7 +7248,7 @@ class ImageAnnotationTool(QMainWindow):
                 self.current_location = old_current_location
         
         # 画像表示を更新
-        self.display_current_image()
+        self.update_ui()
         
         # 推論表示チェックボックスがONの場合、推論結果がなければ実行
         if self.inference_checkbox.isChecked():
@@ -6967,7 +7260,6 @@ class ImageAnnotationTool(QMainWindow):
         self.update_detection_info_panel()
 
         # ギャラリーを更新
-        self.update_gallery()
         
         # 前回のバウンディングボックスを自動適用（もし実装されていれば）
         if hasattr(self, 'auto_apply_last_bbox') and not is_deleted and self.auto_apply_last_bbox:
@@ -7052,13 +7344,7 @@ class ImageAnnotationTool(QMainWindow):
         self.update_location_button_counts()
 
         # Update UI
-        self.update_stats()
-        self.display_current_image()
-        print("アノテーション実行")
-        self.update_gallery()
-
-        # 分布グラフを更新
-        self.update_distribution_graph()
+        self.update_ui()
 
     def restore_deleted_annotation(self):
         """現在表示中の削除済みの画像を復元する（削除状態を解除する）"""
@@ -7368,9 +7654,7 @@ class ImageAnnotationTool(QMainWindow):
                 progress.setLabelText("UI表示を更新中...")
                 progress.setValue(98)
                 QApplication.processEvents()
-                self.update_stats()
-                self.display_current_image()
-                self.update_gallery()
+                self.update_ui()
 
                 # 分布グラフを更新
                 progress.setLabelText("分布グラフを更新中...")
@@ -8430,8 +8714,6 @@ class ImageAnnotationTool(QMainWindow):
 
     def pil_to_qimage(self, pil_image):
         """PIL Imageをqtで使用可能なQImageに変換する"""
-        # ImageQtを使わずに直接変換する方法
-        import numpy as np
         
         # RGBに変換して確実にフォーマットを統一
         if pil_image.mode != 'RGB':
