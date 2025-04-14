@@ -1006,6 +1006,7 @@ class ImageAnnotationTool(QMainWindow):
         self.check =  "check"
         # 2画像目関連の状態を追加
         self.second_images = []  # メイン画像パスをキー、2画像目パスを値とするマッピング
+        self.second_image_mapping_key = None #パス変換用キー、keysの0番目を利用
         self.second_image_keys = []  # 2画像目のキー（例: 'lidar/image_array'）を保存するリスト
         self.load_second_image_confirmed = False  # 2画像目読み込み確認の状態
 
@@ -5437,8 +5438,9 @@ class ImageAnnotationTool(QMainWindow):
                 print(f"画像サイズの取得エラー: {e}")        
 
         #m
-        # リセット前にLIDAR画像のマッピングを作成
-        self.second_images = [item.replace('cam_image_array_', 'lidar_image_array_') for item in images]
+        # 2画像目用のパスマッピング
+        #self.second_images = [item.replace('cam_image_array_', 'lidar_image_array_') for item in images]
+        self.second_images = [item.replace('cam_image_array_', self.second_image_mapping_key+'_image_array_') for item in images]
 
         # Reset state
         self.folder_path = valid_paths[0]  # 最初の親フォルダをメインフォルダとして設定
@@ -5482,10 +5484,10 @@ class ImageAnnotationTool(QMainWindow):
         QMessageBox.information(
             self, 
             "読み込み完了", 
-            f"{len(valid_paths)}個のフォルダから合計{len(self.images)}枚のカメラ画像と{len(self.second_images)}組のLIDAR画像を読み込みました。\nアノテーションデータは読み込まれていません。"
+            f"{len(valid_paths)}個のフォルダから合計{len(self.images)}枚のカメラ画像と{len(self.second_images)}組の２種類目画像を読み込みました。\nアノテーションデータは読み込まれていません。"
         )
         
-        print(f"画像読み込み完了: {len(self.images)}枚のカメラ画像、{len(self.second_images)}組のLIDAR画像")
+        print(f"画像読み込み完了: {len(self.images)}枚のカメラ画像、{len(self.second_images)}組の２種類目画像")
 
 
         # 自動的にアノテーションデータ読み込みを促す確認ダイアログ
@@ -6294,6 +6296,7 @@ class ImageAnnotationTool(QMainWindow):
                     QMessageBox.Yes
                 )
                 self.load_second_image_confirmed = (reply == QMessageBox.Yes)
+                self.second_image_mapping_key = self.second_image_keys[0].split('/')[0]
                 
                 # 進捗ダイアログを再表示
                 progress.show()
@@ -6583,6 +6586,7 @@ class ImageAnnotationTool(QMainWindow):
         self.add_location_button()
         return True
 
+    # ui update系を集約
     def update_ui(self):
         self.update_stats()
         self.display_current_image()
@@ -6595,183 +6599,6 @@ class ImageAnnotationTool(QMainWindow):
     def update_stats(self):
         self.stats_label.setText(f"アノテーション済み: {self.annotated_count} / {len(self.images)}")
     
-    # def display_current_second_image(self):
-    #     # ２画像目を表示
-    #     second_img_path = self.second_images[self.current_index]        
-    #     second_pixmap = QPixmap(second_img_path)
-    #     self.secondary_image_label.setPixmap(second_pixmap)
-    # #m
-    # def display_current_second_image(self):
-    #     """2画像目を表示する - 画像を適切に縮小して表示"""
-    #     if not self.images or not self.load_second_image_confirmed:
-    #         return
-            
-    #     # 2画像目のパスを取得
-    #     current_index = self.current_index
-    #     if current_index >= len(self.images) or current_index >= len(self.second_images):
-    #         return
-            
-    #     second_img_path = self.second_images[current_index]
-        
-    #     # 画像が存在するか確認
-    #     if not os.path.exists(second_img_path):
-    #         return
-        
-    #     try:
-    #         # 2画像目を読み込む
-    #         second_pixmap = QPixmap(second_img_path)
-    #         if second_pixmap.isNull():
-    #             return
-                
-    #         # メイン画像の表示領域を取得
-    #         main_view_width = self.main_image_view.width()
-    #         main_view_height = self.main_image_view.height()
-            
-    #         # 2画像目の表示サイズを計算（メイン画像の20%程度、最大サイズを制限）
-    #         max_width = min(int(main_view_width * 0.2), 300)
-    #         max_height = min(int(main_view_height * 0.2), 300)
-            
-    #         # アスペクト比を維持しながら縮小
-    #         scaled_pixmap = second_pixmap.scaled(
-    #             max_width, 
-    #             max_height, 
-    #             Qt.KeepAspectRatio, 
-    #             Qt.SmoothTransformation
-    #         )
-            
-    #         # 縮小した画像を表示
-    #         self.secondary_image_label.setPixmap(scaled_pixmap)
-            
-    #         # ラベルの表示サイズを調整
-    #         self.secondary_image_label.setFixedSize(scaled_pixmap.width(), scaled_pixmap.height())
-            
-    #         # 画面右上の固定位置に表示
-    #         x_position = self.width() - scaled_pixmap.width() - 20
-    #         y_position = 40  # 上部からのオフセット
-    #         self.secondary_image_label.move(x_position, y_position)
-            
-    #         # ラベルを見えるようにする
-    #         self.secondary_image_label.show()
-    #         self.secondary_image_label.raise_()  # 他のウィジェットの上に表示
-            
-    #     except Exception as e:
-    #         print(f"2画像目の表示エラー: {e}")
-    # #m
-    # def display_current_second_image(self):
-    #     """
-    #     2画像目をメイン画像の適切な位置に表示する
-    #     - ウィンドウサイズ変更に対応
-    #     - メイン画像と重ならないように配置
-    #     - 適切なサイズで表示
-    #     """
-    #     if not self.images or not hasattr(self, 'load_second_image_confirmed') or not self.load_second_image_confirmed:
-    #         return
-            
-    #     # 2画像目のパスを取得
-    #     current_index = self.current_index
-    #     if current_index >= len(self.images):
-    #         return
-            
-    #     current_img_path = self.images[current_index]
-        
-    #     # second_imagesが辞書型かリスト型かをチェック
-    #     if isinstance(self.second_images, dict):
-    #         # 辞書型の場合はキーで検索
-    #         if current_img_path not in self.second_images:
-    #             if hasattr(self, 'secondary_image_label'):
-    #                 self.secondary_image_label.hide()
-    #             return
-    #         second_img_path = self.second_images[current_img_path]
-    #     else:
-    #         # リスト型の場合はインデックスで参照
-    #         if current_index >= len(self.second_images):
-    #             if hasattr(self, 'secondary_image_label'):
-    #                 self.secondary_image_label.hide()
-    #             return
-    #         second_img_path = self.second_images[current_index]
-        
-    #     # 画像が存在するか確認
-    #     if not os.path.exists(second_img_path):
-    #         if hasattr(self, 'secondary_image_label'):
-    #             self.secondary_image_label.hide()
-    #         return
-        
-    #     try:
-    #         # 2画像目を読み込む
-    #         second_pixmap = QPixmap(second_img_path)
-    #         if second_pixmap.isNull():
-    #             if hasattr(self, 'secondary_image_label'):
-    #                 self.secondary_image_label.hide()
-    #             return
-                
-    #         # メイン画像表示エリアのジオメトリを取得
-    #         main_view = self.main_image_view
-            
-    #         # メイン画像のピクスマップを取得
-    #         main_pixmap = main_view.pixmap()
-    #         if main_pixmap is None:
-    #             if hasattr(self, 'secondary_image_label'):
-    #                 self.secondary_image_label.hide()
-    #             return
-                
-    #         # メイン画像の表示領域を計算
-    #         pix_width = main_pixmap.width()
-    #         pix_height = main_pixmap.height()
-            
-    #         # ズーム係数があれば適用（ない場合は1.0とする）
-    #         zoom_factor = getattr(main_view, 'zoom_factor', 1.0)
-            
-    #         # 拡大後のサイズを計算
-    #         scaled_width = int(pix_width * zoom_factor)
-    #         scaled_height = int(pix_height * zoom_factor)
-            
-    #         # 中央に配置するための座標計算
-    #         x = (main_view.width() - scaled_width) // 2
-    #         y = (main_view.height() - scaled_height) // 2
-            
-    #         # メイン画像の表示範囲
-    #         main_image_rect = QRect(x, y, scaled_width, scaled_height)
-            
-    #         # 2画像目の表示サイズを計算（メイン画像の15%程度、固定サイズに制限）
-    #         max_height = min(main_image_rect.height() * 0.15, 120)
-            
-    #         # アスペクト比を維持しながら縮小
-    #         scaled_pixmap = second_pixmap.scaled(
-    #             int(max_height * second_pixmap.width() / second_pixmap.height()), 
-    #             int(max_height), 
-    #             Qt.KeepAspectRatio, 
-    #             Qt.SmoothTransformation
-    #         )
-            
-    #         # 縮小した画像を表示
-    #         self.secondary_image_label.setPixmap(scaled_pixmap)
-            
-    #         # ラベルの表示サイズを調整
-    #         self.secondary_image_label.setFixedSize(scaled_pixmap.width(), scaled_pixmap.height())
-            
-    #         # メイン画像の右上隅付近に表示（メイン画像の内部だが、右上に寄せる）
-    #         x_position = main_image_rect.right() - scaled_pixmap.width() - 10  # 右端から10ピクセル内側
-    #         y_position = main_image_rect.top() + 10                          # 上端から10ピクセル下
-            
-    #         self.secondary_image_label.move(x_position, y_position)
-            
-    #         # ラベルを見えるようにする
-    #         self.secondary_image_label.show()
-    #         self.secondary_image_label.raise_()  # 他のウィジェットの上に表示
-            
-    #         # 黒い背景と緑色の枠線を付けて視認性を良くする
-    #         self.secondary_image_label.setStyleSheet("""
-    #             border: 2px solid #4CAF50; 
-    #             background-color: rgba(0, 0, 0, 100);
-    #         """)
-            
-    #     except Exception as e:
-    #         print(f"2画像目の表示エラー: {e}")
-    #         import traceback
-    #         traceback.print_exc()
-    #         if hasattr(self, 'secondary_image_label'):
-    #             self.secondary_image_label.hide()
-    # #m
     def display_current_second_image(self):
         """
         2画像目をメイン画像の右側に適切に表示する
