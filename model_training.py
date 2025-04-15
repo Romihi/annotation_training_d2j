@@ -4,42 +4,114 @@
 
 import os
 import time
-import json
-from inspect import signature
+from tqdm import tqdm
+from datetime import datetime
+from typing import Dict, List, Any, Optional, Tuple, Callable
+import random
+import numpy as np
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 import torchvision.transforms as transforms
-import numpy as np
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-from typing import Dict, List, Any, Optional, Tuple, Callable
-from datetime import datetime
-
-from model_catalog import get_model, AnnotationDataset, DualImageDataset
-
-import random
 from PIL import Image, ImageOps, ImageEnhance
+
+from model_catalog import get_model, is_dual_input_model
+
+class AnnotationDataset(torch.utils.data.Dataset):
+    """アノテーションデータのためのカスタムデータセット"""
+    def __init__(self, image_paths, annotations, transform=None):
+        self.image_paths = image_paths
+        self.annotations = annotations
+        self.transform = transform
+        
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        
+        # PILで画像を読み込む
+        img = Image.open(img_path).convert('RGB')
+        
+        # 変換を適用
+        if self.transform:
+            try:
+                img = self.transform(img)
+            except Exception as e:
+                # エラーが発生した場合、明示的にNumPy変換を挟む
+                img_np = np.array(img)
+                img = self.transform(img_np)
+        
+        # angle, throttleをターゲットとして使用
+        annotation = self.annotations[idx]
+        target = torch.tensor([annotation["angle"], annotation["throttle"]], dtype=torch.float)
+        
+        return img, target
+    
+class DualImageDataset(AnnotationDataset):
+    """2画像入力モデル用のデータセット"""
+    def __getitem__(self, idx):
+        # 前の画像のインデックス（最初の場合は自分自身を使用）
+        idx_prev = max(0, idx - 1)
+        
+        # 2つの画像を読み込む
+        img1 = Image.open(self.image_paths[idx_prev]).convert('RGB')
+        img2 = Image.open(self.image_paths[idx]).convert('RGB')
+        
+        # 前処理を適用
+        if self.transform:
+            img1 = self.transform(img1)
+            img2 = self.transform(img2)
+        
+        # アノテーションを取得
+        annotation = self.annotations[idx]
+        target = torch.tensor([annotation["angle"], annotation["throttle"]], dtype=torch.float)
+        
+        # タプルではなく明示的なリストとして返す（DataLoaderでの処理がしやすい）
+        return [img1, img2], target
 
 def run_model_with_dual_input_support(model, inputs, device):
     """
     単一 or 二重画像入力の両方に対応したモデル実行ヘルパー
-
+    DataLoaderから来る様々な形式の入力に対応
+    
     Args:
         model: モデルインスタンス
-        inputs: 単一テンソル or (img1, img2) タプル
+        inputs: DataLoaderから受け取る入力（さまざまな形式に対応）
         device: 実行するデバイス (CPU / CUDA)
-
+        
     Returns:
         モデル出力 (テンソル)
     """
-    if isinstance(inputs, (tuple, list)) and len(inputs) == 2:
-        img1, img2 = inputs
-        return model(img1.to(device), img2.to(device))
-    else:
+    
+    # リスト形式（[img1, img2]）
+    if isinstance(inputs, list) and len(inputs) == 2:
+        img1 = inputs[0].to(device)
+        img2 = inputs[1].to(device)
+        return model(img1, img2)
+    
+    # タプル形式（(img1, img2)）
+    elif isinstance(inputs, tuple) and len(inputs) == 2:
+        img1 = inputs[0].to(device)
+        img2 = inputs[1].to(device)
+        return model(img1, img2)
+    
+    # DataLoaderがバッチ化してくる場合のリスト形式
+    elif isinstance(inputs, list) and len(inputs) > 0 and isinstance(inputs[0], (list, tuple)) and len(inputs[0]) == 2:
+        batch_img1 = torch.stack([item[0] for item in inputs]).to(device)
+        batch_img2 = torch.stack([item[1] for item in inputs]).to(device)
+        return model(batch_img1, batch_img2)
+    
+    # 単一画像テンソル
+    elif hasattr(inputs, 'to'):
         return model(inputs.to(device))
-
+    
+    # その他の形式（エラーメッセージを詳細に）
+    else:
+        raise TypeError(f"サポートされていない入力形式: {type(inputs)}. "
+                        f"入力の詳細: {str(inputs)[:100]}...")
 
 def create_augmentation_transform(
     use_flip=True,
@@ -250,147 +322,6 @@ def create_datasets(
     num_workers: int = 4,
     use_augmentation: bool = False
 ) -> Tuple[DataLoader, DataLoader, Dict[str, Any]]:
-    """トレーニングとバリデーション用のデータローダーを作成する"""
-    # 引数チェック
-    if image_paths is None or annotations is None or len(image_paths) == 0 or len(annotations) == 0:
-        raise ValueError("有効な画像パスとアノテーションが必要です。")
-    
-    # サンプル画像から実際のサイズを取得
-    sample_img = Image.open(image_paths[0]).convert('RGB')
-    actual_size = (sample_img.height, sample_img.width)
-    print(f"実際の画像サイズ: {actual_size}")
-    
-    # モデルの前処理を取得（実際のサイズを指定）
-    model = get_model(model_name, pretrained=False, input_size=actual_size)
-    base_transform = model.get_preprocess()
-    
-    # データオーグメンテーションの設定
-    if use_augmentation:
-        if isinstance(use_augmentation, dict):
-            # 詳細設定が提供されている場合
-            aug_params = use_augmentation
-            # まず明示的にToTensorを入れる
-            transform_list = [transforms.ToTensor()]
-            
-            # 水平反転
-            if aug_params.get('use_flip', True):
-                transform_list.append(transforms.RandomHorizontalFlip(p=aug_params.get('flip_prob', 0.5)))
-            
-            # 色調整
-            if aug_params.get('use_color', True):
-                transform_list.append(
-                    transforms.ColorJitter(
-                        brightness=aug_params.get('brightness', 0.2),
-                        contrast=aug_params.get('contrast', 0.2),
-                        saturation=aug_params.get('saturation', 0.2)
-                    )
-                )
-            
-            # 幾何変換
-            if aug_params.get('use_geometry', True):
-                transform_list.append(
-                    transforms.RandomAffine(
-                        degrees=aug_params.get('rotation_degrees', 5),
-                        translate=(aug_params.get('translate_ratio', 0.1), 
-                                aug_params.get('translate_ratio', 0.1))
-                    )
-                )
-            
-            # ランダムイレース（テンソル変換後に適用）
-            if aug_params.get('use_erase', True):
-                transform_list.append(
-                    transforms.RandomErasing(
-                        p=aug_params.get('erase_prob', 0.5),
-                        scale=(aug_params.get('erase_min_ratio', 0.02), 
-                            aug_params.get('erase_max_ratio', 0.2)),
-                        ratio=(0.3, 3.3),
-                        value=0
-                    )
-                )
-            
-            # 正規化（ベース変換の一部として）
-            transform_list.append(
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            )
-            
-            transform = transforms.Compose(transform_list)
-        else:
-            # 従来の単純な有効化の場合
-            transform = transforms.Compose([
-                transforms.Resize(actual_size),  # 実際のサイズにリサイズ
-                transforms.ToTensor(),  # 明示的にToTensorを最初に
-                transforms.RandomHorizontalFlip(),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-                transforms.RandomAffine(degrees=5, translate=(0.1, 0.1)),
-                transforms.RandomErasing(p=0.5, scale=(0.02, 0.2)),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ])
-    else:
-        # オーグメンテーションなしの場合も明示的なToTensorを含める
-        transform = transforms.Compose([
-            transforms.Resize(actual_size),  # 実際のサイズにリサイズ
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-
-    # データセットの作成
-    dataset = AnnotationDataset(image_paths, annotations, transform=transform)
-    
-    # バッチサイズが小さすぎる場合の対策
-    if batch_size < 2:
-        batch_size = 2
-        print("警告: バッチサイズが小さすぎるため、2に調整されました")
-    
-    # トレーニングセットと検証セットに分割
-    val_size = int(len(dataset) * val_split)
-    train_size = len(dataset) - val_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-    
-    # データローダーの作成
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=num_workers
-    )
-    
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        num_workers=num_workers
-    )
-    
-    # データセット情報
-    dataset_info = {
-        'total_samples': len(dataset),
-        'train_samples': len(train_dataset),
-        'val_samples': len(val_dataset),
-        'batch_size': batch_size,
-        'num_classes': 2,  # angle, throttle
-        'use_augmentation': use_augmentation,
-        'actual_image_size': actual_size
-    }
-    
-    return train_loader, val_loader, dataset_info
-
-# モデルが2入力かどうかを判定（forward関数の引数数でチェック）
-def is_dual_input_model(model) -> bool:
-    sig = signature(model.forward)
-    return len(sig.parameters) >= 3  # self, x1, x2
-
-# 2画像対応のdataset
-def create_datasets(
-    data_dir: str = None,
-    annotation_file: str = None,
-    image_paths: List[str] = None,
-    annotations: List[Dict] = None,
-    val_split: float = 0.2, 
-    model_name: str = 'resnet18',
-    batch_size: int = 32,
-    num_workers: int = 4,
-    use_augmentation: bool = False
-) -> Tuple[DataLoader, DataLoader, Dict[str, Any]]:
 
     if image_paths is None or annotations is None or len(image_paths) == 0 or len(annotations) == 0:
         raise ValueError("有効な画像パスとアノテーションが必要です。")
@@ -559,259 +490,19 @@ def train_model(
         epoch_loss = 0.0
         
         # トレーニングステップ
-        for i, (inputs, targets) in enumerate(train_loader):
-            inputs = inputs.to(device)
+        for i, batch_data in enumerate(train_loader):
+            inputs, targets = batch_data
             targets = targets.to(device)
             
-            # 勾配のリセット
             optimizer.zero_grad()
-            
-            # 順伝播
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            
-            # 逆伝播と最適化
-            loss.backward()
-            optimizer.step()
-            
-            # 損失の記録
-            epoch_loss += loss.item() * inputs.size(0)
-            
-            # バッチごとの進捗コールバック（10%ごと）
-            if progress_callback and (i % max(1, len(train_loader) // 10) == 0):
-                batch_progress = i / len(train_loader)
-                total_progress = (epoch + batch_progress) / num_epochs
-                message = f"エポック {epoch+1}/{num_epochs}, バッチ {i}/{len(train_loader)}, 損失: {loss.item():.4f}"
-                should_continue = progress_callback(int(total_progress * num_epochs), num_epochs, message)
-                if not should_continue:
-                    break
-        
-        # エポック損失の計算
-        epoch_loss /= len(train_loader.dataset)
-        train_losses.append(epoch_loss)
-        
-        # 検証
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for inputs, targets in val_loader:
-                inputs = inputs.to(device)
-                targets = targets.to(device)
-                
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                
-                val_loss += loss.item() * inputs.size(0)
-        
-        val_loss /= len(val_loader.dataset)
-        val_losses.append(val_loss)
-        
-        # 学習率の調整
-        scheduler.step(val_loss)
-        
-        # エポックの完了をカウント
-        completed_epochs = epoch + 1
-        
-        # 進捗コールバック - エポック終了
-        if progress_callback:
-            message = f"エポック {epoch+1}/{num_epochs}, 学習損失: {epoch_loss:.4f}, 検証損失: {val_loss:.4f}"
-            should_continue = progress_callback(epoch + 1, num_epochs, message)
-            if not should_continue:
-                break
-        
-        # 最良モデルの保存
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            early_stopping_counter = 0  # カウンタをリセット
-            
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': best_val_loss,
-            }, best_model_path)
-            
-            if progress_callback:
-                progress_callback(epoch + 1, num_epochs, 
-                                f"エポック {epoch+1}/{num_epochs}: 新しい最良モデルを保存しました（損失: {best_val_loss:.6f}）")
-        else:
-            # 検証損失が改善しなかった場合
-            if use_early_stopping:
-                early_stopping_counter += 1
-                if progress_callback:
-                    progress_callback(epoch + 1, num_epochs, 
-                                    f"エポック {epoch+1}/{num_epochs}: 検証損失が改善しませんでした（カウンタ: {early_stopping_counter}/{patience}）")
-                
-                # Early Stoppingの判定
-                if early_stopping_counter >= patience:
-                    if progress_callback:
-                        progress_callback(epoch + 1, num_epochs, 
-                                        f"エポック {epoch+1}/{num_epochs}: Early Stoppingによりトレーニングを終了します")
-                    early_stopped = True
-                    stopped_epoch = epoch + 1
-                    break
-    
-    # 最終モデルの保存
-    torch.save({
-        'epoch': completed_epochs,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'best_val_loss': best_val_loss,
-        'early_stopped': early_stopped,
-        'stopped_epoch': stopped_epoch if early_stopped else completed_epochs,
-    }, model_path)
-    
-    # トレーニング結果
-    training_results = {
-        'model_name': model_name,
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'best_val_loss': best_val_loss,
-        'model_path': model_path,
-        'best_model_path': best_model_path,
-        'num_epochs': num_epochs,
-        'completed_epochs': completed_epochs,
-        'learning_rate': learning_rate,
-        'weight_decay': weight_decay,
-        'pretrained': pretrained,
-        'loaded_weights': model_path is not None and os.path.exists(model_path),
-        'early_stopped': early_stopped,
-        'stopped_epoch': stopped_epoch if early_stopped else completed_epochs,
-        'patience': patience if use_early_stopping else 0,
-    }
-    
-    # トレーニング結果の可視化
-    plot_training_results(training_results, save_dir, timestamp)
-    
-    return training_results
-#２画像対応
-#m
-def train_model(
-    model_name: str,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    num_epochs: int = 30,
-    learning_rate: float = 0.001,
-    weight_decay: float = 1e-4,
-    save_dir: str = './saved_models',
-    device: Optional[torch.device] = None,
-    progress_callback: Optional[Callable[[int, int, str], bool]] = None,
-    pretrained: bool = True,
-    model_path: Optional[str] = None,
-    use_early_stopping: bool = False,
-    patience: int = 5
-) -> Dict[str, Any]:
-    """モデルをトレーニングする
-
-    Args:
-        model_name: トレーニングするモデル名
-        train_loader: トレーニングデータローダー
-        val_loader: 検証用データローダー
-        num_epochs: エポック数
-        learning_rate: 学習率
-        weight_decay: 重み減衰
-        save_dir: モデル保存ディレクトリ
-        device: 使用するデバイス (Noneの場合は自動選択)
-        progress_callback: 進捗コールバック関数 (current, total, message) -> continue
-        pretrained: 事前学習済みの重みを使用するかどうか
-        model_path: 特定のモデルファイルから重みをロードする場合のパス
-        use_early_stopping: Early Stoppingを使用するかどうか
-        patience: Early Stoppingの忍耐値（検証損失が改善しなくなってから待機するエポック数）
-
-    Returns:
-        トレーニング結果の辞書
-    """
-    # デバイスの設定
-    if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # モデルのロード
-    if progress_callback:
-        progress_callback(0, num_epochs, "モデルをロード中...")
-    
-    # まず事前学習済みの重みでモデルを初期化（またはランダム初期化）
-    model = get_model(model_name, pretrained=pretrained)
-    
-    # 特定のモデルファイルから重みをロードする場合
-    if model_path and os.path.exists(model_path):
-        if progress_callback:
-            progress_callback(0, num_epochs, f"保存済みモデル '{os.path.basename(model_path)}' から重みをロード中...")
-        
-        try:
-            # モデルチェックポイントをロード
-            checkpoint = torch.load(model_path, map_location=device)
-            
-            # state_dictがあるかチェック
-            if 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
-                print(f"モデル重みを '{model_path}' からロードしました")
-            else:
-                # 直接state_dictが保存されている場合
-                model.load_state_dict(checkpoint)
-                print(f"モデル重みを '{model_path}' からロードしました")
-                
-        except Exception as e:
-            print(f"モデル重みのロードに失敗しました: {e}")
-            print("事前学習済みモデルまたはランダム初期化を使用します")
-    
-    model = model.to(device)
-    
-    # 損失関数と最適化アルゴリズム
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
-    
-    # トレーニングループ
-    train_losses = []
-    val_losses = []
-    best_val_loss = float('inf')
-    
-    # Early Stopping用の変数
-    early_stopping_counter = 0
-    early_stopped = False
-    stopped_epoch = 0
-    
-    # 保存ディレクトリの作成
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # タイムスタンプを使用してファイル名を生成
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_path = os.path.join(save_dir, f'{model_name}_model_{timestamp}.pth')
-    best_model_path = os.path.join(save_dir, f'{model_name}_best_{timestamp}.pth')
-    
-    completed_epochs = 0
-    for epoch in range(num_epochs):
-        # 進捗コールバック - エポック開始
-        if progress_callback:
-            message = f"エポック {epoch+1}/{num_epochs} 開始"
-            should_continue = progress_callback(epoch, num_epochs, message)
-            if not should_continue:
-                break
-        
-        model.train()
-        epoch_loss = 0.0
-        
-        # トレーニングステップ
-        for i, (inputs, targets) in enumerate(train_loader):
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-            
-            # 勾配のリセット
-            optimizer.zero_grad()
-            
-            # 順伝播
             outputs = run_model_with_dual_input_support(model, inputs, device)
-
             loss = criterion(outputs, targets)
-            
-            # 逆伝播と最適化
             loss.backward()
             optimizer.step()
             
-            # 損失の記録
-            epoch_loss += loss.item() * inputs.size(0)
+            # targetsからバッチサイズを取得（常にテンソル）
+            batch_size = targets.size(0)
+            epoch_loss += loss.item() * batch_size
             
             # バッチごとの進捗コールバック（10%ごと）
             if progress_callback and (i % max(1, len(train_loader) // 10) == 0):
@@ -830,14 +521,17 @@ def train_model(
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for inputs, targets in val_loader:
-                inputs = inputs.to(device)
+            for batch_data in val_loader:
+                inputs, targets = batch_data
                 targets = targets.to(device)
                 
+                # run_model_with_dual_input_supportに入力を渡す（.to(device)は関数内で処理）
                 outputs = run_model_with_dual_input_support(model, inputs, device)
                 loss = criterion(outputs, targets)
                 
-                val_loss += loss.item() * inputs.size(0)
+                # バッチサイズは常にtargetsから取得
+                batch_size = targets.size(0)
+                val_loss += loss.item() * batch_size
         
         val_loss /= len(val_loader.dataset)
         val_losses.append(val_loss)
@@ -929,14 +623,16 @@ def validate_model(model, dataloader, criterion, device):
     val_loss = 0.0
     
     with torch.no_grad():
-        for inputs, targets in dataloader:
-            inputs = inputs.to(device)
+        for batch_data in dataloader:  # val_loader から dataloader に変更
+            inputs, targets = batch_data
             targets = targets.to(device)
             
             outputs = run_model_with_dual_input_support(model, inputs, device)
             loss = criterion(outputs, targets)
             
-            val_loss += loss.item() * inputs.size(0)
+            # targetsからバッチサイズを取得
+            batch_size = targets.size(0)
+            val_loss += loss.item() * batch_size
     
     return val_loss / len(dataloader.dataset)
 
@@ -1057,152 +753,6 @@ def evaluate_model(
     
     return eval_results
 
-def compare_models(
-    model_names: List[str],
-    test_loader: DataLoader,
-    model_dir: str = './saved_models',
-    use_best: bool = True,
-    device: Optional[torch.device] = None
-) -> Dict[str, List[Any]]:
-    """複数のモデルを比較する
-
-    Args:
-        model_names: 比較するモデル名のリスト
-        test_loader: テストデータローダー
-        model_dir: モデルディレクトリ
-        use_best: 最良モデルを使用するか (Falseの場合は最終モデル)
-        device: 使用するデバイス (Noneの場合は自動選択)
-
-    Returns:
-        モデル比較結果の辞書
-    """
-    results = {
-        'model_names': [],
-        'mse': [],
-        'mae': [],
-        'angle_error': [],
-        'throttle_error': [],
-        'inference_time': [],
-        'inference_time_per_sample': [],
-        'params_count': []
-    }
-    
-    for model_name in model_names:
-        # モデルパスの設定
-        suffix = 'best' if use_best else 'final'
-        model_path = os.path.join(model_dir, f'{model_name}_{suffix}.pth')
-        
-        if not os.path.exists(model_path):
-            print(f'Warning: Model file not found: {model_path}. Skipping {model_name}.')
-            continue
-        
-        # モデル評価
-        eval_result = evaluate_model(model_name, test_loader, model_path, device)
-        
-        # パラメータ数の取得
-        model = get_model(model_name)
-        params_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        
-        # 結果の記録
-        results['model_names'].append(model_name)
-        results['mse'].append(eval_result['mse'])
-        results['mae'].append(eval_result['mae'])
-        results['angle_error'].append(eval_result['angle_error'])
-        results['throttle_error'].append(eval_result['throttle_error'])
-        results['inference_time'].append(eval_result['inference_time'])
-        results['inference_time_per_sample'].append(eval_result['inference_time_per_sample'])
-        results['params_count'].append(params_count / 1e6)  # 百万単位
-    
-    # 結果の表示（テーブル形式）
-    print('\nModel Comparison:')
-    print('-' * 100)
-    print(f"{'Model':<25} {'MSE':<10} {'MAE':<10} {'Angle Err':<10} {'Throttle Err':<12} {'Inf. Time (ms)':<15} {'Params (M)':<10}")
-    print('-' * 100)
-    
-    for i, model_name in enumerate(results['model_names']):
-        print(f"{model_name:<25} {results['mse'][i]:<10.6f} {results['mae'][i]:<10.6f} {results['angle_error'][i]:<10.6f} {results['throttle_error'][i]:<12.6f} {results['inference_time_per_sample'][i]*1000:<15.4f} {results['params_count'][i]:<10.2f}")
-    
-    # 結果をプロット
-    plot_model_comparison(results)
-    
-    return results
-
-def plot_model_comparison(results):
-    """モデル比較結果をプロットする"""
-    # 1. 精度プロット（MSEとMAE）
-    plt.figure(figsize=(14, 10))
-    
-    plt.subplot(2, 2, 1)
-    bars = plt.bar(results['model_names'], results['mse'])
-    plt.title('Mean Squared Error')
-    plt.xticks(rotation=45, ha='right')
-    plt.ylabel('MSE')
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-    for bar in bars:
-        height = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width()/2., height + 0.001,
-                 f'{height:.6f}', ha='center', va='bottom', rotation=0, fontsize=8)
-    
-    plt.subplot(2, 2, 2)
-    bars = plt.bar(results['model_names'], results['mae'])
-    plt.title('Mean Absolute Error')
-    plt.xticks(rotation=45, ha='right')
-    plt.ylabel('MAE')
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-    for bar in bars:
-        height = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width()/2., height + 0.001,
-                 f'{height:.6f}', ha='center', va='bottom', rotation=0, fontsize=8)
-    
-    # 2. 角度とスロットルの誤差
-    plt.subplot(2, 2, 3)
-    bars = plt.bar(results['model_names'], results['angle_error'])
-    plt.title('Average Angle Error')
-    plt.xticks(rotation=45, ha='right')
-    plt.ylabel('Error')
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-    for bar in bars:
-        height = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width()/2., height + 0.001,
-                 f'{height:.6f}', ha='center', va='bottom', rotation=0, fontsize=8)
-    
-    plt.subplot(2, 2, 4)
-    bars = plt.bar(results['model_names'], results['throttle_error'])
-    plt.title('Average Throttle Error')
-    plt.xticks(rotation=45, ha='right')
-    plt.ylabel('Error')
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-    for bar in bars:
-        height = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width()/2., height + 0.001,
-                 f'{height:.6f}', ha='center', va='bottom', rotation=0, fontsize=8)
-    
-    plt.tight_layout()
-    plt.savefig('model_accuracy_comparison.png')
-    plt.close()
-    
-    # 3. 推論時間とパラメータ数の関係
-    plt.figure(figsize=(10, 6))
-    plt.scatter(results['params_count'], [t*1000 for t in results['inference_time_per_sample']], s=80, alpha=0.7)
-    
-    # モデル名をプロット
-    for i, model_name in enumerate(results['model_names']):
-        plt.annotate(model_name, 
-                     (results['params_count'][i], results['inference_time_per_sample'][i]*1000),
-                     xytext=(5, 5), textcoords='offset points', fontsize=8)
-    
-    plt.xlabel('Parameters Count (Millions)')
-    plt.ylabel('Inference Time per Sample (ms)')
-    plt.title('Model Efficiency: Inference Time vs Model Size')
-    plt.grid(True, linestyle='--', alpha=0.7)
-    
-    # X軸を対数スケールに
-    plt.xscale('log')
-    
-    plt.tight_layout()
-    plt.savefig('model_efficiency_comparison.png')
-    plt.close()
-
 def visualize_predictions(
     model_name: str,
     test_loader: DataLoader,
@@ -1303,90 +853,6 @@ def visualize_predictions(
     plt.close()
     print(f'Predictions visualization saved: {model_name}_predictions.png')
 
-def export_model_to_h5(model_path, output_path, model_type='linear'):
-    """PyTorchモデルをDonkeycar互換のh5形式に変換する"""
-    try:
-        import tensorflow as tf
-        from tensorflow import keras
-        import numpy as np
-        
-        # TensorFlow/Kerasのバージョンを確認
-        tf_version = tf.__version__
-        keras_version = keras.__version__
-        print(f"TensorFlow version: {tf_version}")
-        print(f"Keras version: {keras_version}")
-        
-        # Donkeycarの標準入力サイズ
-        input_shape = (120, 160, 3)
-        
-        # Donkeycar互換のモデルを直接作成
-        img_in = keras.layers.Input(shape=input_shape, name='img_in')
-        
-        # モデルタイプに基づいて適切なCNNレイヤーを構築
-        drop = 0.2
-        x = img_in
-        x = keras.layers.Conv2D(24, (5, 5), strides=(2, 2), activation='relu', name='conv2d_1')(x)
-        x = keras.layers.Dropout(drop)(x)
-        x = keras.layers.Conv2D(32, (5, 5), strides=(2, 2), activation='relu', name='conv2d_2')(x)
-        x = keras.layers.Dropout(drop)(x)
-        x = keras.layers.Conv2D(64, (5, 5), strides=(2, 2), activation='relu', name='conv2d_3')(x)
-        x = keras.layers.Dropout(drop)(x)
-        x = keras.layers.Conv2D(64, (3, 3), strides=(1, 1), activation='relu', name='conv2d_4')(x)
-        x = keras.layers.Dropout(drop)(x)
-        x = keras.layers.Conv2D(64, (3, 3), strides=(1, 1), activation='relu', name='conv2d_5')(x)
-        x = keras.layers.Dropout(drop)(x)
-        x = keras.layers.Flatten(name='flattened')(x)
-        x = keras.layers.Dense(100, activation='relu', name='dense_1')(x)
-        x = keras.layers.Dropout(drop)(x)
-        x = keras.layers.Dense(50, activation='relu', name='dense_2')(x)
-        x = keras.layers.Dropout(drop)(x)
-        
-        # リニアモデルの場合は2つの出力（角度とスロットル）
-        outputs = []
-        outputs.append(keras.layers.Dense(1, activation='linear', name='n_outputs0')(x))
-        outputs.append(keras.layers.Dense(1, activation='linear', name='n_outputs1')(x))
-        
-        # Kerasモデルを作成
-        model = keras.Model(inputs=[img_in], outputs=outputs, name='linear')
-        
-        # モデルをコンパイル - Donkeycarと互換性のある設定
-        # 古いKerasバージョンに対応するためにlrパラメータを使用
-        try:
-            model.compile(optimizer=keras.optimizers.Adam(learning_rate=0.001), loss='mse')
-        except:
-            # 古いKerasバージョンでは'lr'を使用
-            model.compile(optimizer=keras.optimizers.Adam(lr=0.001), loss='mse')
-        
-        # モデルの保存 - バージョン互換性のために基本的なオプションを使用
-        try:
-            # 新しい方法での保存を試みる
-            model.save(output_path, include_optimizer=True, save_format='h5')
-        except:
-            try:
-                # 古い方法での保存を試みる
-                model.save(output_path, include_optimizer=True)
-            except:
-                # さらに古い方法
-                model.save(output_path)
-        
-        print(f"Donkeycar互換のモデルを保存しました: {output_path}")
-        
-        # モデルの読み込みテスト
-        try:
-            test_model = keras.models.load_model(output_path)
-            print("保存したモデルを正常に読み込めることを確認しました。")
-        except Exception as test_error:
-            print(f"保存したモデルの読み込みテスト中にエラーが発生しました: {test_error}")
-            print("モデルは保存されましたが、Donkeycarで読み込めない可能性があります。")
-        
-        return True
-        
-    except Exception as e:
-        print(f"モデル変換中にエラーが発生しました: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
 # モジュールが直接実行された場合のサンプル処理（オプション）
 if __name__ == "__main__":
     import argparse
@@ -1394,7 +860,7 @@ if __name__ == "__main__":
     # コマンドライン引数の設定
     parser = argparse.ArgumentParser(description='モデルトレーニングユーティリティ')
     parser.add_argument('--data_dir', type=str, required=True, help='データディレクトリ')
-    parser.add_argument('--model', type=str, default='mobilenetv3_small_100', help='モデルタイプ')
+    parser.add_argument('--model', type=str, default='resnet18', help='モデルタイプ')
     parser.add_argument('--epochs', type=int, default=30, help='エポック数')
     parser.add_argument('--batch_size', type=int, default=8, help='バッチサイズ')
     args = parser.parse_args()

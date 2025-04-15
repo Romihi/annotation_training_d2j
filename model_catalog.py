@@ -34,7 +34,6 @@ def load_model_weights(model, weights_path, device):
         print("Loaded state_dict format model")
     return model
 
-
 class BaseModel(nn.Module):
     """すべてのモデルの基底クラス"""
     def __init__(self, name="base"):
@@ -340,16 +339,6 @@ class GhostNet050Model(TIMMBasedModel):
         )
 
 
-class ShuffleNetV2_x05Model(TIMMBasedModel):
-    """TIMMベースのShuffleNetV2 x0.5モデル"""
-    def __init__(self, pretrained=True):
-        super(ShuffleNetV2_x05Model, self).__init__(
-            name="shufflenetv2_x0_5",
-            timm_model_name="shufflenetv2_x0_5",
-            pretrained=pretrained
-        )
-
-
 class SwinTinyModel(TIMMBasedModel):
     """TIMMベースのSwin Transformerモデル"""
     def __init__(self, pretrained=True):
@@ -376,15 +365,6 @@ class SwinV2CRTinyNSModel(TIMMBasedModel):
         super(SwinV2CRTinyNSModel, self).__init__(
             name="swinv2_cr_tiny_ns_224",
             timm_model_name="swinv2_cr_tiny_ns_224",
-            pretrained=pretrained
-        )
-
-class SwinMoETinyModel(TIMMBasedModel):
-    """TIMMベースのSwin MoE Tiny Patch4 Window7 224モデル"""
-    def __init__(self, pretrained=True):
-        super(SwinMoETinyModel, self).__init__(
-            name="swin_moe_tiny_patch4_window7_224",
-            timm_model_name="swin_moe_tiny_patch4_window7_224",
             pretrained=pretrained
         )
 
@@ -509,7 +489,14 @@ class DonkeyModel_FCN(BaseModel):
     
 # 2画像クラス
 class DualInputBaseModel(BaseModel):
+    """2画像入力モデルの基底クラス"""
+    def __init__(self, name="dual_base", pretrained=False):
+        super().__init__(name=name)
+        # pretrained引数は現在は使用していないが、将来的な拡張性のために受け取る
+        self.pretrained = pretrained
+    
     def run(self, img_arr1: np.ndarray, img_arr2: np.ndarray):
+        """2つの画像アレイに対して推論を実行"""
         if self._preprocess is None:
             self._preprocess = self.get_preprocess()
 
@@ -522,13 +509,16 @@ class DualInputBaseModel(BaseModel):
         result = result.cpu().numpy().reshape(-1)
         result = result * 2 - 1  # [-1,1]スケーリング（必要なら）
         return result[0], result[1]
-
+    
 class DonkeyDualConcatModel(DualInputBaseModel):
-    def __init__(self, input_size=(224, 224)):
-        super().__init__(name="donkey_dual_concat")
+    """2つの画像の特徴量を連結するモデル"""
+    def __init__(self, input_size=(224, 224), pretrained=False):
+        super().__init__(name="donkey_dual_concat", pretrained=pretrained)
         self.input_size = input_size
-        self.feature = DonkeyModel(input_size=input_size).features
-        self.dense = DonkeyModel(input_size=input_size).dense_layers
+        
+        # 特徴抽出器を作成（pretrainedを適切に渡す）
+        self.feature = DonkeyModel(input_size=input_size, pretrained=pretrained).features
+        self.dense = DonkeyModel(input_size=input_size, pretrained=pretrained).dense_layers
         self.regressor = nn.Linear(50 * 2, 2)
 
     def forward(self, x1, x2):
@@ -541,11 +531,16 @@ class DonkeyDualConcatModel(DualInputBaseModel):
             transforms.Resize(self.input_size),
             transforms.ToTensor(),
         ])
-
+    
 class DonkeyDual6chModel(DualInputBaseModel):
-    def __init__(self, input_size=(224, 224)):
-        super().__init__(name="donkey_dual_6ch")
+    """2つの画像をチャネル方向に結合するモデル"""
+    def __init__(self, input_size=(224, 224), pretrained=False):
+        super().__init__(name="donkey_dual_6ch", pretrained=pretrained)
         self.input_size = input_size
+        
+        # pretrainedは現在は使用しないが、将来的な拡張のために保持
+        self.pretrained = pretrained
+        
         self.conv = nn.Sequential(
             nn.Conv2d(6, 24, kernel_size=5, stride=2),
             nn.ReLU(), nn.Dropout(0.2),
@@ -573,21 +568,16 @@ class DonkeyDual6chModel(DualInputBaseModel):
             transforms.ToTensor(),
         ])
 
-class SimpleCrossAttention(nn.Module):
-    def __init__(self, dim, heads=4):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=heads, batch_first=True)
-        self.norm = nn.LayerNorm(dim)
-
-    def forward(self, q, k):
-        out, _ = self.attn(q, k, k)
-        return self.norm(q + out)
-
 class DonkeyCrossAttentionModel(DualInputBaseModel):
-    def __init__(self, input_size=(224, 224)):
-        super().__init__(name="donkey_crossattn")
+    """クロスアテンションを使用して2つの画像を処理するモデル"""
+    def __init__(self, input_size=(224, 224), pretrained=False):
+        super().__init__(name="donkey_crossattn", pretrained=pretrained)
         self.input_size = input_size
-        self.feature = DonkeyModel(input_size=input_size).features
+        
+        # 特徴抽出器を作成（pretrainedを適切に渡す）
+        self.feature = DonkeyModel_FCN(input_size=input_size, pretrained=pretrained).features
+        #self.feature = DonkeyModel(input_size=input_size, pretrained=pretrained).features
+        
         dummy = self.feature(torch.zeros(1, 3, *input_size))
         dim = dummy.shape[1]
         self.cross_attn = SimpleCrossAttention(dim)
@@ -610,7 +600,7 @@ class DonkeyCrossAttentionModel(DualInputBaseModel):
         ])
 
 class SimpleCrossAttention(nn.Module):
-    def __init__(self, dim, heads=4):
+    def __init__(self, dim, heads=2):
         super().__init__()
         self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=heads, batch_first=True)
         self.norm = nn.LayerNorm(dim)
@@ -618,33 +608,6 @@ class SimpleCrossAttention(nn.Module):
     def forward(self, q, k):
         out, _ = self.attn(q, k, k)
         return self.norm(q + out)
-
-class DonkeyCrossAttentionModel(DualInputBaseModel):
-    def __init__(self, input_size=(224, 224)):
-        super().__init__(name="donkey_crossattn")
-        self.input_size = input_size
-        self.feature = DonkeyModel(input_size=input_size).features
-        dummy = self.feature(torch.zeros(1, 3, *input_size))
-        dim = dummy.shape[1]
-        self.cross_attn = SimpleCrossAttention(dim)
-        self.regressor = nn.Sequential(
-            nn.Linear(dim, 100),
-            nn.ReLU(),
-            nn.Linear(100, 2)
-        )
-
-    def forward(self, x1, x2):
-        f1 = self.feature(x1).unsqueeze(1)  # (B, 1, C)
-        f2 = self.feature(x2).unsqueeze(1)
-        fused = self.cross_attn(f1, f2).squeeze(1)
-        return self.regressor(fused)
-
-    def get_preprocess(self):
-        return transforms.Compose([
-            transforms.Resize(self.input_size),
-            transforms.ToTensor(),
-        ])
-
 
 # 利用可能なすべてのモデルを登録する辞書
 MODEL_REGISTRY = {
@@ -685,16 +648,12 @@ MODEL_REGISTRY = {
     
     # GhostNet
     "ghostnet_050": GhostNet050Model,
-    
-    # ShuffleNetV2
-    "shufflenetv2_x0_5": ShuffleNetV2_x05Model,
-    
+        
     # Swin Transformer variants
     "swin_tiny_patch4_window7_224": SwinTinyModel,
     "swin_tiny": SwinTinyModel,  # 短縮名も対応
     "swin_s3_tiny_224": SwinS3TinyModel,
     "swinv2_cr_tiny_ns_224": SwinV2CRTinyNSModel,
-    "swin_moe_tiny_patch4_window7_224": SwinMoETinyModel,
     
     # EfficientFormer variants
     "efficientformer_l1": EfficientFormerL1Model,
@@ -705,6 +664,38 @@ MODEL_REGISTRY = {
     "donkey_crossattn": DonkeyCrossAttentionModel,
 }
 
+def is_dual_input_model(model):
+    """
+    モデルが2画像入力モデルかどうかを判定する
+    
+    Args:
+        model: 判定するモデルインスタンス
+        
+    Returns:
+        bool: 2画像入力モデルの場合はTrue、そうでない場合はFalse
+    """
+    # DualInputBaseModelのインスタンスかどうかを確認
+    return isinstance(model, DualInputBaseModel)
+
+def is_dual_input_model_type(model_type):
+    """
+    モデルタイプが2画像入力モデルに対応するかどうかを判定する
+    
+    Args:
+        model_type: モデルタイプの文字列
+        
+    Returns:
+        bool: 2画像入力モデルの場合はTrue、そうでない場合はFalse
+    """
+    # 2画像モデルのプレフィックスまたは完全一致で判定
+    dual_model_types = [
+        "donkey_dual_concat",
+        "donkey_dual_6ch",
+        "donkey_crossattn"
+    ]
+    
+    # リストに含まれているか、または "dual" を含む名前か
+    return model_type in dual_model_types or "dual" in model_type.lower()
 
 # モデルの利用に関する関数
 def get_model(model_type, pretrained=False, input_size=None):
@@ -759,46 +750,52 @@ def get_timm_model_groups():
     
     return model_groups
 
+def check_all_models():
+    """
+    全てのモデルをチェックし、単一画像モデルと2画像モデルを分類する
     
-class AnnotationDataset(torch.utils.data.Dataset):
-    """アノテーションデータのためのカスタムデータセット"""
-    def __init__(self, image_paths, annotations, transform=None):
-        self.image_paths = image_paths
-        self.annotations = annotations
-        self.transform = transform
-        
-    def __len__(self):
-        return len(self.image_paths)
+    Returns:
+        tuple: (単一画像モデルのリスト, 2画像モデルのリスト)
+    """
+    single_image_models = []
+    dual_image_models = []
     
-    def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        
-        # PILで画像を読み込む
-        img = Image.open(img_path).convert('RGB')
-        
-        # 変換を適用
-        if self.transform:
-            try:
-                img = self.transform(img)
-            except Exception as e:
-                # エラーが発生した場合、明示的にNumPy変換を挟む
-                img_np = np.array(img)
-                img = self.transform(img_np)
-        
-        # angle, throttleをターゲットとして使用
-        annotation = self.annotations[idx]
-        target = torch.tensor([annotation["angle"], annotation["throttle"]], dtype=torch.float)
-        
-        return img, target
+    for model_name, model_class in MODEL_REGISTRY.items():
+        try:
+            # すべてのモデルに pretrained=False を渡す（統一したインターフェース）
+            model = model_class(pretrained=False)
+            
+            # 実際のインスタンスをチェック
+            if is_dual_input_model(model):
+                dual_image_models.append(model_name)
+            else:
+                single_image_models.append(model_name)
+        except Exception as e:
+            print(f"モデル {model_name} の初期化に失敗: {e}")
+            
+            # エラーがあっても、名前ベースで分類を試みる
+            if is_dual_input_model_type(model_name):
+                dual_image_models.append(f"{model_name} (名前ベースで判断)")
+            else:
+                single_image_models.append(f"{model_name} (初期化失敗)")
     
-class DualImageDataset(AnnotationDataset):
-    def __getitem__(self, idx):
-        idx_prev = max(0, idx - 1)
-        img1 = Image.open(self.image_paths[idx_prev]).convert('RGB')
-        img2 = Image.open(self.image_paths[idx]).convert('RGB')
-        if self.transform:
-            img1 = self.transform(img1)
-            img2 = self.transform(img2)
-        annotation = self.annotations[idx]
-        target = torch.tensor([annotation["angle"], annotation["throttle"]], dtype=torch.float)
-        return (img1, img2), target
+    return single_image_models, dual_image_models
+
+def print_model_classification():
+    """モデルの分類結果を表示する"""
+    print("=== モデル分類結果 ===")
+    single_models, dual_models = check_all_models()
+    
+    print("\n単一画像モデル:")
+    for model in sorted(single_models):
+        print(f"- {model}")
+    
+    print("\n2画像入力モデル:")
+    for model in sorted(dual_models):
+        print(f"- {model}")
+        
+    print(f"\n合計: 単一画像モデル {len(single_models)}個, 2画像モデル {len(dual_models)}個")
+
+# メイン実行部として追加（モジュールとして実行時のみ動作）
+if __name__ == "__main__":
+    print_model_classification()

@@ -17,6 +17,7 @@ import numpy as np
 import io
 from PyQt5.QtGui import QPixmap, QImage
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 torch.set_num_threads(2)  # スレッド数を制限
 # マルチプロセッシングのコンテキストが設定されていない場合のみ設定する
@@ -41,7 +42,7 @@ from PyQt5.QtCore import Qt, QRect, QPoint, QTimer, QEvent
 from PIL import Image, ImageDraw
 
 # カスタムモジュールのインポート
-from model_catalog import get_model, list_available_models
+from model_catalog import get_model, list_available_models,is_dual_input_model_type
 from inference_utils import batch_inference
 from exports_file import export_to_donkey, export_to_jetracer, export_to_video
 from model_training import train_model, create_datasets
@@ -54,6 +55,7 @@ except ImportError:
     print("警告: enhanced_annotations.pyが見つかりません。物体検知アノテーション表示拡張は無効です")
     use_yolo = False
 
+print("check")
 
 import traceback
 def exception_hook(exc_type, exc_value, exc_traceback):
@@ -4755,22 +4757,12 @@ class ImageAnnotationTool(QMainWindow):
                 f"モデル読み込み中にエラーが発生しました: {str(e)}"
             )
             
-    # def toggle_augmentation_options(self):
-    #     """データオーグメンテーションのオプションの有効/無効を切り替える"""
-    #     enabled = self.augmentation_checkbox.isChecked()
-    #     self.aug_options_container.setEnabled(enabled)
-
     def set_clip_start_to_current(self):
         """現在のインデックスをクリップ開始位置に設定する"""
         if not self.images:
             return
         
         self.clip_start_spin.setValue(self.current_index)
-        # QMessageBox.information(
-        #     self,
-        #     "設定完了",
-        #     f"クリップ開始位置を現在のインデックス ({self.current_index}) に設定しました。"
-        # )
 
     def set_clip_end_to_current(self):
         """現在のインデックスをクリップ終了位置に設定する"""
@@ -4778,11 +4770,6 @@ class ImageAnnotationTool(QMainWindow):
             return
         
         self.clip_end_spin.setValue(self.current_index)
-        # QMessageBox.information(
-        #     self,
-        #     "設定完了",
-        #     f"クリップ終了位置を現在のインデックス ({self.current_index}) に設定しました。"
-        # )
 
     def delete_current_annotation(self):
         """現在表示中のアノテーションを削除する"""
@@ -5375,7 +5362,7 @@ class ImageAnnotationTool(QMainWindow):
         
         #m
         for img_folder in image_folders:
-            print(f"画像フォルダを検索中: {img_folder}")
+            # print(f"画像フォルダを検索中: {img_folder}")
             
             # imagesフォルダ内の画像を検索
             try:
@@ -5385,14 +5372,14 @@ class ImageAnnotationTool(QMainWindow):
                         # パターンでマッチングして分類
                         if camera_pattern.match(file):
                             all_images.append(file_path)
-                            print(f"カメラ画像を追加: {file}")
+                            # print(f"カメラ画像を追加: {file}")
                         elif lidar_pattern.match(file):
                             lidar_images.append(file_path)
-                            print(f"LIDAR画像を追加: {file}")
+                            # print(f"LIDAR画像を追加: {file}")
                         else:
                             # パターンにマッチしない場合はデフォルトでカメラ画像として扱う
                             all_images.append(file_path)
-                            print(f"その他の画像を追加: {file}")
+                            # print(f"その他の画像を追加: {file}")
             except Exception as e:
                 print(f"画像フォルダ {img_folder} の読み込みエラー: {e}")
         
@@ -5438,9 +5425,9 @@ class ImageAnnotationTool(QMainWindow):
                 print(f"画像サイズの取得エラー: {e}")        
 
         #m
-        # 2画像目用のパスマッピング
-        #self.second_images = [item.replace('cam_image_array_', 'lidar_image_array_') for item in images]
-        self.second_images = [item.replace('cam_image_array_', self.second_image_mapping_key+'_image_array_') for item in images]
+        # TODO:2画像目用のパスマッピング(後ほど順序バグFIX)
+        self.second_images = [item.replace('cam_image_array_', 'lidar_image_array_') for item in images]
+        #self.second_images = [item.replace('cam_image_array_', self.second_image_mapping_key+'_image_array_') for item in images]
 
         # Reset state
         self.folder_path = valid_paths[0]  # 最初の親フォルダをメインフォルダとして設定
@@ -6333,9 +6320,6 @@ class ImageAnnotationTool(QMainWindow):
                     if match:
                         index = int(match.group(1))
                         image_index_map[basename] = index
-                        # デバッグ用に最初の数枚を表示
-                        if len(image_index_map) <= 5:
-                            print(f"ファイル名マッピング: {basename} -> インデックス {index}")
                 except Exception as e:
                     print(f"ファイル名からインデックスを抽出できません: {basename} - {e}")
             
@@ -7720,6 +7704,42 @@ class ImageAnnotationTool(QMainWindow):
                 f"動画作成中にエラーが発生しました: {str(e)}"
             )
 
+    def get_second_image_path(self, img_path):
+        """Get the corresponding second image path for a given primary image path."""
+        # Method 1: Using second_images dictionary mapping
+        if hasattr(self, 'second_images') and isinstance(self.second_images, dict) and img_path in self.second_images:
+            second_path = self.second_images[img_path]
+            if os.path.exists(second_path):
+                return second_path
+        
+        # Method 2: Using second_images as a list with same indices as primary images
+        if hasattr(self, 'second_images') and isinstance(self.second_images, list):
+            if img_path in self.images:
+                idx = self.images.index(img_path)
+                if idx < len(self.second_images):
+                    second_path = self.second_images[idx]
+                    if os.path.exists(second_path):
+                        return second_path
+        
+        # Method 3: Automatic generation based on naming patterns
+        if hasattr(self, 'second_image_mapping_key') and self.second_image_mapping_key:
+            # Convert 'cam' to 'lidar' in the filename
+            second_path = img_path.replace('cam_image_array', f'{self.second_image_mapping_key}_image_array')
+            if os.path.exists(second_path):
+                return second_path
+        
+        # Method 4: Use previous image as the second image
+        if img_path in self.images:
+            idx = self.images.index(img_path)
+            if idx > 0:  # Not the first image
+                prev_path = self.images[idx-1]
+                if os.path.exists(prev_path):
+                    return prev_path
+        
+        # No valid second image found
+        return None
+
+    # #m
     def train_and_save_model(self):
         if not self.annotations:
             QMessageBox.warning(self, "警告", "モデルを学習するにはアノテーションが必要です。")
@@ -7727,6 +7747,25 @@ class ImageAnnotationTool(QMainWindow):
         
         # 現在選択されているモデルを取得
         model_type = self.auto_method_combo.currentText()
+
+        # 2画像入力モデルかどうかを確認
+        is_dual_model = is_dual_input_model_type(model_type)
+        if is_dual_model:
+            # 2画像目の有無を確認
+            if not hasattr(self, 'second_images') or not self.second_images:
+                reply = QMessageBox.question(
+                    self, 
+                    "2画像モデルの学習", 
+                    f"モデル '{model_type}' は2つの画像入力を使用します。\n"
+                    f"2画像目のデータが見つかりません。続行しますか？\n\n"
+                    f"「はい」: 連続する2枚の画像を使用します。\n"
+                    f"「いいえ」: 学習をキャンセルします。",
+                    QMessageBox.Yes | QMessageBox.No, 
+                    QMessageBox.No
+                )
+                
+                if reply == QMessageBox.No:
+                    return
         
         # 学習設定ダイアログを表示
         training_settings = QDialog(self)
@@ -7742,6 +7781,24 @@ class ImageAnnotationTool(QMainWindow):
         # 基本設定タブ
         basic_tab = QWidget()
         basic_layout = QVBoxLayout(basic_tab)
+
+        #m
+        # 2画像モデルの場合、追加の設定オプション
+        if is_dual_model:
+            second_image_group = QGroupBox("2画像目の設定")
+            second_image_layout = QVBoxLayout(second_image_group)
+            
+            # 2画像目の取得方法
+            image_source_radio_consecutive = QRadioButton("連続する画像を使用 (現在の画像と1つ前の画像)")
+            image_source_radio_consecutive.setChecked(False)
+            second_image_layout.addWidget(image_source_radio_consecutive)
+            
+            if hasattr(self, 'second_images') and self.second_images:
+                image_source_radio_lidar = QRadioButton("2画像目を使用")
+                image_source_radio_lidar.setChecked(True)
+                second_image_layout.addWidget(image_source_radio_lidar)
+            
+            basic_layout.addWidget(second_image_group)
         
         # エポック数設定
         epoch_layout = QHBoxLayout()
@@ -8047,6 +8104,12 @@ class ImageAnnotationTool(QMainWindow):
             'erase_min_ratio': aug_erase_min_ratio.value(),
             'erase_max_ratio': aug_erase_max_ratio.value()
         }
+
+        # 2画像モードの設定の取得
+        use_lidar = False
+        if is_dual_model and hasattr(self, 'second_images') and self.second_images:
+            use_lidar = image_source_radio_lidar.isChecked() if 'image_source_radio_lidar' in locals() else False
+        
         
         # モデルトレーニングの続きの確認
         sampling_info = ""
@@ -8075,6 +8138,14 @@ class ImageAnnotationTool(QMainWindow):
                 aug_info += f"範囲: {augmentation_params['erase_min_ratio']}～{augmentation_params['erase_max_ratio']})\n"
         else:
             aug_info += "無効\n"
+
+        # 2画像モデルの情報
+        dual_model_info = ""
+        if is_dual_model:
+            if use_lidar:
+                dual_model_info = "2画像目: LiDAR画像を使用\n"
+            else:
+                dual_model_info = "2画像目: 連続する画像を使用\n"
 
         reply = QMessageBox.question(
             self, 
@@ -8128,9 +8199,47 @@ class ImageAnnotationTool(QMainWindow):
                 return
             
             annotation_values = [self.annotations[img_path] for img_path in image_paths]
-            
+
+            # 2画像モデルの場合、2つ目の画像パスを準備
+            if is_dual_model:
+                # 既にあるLiDAR画像を使用
+                if use_lidar and hasattr(self, 'second_images') and self.second_images:
+                    # second_imagesはimage_pathsの各要素に対応する辞書または配列
+                    second_image_paths = []
+                    for img_path in image_paths:
+                        # second_imagesが辞書型の場合
+                        if isinstance(self.second_images, dict):
+                            second_img = self.second_images.get(img_path)
+                            if second_img and os.path.exists(second_img):
+                                second_image_paths.append(second_img)
+                            else:
+                                # 2画像目が見つからない場合は、そのデータポイントを除外
+                                idx = image_paths.index(img_path)
+                                image_paths.pop(idx)
+                                annotation_values.pop(idx)
+                        # second_imagesが配列の場合
+                        elif isinstance(self.second_images, list) and len(self.second_images) > 0:
+                            idx = self.images.index(img_path)
+                            if idx < len(self.second_images):
+                                second_img = self.second_images[idx]
+                                if os.path.exists(second_img):
+                                    second_image_paths.append(second_img)
+                                else:
+                                    # 2画像目が見つからない場合は、そのデータポイントを除外
+                                    idx = image_paths.index(img_path)
+                                    image_paths.pop(idx)
+                                    annotation_values.pop(idx)
+                else:
+                    # 連続する画像を使用する場合（1つ前の画像を2画像目として使用）
+                    # 注: 最初の画像はデータポイントとして使用できない（1つ前の画像がないため）
+                    for i in range(len(image_paths)-1, 0, -1):
+                        if i-1 < 0:
+                            # 最初の画像は除外
+                            image_paths.pop(i)
+                            annotation_values.pop(i)
+
             # データ数の確認と最小バッチサイズの調整
-            batch_size = min(32, len(image_paths))  # バッチサイズを調整
+            batch_size = min(16, len(image_paths))  # バッチサイズを調整
             if batch_size < 2:
                 QMessageBox.warning(self, "警告", "データ数が不足しています。最低2枚の画像が必要です。")
                 return
@@ -8175,6 +8284,31 @@ class ImageAnnotationTool(QMainWindow):
 
             progress.setLabelText(f"入力サイズ: {input_size} で学習準備中...")
             progress.setValue(10)
+            QApplication.processEvents()
+
+            #m
+            # データセットの作成（2画像モデルか通常モデルかで処理を分岐）
+            if is_dual_model:
+                # 2画像モデル用のデータセット作成
+                train_loader, val_loader, dataset_info = create_datasets(
+                    image_paths=image_paths,
+                    annotations=annotation_values,
+                    model_name=model_type,  # 2画像モデル名
+                    use_augmentation=augmentation_params if augmentation_params['enabled'] else False,
+                    batch_size=batch_size  # バッチサイズ
+                )
+            else:
+                # 通常の1画像モデル用のデータセット作成
+                train_loader, val_loader, dataset_info = create_datasets(
+                    image_paths=image_paths,
+                    annotations=annotation_values,
+                    model_name=model_type,
+                    use_augmentation=augmentation_params if augmentation_params['enabled'] else False,
+                    batch_size=batch_size  # バッチサイズ
+                )
+            
+            progress.setLabelText("モデルを初期化中...")
+            progress.setValue(20)
             QApplication.processEvents()
 
             # モデルの学習 - 事前学習済み重みをロードするかどうかのフラグを追加
@@ -8281,6 +8415,15 @@ class ImageAnnotationTool(QMainWindow):
                 traceback.print_exc()  # スタックトレースを出力して詳細を確認
                 mlflow_info = f"MLflowへの記録中にエラーが発生しました: {str(e)}"
             
+            # 2画像モデル情報を取得（表示用）
+            dual_model_desc = ""
+            if is_dual_model:
+                if use_lidar:
+                    dual_model_desc = "2画像モデル: LiDAR画像を使用\n"
+                else:
+                    dual_model_desc = "2画像モデル: 連続する画像を使用\n"            
+
+
             # オーグメンテーション情報を取得
             aug_details = ""
             if augmentation_params['enabled']:
@@ -8345,7 +8488,7 @@ class ImageAnnotationTool(QMainWindow):
                 "エラー", 
                 f"モデル学習中にエラーが発生しました: {str(e)}"
             )    
-    
+
     def show_augmentation_preview_dialog(self, aug_params):        
         if not self.images:
             QMessageBox.warning(self, "警告", "プレビュー対象の画像がありません。")
