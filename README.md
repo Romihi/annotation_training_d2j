@@ -64,6 +64,14 @@ pip install -r requirements.txt
 python annotation_bbox.py
 ```
 
+4. Docker で使う場合（Jetson対応）:
+```bash
+cd docker
+./run_docker.sh
+```
+annotation_tool内はdocker環境におけるappとして共有化されます。
+
+
 ## 使用ガイド
 
 ### 基本的なワークフロー
@@ -88,7 +96,7 @@ python annotation_bbox.py
 2. 「学習・保存」をクリックしてトレーニングパラメータを設定
 3. エポック数、学習率、データ拡張などの設定を調整
 4. トレーニングを開始し、進捗を監視
-5. MLflow（有効な場合）で結果を表示
+5. MLflowで結果を表示
 
 ### 自動アノテーション
 
@@ -96,14 +104,24 @@ python annotation_bbox.py
 2. ドロップダウンからモデルを選択（またはデフォルトを使用）
 3. 「オートアノテーション実行」をクリックして残りの画像を自動的にアノテーション
 
-## フォルダ構造
+## メインフォルダ・ファイル構造
+annotation_tool/
+├── annotation_bbox.py     # メインUI
+├── model_catalog.py       # モデル読み込み
+├── exports_file.py        # 書き出し関連
+├── requirements.txt       # 依存ライブラリ
+├── models/                # モデルファイル保存先
+├── mlrun/                 # 学習記録保存先
+├── sessons/               # ツールのファイル読込記録
+├── docker/
+│   ├── Dockerfile
+│   ├── requirements.txt   # Jetson用docker環境依存ライブラリ
+│   └── run_docker.sh      
 
-ツールは以下のディレクトリを作成します:
-- `annotation/`: すべてのアノテーションデータのメインディレクトリ
+ツールは他に以下のディレクトリを作成します:
+- `対象画像フォルダ/annotation/`: すべてのアノテーションデータのメインディレクトリ
 - `annotation/data_donkey/`: Donkeycarエクスポートファイル用
 - `annotation/data_jetracer/`: Jetracerエクスポートファイル用
-- `models/`: 保存されたトレーニング済みモデル用
-- `mlruns/`: MLflow実験追跡データ用
 
 ## トラブルシューティング
 

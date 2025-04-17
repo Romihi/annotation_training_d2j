@@ -2524,9 +2524,6 @@ class ImageAnnotationTool(QMainWindow):
 
         # ２画像目を小窓に表示
         self.secondary_image_label = QLabel(self)
-        self.secondary_image_label.setFixedSize(100, 100)  # 例: 1280x960 の1/8サイズ
-        self.secondary_image_label.setStyleSheet("border: 1px solid gray; background-color: black;")
-        self.secondary_image_label.move(1250, 40)  # メイン画像の右上に配置
         
         # ナビゲーションコントロールをメイン画像の下に配置
         nav_container = QWidget()
@@ -5424,10 +5421,15 @@ class ImageAnnotationTool(QMainWindow):
             except Exception as e:
                 print(f"画像サイズの取得エラー: {e}")        
 
-        #m
-        # TODO:2画像目用のパスマッピング(後ほど順序バグFIX)
-        self.second_images = [item.replace('cam_image_array_', 'lidar_image_array_') for item in images]
-        #self.second_images = [item.replace('cam_image_array_', self.second_image_mapping_key+'_image_array_') for item in images]
+        # 2画像目用のパスマッピング
+        if hasattr(self, 'second_image_mapping_key') and self.second_image_mapping_key:
+            # 検出された特定のセンサーキーを使用
+            self.second_images = [item.replace('cam_image_array_', f'{self.second_image_mapping_key}_image_array_') for item in images]
+            print(f"検出されたセンサー '{self.second_image_mapping_key}' を使用して2画像目のパスを生成")
+        else:
+            # 互換性維持のためデフォルトはlidar
+            self.second_images = [item.replace('cam_image_array_', 'lidar_image_array_') for item in images]
+            print("デフォルトの 'lidar' センサーを使用して2画像目のパスを生成")
 
         # Reset state
         self.folder_path = valid_paths[0]  # 最初の親フォルダをメインフォルダとして設定
@@ -6248,8 +6250,6 @@ class ImageAnnotationTool(QMainWindow):
                 progress.close()
                 return False
             
-
-            #m
             # ここから新しいコードの追加: 2画像目のキーについて最初に確認
             self.second_image_keys = []
             
@@ -6262,7 +6262,7 @@ class ImageAnnotationTool(QMainWindow):
                         entry = json.loads(first_line)
                         # すべてのキーを確認
                         for key in entry.keys():
-                            # image_arrayを含むキーで、cam/image_arrayではない
+                            # "/image_array"を含むキーで、"cam/image_array"ではない
                             if '/image_array' in key and key != 'cam/image_array':
                                 self.second_image_keys.append(key)
                                 print(f"2画像目のキーを検出: {key}")
@@ -6283,7 +6283,12 @@ class ImageAnnotationTool(QMainWindow):
                     QMessageBox.Yes
                 )
                 self.load_second_image_confirmed = (reply == QMessageBox.Yes)
-                self.second_image_mapping_key = self.second_image_keys[0].split('/')[0]
+                
+                # 最初のキーをマッピングに使用 (センサー名部分を抽出)
+                if self.second_image_keys and self.load_second_image_confirmed:
+                    # 形式: "sensor/image_array" からセンサー名だけ抽出
+                    self.second_image_mapping_key = self.second_image_keys[0].split('/')[0]
+                    print(f"2画像マッピングキー: {self.second_image_mapping_key}")
                 
                 # 進捗ダイアログを再表示
                 progress.show()
@@ -7721,14 +7726,46 @@ class ImageAnnotationTool(QMainWindow):
                     if os.path.exists(second_path):
                         return second_path
         
-        # Method 3: Automatic generation based on naming patterns
+        # Method 3: Automatic generation based on detected sensor key
         if hasattr(self, 'second_image_mapping_key') and self.second_image_mapping_key:
-            # Convert 'cam' to 'lidar' in the filename
+            # 検出されたセンサー名に基づいて画像パスを変換
             second_path = img_path.replace('cam_image_array', f'{self.second_image_mapping_key}_image_array')
             if os.path.exists(second_path):
                 return second_path
         
-        # Method 4: Use previous image as the second image
+        # Method 4: Fallback for lidar (互換性のため)
+        lidar_path = img_path.replace('cam_image_array', 'lidar_image_array')
+        if os.path.exists(lidar_path):
+            return lidar_path
+        
+        # Method 5: Try generic pattern matching for any sensor
+        if img_path in self.images:
+            base_name = os.path.basename(img_path)
+            base_dir = os.path.dirname(img_path)
+            
+            # カメラ画像のパターンを特定 (通常は "xxxx_cam_image_array_.jpg" 形式)
+            cam_pattern = r'(\d+)_cam_image_array_(.*\.(jpg|jpeg|png|bmp|gif))$'
+            match = re.match(cam_pattern, base_name, re.IGNORECASE)
+            
+            if match:
+                # ファイル名の先頭部分とサフィックスを取得
+                prefix = match.group(1)  # 例：10900
+                suffix = match.group(2)  # 例：.jpg
+                
+                # 同じディレクトリ内の他のセンサー画像ファイルを探す
+                try:
+                    for file in os.listdir(base_dir):
+                        # カメラ以外のセンサーパターン: "xxxx_<sensor>_image_array_.jpg"
+                        sensor_pattern = fr'{prefix}_(\w+)_image_array_{suffix}$'
+                        sensor_match = re.match(sensor_pattern, file, re.IGNORECASE)
+                        
+                        if sensor_match and "cam" not in sensor_match.group(1).lower():
+                            sensor_path = os.path.join(base_dir, file)
+                            return sensor_path
+                except Exception as e:
+                    print(f"センサー画像検索エラー: {e}")
+        
+        # Method 6: Use previous image as fallback
         if img_path in self.images:
             idx = self.images.index(img_path)
             if idx > 0:  # Not the first image
