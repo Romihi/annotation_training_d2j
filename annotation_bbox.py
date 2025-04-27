@@ -1095,14 +1095,7 @@ class ImageAnnotationTool(QMainWindow):
             ax1.tick_params(axis='both', which='major', labelsize=7)
             ax1.grid(True, alpha=0.3)
             ax1.set_xlim(-1.05, 1.05)
-            
-            # 統計情報を追加
-            angle_mean = np.mean(angles)
-            angle_std = np.std(angles)
-            # ax1.text(0.05, 0.95, f'平均: {angle_mean:.3f}\n標準偏差: {angle_std:.3f}', 
-            #         transform=ax1.transAxes, fontsize=7, 
-            #         verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-            
+                        
             # throttle分布をヒストグラムで表示
             n2, bins2, patches2 = ax2.hist(throttles, bins=bins, alpha=0.7, color='salmon')
             # 度数に応じた色付け
@@ -1119,19 +1112,7 @@ class ImageAnnotationTool(QMainWindow):
             ax2.tick_params(axis='both', which='major', labelsize=7)
             ax2.grid(True, alpha=0.3)
             ax2.set_xlim(-1.05, 1.05)
-            
-            # 統計情報を追加
-            throttle_mean = np.mean(throttles)
-            throttle_std = np.std(throttles)
-            # ax2.text(0.05, 0.95, f'平均: {throttle_mean:.3f}\n標準偏差: {throttle_std:.3f}', 
-            #         transform=ax2.transAxes, fontsize=7, 
-            #         verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-            
-            # # データ数を右上に表示
-            # fig.text(0.95, 0.98, f'n = {len(angles)}', 
-            #         horizontalalignment='right', verticalalignment='top', 
-            #         fontsize=8, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-            
+                        
             # レイアウト調整
             plt.tight_layout(pad=1.0)
             
@@ -1156,212 +1137,6 @@ class ImageAnnotationTool(QMainWindow):
             import traceback
             traceback.print_exc()
             self.distribution_label.setText(f"グラフ作成エラー: {str(e)}")
-
-    # ONNXへの変換機能
-    def convert_to_onnx(self):
-        """現在読み込まれているPyTorchモデルをONNX形式に変換する"""
-        if not self.images:
-            QMessageBox.warning(self, "警告", "画像が読み込まれていません。")
-            return
-        
-        # モデル情報を取得
-        model_type = self.auto_method_combo.currentText()
-        selected_model = self.model_combo.currentText()
-        
-        if selected_model == "モデルが見つかりません" or selected_model == "フォルダを選択してください" or "が見つかりません" in selected_model:
-            QMessageBox.warning(self, "警告", "有効なモデルが選択されていません。まずモデルを読み込んでください。")
-            return
-        
-        # モデルのパスを取得
-        models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
-        model_path = os.path.join(models_dir, selected_model)
-        
-        # モデルが存在するか確認
-        if not os.path.exists(model_path):
-            QMessageBox.warning(self, "警告", f"選択されたモデルが見つかりません: {selected_model}")
-            return
-        
-        # 出力パスと設定を取得するためのダイアログを表示
-        onnx_settings = QDialog(self)
-        onnx_settings.setWindowTitle("ONNXモデル変換設定")
-        onnx_settings.setMinimumWidth(400)
-        
-        settings_layout = QVBoxLayout(onnx_settings)
-        
-        # 入力サイズ設定
-        size_layout = QHBoxLayout()
-        size_layout.addWidget(QLabel("入力サイズ:"))
-        
-        width_layout = QHBoxLayout()
-        width_layout.addWidget(QLabel("幅:"))
-        width_spin = QSpinBox()
-        width_spin.setRange(1, 1024)
-        width_spin.setValue(224)
-        width_layout.addWidget(width_spin)
-        
-        height_layout = QHBoxLayout()
-        height_layout.addWidget(QLabel("高さ:"))
-        height_spin = QSpinBox()
-        height_spin.setRange(1, 1024)
-        height_spin.setValue(224)
-        height_layout.addWidget(height_spin)
-        
-        size_layout.addLayout(width_layout)
-        size_layout.addLayout(height_layout)
-        settings_layout.addLayout(size_layout)
-        
-        # 動的バッチサイズと単純化の設定
-        options_layout = QVBoxLayout()
-        
-        dynamic_batch = QCheckBox("動的バッチサイズを有効にする")
-        dynamic_batch.setChecked(True)
-        options_layout.addWidget(dynamic_batch)
-        
-        simplify_model = QCheckBox("ONNXモデルを単純化する")
-        simplify_model.setChecked(True)
-        options_layout.addWidget(simplify_model)
-        
-        settings_layout.addLayout(options_layout)
-        
-        # opsetバージョン設定
-        opset_layout = QHBoxLayout()
-        opset_layout.addWidget(QLabel("ONNX Opsetバージョン:"))
-        opset_combo = QComboBox()
-        opset_combo.addItems(["12", "13", "14", "15", "16"])
-        opset_combo.setCurrentText("12")
-        opset_layout.addWidget(opset_combo)
-        settings_layout.addLayout(opset_layout)
-        
-        # 説明ラベル
-        info_label = QLabel("注意: ONNX変換には、onnx、onnxruntime、onnx-simplifierパッケージが必要です。")
-        info_label.setWordWrap(True)
-        info_label.setStyleSheet("color: #666666; font-style: italic;")
-        settings_layout.addWidget(info_label)
-        
-        # ボタンの配置
-        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        button_box.accepted.connect(onnx_settings.accept)
-        button_box.rejected.connect(onnx_settings.reject)
-        settings_layout.addWidget(button_box)
-        
-        # ダイアログを表示
-        if not onnx_settings.exec_():
-            return
-        
-        # 設定値の取得
-        input_width = width_spin.value()
-        input_height = height_spin.value()
-        use_dynamic_axes = dynamic_batch.isChecked()
-        use_simplify = simplify_model.isChecked()
-        opset_version = int(opset_combo.currentText())
-        
-        # 出力ファイル名を選択
-        base_name = os.path.splitext(selected_model)[0]
-        default_output = os.path.join(models_dir, f"{base_name}.onnx")
-        
-        output_path, _ = QFileDialog.getSaveFileName(
-            self, "ONNXモデルの保存先を選択", 
-            default_output,
-            "ONNX Models (*.onnx)"
-        )
-        
-        if not output_path:
-            return
-        
-        # 進捗ダイアログを表示
-        progress = QProgressDialog(
-            f"モデル '{model_type} ({selected_model})' をONNX形式に変換中...", 
-            "キャンセル", 0, 100, self
-        )
-        progress.setWindowTitle("ONNX変換")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
-        progress.show()
-        QApplication.processEvents()
-        
-        try:
-            # pytorch_to_onnx モジュールのインポート
-            progress.setLabelText("ONNX変換モジュールを読み込み中...")
-            progress.setValue(10)
-            QApplication.processEvents()
-            
-            # 現在のディレクトリを取得
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            
-            # これが呼び出し元のファイルと同じディレクトリにあるか確認
-            pytorch_to_onnx_path = os.path.join(current_dir, "pytorch_to_onnx.py")
-            
-            if os.path.exists(pytorch_to_onnx_path):
-                import importlib.util
-                spec = importlib.util.spec_from_file_location("pytorch_to_onnx", pytorch_to_onnx_path)
-                pytorch_to_onnx = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(pytorch_to_onnx)
-                
-                progress.setLabelText(f"モデル {model_type} をONNX形式に変換しています...")
-                progress.setValue(20)
-                QApplication.processEvents()
-                
-                # 変換関数の実行
-                # 進捗表示のためのコールバック関数
-                def progress_callback(current, total, message=None):
-                    if message:
-                        progress.setLabelText(message)
-                    value = 20 + int(current * 70 / total)  # 20%～90%の範囲で進捗を表示
-                    progress.setValue(value)
-                    QApplication.processEvents()
-                    return not progress.wasCanceled()
-                
-                # 変換実行
-                onnx_model_path = pytorch_to_onnx.convert_pytorch_to_onnx(
-                    model_path=model_path,
-                    model_type=model_type,
-                    output_path=output_path,
-                    input_size=(input_height, input_width),
-                    dynamic_axes=use_dynamic_axes,
-                    simplify=use_simplify,
-                    opset_version=opset_version
-                )
-                
-                progress.setValue(100)
-                progress.close()
-                
-                if onnx_model_path:
-                    QMessageBox.information(
-                        self,
-                        "変換成功",
-                        f"PyTorchモデル '{selected_model}' がONNX形式に変換されました。\n"
-                        f"出力パス: {onnx_model_path}\n\n"
-                        f"入力サイズ: {input_width}x{input_height}\n"
-                        f"動的バッチサイズ: {'有効' if use_dynamic_axes else '無効'}\n"
-                        f"モデル単純化: {'有効' if use_simplify else '無効'}\n"
-                        f"Opsetバージョン: {opset_version}"
-                    )
-                else:
-                    QMessageBox.critical(
-                        self,
-                        "変換エラー",
-                        "ONNX変換中にエラーが発生しました。詳細はコンソール出力を確認してください。"
-                    )
-            else:
-                progress.close()
-                QMessageBox.critical(
-                    self,
-                    "ファイルエラー",
-                    f"pytorch_to_onnx.py ファイルが見つかりません。\n"
-                    f"検索したパス: {pytorch_to_onnx_path}\n\n"
-                    f"このファイルがアプリケーションと同じディレクトリにあることを確認してください。"
-                )
-                
-        except Exception as e:
-            progress.close()
-            QMessageBox.critical(
-                self,
-                "エラー",
-                f"ONNX変換中にエラーが発生しました: {str(e)}"
-            )
-            import traceback
-            traceback.print_exc()
 
     # YOLOモデルをパスから読み込むヘルパーメソッド
     def load_yolo_model_from_path(self, model_path):
@@ -2071,28 +1846,6 @@ class ImageAnnotationTool(QMainWindow):
         # 更新完了メッセージ
         self.statusBar().showMessage(f"{len(model_files)}個の{current_arch}モデルを読み込みました", 3000)
 
-    def change_zoom(self, value):
-        """ズーム係数を変更する（スピンボックスから）"""
-        self.main_image_view.zoom_factor = value
-        self.main_image_view.update()
-        
-        # スライダーの値も同期
-        # valueChanged信号の再帰的な呼び出しを防ぐため、blockSignalsを使用
-        self.zoom_slider.blockSignals(True)
-        self.zoom_slider.setValue(int(value * 10))
-        self.zoom_slider.blockSignals(False)
-
-    def slider_zoom_changed(self, value):
-        """ズーム係数を変更する（スライダーから）"""
-        zoom_value = value / 10.0
-        self.main_image_view.zoom_factor = zoom_value
-        self.main_image_view.update()
-        
-        # スピンボックスの値も同期
-        self.zoom_spinbox.blockSignals(True)
-        self.zoom_spinbox.setValue(zoom_value)
-        self.zoom_spinbox.blockSignals(False)
-
     def play_forward(self):
         """自動再生（順方向）"""
         # 再生中かどうかをチェック
@@ -2309,14 +2062,6 @@ class ImageAnnotationTool(QMainWindow):
         pilot_layout.addLayout(inference_layout)
 
         left_layout.addWidget(self.pilot_container)
-
-        # ONNX変換ボタン
-        # ONNXモデル変換ボタン
-        self.onnx_convert_button = QPushButton("ONNXモデルに変換")
-        self.onnx_convert_button.clicked.connect(self.convert_to_onnx)
-        self.onnx_convert_button.setStyleSheet("QPushButton { background-color: #8A2BE2; color: white; }")
-
-        left_layout.addWidget(self.onnx_convert_button)
                     
         # 物体検知推論結果表示フラグの初期化
         self.show_detection_inference = False
@@ -2414,20 +2159,7 @@ class ImageAnnotationTool(QMainWindow):
         self.detection_inference_checkbox.stateChanged.connect(self.toggle_detection_inference_display)
         detection_inference_layout.addWidget(self.detection_inference_checkbox)
         obj_detection_layout.addLayout(detection_inference_layout)
-
-        # ONNXモデル変換ボタン
-        self.yolo_onnx_convert_button = QPushButton("YOLOモデルをONNXに変換")
-        self.yolo_onnx_convert_button.clicked.connect(self.convert_yolo_to_onnx)
-        self.yolo_onnx_convert_button.setStyleSheet("QPushButton { background-color: #8A2BE2; color: white; }")
-        obj_detection_layout.addWidget(self.yolo_onnx_convert_button)
         
-        # 一括推論ボタン
-        ## disabled
-        # batch_inference_button = QPushButton("一括推論実行")
-        # batch_inference_button.clicked.connect(self.run_batch_yolo_inference)
-        # batch_inference_button.setToolTip("全画像に対してYOLO推論を一括実行します")
-        # detection_inference_layout.addWidget(batch_inference_button)
-
         # 物体検知コンテナ追加
         left_layout.addWidget(self.object_detection_container)
 
@@ -2470,53 +2202,6 @@ class ImageAnnotationTool(QMainWindow):
                         
         # ステータスバー
         self.statusBar().showMessage("Bキーを押しながらクリックすると、いつでもバウンディングボックスを作成できます。Deleteキーで選択したボックスを削除できます。", 10000)
-
-        # 説明文を左パネルの最後に移動し、スクロール可能にする
-        #left_layout.addWidget(QLabel(""))  # セパレーター用の空行
-        instructions_label = QLabel("使用方法:")
-        instructions_label.setStyleSheet("font-weight: bold;")
-        left_layout.addWidget(instructions_label)
-
-        # アノテーション関連ボタンの初期状態を非アクティブに設定
-        self.set_annotation_buttons_enabled(False)
-
-        # スクロール可能なエリアを作成
-        instructions_scroll = QScrollArea()
-        instructions_scroll.setWidgetResizable(True)  # リサイズ可能に設定
-        instructions_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)  # 水平スクロールバーは非表示
-        instructions_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)  # 垂直スクロールバーは必要に応じて表示
-        instructions_scroll.setMinimumHeight(150)  # 最小の高さを設定
-        instructions_scroll.setMaximumHeight(200)  # 最大の高さを制限
-
-        # 説明テキスト用のラベルを作成
-        instructions_widget = QWidget()
-        instructions_layout = QVBoxLayout(instructions_widget)
-        instructions_layout.setContentsMargins(0, 0, 0, 0)
-
-        instructions = QLabel(
-            "1. 画像フォルダを選択\n"
-            "2. 画像をクリックしてアノテーションを追加\n"
-            "3. ナビゲーションボタンで画像間を移動\n"
-            "4. 「保存」ボタンでアノテーションを保存\n"
-            "5. 「アノテーション動画作成」で動画を作成\n"
-            "6. 「オートアノテーション実行」で自動アノテーション\n"
-            "7. 「推論結果表示」で推論結果を青丸表示\n\n"
-            "キーボードショートカット:\n"
-            "- 左矢印キー: 10枚前に戻る\n"
-            "- 右矢印キー: 10枚先に進む\n\n"
-            "位置情報の使い方:\n"
-            "- 位置情報ボタンをクリックして位置を選択\n"
-            "- 選択した位置情報はアノテーション時に保存されます\n"
-            "- 位置情報は色分けされ、枠の色と位置番号バッジで表示されます\n"
-            "- ギャラリーでも位置情報に応じた色で表示されます"
-        )
-        instructions.setWordWrap(True)  # テキストの折り返しを有効に
-        instructions_layout.addWidget(instructions)
-        instructions_layout.addStretch()
-
-        # スクロールエリアにウィジェットを設定
-        instructions_scroll.setWidget(instructions_widget)
-        left_layout.addWidget(instructions_scroll)
 
         # 最後にスペーサーを追加
         left_layout.addStretch()
@@ -3664,199 +3349,6 @@ class ImageAnnotationTool(QMainWindow):
             print(f"単一画像YOLO推論エラー: {e}")
             return False
 
-    def convert_yolo_to_onnx(self):
-        """現在読み込まれているYOLOモデルをONNX形式に変換する"""
-        if not self.images:
-            QMessageBox.warning(self, "警告", "画像が読み込まれていません。")
-            return
-        
-        # モデル情報を取得 - 表示名と実際のパス
-        current_index = self.yolo_saved_model_combo.currentIndex()
-        selected_model_display = self.yolo_saved_model_combo.currentText()
-        
-        # ユーザーデータからパスを取得（相対パス）
-        relative_path = self.yolo_saved_model_combo.itemData(current_index)
-        
-        if not relative_path or selected_model_display == "YOLOモデルが見つかりません" or selected_model_display == "フォルダを選択してください":
-            QMessageBox.warning(self, "警告", "有効なYOLOモデルが選択されていません。まずYOLOモデルを読み込んでください。")
-            return
-        
-        # モデルのパスを取得 - 相対パスからフルパスに変換
-        models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
-        model_path = os.path.join(models_dir, relative_path)
-        
-        # モデルが存在するか確認
-        if not os.path.exists(model_path):
-            QMessageBox.warning(self, "警告", f"選択されたYOLOモデルが見つかりません: {model_path}")
-            return
-        
-        # 出力パスと設定を取得するためのダイアログを表示
-        onnx_settings = QDialog(self)
-        onnx_settings.setWindowTitle("YOLO-ONNX変換設定")
-        onnx_settings.setMinimumWidth(400)
-        
-        settings_layout = QVBoxLayout(onnx_settings)
-        
-        # 入力サイズ設定
-        size_layout = QHBoxLayout()
-        size_layout.addWidget(QLabel("入力サイズ:"))
-        
-        width_layout = QHBoxLayout()
-        width_layout.addWidget(QLabel("幅:"))
-        width_spin = QSpinBox()
-        width_spin.setRange(32, 1920)
-        width_spin.setValue(640)  # YOLOではデフォルト640がよく使われる
-        width_layout.addWidget(width_spin)
-        
-        height_layout = QHBoxLayout()
-        height_layout.addWidget(QLabel("高さ:"))
-        height_spin = QSpinBox()
-        height_spin.setRange(32, 1920)
-        height_spin.setValue(640)  # YOLOではデフォルト640がよく使われる
-        height_layout.addWidget(height_spin)
-        
-        size_layout.addLayout(width_layout)
-        size_layout.addLayout(height_layout)
-        settings_layout.addLayout(size_layout)
-        
-        # 追加オプション設定
-        options_layout = QVBoxLayout()
-        
-        dynamic_batch = QCheckBox("動的バッチサイズを有効にする")
-        dynamic_batch.setChecked(True)
-        options_layout.addWidget(dynamic_batch)
-        
-        half_precision = QCheckBox("FP16（半精度）を使用する")
-        half_precision.setChecked(False)
-        options_layout.addWidget(half_precision)
-        
-        settings_layout.addLayout(options_layout)
-        
-        # 説明ラベル
-        info_label = QLabel("注意: YOLO-ONNX変換には、ultralytics パッケージが必要です。")
-        info_label.setWordWrap(True)
-        info_label.setStyleSheet("color: #666666; font-style: italic;")
-        settings_layout.addWidget(info_label)
-        
-        # ボタンの配置
-        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        button_box.accepted.connect(onnx_settings.accept)
-        button_box.rejected.connect(onnx_settings.reject)
-        settings_layout.addWidget(button_box)
-        
-        # ダイアログを表示
-        if not onnx_settings.exec_():
-            return
-        
-        # 設定値の取得
-        input_width = width_spin.value()
-        input_height = height_spin.value()
-        use_dynamic_axes = dynamic_batch.isChecked()
-        use_half_precision = half_precision.isChecked()
-        
-        # 出力ファイル名を選択
-        base_name = os.path.splitext(os.path.basename(model_path))[0]
-        model_dir = os.path.dirname(model_path)
-        default_output = os.path.join(model_dir, f"{base_name}.onnx")
-        
-        output_path, _ = QFileDialog.getSaveFileName(
-            self, "YOLO-ONNXモデルの保存先を選択", 
-            default_output,
-            "ONNX Models (*.onnx)"
-        )
-        
-        if not output_path:
-            return
-        
-        # 進捗ダイアログを表示
-        progress = QProgressDialog(
-            f"YOLOモデル '{selected_model_display}' をONNX形式に変換中...", 
-            "キャンセル", 0, 100, self
-        )
-        progress.setWindowTitle("YOLO-ONNX変換")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
-        progress.show()
-        QApplication.processEvents()
-        
-        try:
-            # Ultralyticsのインポート
-            progress.setLabelText("Ultralytics YOLOモジュールを読み込み中...")
-            progress.setValue(10)
-            QApplication.processEvents()
-            
-            try:
-                from ultralytics import YOLO
-            except ImportError:
-                progress.close()
-                QMessageBox.critical(
-                    self, 
-                    "エラー", 
-                    "Ultralytics YOLOパッケージがインストールされていません。\n"
-                    "pip install ultralytics でインストールしてください。"
-                )
-                return
-            
-            progress.setLabelText("YOLOモデルを読み込み中...")
-            progress.setValue(20)
-            QApplication.processEvents()
-            
-            # YOLOモデルをロード
-            model = YOLO(model_path)
-            
-            progress.setLabelText("ONNX形式に変換中...")
-            progress.setValue(30)
-            QApplication.processEvents()
-            
-            # ONNX変換を実行
-            success = model.export(
-                format="onnx",
-                imgsz=[input_height, input_width],
-                dynamic=use_dynamic_axes,
-                half=use_half_precision,
-                simplify=True,
-                opset=12,
-                verbose=False
-            )
-            
-            # 標準の出力先と指定された出力先が異なる場合はファイルをコピー
-            default_onnx_path = model_path.replace('.pt', '.onnx')
-            if default_onnx_path != output_path and os.path.exists(default_onnx_path):
-                import shutil
-                shutil.copy2(default_onnx_path, output_path)
-            
-            progress.setValue(100)
-            progress.close()
-            
-            if os.path.exists(output_path):
-                QMessageBox.information(
-                    self,
-                    "変換成功",
-                    f"YOLOモデル '{selected_model_display}' がONNX形式に変換されました。\n"
-                    f"出力パス: {output_path}\n\n"
-                    f"入力サイズ: {input_width}x{input_height}\n"
-                    f"動的バッチサイズ: {'有効' if use_dynamic_axes else '無効'}\n"
-                    f"FP16（半精度）: {'有効' if use_half_precision else '無効'}"
-                )
-            else:
-                QMessageBox.warning(
-                    self,
-                    "変換警告",
-                    f"変換処理は完了しましたが、出力ファイルが見つかりません: {output_path}\n"
-                    f"デフォルトの出力先を確認してください: {default_onnx_path}"
-                )
-                
-        except Exception as e:
-            progress.close()
-            QMessageBox.critical(
-                self,
-                "エラー",
-                f"YOLO-ONNX変換中にエラーが発生しました: {str(e)}"
-            )
-            import traceback
-            traceback.print_exc()
-
     # 5. 情報パネルに物体検知推論結果を表示する処理の追加
     def update_detection_inference_display(self):
         """物体検知推論結果の表示を更新"""
@@ -4833,22 +4325,12 @@ class ImageAnnotationTool(QMainWindow):
                 f"モデル読み込み中にエラーが発生しました: {str(e)}"
             )
             
-    # def toggle_augmentation_options(self):
-    #     """データオーグメンテーションのオプションの有効/無効を切り替える"""
-    #     enabled = self.augmentation_checkbox.isChecked()
-    #     self.aug_options_container.setEnabled(enabled)
-
     def set_clip_start_to_current(self):
         """現在のインデックスをクリップ開始位置に設定する"""
         if not self.images:
             return
         
         self.clip_start_spin.setValue(self.current_index)
-        # QMessageBox.information(
-        #     self,
-        #     "設定完了",
-        #     f"クリップ開始位置を現在のインデックス ({self.current_index}) に設定しました。"
-        # )
 
     def set_clip_end_to_current(self):
         """現在のインデックスをクリップ終了位置に設定する"""
@@ -4856,11 +4338,6 @@ class ImageAnnotationTool(QMainWindow):
             return
         
         self.clip_end_spin.setValue(self.current_index)
-        # QMessageBox.information(
-        #     self,
-        #     "設定完了",
-        #     f"クリップ終了位置を現在のインデックス ({self.current_index}) に設定しました。"
-        # )
 
     def delete_current_annotation(self):
         """現在表示中のアノテーションを削除する"""
@@ -5541,6 +5018,9 @@ class ImageAnnotationTool(QMainWindow):
         self.refresh_model_list()
         if use_yolo:
             self.refresh_yolo_model_list()
+
+        ### add loca model
+        self.add_location_model_section()
 
         # 位置ボタンのカウント表示を更新
         self.update_location_button_counts()
@@ -8409,6 +7889,29 @@ class ImageAnnotationTool(QMainWindow):
             self.location_buttons_layout.addWidget(button)
             self.location_buttons.append(button)
 
+    ###
+    def train_location_model(self):
+        """位置情報推論モデル（分類）の学習を行い、成果物を保存する"""
+        if not self.images or not self.location_annotations:
+            QMessageBox.warning(self, "警告", "位置情報アノテーションが存在しません。")
+            return
+
+        from model_training import train_location_model
+
+        image_paths = list(self.location_annotations.keys())
+        labels = [self.location_annotations[p] for p in image_paths]
+
+        save_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+
+        save_path, best_acc = train_location_model(
+            model_name="location_simplecnn",
+            image_paths=image_paths,
+            labels=labels,
+            save_dir=save_dir
+        )
+
+        QMessageBox.information(self, "完了", f"位置情報モデルの学習が完了しました。\n最良精度: {best_acc:.3f}\nモデルは {save_path} に保存されました。")
+
     def get_augmentation_params(self):
         """現在のオーグメンテーション設定をパラメータ辞書として取得する"""
         return {
@@ -8618,6 +8121,975 @@ class ImageAnnotationTool(QMainWindow):
                 self.detection_inference_info_label.setText("")
         
         return False
+
+
+    # Add this method to the ImageAnnotationTool class to create the location model section UI
+    def add_location_model_section(self):
+        """位置推論モデルのセクションを追加する"""
+        # 位置モデルマネージャーの初期化
+        from location_model_manager import LocationModelManager
+        self.location_model_manager = LocationModelManager(APP_DIR_PATH, MODELS_DIR_NAME)
+        import torch.nn as nn  # nn モジュールをインポート
+        
+        # YOLOモデル領域の上に位置推論モデルセクションを配置するため、
+        # オリジナルのレイアウトを取得
+        left_layout = self.findChild(QVBoxLayout, "left_layout")
+        if not left_layout:
+            # レイアウトが見つからない場合、centralWidgetを取得して探す
+            left_layout = self.centralWidget().layout().itemAt(0).widget().layout()
+        
+        # 既存のYOLO物体検知コンテナのインデックスを見つける
+        object_detection_index = -1
+        for i in range(left_layout.count()):
+            item = left_layout.itemAt(i)
+            if item.widget() == self.object_detection_container:
+                object_detection_index = i
+                break
+        
+        if object_detection_index == -1:
+            print("物体検知コンテナが見つかりません。位置モデルセクションは末尾に追加します。")
+            object_detection_index = left_layout.count()
+        
+        # 位置推論モデルコンテナを作成
+        self.location_model_container = QWidget()
+        location_model_layout = QVBoxLayout(self.location_model_container)
+        
+        # ヘッダータイトル
+        location_model_label = QLabel("位置推論モデル:")
+        location_model_label.setStyleSheet("font-weight: bold")
+        location_model_layout.addWidget(location_model_label)
+        
+        # モデル選択
+        model_type_layout = QHBoxLayout()
+        model_type_layout.addWidget(QLabel("モデルタイプ:"))
+        self.location_model_combo = QComboBox()
+        self.location_model_combo.addItems(["donkey_location", "resnet18_location"])
+        model_type_layout.addWidget(self.location_model_combo)
+        location_model_layout.addLayout(model_type_layout)
+        
+        # 事前学習済みモデル選択
+        self.location_saved_model_combo = QComboBox()
+        self.location_saved_model_combo.setMinimumWidth(180)
+        self.location_saved_model_combo.setStyleSheet("combobox-popup: 0;")
+        location_model_layout.addWidget(self.location_saved_model_combo)
+        
+        # モデル操作ボタン
+        location_model_buttons_layout = QHBoxLayout()
+        
+        # モデルリスト更新ボタン
+        self.location_refresh_button = QPushButton("モデル一覧更新")
+        self.location_refresh_button.clicked.connect(self.refresh_location_model_list)
+        location_model_buttons_layout.addWidget(self.location_refresh_button)
+        
+        # モデル読み込みボタン
+        self.location_load_button = QPushButton("モデル読込")
+        self.location_load_button.setToolTip("modelsフォルダのモデルを読込む")
+        self.location_load_button.clicked.connect(self.load_location_model)
+        self.location_load_button.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")
+        location_model_buttons_layout.addWidget(self.location_load_button)
+        
+        location_model_layout.addLayout(location_model_buttons_layout)
+        
+        # 位置モデル学習ボタン
+        train_location_button = QPushButton("位置モデルを学習・保存")
+        train_location_button.clicked.connect(self.train_and_save_location_model)
+        location_model_layout.addWidget(train_location_button)
+        
+        # 位置推論表示チェックボックス
+        location_inference_layout = QHBoxLayout()
+        self.location_inference_checkbox = QCheckBox("位置推論結果表示")
+        self.location_inference_checkbox.setChecked(False)
+        self.location_inference_checkbox.stateChanged.connect(self.toggle_location_inference_display)
+        location_inference_layout.addWidget(self.location_inference_checkbox)
+        location_model_layout.addLayout(location_inference_layout)
+        
+        # オートアノテーションボタン
+        location_auto_annotate_button = QPushButton("位置オートアノテーション実行")
+        location_auto_annotate_button.clicked.connect(self.auto_annotate_location)
+        location_model_layout.addWidget(location_auto_annotate_button)
+        
+        # YOLOコンテナの前に位置モデルコンテナを挿入
+        left_layout.insertWidget(object_detection_index, self.location_model_container)
+        
+        # 推論結果格納用の辞書を初期化
+        self.location_inference_results = {}
+        
+        # モデルリストの取得は新しいマネージャーを使用
+        self.refresh_location_model_list()
+        
+        # 推論結果格納用の辞書を初期化
+        self.location_inference_results = {}
+
+    def refresh_location_model_list(self):
+        """保存されている位置モデルのリストを更新"""
+        self.location_saved_model_combo.clear()
+        
+        # 更新開始のダイアログを表示
+        self.statusBar().showMessage("位置モデルリストを更新中...")
+        QApplication.processEvents()
+        
+        if not hasattr(self, 'folder_path') or not self.folder_path:
+            self.location_saved_model_combo.addItem("フォルダを選択してください")
+            self.statusBar().clearMessage()
+            return
+        
+        # マネージャーからモデルリストを取得
+        model_files = self.location_model_manager.get_model_list()
+        
+        if not model_files:
+            # フィルタリングした結果がなければ、その旨を表示
+            self.location_saved_model_combo.addItem("位置モデルが見つかりません")
+            self.statusBar().showMessage("位置モデルが見つかりません。モデルを学習してください", 3000)
+            return
+        
+        # コンボボックスに追加
+        for model_file in model_files:
+            self.location_saved_model_combo.addItem(model_file)
+        
+        # 更新完了メッセージ
+        self.statusBar().showMessage(f"{len(model_files)}個の位置モデルを読み込みました", 3000)
+
+    def load_location_model(self):
+        """選択された位置モデルを読み込む"""
+        if not self.images:
+            QMessageBox.warning(self, "警告", "画像が読み込まれていません。")
+            return
+        
+        # モデル情報を取得
+        model_type = self.location_model_combo.currentText()
+        selected_model = self.location_saved_model_combo.currentText()
+        
+        if selected_model == "位置モデルが見つかりません" or selected_model == "フォルダを選択してください":
+            QMessageBox.warning(self, "警告", "有効な位置モデルが選択されていません。")
+            return
+        
+        # モデルのパスを取得
+        models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+        model_path = os.path.join(models_dir, selected_model)
+        
+        # モデルが存在するか確認
+        if not os.path.exists(model_path):
+            QMessageBox.warning(self, "警告", f"選択されたモデルが見つかりません: {selected_model}")
+            return
+        
+        # 進捗ダイアログを表示
+        progress = QProgressDialog(
+            f"位置モデル '{model_type} ({selected_model})' を読み込み中...", 
+            "キャンセル", 0, 100, self
+        )
+        progress.setWindowTitle("モデル読み込み")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+        
+        # 進捗コールバック関数
+        def update_progress(value, message=None):
+            if message:
+                progress.setLabelText(message)
+            progress.setValue(value)
+            QApplication.processEvents()
+            return not progress.wasCanceled()
+        
+        try:
+            # マネージャーを使用してモデルをロード
+            success, result = self.location_model_manager.load_model(
+                model_type, model_path, update_progress
+            )
+            
+            if not success:
+                progress.close()
+                QMessageBox.critical(
+                    self, 
+                    "エラー", 
+                    f"位置モデルの読み込み中にエラーが発生しました: {result}"
+                )
+                return
+            
+            num_classes = result
+            
+            update_progress(80, "初期推論を実行中...")
+            
+            # 現在の画像に対して推論を実行
+            self.run_location_inference()
+            
+            update_progress(90, "推論表示を更新中...")
+            
+            # 推論表示チェックボックスを自動的にオンにする
+            self.location_inference_checkbox.setChecked(True)
+            
+            update_progress(100)
+            progress.close()
+            
+            # 成功メッセージ
+            self.statusBar().showMessage(f"位置モデル '{model_type} ({selected_model})' を読み込みました (クラス数: {num_classes})", 5000)
+            
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"位置モデルの読み込み中にエラーが発生しました: {str(e)}"
+            )
+
+    def run_location_inference(self):
+        """現在の画像に対して位置推論を実行"""
+        if not self.images or not hasattr(self, 'location_model_manager'):
+            return
+        
+        current_img_path = self.images[self.current_index]
+        
+        # マネージャーを使用して推論を実行
+        result = self.location_model_manager.run_inference(current_img_path)
+        
+        if result:
+            # 推論結果を保存
+            self.location_inference_results[current_img_path] = result
+            
+            # 表示を更新
+            self.update_location_inference_display()
+            
+            return True
+        
+        return False
+
+        
+    def refresh_location_model_list(self):
+        """保存されている位置モデルのリストを更新"""
+        self.location_saved_model_combo.clear()
+        
+        # 更新開始のダイアログを表示
+        self.statusBar().showMessage("位置モデルリストを更新中...")
+        QApplication.processEvents()
+        
+        if not hasattr(self, 'folder_path') or not self.folder_path:
+            self.location_saved_model_combo.addItem("フォルダを選択してください")
+            self.statusBar().clearMessage()
+            return
+        
+        # マネージャーからモデルリストを取得
+        model_files = self.location_model_manager.get_model_list()
+        
+        if not model_files:
+            # フィルタリングした結果がなければ、その旨を表示
+            self.location_saved_model_combo.addItem("位置モデルが見つかりません")
+            self.statusBar().showMessage("位置モデルが見つかりません。モデルを学習してください", 3000)
+            return
+        
+        # コンボボックスに追加
+        for model_file in model_files:
+            self.location_saved_model_combo.addItem(model_file)
+        
+        # 更新完了メッセージ
+        self.statusBar().showMessage(f"{len(model_files)}個の位置モデルを読み込みました", 3000)
+
+    def load_location_model(self):
+        """選択された位置モデルを読み込む"""
+        if not self.images:
+            QMessageBox.warning(self, "警告", "画像が読み込まれていません。")
+            return
+        
+        # モデル情報を取得
+        model_type = self.location_model_combo.currentText()
+        selected_model = self.location_saved_model_combo.currentText()
+        
+        if selected_model == "位置モデルが見つかりません" or selected_model == "フォルダを選択してください":
+            QMessageBox.warning(self, "警告", "有効な位置モデルが選択されていません。")
+            return
+        
+        # モデルのパスを取得
+        models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+        model_path = os.path.join(models_dir, selected_model)
+        
+        # モデルが存在するか確認
+        if not os.path.exists(model_path):
+            QMessageBox.warning(self, "警告", f"選択されたモデルが見つかりません: {selected_model}")
+            return
+        
+        # 進捗ダイアログを表示
+        progress = QProgressDialog(
+            f"位置モデル '{model_type} ({selected_model})' を読み込み中...", 
+            "キャンセル", 0, 100, self
+        )
+        progress.setWindowTitle("モデル読み込み")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+        
+        # 進捗コールバック関数
+        def update_progress(value, message=None):
+            if message:
+                progress.setLabelText(message)
+            progress.setValue(value)
+            QApplication.processEvents()
+            return not progress.wasCanceled()
+        
+        try:
+            # マネージャーを使用してモデルをロード
+            success, result = self.location_model_manager.load_model(
+                model_type, model_path, update_progress
+            )
+            
+            if not success:
+                progress.close()
+                QMessageBox.critical(
+                    self, 
+                    "エラー", 
+                    f"位置モデルの読み込み中にエラーが発生しました: {result}"
+                )
+                return
+            
+            num_classes = result
+            
+            update_progress(80, "初期推論を実行中...")
+            
+            # 現在の画像に対して推論を実行
+            self.run_location_inference()
+            
+            update_progress(90, "推論表示を更新中...")
+            
+            # 推論表示チェックボックスを自動的にオンにする
+            self.location_inference_checkbox.setChecked(True)
+            
+            update_progress(100)
+            progress.close()
+            
+            # 成功メッセージ
+            self.statusBar().showMessage(f"位置モデル '{model_type} ({selected_model})' を読み込みました (クラス数: {num_classes})", 5000)
+            
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"位置モデルの読み込み中にエラーが発生しました: {str(e)}"
+            )
+
+    def run_location_inference(self):
+        """現在の画像に対して位置推論を実行"""
+        if not self.images or not hasattr(self, 'location_model_manager'):
+            return
+        
+        current_img_path = self.images[self.current_index]
+        
+        # マネージャーを使用して推論を実行
+        result = self.location_model_manager.run_inference(current_img_path)
+        
+        if result:
+            # 推論結果を保存
+            self.location_inference_results[current_img_path] = result
+            
+            # 表示を更新
+            self.update_location_inference_display()
+            
+            return True
+        
+        return False
+
+
+    # 位置推論表示切り替え
+    def toggle_location_inference_display(self, state):
+        """位置推論表示の切り替え"""
+        show_inference = (state == Qt.Checked)
+        self.show_location_inference = show_inference
+        
+        # 表示を更新
+        self.update_location_inference_display()
+        
+        # 表示状態をステータスバーに反映
+        if show_inference:
+            self.statusBar().showMessage("位置推論結果表示をオンにしました", 3000)
+        else:
+            self.statusBar().showMessage("位置推論結果表示をオフにしました", 3000)
+
+    # 位置推論表示更新
+    def update_location_inference_display(self):
+        """位置推論表示を更新する"""
+        if not self.images:
+            return
+        
+        current_img_path = self.images[self.current_index]
+        is_deleted = hasattr(self, 'deleted_indexes') and self.current_index in self.deleted_indexes
+        
+        if hasattr(self, 'location_inference_checkbox') and self.location_inference_checkbox.isChecked() and not is_deleted:
+            if current_img_path in self.location_inference_results:
+                # 推論結果を取得
+                result = self.location_inference_results[current_img_path]
+                pred_class = result['pred_class']
+                confidence = result['confidence']
+                all_probs = result.get('all_probs', [])
+                
+                # 情報テキストを構築
+                inference_text = "<b>位置推論結果:</b><br>"
+                inference_text += f"予測位置: <span style='color: #FF6666;'>{pred_class}</span><br>"
+                inference_text += f"確信度: <span style='color: #FF6666;'>{confidence:.4f}</span><br>"
+                
+                # すべてのクラスの確率を表示
+                if all_probs:
+                    inference_text += "<br>各位置の確率:<br>"
+                    for i, prob in enumerate(all_probs):
+                        # 位置によって色を変える
+                        color = get_location_color(i).name()
+                        # 予測クラスなら太字で表示
+                        if i == pred_class:
+                            inference_text += f"位置 {i}: <span style='color: {color}; font-weight: bold;'>{prob:.4f}</span><br>"
+                        else:
+                            inference_text += f"位置 {i}: <span style='color: {color};'>{prob:.4f}</span><br>"
+                
+                # テキストをラベルに設定
+                if hasattr(self, 'location_inference_info_label'):
+                    self.location_inference_info_label.setText(inference_text)
+                    self.location_inference_info_label.setTextFormat(Qt.RichText)
+                else:
+                    # ラベルがない場合は新規作成
+                    self.location_inference_info_label = QLabel(inference_text)
+                    self.location_inference_info_label.setWordWrap(True)
+                    self.location_inference_info_label.setStyleSheet("color: purple;")
+                    
+                    # レイアウトに追加（推論結果表示の下）
+                    if hasattr(self, 'detection_inference_info_label') and self.detection_inference_info_label.parent():
+                        parent_layout = self.detection_inference_info_label.parent().layout()
+                        if parent_layout:
+                            parent_layout.addWidget(self.location_inference_info_label)
+                    elif hasattr(self, 'inference_info_label') and self.inference_info_label.parent():
+                        parent_layout = self.inference_info_label.parent().layout()
+                        if parent_layout:
+                            parent_layout.addWidget(self.location_inference_info_label)
+                
+            # モデルがロードされていなくて推論結果もない場合は、推論を実行
+            elif hasattr(self, 'location_model') and hasattr(self, 'run_location_inference'):
+                self.run_location_inference()
+                # 再帰的に呼び出して表示を更新
+                self.update_location_inference_display()
+        else:
+            # 表示がオフの場合はラベルをクリア
+            if hasattr(self, 'location_inference_info_label'):
+                self.location_inference_info_label.setText("")
+
+    # 位置モデル学習
+    def train_and_save_location_model(self):
+        """位置モデルを学習して保存する"""
+        if not self.images or not self.location_annotations:
+            QMessageBox.warning(self, "警告", "位置モデルを学習するには位置アノテーションが必要です。")
+            return
+        
+        # 使用可能な位置情報のユニークなリストを取得
+        unique_locations = sorted(list(set(self.location_annotations.values())))
+        actual_classes = len(unique_locations)
+        
+        if actual_classes < 2:
+            QMessageBox.warning(self, "警告", f"位置モデルを学習するには少なくとも2つの異なる位置ラベルが必要です。現在: {actual_classes}種類")
+            return
+        
+        # 常に8クラスを使用（実際のクラス数に関わらず）
+        num_classes = 8
+        
+        # 選択されたモデル
+        model_type = self.location_model_combo.currentText()
+        
+        # 学習設定ダイアログを表示
+        training_settings = QDialog(self)
+        training_settings.setWindowTitle("位置モデル学習設定")
+        training_settings.setMinimumWidth(500)
+        
+        settings_layout = QVBoxLayout(training_settings)
+        
+        # 現在の位置情報の概要を表示
+        info_label = QLabel(f"検出された位置ラベル: {actual_classes}種類 ({', '.join(map(str, unique_locations))})")
+        settings_layout.addWidget(info_label)
+        
+        # 固定クラス数の情報表示
+        fixed_class_label = QLabel(f"※ 位置モデルは常に{num_classes}クラス出力で作成されます。")
+        fixed_class_label.setStyleSheet("color: #666666; font-style: italic;")
+        settings_layout.addWidget(fixed_class_label)
+        
+        # エポック数設定
+        epoch_layout = QHBoxLayout()
+        epoch_layout.addWidget(QLabel("学習エポック数:"))
+        epoch_spin = QSpinBox()
+        epoch_spin.setRange(1, 1000)
+        epoch_spin.setValue(30)  # デフォルト: 30エポック
+        epoch_layout.addWidget(epoch_spin)
+        settings_layout.addLayout(epoch_layout)
+        
+        # バッチサイズ設定
+        batch_layout = QHBoxLayout()
+        batch_layout.addWidget(QLabel("バッチサイズ:"))
+        batch_spin = QSpinBox()
+        batch_spin.setRange(1, 128)
+        batch_spin.setValue(16)  # デフォルト: 16
+        batch_layout.addWidget(batch_spin)
+        settings_layout.addLayout(batch_layout)
+        
+        # データオーグメンテーション設定
+        aug_check = QCheckBox("データオーグメンテーションを有効にする")
+        aug_check.setChecked(True)
+        settings_layout.addWidget(aug_check)
+        
+        # Early Stopping設定
+        early_stopping_check = QCheckBox("Early Stopping を有効にする")
+        early_stopping_check.setChecked(True)
+        settings_layout.addWidget(early_stopping_check)
+        
+        patience_layout = QHBoxLayout()
+        patience_layout.addWidget(QLabel("忍耐エポック数:"))
+        patience_spin = QSpinBox()
+        patience_spin.setRange(1, 20)
+        patience_spin.setValue(5)
+        patience_spin.setEnabled(True)
+        patience_layout.addWidget(patience_spin)
+        settings_layout.addLayout(patience_layout)
+        
+        # 学習率設定
+        lr_layout = QHBoxLayout()
+        lr_layout.addWidget(QLabel("学習率:"))
+        
+        lr_combo = QComboBox()
+        learning_rates = ["0.001", "0.0005", "0.0001", "0.00005", "0.00001"]
+        lr_combo.addItems(learning_rates)
+        lr_combo.setCurrentIndex(0)  # デフォルト: 0.001
+        lr_layout.addWidget(lr_combo)
+        settings_layout.addLayout(lr_layout)
+        
+        # ボタンの配置
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(training_settings.accept)
+        button_box.rejected.connect(training_settings.reject)
+        settings_layout.addWidget(button_box)
+        
+        # ダイアログを表示
+        if not training_settings.exec_():
+            return
+        
+        # 設定値の取得
+        num_epochs = epoch_spin.value()
+        batch_size = batch_spin.value()
+        use_augmentation = aug_check.isChecked()
+        use_early_stopping = early_stopping_check.isChecked()
+        patience = patience_spin.value() if use_early_stopping else 0
+        learning_rate = float(lr_combo.currentText())
+        
+        # データの準備
+        try:
+            # 位置ラベルのマッピングを作成（実際の位置値をインデックスに変換）
+            location_to_index = {loc: i for i, loc in enumerate(unique_locations)}
+            
+            # データを準備
+            from model_training import prepare_location_data_from_annotations
+            image_paths, location_labels = prepare_location_data_from_annotations(
+                self.annotations, self.location_annotations
+            )
+            
+            # ラベルをインデックスに変換
+            location_indices = [location_to_index[label] for label in location_labels]
+            
+            # 進捗ダイアログを表示
+            progress = QProgressDialog(
+                f"位置モデル '{model_type}' の学習データを準備中...", 
+                "キャンセル", 0, 100, self
+            )
+            progress.setWindowTitle("位置モデル学習")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+            QApplication.processEvents()
+            
+            # データセット作成
+            from model_training import create_location_datasets
+            train_loader, val_loader, dataset_info = create_location_datasets(
+                image_paths=image_paths,
+                location_labels=location_indices,
+                val_split=0.2,
+                model_name=model_type,
+                batch_size=batch_size,
+                use_augmentation=use_augmentation
+            )
+            
+            progress.setValue(20)
+            progress.setLabelText(f"モデル '{model_type}' を初期化中... (固定{num_classes}クラス)")
+            QApplication.processEvents()
+            
+            # モデル保存ディレクトリ
+            models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+            os.makedirs(models_dir, exist_ok=True)
+            
+            # 進捗コールバック関数
+            def update_progress(current, total, message=None):
+                if message:
+                    progress.setLabelText(message)
+                progress.setValue(20 + int(current * 70 / total))
+                QApplication.processEvents()
+                return not progress.wasCanceled()
+            
+            # モデル学習 - 常に8クラスで初期化
+            from model_training import train_location_model
+            training_results = train_location_model(
+                model_name=model_type,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                num_classes=num_classes,  # 常に8クラスを使用
+                num_epochs=num_epochs,
+                learning_rate=learning_rate,
+                save_dir=models_dir,
+                progress_callback=update_progress,
+                use_early_stopping=use_early_stopping,
+                patience=patience
+            )
+            
+            # モデルのメタデータに実際のクラス数を保存
+            # チェックポイントを読み込み
+            checkpoint_path = training_results['best_model_path']
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            
+            # 'num_classes'キーに実際のクラス数とマッピング情報を追加
+            checkpoint['num_classes'] = num_classes
+            checkpoint['actual_classes'] = actual_classes
+            checkpoint['location_mapping'] = location_to_index
+            
+            # 更新したチェックポイントを保存
+            torch.save(checkpoint, checkpoint_path)
+            
+            progress.setValue(95)
+            progress.setLabelText("モデルリストを更新中...")
+            QApplication.processEvents()
+            
+            # MLflowに結果を記録
+            if hasattr(self, 'initialize_mlflow') and hasattr(self, 'log_model_to_mlflow'):
+                try:
+                    # MLflow初期化
+                    self.initialize_mlflow()
+                    
+                    # MLflowに記録
+                    self.log_model_to_mlflow(
+                        model_path=training_results['best_model_path'],
+                        model_type=model_type,
+                        training_params={
+                            "num_epochs": num_epochs,
+                            "completed_epochs": training_results['completed_epochs'],
+                            "learning_rate": learning_rate,
+                            "batch_size": batch_size,
+                            "use_early_stopping": use_early_stopping,
+                            "patience": patience,
+                            "early_stopped": training_results['early_stopped'],
+                            "augmentation_enabled": use_augmentation,
+                            "fixed_classes": num_classes,
+                            "actual_classes": actual_classes
+                        },
+                        metrics={
+                            "best_val_loss": training_results['best_val_loss'],
+                            "best_val_acc": training_results['best_val_acc'],
+                            "train_losses": training_results['train_losses'],
+                            "val_losses": training_results['val_losses'],
+                            "train_accuracies": training_results['train_accuracies'],
+                            "val_accuracies": training_results['val_accuracies']
+                        },
+                        dataset_info={
+                            "total_annotations": len(self.location_annotations),
+                            "used_samples": len(image_paths),
+                            "train_samples": dataset_info['train_samples'],
+                            "val_samples": dataset_info['val_samples'],
+                            "input_shape": dataset_info['actual_image_size'],
+                            "num_classes": num_classes,
+                            "actual_classes": actual_classes
+                        }
+                    )
+                    mlflow_msg = "MLflowに学習履歴を記録しました。"
+                except Exception as e:
+                    print(f"MLflow記録エラー: {e}")
+                    mlflow_msg = f"MLflowへの記録に失敗しました: {str(e)}"
+            else:
+                mlflow_msg = "MLflow機能が利用できないため、学習履歴は記録されませんでした。"
+            
+            # モデルリストを更新
+            self.refresh_location_model_list()
+            
+            progress.setValue(100)
+            progress.close()
+            
+            # 学習完了メッセージ
+            QMessageBox.information(
+                self, 
+                "学習完了", 
+                f"{model_type} 位置モデルを学習し保存しました: {os.path.basename(training_results['best_model_path'])}\n" +
+                f"最良検証損失: {training_results['best_val_loss']:.6f}\n" +
+                f"最良検証精度: {training_results['best_val_acc']:.2f}%\n" +
+                f"実施エポック数: {training_results['completed_epochs']}/{num_epochs}\n" +
+                f"出力クラス数: {num_classes} (実際の位置クラス数: {actual_classes})\n" +
+                f"学習データ数: {len(image_paths)}枚\n" +
+                f"{mlflow_msg}"
+            )
+            
+        except Exception as e:
+            if 'progress' in locals():
+                progress.close()
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"位置モデル学習中にエラーが発生しました: {str(e)}"
+            )
+
+
+    # 一括位置推論実行
+    def run_batch_location_inference(self):
+        """すべての画像に対して位置推論を実行"""
+        if not self.images or not hasattr(self, 'location_model'):
+            QMessageBox.warning(self, "警告", "位置モデルが読み込まれていないか、画像がありません。")
+            return
+        
+        # 確認ダイアログ
+        reply = QMessageBox.question(
+            self,
+            "一括推論確認",
+            f"全{len(self.images)}枚の画像に対して位置推論を実行しますか？\n"
+            f"処理には時間がかかる場合があります。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.No:
+            return
+        
+        # 進捗ダイアログ
+        progress = QProgressDialog("位置推論実行中...", "キャンセル", 0, len(self.images), self)
+        progress.setWindowTitle("一括推論中")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+        
+        try:
+            # バッチサイズ
+            batch_size = 64
+            
+            # 全画像処理
+            processed_count = 0
+            
+            for i in range(0, len(self.images), batch_size):
+                if progress.wasCanceled():
+                    break
+                
+                # 現在のバッチ
+                batch_paths = self.images[i:i+batch_size]
+                progress.setValue(i)
+                
+                # 各画像に対して推論実行
+                for img_path in batch_paths:
+                    try:
+                        # 画像を読み込む
+                        img = Image.open(img_path).convert('RGB')
+                        
+                        # モデルの前処理を取得
+                        if not hasattr(self.location_model, '_preprocess') or self.location_model._preprocess is None:
+                            self.location_model._preprocess = self.location_model.get_preprocess()
+                        
+                        # 前処理を適用
+                        tensor_image = self.location_model._preprocess(img)
+                        tensor_image = tensor_image.unsqueeze(0)
+                        
+                        # デバイスを取得
+                        device = next(self.location_model.parameters()).device
+                        tensor_image = tensor_image.to(device)
+                        
+                        # 推論実行
+                        with torch.no_grad():
+                            logits = self.location_model(tensor_image)
+                            probs = torch.softmax(logits, dim=1)
+                            
+                            # クラスインデックスと確率を取得
+                            max_prob, pred_class = torch.max(probs, dim=1)
+                            
+                            # 全クラスの確率をリストとして取得
+                            all_probs = probs[0].cpu().numpy().tolist()
+                        
+                        # 推論結果を保存
+                        self.location_inference_results[img_path] = {
+                            'pred_class': pred_class.item(),
+                            'confidence': max_prob.item(),
+                            'all_probs': all_probs
+                        }
+                        
+                        processed_count += 1
+                        
+                    except Exception as e:
+                        print(f"画像 {img_path} の推論中にエラー: {e}")
+                        continue
+                
+                # 進捗表示を更新
+                progress.setValue(processed_count)
+            
+            progress.close()
+            
+            # 推論表示チェックボックスを自動的にオンにする
+            self.location_inference_checkbox.setChecked(True)
+            
+            # 表示を更新
+            self.update_location_inference_display()
+            
+            # 完了メッセージ
+            if not progress.wasCanceled():
+                QMessageBox.information(
+                    self,
+                    "一括推論完了",
+                    f"{processed_count}枚の画像に対する位置推論を完了しました。"
+                )
+            
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(
+                self,
+                "エラー",
+                f"一括位置推論実行中にエラーが発生しました: {str(e)}"
+            )
+
+    # オートアノテーション（位置情報）
+    def auto_annotate_location(self):
+        """位置推論モデルを使用して自動的に位置アノテーションを実行"""
+        if not self.images or not hasattr(self, 'location_model'):
+            QMessageBox.warning(self, "警告", "位置モデルが読み込まれていないか、画像がありません。")
+            return
+        
+        # アノテーション済み画像を除外する
+        unannotated_images = [img for img in self.images if img not in self.location_annotations]
+        
+        if not unannotated_images:
+            QMessageBox.information(self, "情報", "すべての画像に位置アノテーションが付けられています。")
+            return
+        
+        # 確認ダイアログ
+        reply = QMessageBox.question(
+            self,
+            "オートアノテーション確認",
+            f"{len(unannotated_images)}枚の未アノテーション画像に対して位置オートアノテーションを実行しますか？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+        
+        if reply == QMessageBox.No:
+            return
+        
+        # 信頼度閾値の設定
+        confidence, ok = QInputDialog.getDouble(
+            self, 
+            "信頼度閾値", 
+            "アノテーション適用の最小信頼度 (0.0-1.0):",
+            0.8, 0.5, 1.0, 2
+        )
+        
+        if not ok:
+            return
+        
+        # 進捗ダイアログ
+        progress = QProgressDialog("位置オートアノテーション実行中...", "キャンセル", 0, len(unannotated_images), self)
+        progress.setWindowTitle("オートアノテーション")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+        
+        try:
+            # バッチサイズ
+            batch_size = 64
+            
+            # 全画像処理
+            processed_count = 0
+            applied_count = 0
+            
+            for i in range(0, len(unannotated_images), batch_size):
+                if progress.wasCanceled():
+                    break
+                
+                # 現在のバッチ
+                batch_paths = unannotated_images[i:i+batch_size]
+                progress.setValue(i)
+                
+                # 各画像に対して推論実行
+                for img_path in batch_paths:
+                    try:
+                        # 既に推論結果がある場合はそれを使用
+                        if img_path in self.location_inference_results:
+                            result = self.location_inference_results[img_path]
+                            pred_class = result['pred_class']
+                            pred_confidence = result['confidence']
+                        else:
+                            # 画像を読み込む
+                            img = Image.open(img_path).convert('RGB')
+                            
+                            # モデルの前処理を取得
+                            if not hasattr(self.location_model, '_preprocess') or self.location_model._preprocess is None:
+                                self.location_model._preprocess = self.location_model.get_preprocess()
+                            
+                            # 前処理を適用
+                            tensor_image = self.location_model._preprocess(img)
+                            tensor_image = tensor_image.unsqueeze(0)
+                            
+                            # デバイスを取得
+                            device = next(self.location_model.parameters()).device
+                            tensor_image = tensor_image.to(device)
+                            
+                            # 推論実行
+                            with torch.no_grad():
+                                logits = self.location_model(tensor_image)
+                                probs = torch.softmax(logits, dim=1)
+                                
+                                # クラスインデックスと確率を取得
+                                max_prob, pred_class = torch.max(probs, dim=1)
+                                
+                                # 全クラスの確率をリストとして取得
+                                all_probs = probs[0].cpu().numpy().tolist()
+                            
+                            # 推論結果を保存
+                            pred_class = pred_class.item()
+                            pred_confidence = max_prob.item()
+                            
+                            self.location_inference_results[img_path] = {
+                                'pred_class': pred_class,
+                                'confidence': pred_confidence,
+                                'all_probs': all_probs
+                            }
+                        
+                        # 信頼度が閾値を超える場合のみアノテーションを適用
+                        if pred_confidence >= confidence:
+                            # 位置アノテーションとしてデータベースに追加
+                            self.location_annotations[img_path] = pred_class
+                            
+                            # 自動運転アノテーションもある場合は追加
+                            if img_path in self.annotations:
+                                self.annotations[img_path]["loc"] = pred_class
+                            
+                            applied_count += 1
+                        
+                        processed_count += 1
+                        
+                    except Exception as e:
+                        print(f"画像 {img_path} の推論中にエラー: {e}")
+                        continue
+                
+                # 進捗表示を更新
+                progress.setValue(processed_count)
+            
+            progress.close()
+            
+            # UI更新
+            self.update_location_button_counts()
+            self.update_ui()
+            
+            # 完了メッセージ
+            if not progress.wasCanceled():
+                QMessageBox.information(
+                    self,
+                    "オートアノテーション完了",
+                    f"{processed_count}枚の画像に対して位置推論を実行し、\n"
+                    f"{applied_count}枚の画像に位置アノテーション（信頼度: {confidence:.2f}以上）を適用しました。"
+                )
+            
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(
+                self,
+                "エラー",
+                f"位置オートアノテーション実行中にエラーが発生しました: {str(e)}"
+            )
+
 
 # メインプログラムのセクション
 if __name__ == "__main__":

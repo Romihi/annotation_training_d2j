@@ -507,6 +507,151 @@ class DonkeyModel_FCN(BaseModel):
             #transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
+# Add these classification models to model_catalog.py
+class DonkeyLocationModel(BaseModel):
+    """Donkeycarモデルをベースとした位置分類用モデル"""
+    def __init__(self, num_classes=8, pretrained=False, input_size=(224, 224)):
+        super(DonkeyLocationModel, self).__init__(name="donkey_location")
+        
+        # 入力サイズを保存（前処理と特徴計算で使用）
+        self.input_size = input_size
+        self.num_classes = num_classes
+        
+        # 特徴抽出部分（DonkeyModelと同じ）
+        drop = 0.2
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 24, kernel_size=5, stride=2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop),
+            nn.Conv2d(24, 32, kernel_size=5, stride=2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop),
+            nn.Conv2d(32, 64, kernel_size=5, stride=2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop),
+            nn.Flatten()
+        )
+        
+        # 計算される特徴マップサイズに依存するため、ダミー入力を使って計算
+        dummy_input = torch.zeros(1, 3, input_size[0], input_size[1])
+        dummy_output = self.features(dummy_input)
+        feature_size = dummy_output.shape[1]
+        
+        print(f"DonkeyLocationModel feature size: {feature_size} for input {input_size}")
+
+        # 全結合層
+        self.dense_layers = nn.Sequential(
+            nn.Linear(feature_size, 100),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop),
+            nn.Linear(100, 50),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop),
+        )        
+
+        # 分類器（位置情報の予測）
+        self.classifier = nn.Linear(50, num_classes)
+    
+    def forward(self, x):
+        x = self.features(x)
+        x = self.dense_layers(x)
+        x = self.classifier(x)
+        return x
+    
+    def get_preprocess(self):
+        """Donkeycar用の前処理 - 保存されている入力サイズを使用"""
+        return transforms.Compose([
+            transforms.Resize(self.input_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+    def run(self, img_arr):
+        """推論メソッド（分類用）"""
+        # 前処理パイプラインが初期化されていなければ作成
+        if self._preprocess is None:
+            self._preprocess = self.get_preprocess()
+        
+        # PILイメージに変換して前処理を適用
+        pil_image = Image.fromarray(img_arr)
+        tensor_image = self._preprocess(pil_image)
+        tensor_image = tensor_image.unsqueeze(0)
+        
+        # デバイスに転送
+        tensor_image = tensor_image.to(self.device)
+                
+        # 勾配計算なしで推論を実行
+        with torch.no_grad():
+            logits = self(tensor_image)
+            probs = torch.softmax(logits, dim=1)
+            
+            # クラスインデックスと確率を取得
+            max_prob, pred_class = torch.max(probs, dim=1)
+        
+        # CPU上のNumPy配列に変換
+        pred_class = pred_class.cpu().numpy()[0]
+        max_prob = max_prob.cpu().numpy()[0]
+        
+        return pred_class, max_prob
+
+class ResNet18LocationModel(TIMMBasedModel):
+    """ResNet18をベースとした位置分類用モデル"""
+    def __init__(self, num_classes=8, pretrained=True):
+        self.num_classes = num_classes
+        super(ResNet18LocationModel, self).__init__(
+            name="resnet18_location",
+            timm_model_name="resnet18",
+            pretrained=pretrained,
+            num_outputs=num_classes
+        )
+
+    def forward(self, x):
+        """順伝播処理"""
+        features = self.base_model(x)
+        
+        # 特徴量がテンソルでない場合（辞書など）の対応
+        if not isinstance(features, torch.Tensor):
+            features = next(iter(features.values()))
+            
+        # 分類出力
+        logits = self.regressor(features)
+        return logits
+
+    def run(self, img_arr):
+        """推論メソッド（分類用）"""
+        # 前処理パイプラインが初期化されていなければ作成
+        if self._preprocess is None:
+            self._preprocess = self.get_preprocess()
+        
+        # PILイメージに変換して前処理を適用
+        pil_image = Image.fromarray(img_arr)
+        tensor_image = self._preprocess(pil_image)
+        tensor_image = tensor_image.unsqueeze(0)
+        
+        # デバイスに転送
+        tensor_image = tensor_image.to(self.device)
+                
+        # 勾配計算なしで推論を実行
+        with torch.no_grad():
+            logits = self(tensor_image)
+            probs = torch.softmax(logits, dim=1)
+            
+            # クラスインデックスと確率を取得
+            max_prob, pred_class = torch.max(probs, dim=1)
+        
+        # CPU上のNumPy配列に変換
+        pred_class = pred_class.cpu().numpy()[0]
+        max_prob = max_prob.cpu().numpy()[0]
+        
+        return pred_class, max_prob
+
+
 # 利用可能なすべてのモデルを登録する辞書
 MODEL_REGISTRY = {
     # Donkeycar model
@@ -559,7 +704,11 @@ MODEL_REGISTRY = {
     
     # EfficientFormer variants
     "efficientformer_l1": EfficientFormerL1Model,
-    
+
+    # 位置推論モデル
+    "donkey_location": DonkeyLocationModel,
+    "resnet18_location": ResNet18LocationModel,
+
 }
 
 
