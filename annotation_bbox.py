@@ -1038,6 +1038,17 @@ class ImageAnnotationTool(QMainWindow):
 
         QApplication.instance().installEventFilter(self)
 
+    #m
+    def init_location_model_attributes(self):
+        """位置モデル関連の属性を初期化"""
+        # 位置モデル関連の状態変数
+        self.location_model_loaded = False  # 位置モデルが読み込まれているかどうか
+        self.location_inference_results = {}  # 位置推論結果を保存する辞書
+        
+        # 位置推論結果表示フラグ
+        self.show_location_inference = False
+
+
     def update_distribution_graph(self):
         """アノテーションの角度とスロットル値の分布を縦並びのヒストグラムで表示"""
         import matplotlib
@@ -1292,6 +1303,26 @@ class ImageAnnotationTool(QMainWindow):
         # 物体検知推論結果格納用の辞書を初期化
         self.detection_inference_results = {}
 
+    #m
+    def add_location_inference_controls(self):
+        """位置推論表示コントロールを追加"""
+        # 既存の推論結果表示オプションの後に追加
+        if hasattr(self, 'inference_checkbox'):
+            inference_parent = self.inference_checkbox.parent()
+            if inference_parent:
+                parent_layout = inference_parent.layout()
+                
+                if parent_layout:
+                    # 位置推論結果表示チェックボックス
+                    location_inference_layout = QHBoxLayout()
+                    self.location_inference_checkbox = QCheckBox("位置推論結果表示")
+                    self.location_inference_checkbox.setChecked(False)
+                    self.location_inference_checkbox.stateChanged.connect(self.toggle_location_inference_display)
+                    location_inference_layout.addWidget(self.location_inference_checkbox)
+                    
+                    # レイアウトに追加
+                    parent_layout.addLayout(location_inference_layout)
+
     def toggle_detection_inference_display(self, state):
         """物体検知推論表示の切り替え"""
         show_inference = (state == Qt.Checked)
@@ -1309,6 +1340,24 @@ class ImageAnnotationTool(QMainWindow):
         else:
             self.statusBar().showMessage("物体検知推論結果表示をオフにしました", 3000)
     
+    #m
+    def toggle_location_inference_display(self, state):
+        """位置推論表示の切り替え"""
+        show_inference = (state == Qt.Checked)
+        print(f"位置推論表示切替: {show_inference} (state={state}, Qt.Checked={Qt.Checked})")
+
+        self.show_location_inference = show_inference
+
+        # 画面更新
+        self.update_location_info_panel()
+        self.main_image_view.update()
+        
+        # 表示状態をステータスバーに反映
+        if show_inference:
+            self.statusBar().showMessage("位置推論結果表示をオンにしました", 3000)
+        else:
+            self.statusBar().showMessage("位置推論結果表示をオフにしました", 3000)
+
     def initialize_mlflow(self):
         """MLflowの初期化と設定を行う - Windows環境対応（修正版）"""
         import os
@@ -1667,6 +1716,7 @@ class ImageAnnotationTool(QMainWindow):
                         font-weight: bold;
                     }}
                 """)
+
 
     def add_location_button(self):
         """位置情報選択ボタンを追加する"""
@@ -2727,6 +2777,67 @@ class ImageAnnotationTool(QMainWindow):
                 self.inference_info_label.setText("")
             
             self.main_image_view.inference_point = None
+            
+            return False
+
+    #m
+    def update_location_info_panel(self):
+        """位置推論結果の情報パネルを更新する"""
+        if not self.images:
+            return False
+                
+        current_img_path = self.images[self.current_index]
+        is_deleted = hasattr(self, 'deleted_indexes') and self.current_index in self.deleted_indexes
+        
+        if hasattr(self, 'location_inference_checkbox') and self.location_inference_checkbox.isChecked() and not is_deleted:
+            if current_img_path in self.location_inference_results:
+                # 推論結果を取得
+                inference = self.location_inference_results[current_img_path]
+                
+                # 位置推論情報のリッチテキスト
+                inference_text = "<b>位置推論結果:</b><br>"
+                
+                # 位置情報を取得
+                location = inference.get("loc", None)
+                
+                # 位置情報があれば色付きバッジとして表示
+                if location is not None:
+                    loc_color = get_location_color(location)
+                    
+                    inference_text += f"<br><div style='margin-top: 10px;'>"
+                    inference_text += f"<div style='display: inline-block; background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 5px; border-radius: 5px;'>"
+                    inference_text += f"推論位置 {location}</div></div>"
+
+                # リッチテキストとして設定
+                if hasattr(self, 'location_inference_info_label'):
+                    self.location_inference_info_label.setText(inference_text)
+                    self.location_inference_info_label.setTextFormat(Qt.RichText)
+                    self.location_inference_info_label.repaint()
+                    QApplication.processEvents()  # UIを即時更新
+
+                # ImageLabelに位置推論ポイントを設定（後で実装するdraw_location_inference関数用）
+                self.main_image_view.location_inference_result = inference
+                
+                return True
+                    
+            elif hasattr(self, 'run_location_inference_check'):
+                # 推論結果がない場合は実行
+                self.run_location_inference_check(False)
+                
+                # 推論実行後に再度チェック
+                if current_img_path in self.location_inference_results:
+                    # 再帰的に呼び出して情報パネルを更新
+                    return self.update_location_info_panel()
+                
+                return False
+        else:
+            # 表示がオフの場合は情報パネルをクリア
+            if hasattr(self, 'location_inference_info_label'):
+                self.location_inference_info_label.setText("")
+            
+            # 位置推論ポイントをクリア
+            if hasattr(self, 'main_image_view'):
+                self.main_image_view.location_inference_result = None
             
             return False
 
@@ -4154,177 +4265,6 @@ class ImageAnnotationTool(QMainWindow):
                 if "background-color" not in current_style:  # 特殊スタイルがないボタンのみ
                     button.setStyleSheet(button_style)
 
-    def load_selected_model(self):
-        """選択されたモデルを明示的に読み込む - 詳細な進捗メッセージ付き"""
-        if not self.images:
-            QMessageBox.warning(self, "警告", "画像が読み込まれていません。")
-            return
-        
-        # モデル情報を取得
-        model_type = self.auto_method_combo.currentText()
-        selected_model = self.model_combo.currentText()
-        
-        if selected_model == "モデルが見つかりません" or selected_model == "フォルダを選択してください" or "が見つかりません" in selected_model:
-            QMessageBox.warning(self, "警告", "有効なモデルが選択されていません。")
-            return
-        
-        # モデルのパスを取得
-        models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
-        model_path = os.path.join(models_dir, selected_model)
-        
-        # モデルが存在するか確認
-        if not os.path.exists(model_path):
-            QMessageBox.warning(self, "警告", f"選択されたモデルが見つかりません: {selected_model}")
-            return
-        
-        # 進捗ダイアログを表示
-        progress = QProgressDialog(
-            f"モデル '{model_type} ({selected_model})' を読み込み中...", 
-            "キャンセル", 0, 100, self
-        )
-        progress.setWindowTitle("モデル読み込み")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)  # すぐに表示
-        progress.setValue(0)
-        progress.show()
-        QApplication.processEvents()
-        
-        # 既存の推論結果がある場合は確認ダイアログを表示
-        clear_inference = False
-        if self.inference_results:
-            progress.setLabelText(f"既存の推論結果: {len(self.inference_results)}個\n確認ダイアログを表示します...")
-            progress.setValue(5)
-            QApplication.processEvents()
-            
-            # 進捗ダイアログを一時的に非表示
-            progress.hide()
-            
-            reply = QMessageBox.question(
-                self, 
-                "推論結果のクリア確認", 
-                f"現在、{len(self.inference_results)}個の推論結果が保存されています。\n"
-                f"モデルを変更すると古い推論結果が新しいモデルと不整合を起こす可能性があります。\n\n"
-                f"既存の推論結果をクリアしますか？",
-                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
-                QMessageBox.Yes
-            )
-            
-            if reply == QMessageBox.Cancel:
-                progress.cancel()
-                return  # 操作をキャンセル
-            
-            clear_inference = (reply == QMessageBox.Yes)
-            
-            # 進捗ダイアログを再表示
-            progress.show()
-        
-        try:
-            # 推論結果をクリアする場合
-            if clear_inference:
-                progress.setLabelText("既存の推論結果をクリア中...")
-                progress.setValue(10)
-                QApplication.processEvents()
-                
-                old_count = len(self.inference_results)
-                self.inference_results = {}
-                self.statusBar().showMessage(f"{old_count}個の古い推論結果をクリアしました", 2000)
-            
-            # モデルの初期化
-            progress.setLabelText("モデルアーキテクチャの初期化中...")
-            progress.setValue(20)
-            QApplication.processEvents()
-            
-            # PyTorchモデルの読み込み
-            progress.setLabelText(f"モデルファイルを読み込み中: {os.path.basename(model_path)}")
-            progress.setValue(40)
-            QApplication.processEvents()
-            
-            # モデルをメモリに読み込む
-            progress.setLabelText("モデルを初期化中...")
-            progress.setValue(50)
-            QApplication.processEvents()
-            
-            # GPU/CPUへの転送
-            device_type = "GPU" if torch.cuda.is_available() else "CPU"
-            progress.setLabelText(f"モデルを{device_type}に転送中...")
-            progress.setValue(60)
-            QApplication.processEvents()
-            
-            # 現在の画像に対する推論を実行
-            current_img_path = self.images[self.current_index]
-            progress.setLabelText(f"推論実行中: {os.path.basename(current_img_path)}")
-            progress.setValue(70)
-            QApplication.processEvents()
-            
-            # モデルを強制的に再読み込み（現在表示中の画像だけ推論）
-            inference_results = batch_inference(
-                [current_img_path],
-                method="model", 
-                model_type=model_type,
-                model_path=model_path,
-                force_reload=True  # 強制再読み込み
-            )
-            
-            progress.setLabelText("推論結果を保存中...")
-            progress.setValue(80)
-            QApplication.processEvents()
-            
-            # 推論結果を保存
-            self.inference_results.update(inference_results)
-            
-            # モデル変更を検出するための状態を保持
-            self._last_model_info = (model_type, model_path)
-            
-            # 推論表示チェックボックスを自動的にオンにする
-            progress.setLabelText("推論表示を更新中...")
-            progress.setValue(90)
-            QApplication.processEvents()
-            
-            self.inference_checkbox.setChecked(True)
-            
-            # 推論表示を更新
-            self.update_inference_display()
-            self.main_image_view.update()
-            self.update_gallery()  # ギャラリー表示も更新
-            
-            progress.setValue(100)
-            QApplication.processEvents()
-            
-            # 成功メッセージ
-            message_suffix = ""
-            if clear_inference:
-                message_suffix = " (古い推論結果はクリアされました)"
-            self.statusBar().showMessage(f"モデル '{model_type} ({selected_model})' を読み込みました{message_suffix}", 3000)
-            
-            # 確認ダイアログ
-            confirm_message = f"モデル '{model_type} ({selected_model})' を読み込みました。"
-            if clear_inference:
-                confirm_message += f"\n\n{len(self.inference_results)}個の新しい推論結果が利用可能です。"
-            else:
-                confirm_message += f"\n\n既存の推論結果は保持されています。必要に応じて「一括推論実行」ボタンで更新してください。"
-            
-            confirm_message += "\n\n推論結果表示が自動的にオンになりました。"
-            
-            # 進捗ダイアログを閉じる
-            progress.close()
-            
-            QMessageBox.information(
-                self, 
-                "モデル読み込み完了", 
-                confirm_message
-            )
-            
-        except Exception as e:
-            # エラー発生時も進捗ダイアログを閉じる
-            progress.close()
-            
-            self.statusBar().clearMessage()
-            QMessageBox.critical(
-                self, 
-                "エラー", 
-                f"モデル読み込み中にエラーが発生しました: {str(e)}"
-            )
-            
     def set_clip_start_to_current(self):
         """現在のインデックスをクリップ開始位置に設定する"""
         if not self.images:
@@ -4764,6 +4704,136 @@ class ImageAnnotationTool(QMainWindow):
                 "エラー", 
                 f"推論中にエラーが発生しました: {str(e)}"
             )
+
+    #m
+    def run_location_inference_check(self, all_images=False):
+        """位置推論を実行するメソッド"""
+        if not self.images:
+            return
+        
+        # 現在のモデル情報を取得
+        model_type = self.auto_method_combo.currentText()
+        selected_model = self.model_combo.currentText()
+        
+        # 推論対象の画像を決定
+        if all_images:
+            target_images = self.images
+            progress_title = "全画像の位置推論を実行中..."
+        else:
+            target_images = [self.images[self.current_index]]
+            progress_title = "位置推論実行中..."
+        
+        # モデルのパスを取得
+        model_path = None
+        if hasattr(self, 'model_combo') and self.model_combo.currentText() not in ["モデルが見つかりません", "フォルダを選択してください"] and "が見つかりません" not in self.model_combo.currentText():
+            models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+            model_path = os.path.join(models_dir, selected_model)
+            
+            if not os.path.exists(model_path):
+                QMessageBox.warning(self, "警告", f"選択されたモデルが見つかりません: {selected_model}")
+                return
+        
+        # モデル変更を検出するための状態を保持
+        current_model_info = (model_type, model_path)
+        force_reload = False
+        
+        # モデルが変更された場合のみ強制再読み込み
+        if not hasattr(self, '_last_location_model_info') or self._last_location_model_info != current_model_info:
+            force_reload = True
+            self._last_location_model_info = current_model_info
+        
+        try:
+            # ステータスバーにメッセージ表示
+            model_desc = os.path.basename(model_path) if model_path else '事前学習済み'
+            self.statusBar().showMessage(f"位置推論処理中... モデル: {model_type} ({model_desc})")
+            QApplication.processEvents()
+
+            # 推論を実行
+            if model_type in list_available_models():
+                # モデルを使用した推論
+                inference_results = batch_inference(
+                    target_images, 
+                    method="model", 
+                    model_type=model_type,
+                    model_path=model_path,
+                    force_reload=force_reload
+                )
+            else:
+                QMessageBox.warning(self, "警告", "サポートされていない推論方法です。")
+                return
+            
+            # 推論結果を保存
+            old_count = len(self.location_inference_results)
+            for img_path, result in inference_results.items():
+                # 結果から位置情報を抽出
+                if "pilot/loc" in result:
+                    location = result["pilot/loc"]
+                elif "loc" in result:
+                    location = result["loc"]
+                else:
+                    # 位置情報がない場合、何らかのロジックで判断（例：角度から推定）
+                    location = self.estimate_location_from_angle(result.get("angle", 0))
+                
+                # 位置情報付きの結果を保存
+                self.location_inference_results[img_path] = {
+                    "loc": location,
+                    "x": result.get("x", 0),
+                    "y": result.get("y", 0)
+                }
+            
+            new_count = len(self.location_inference_results)
+            
+            # 位置推論表示チェックボックスを自動的にオンにする
+            was_checked = self.location_inference_checkbox.isChecked()
+            self.location_inference_checkbox.setChecked(True)
+            
+            # 表示を更新
+            self.update_location_info_panel()
+            self.main_image_view.update()
+
+            # ステータスバーのメッセージをクリア
+            self.statusBar().clearMessage()
+
+            # 全画像の推論の場合はメッセージ表示
+            if all_images:
+                added_results = new_count - old_count
+                updated_results = len(target_images) - added_results
+                
+                check_message = ""
+                if not was_checked:
+                    check_message = "\n\n位置推論結果表示が自動的にオンになりました。"
+                    
+                QMessageBox.information(
+                    self, 
+                    "位置推論完了", 
+                    f"{len(target_images)}枚の画像に対する位置推論を完了しました。\n"
+                    f"{added_results}個の新しい結果が追加され、{updated_results}個の結果が更新されました。\n\n"
+                    f"使用モデル: {model_type} ({model_desc}){check_message}"
+                )
+            
+        except Exception as e:
+            self.statusBar().clearMessage()
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"位置推論中にエラーが発生しました: {str(e)}"
+            )
+    #m
+    def estimate_location_from_angle(self, angle):
+        """角度から位置情報を推定する（簡易的な実装）"""
+        # 角度の範囲に基づいて位置を推定
+        # 例: -1.0～1.0の範囲を8つの位置に分割
+        angle_range = 2.0  # -1.0～1.0
+        section_size = angle_range / 8
+        
+        # 角度を位置番号に変換（0～7）
+        normalized_angle = angle + 1.0  # 0～2.0に正規化
+        location = int(normalized_angle / section_size)
+        
+        # 範囲外の値を調整
+        location = max(0, min(location, 7))
+        
+        return location
 
     def update_inference_display(self):
         """推論結果の表示を更新する"""
@@ -6407,7 +6477,13 @@ class ImageAnnotationTool(QMainWindow):
                 # 互換性のため、最後のボックスも個別に保存
                 if self.last_bboxes:
                     self.last_bbox = self.last_bboxes[-1].copy()
-        
+
+        # 位置推論表示チェックボックスがONの場合、位置推論結果がなければ実行
+        if hasattr(self, 'location_inference_checkbox') and self.location_inference_checkbox.isChecked():
+            current_img_path = self.images[self.current_index]
+            if current_img_path not in self.location_inference_results:
+                self.run_location_inference_check(False)
+
         # 自動位置設定をする前の現在の位置情報を保存
         old_current_location = self.current_location
         
@@ -8220,6 +8296,27 @@ class ImageAnnotationTool(QMainWindow):
         # 推論結果格納用の辞書を初期化
         self.location_inference_results = {}
 
+    def run_location_inference(self):
+        """現在の画像に対して位置推論を実行"""
+        if not self.images or not hasattr(self, 'location_model_manager'):
+            return
+        
+        current_img_path = self.images[self.current_index]
+        
+        # マネージャーを使用して推論を実行
+        result = self.location_model_manager.run_inference(current_img_path)
+        
+        if result:
+            # 推論結果を保存
+            self.location_inference_results[current_img_path] = result
+            
+            # 表示を更新
+            self.update_location_inference_display()
+            
+            return True
+        
+        return False
+
     def refresh_location_model_list(self):
         """保存されている位置モデルのリストを更新"""
         self.location_saved_model_combo.clear()
@@ -8353,157 +8450,6 @@ class ImageAnnotationTool(QMainWindow):
             return True
         
         return False
-
-        
-    def refresh_location_model_list(self):
-        """保存されている位置モデルのリストを更新"""
-        self.location_saved_model_combo.clear()
-        
-        # 更新開始のダイアログを表示
-        self.statusBar().showMessage("位置モデルリストを更新中...")
-        QApplication.processEvents()
-        
-        if not hasattr(self, 'folder_path') or not self.folder_path:
-            self.location_saved_model_combo.addItem("フォルダを選択してください")
-            self.statusBar().clearMessage()
-            return
-        
-        # マネージャーからモデルリストを取得
-        model_files = self.location_model_manager.get_model_list()
-        
-        if not model_files:
-            # フィルタリングした結果がなければ、その旨を表示
-            self.location_saved_model_combo.addItem("位置モデルが見つかりません")
-            self.statusBar().showMessage("位置モデルが見つかりません。モデルを学習してください", 3000)
-            return
-        
-        # コンボボックスに追加
-        for model_file in model_files:
-            self.location_saved_model_combo.addItem(model_file)
-        
-        # 更新完了メッセージ
-        self.statusBar().showMessage(f"{len(model_files)}個の位置モデルを読み込みました", 3000)
-
-    def load_location_model(self):
-        """選択された位置モデルを読み込む"""
-        if not self.images:
-            QMessageBox.warning(self, "警告", "画像が読み込まれていません。")
-            return
-        
-        # モデル情報を取得
-        model_type = self.location_model_combo.currentText()
-        selected_model = self.location_saved_model_combo.currentText()
-        
-        if selected_model == "位置モデルが見つかりません" or selected_model == "フォルダを選択してください":
-            QMessageBox.warning(self, "警告", "有効な位置モデルが選択されていません。")
-            return
-        
-        # モデルのパスを取得
-        models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
-        model_path = os.path.join(models_dir, selected_model)
-        
-        # モデルが存在するか確認
-        if not os.path.exists(model_path):
-            QMessageBox.warning(self, "警告", f"選択されたモデルが見つかりません: {selected_model}")
-            return
-        
-        # 進捗ダイアログを表示
-        progress = QProgressDialog(
-            f"位置モデル '{model_type} ({selected_model})' を読み込み中...", 
-            "キャンセル", 0, 100, self
-        )
-        progress.setWindowTitle("モデル読み込み")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
-        progress.show()
-        QApplication.processEvents()
-        
-        # 進捗コールバック関数
-        def update_progress(value, message=None):
-            if message:
-                progress.setLabelText(message)
-            progress.setValue(value)
-            QApplication.processEvents()
-            return not progress.wasCanceled()
-        
-        try:
-            # マネージャーを使用してモデルをロード
-            success, result = self.location_model_manager.load_model(
-                model_type, model_path, update_progress
-            )
-            
-            if not success:
-                progress.close()
-                QMessageBox.critical(
-                    self, 
-                    "エラー", 
-                    f"位置モデルの読み込み中にエラーが発生しました: {result}"
-                )
-                return
-            
-            num_classes = result
-            
-            update_progress(80, "初期推論を実行中...")
-            
-            # 現在の画像に対して推論を実行
-            self.run_location_inference()
-            
-            update_progress(90, "推論表示を更新中...")
-            
-            # 推論表示チェックボックスを自動的にオンにする
-            self.location_inference_checkbox.setChecked(True)
-            
-            update_progress(100)
-            progress.close()
-            
-            # 成功メッセージ
-            self.statusBar().showMessage(f"位置モデル '{model_type} ({selected_model})' を読み込みました (クラス数: {num_classes})", 5000)
-            
-        except Exception as e:
-            progress.close()
-            QMessageBox.critical(
-                self, 
-                "エラー", 
-                f"位置モデルの読み込み中にエラーが発生しました: {str(e)}"
-            )
-
-    def run_location_inference(self):
-        """現在の画像に対して位置推論を実行"""
-        if not self.images or not hasattr(self, 'location_model_manager'):
-            return
-        
-        current_img_path = self.images[self.current_index]
-        
-        # マネージャーを使用して推論を実行
-        result = self.location_model_manager.run_inference(current_img_path)
-        
-        if result:
-            # 推論結果を保存
-            self.location_inference_results[current_img_path] = result
-            
-            # 表示を更新
-            self.update_location_inference_display()
-            
-            return True
-        
-        return False
-
-
-    # 位置推論表示切り替え
-    def toggle_location_inference_display(self, state):
-        """位置推論表示の切り替え"""
-        show_inference = (state == Qt.Checked)
-        self.show_location_inference = show_inference
-        
-        # 表示を更新
-        self.update_location_inference_display()
-        
-        # 表示状態をステータスバーに反映
-        if show_inference:
-            self.statusBar().showMessage("位置推論結果表示をオンにしました", 3000)
-        else:
-            self.statusBar().showMessage("位置推論結果表示をオフにしました", 3000)
 
     # 位置推論表示更新
     def update_location_inference_display(self):
@@ -8831,7 +8777,6 @@ class ImageAnnotationTool(QMainWindow):
                 "エラー", 
                 f"位置モデル学習中にエラーが発生しました: {str(e)}"
             )
-
 
     # 一括位置推論実行
     def run_batch_location_inference(self):
