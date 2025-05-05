@@ -1,0 +1,8 @@
+
+# YOLO形式のデータセット設定
+path: C:\Users\hkior\projects\annotation_training_d2j\annotation\yolo_annotations  # データセットのルートディレクトリ
+train: images  # 訓練用画像の相対パス
+val: images    # 検証用画像の相対パス
+
+nc: 1  # クラス数
+names: ['car']  # クラス名

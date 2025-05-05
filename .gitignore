@@ -5,6 +5,7 @@ sessions/
 models/
 mlruns/
 utils/
+tmp/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

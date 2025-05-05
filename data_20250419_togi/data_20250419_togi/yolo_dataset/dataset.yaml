@@ -1,0 +1,9 @@
+
+    path: C:/Users/hkior/projects/annotation_training_d2j/data_20250419_togi/data_20250419_togi\yolo_dataset
+    train: train/images
+    val: val/images
+    test: test/images
+
+    nc: 4
+    names: ['car', 'person', 'sign', 'cone']
+            

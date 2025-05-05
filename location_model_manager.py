@@ -14,8 +14,15 @@ class LocationModelManager:
         self.model_path = None
         self.num_classes = 8  # 固定で8クラス
         
-    def get_model_list(self):
-        """利用可能な位置モデルのリストを取得"""
+    def get_model_list(self, model_type=None):
+        """利用可能な位置モデルのリストを取得 - モデルタイプでフィルタリング
+
+        Args:
+            model_type (str, optional): フィルタリングするモデルタイプ。指定しない場合はすべての位置モデルを返す。
+
+        Returns:
+            list: 位置モデルのファイル名リスト（モデルタイプでフィルタリング済み）
+        """
         models_dir = os.path.join(self.APP_DIR_PATH, self.MODELS_DIR_NAME)
         os.makedirs(models_dir, exist_ok=True)
         
@@ -25,14 +32,22 @@ class LocationModelManager:
         # 位置モデルでフィルタリング
         model_files = []
         for model_file in all_model_files:
+            # まず位置モデルかどうかをチェック
             if any(keyword in model_file.lower() for keyword in ['location', 'loc_model']):
-                model_files.append(model_file)
+                # モデルタイプが指定されている場合はさらにフィルタリング
+                if model_type:
+                    # モデルタイプがファイル名に含まれているか確認
+                    if model_type.lower() in model_file.lower():
+                        model_files.append(model_file)
+                else:
+                    # モデルタイプが指定されていない場合はすべての位置モデルを追加
+                    model_files.append(model_file)
         
         # モデルファイルを日付順にソート（新しいものが上）
         model_files.sort(reverse=True)
         
         return model_files
-    
+
     def load_model(self, model_type, model_path, progress_callback=None):
         """位置モデルを読み込む"""
         try:
@@ -168,4 +183,6 @@ class LocationModelManager:
         
         return results
     
-    # その他の必要なメソッド...
+    def is_model_loaded(self):
+        """位置モデルが読み込まれているかチェック"""
+        return hasattr(self, 'model') and self.model is not None

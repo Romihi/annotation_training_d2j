@@ -74,8 +74,8 @@ def enhanced_display_current_image(self):
         self.current_image_info.setStyleSheet("color: #333333; font-weight: bold;")
     
     # アノテーション情報の表示
-    if current_img_path in self.annotations and self.annotations[current_img_path] and not is_deleted:
-        anno = self.annotations[current_img_path]
+    if self.current_index in self.annotations and not is_deleted:
+        anno = self.annotations[self.current_index]
         
         # 基本的なアノテーション情報
         annotation_text = f"<b>運転アノテーション情報:</b><br>"
@@ -120,11 +120,11 @@ def enhanced_display_current_image(self):
     location_value = None
     if not is_deleted:
         # アノテーションの位置情報を確認
-        if current_img_path in self.annotations and 'loc' in self.annotations[current_img_path]:
-            location_value = self.annotations[current_img_path]['loc']
+        if self.current_index in self.annotations and 'loc' in self.annotations[self.current_index]:
+            location_value = self.annotations[self.current_index]['loc']
         # 位置情報専用の辞書を確認
-        elif current_img_path in self.location_annotations:
-            location_value = self.location_annotations[current_img_path]
+        elif self.current_index in self.location_annotations:
+            location_value = self.location_annotations[self.current_index]
     
     # 位置情報ラベルの更新
     if location_value is not None and not is_deleted:
@@ -160,15 +160,15 @@ def enhanced_display_current_image(self):
         self.main_image_view.setPixmap(pixmap)
         
         # アノテーションポイントの設定
-        if not is_deleted and current_img_path in self.annotations and self.annotations[current_img_path]:
-            anno = self.annotations[current_img_path]
+        if not is_deleted and self.current_index in self.annotations :
+            anno = self.annotations[self.current_index]
             self.main_image_view.annotation_point = QPoint(anno['x'], anno['y'])
         else:
             self.main_image_view.annotation_point = None
         
         # 推論ポイントの設定
-        if not is_deleted and self.inference_checkbox.isChecked() and current_img_path in self.inference_results:
-            inference = self.inference_results[current_img_path]
+        if not is_deleted and self.inference_checkbox.isChecked() and self.current_index in self.inference_results:
+            inference = self.inference_results[self.current_index]
             self.main_image_view.inference_point = QPoint(inference['x'], inference['y'])
         else:
             self.main_image_view.inference_point = None
@@ -500,16 +500,24 @@ def enhanced_update_gallery(self):
             annotation = None
             location_value = None  # Initialize here to prevent the error
             
-            if not is_deleted and img_path in self.annotations:
-                annotation = self.annotations[img_path]
+            if not is_deleted and idx in self.annotations:
+                annotation = self.annotations[idx]
             
                 # 位置情報を事前に特定
                 if annotation and 'loc' in annotation:
                     location_value = annotation['loc']
-                # あるいは位置情報専用の辞書を確認
-                elif img_path in self.location_annotations:
-                    location_value = self.location_annotations[img_path]
+
+            # if not is_deleted and img_path in self.annotations:
+            #     annotation = self.annotations[img_path]
             
+            #     # 位置情報を事前に特定
+            #     if annotation and 'loc' in annotation:
+            #         location_value = annotation['loc']
+            #     # あるいは位置情報専用の辞書を確認
+            #     elif img_path in self.location_annotations:
+            #         location_value = self.location_annotations[img_path]
+
+
             # 物体検知アノテーションを取得 (新規追加)
             bbox_annotations = None
             if not is_deleted and img_path in self.bbox_annotations:

@@ -1,0 +1,7 @@
+{"_index": 0, "_session_id": "25-05-01_0", "_timestamp_ms": 1746111345169, "user/angle": -0.2946428571428571, "user/mode": "user", "user/throttle": 0.125, "cam/image_array": "0_cam_image_array_.jpg"}
+{"_index": 1, "_session_id": "25-05-01_0", "_timestamp_ms": 1746111345173, "user/angle": 0.1785714285714286, "user/mode": "user", "user/throttle": 0.1964285714285714, "cam/image_array": "10_cam_image_array_.jpg"}
+{"_index": 2, "_session_id": "25-05-01_0", "_timestamp_ms": 1746111345176, "user/angle": 0.3392857142857142, "user/mode": "user", "user/throttle": 0.3125, "cam/image_array": "20_cam_image_array_.jpg"}
+{"_index": 3, "_session_id": "25-05-01_0", "_timestamp_ms": 1746111345179, "user/angle": 0.2321428571428572, "user/mode": "user", "user/throttle": 0.4910714285714286, "cam/image_array": "30_cam_image_array_.jpg"}
+{"_index": 4, "_session_id": "25-05-01_0", "_timestamp_ms": 1746111345182, "user/angle": -0.5982142857142857, "user/mode": "user", "user/throttle": 0.3928571428571429, "lidar/image_array": "40_lidar_image_array_.jpg"}
+{"_index": 5, "_session_id": "25-05-01_0", "_timestamp_ms": 1746111345184, "user/angle": 0.09821428571428581, "user/mode": "user", "user/throttle": 0.2410714285714286, "lidar/image_array": "50_lidar_image_array_.jpg"}
+{"_index": 6, "_session_id": "25-05-01_0", "_timestamp_ms": 1746111345188, "user/angle": 0.2857142857142858, "user/mode": "user", "user/throttle": -0.0803571428571428, "lidar/image_array": "60_lidar_image_array_.jpg"}

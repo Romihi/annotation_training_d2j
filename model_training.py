@@ -1577,12 +1577,33 @@ def visualize_location_predictions(
     plt.close()
     print(f'Location predictions visualization saved: {model_name}_location_predictions.png')
 
-def prepare_location_data_from_annotations(annotations, location_annotations):
+# def prepare_location_data_from_annotations(annotations, location_annotations):
+#     """アノテーションから位置分類用のデータを準備する
+
+#     Args:
+#         annotations: 自動運転アノテーション辞書
+#         location_annotations: 位置アノテーション辞書
+
+#     Returns:
+#         画像パスのリスト、位置ラベルのリスト
+#     """
+#     image_paths = []
+#     location_labels = []
+    
+#     # 位置情報があるアノテーションを収集
+#     for img_path, location in location_annotations.items():
+#         if img_path in annotations:  # 自動運転アノテーションもある場合のみ
+#             image_paths.append(img_path)
+#             location_labels.append(location)
+    
+#     return image_paths, location_labels
+def prepare_location_data_from_annotations(annotations, location_annotations, images_list=None):
     """アノテーションから位置分類用のデータを準備する
 
     Args:
         annotations: 自動運転アノテーション辞書
         location_annotations: 位置アノテーション辞書
+        images_list: 画像パスのリスト（オプション、インデックスから変換するために使用）
 
     Returns:
         画像パスのリスト、位置ラベルのリスト
@@ -1591,12 +1612,42 @@ def prepare_location_data_from_annotations(annotations, location_annotations):
     location_labels = []
     
     # 位置情報があるアノテーションを収集
-    for img_path, location in location_annotations.items():
-        if img_path in annotations:  # 自動運転アノテーションもある場合のみ
-            image_paths.append(img_path)
-            location_labels.append(location)
+    for key, location in location_annotations.items():
+        # キーがインデックス（整数）かどうかをチェック
+        if isinstance(key, int) and images_list:
+            # インデックスが有効範囲内かチェック
+            if 0 <= key < len(images_list):
+                # インデックスから画像パスに変換
+                img_path = images_list[key]
+                
+                # annotations辞書にも同じキーがあるかチェック
+                if key in annotations:
+                    image_paths.append(img_path)
+                    location_labels.append(location)
+        else:
+            # キーが画像パス（文字列）の場合
+            img_path = key
+            
+            # パスが存在するかチェック
+            if os.path.exists(img_path) and img_path in annotations:
+                image_paths.append(img_path)
+                location_labels.append(location)
     
-    return image_paths, location_labels
+    # 画像パスが実際に存在するかを最終確認
+    valid_paths = []
+    valid_labels = []
+    for path, label in zip(image_paths, location_labels):
+        if os.path.exists(path):
+            valid_paths.append(path)
+            valid_labels.append(label)
+        else:
+            print(f"警告: 画像パスが存在しません: {path}")
+    
+    print(f"位置データ準備完了: {len(valid_paths)} 個の有効な画像パス")
+    if len(valid_paths) == 0:
+        raise ValueError("有効な画像パスがありません。位置アノテーションを確認してください。")
+    
+    return valid_paths, valid_labels
 
 # モジュールが直接実行された場合のサンプル処理（オプション）
 if __name__ == "__main__":
