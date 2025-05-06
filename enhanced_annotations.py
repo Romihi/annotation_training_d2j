@@ -372,6 +372,84 @@ class EnhancedThumbnailWidget(QWidget):
         if self.on_click and event.button() == Qt.LeftButton:
             self.on_click(self.index)
 
+    # def load_image(self, img_path):
+    #     if not os.path.exists(img_path):
+    #         return
+        
+    #     try:
+    #         # PILで画像を開く
+    #         pil_img = Image.open(img_path)
+            
+    #         # 画像のコピーを作成して描画する
+    #         draw_img = pil_img.copy()
+    #         draw = ImageDraw.Draw(draw_img)
+            
+    #         # 基本的なアノテーションを描画（以前のコード部分）
+    #         if self.annotation and not self.is_deleted:
+    #             # アノテーションの座標を取得
+    #             x, y = self.annotation["x"], self.annotation["y"]
+                
+    #             # 丸を描画
+    #             circle_size = 15  # サムネイル用の丸のサイズを大きく
+    #             draw.ellipse((x-circle_size, y-circle_size, x+circle_size, y+circle_size), 
+    #                          outline='red', width=4)
+            
+    #         # 物体検知アノテーションがある場合は矩形を描画 (新規追加)
+    #         if self.bbox_annotations and not self.is_deleted:
+    #             img_width, img_height = pil_img.size
+                
+    #             for bbox in self.bbox_annotations:
+    #                 # クラスに応じた色を定義
+    #                 class_colors = {
+    #                     'car': (255, 0, 0),      # 赤
+    #                     'person': (0, 255, 0),   # 緑
+    #                     'sign': (0, 0, 255),     # 青
+    #                     'cone': (255, 255, 0),   # 黄
+    #                     'unknown': (128, 128, 128)  # グレー
+    #                 }
+                    
+    #                 class_name = bbox.get('class', 'unknown')
+    #                 color = class_colors.get(class_name, (255, 0, 0))
+                    
+    #                 # 正規化された座標を実際の座標に変換
+    #                 x1 = int(bbox['x1'] * img_width)
+    #                 y1 = int(bbox['y1'] * img_height)
+    #                 x2 = int(bbox['x2'] * img_width)
+    #                 y2 = int(bbox['y2'] * img_height)
+                    
+    #                 # 矩形を描画
+    #                 draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+                    
+    #                 # ラベルを表示 (サムネイルでは小さいのでクラス名の1文字目だけ表示)
+    #                 label_text = class_name[0].upper()  # 頭文字のみ
+                    
+    #                 # ラベル背景
+    #                 text_size = 10  # 大まかなテキストサイズ（PILのfont.getsize()の代替）
+    #                 label_bg = (x1, y1-text_size, x1+text_size, y1)
+    #                 draw.rectangle(label_bg, fill=color)
+                    
+    #                 # テキスト描画
+    #                 draw.text((x1+2, y1-text_size), label_text, fill=(255, 255, 255))
+            
+    #         # 画像をQImageに変換
+    #         draw_img = draw_img.convert("RGBA")
+    #         data = draw_img.tobytes("raw", "RGBA")
+    #         qimg = QImage(data, draw_img.width, draw_img.height, QImage.Format_RGBA8888)
+            
+    #         # QImageをQPixmapに変換してサムネイルに設定
+    #         pixmap = QPixmap.fromImage(qimg)
+            
+    #         if not pixmap.isNull():
+    #             pixmap = pixmap.scaled(170, 170, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    #             self.img_label.setPixmap(pixmap)
+                
+    #             # 削除済みの場合は半透明にする追加の処理
+    #             if self.is_deleted:
+    #                 self.setGraphicsEffect(QGraphicsOpacityEffect(opacity=0.5))
+            
+    #     except Exception as e:
+    #         print(f"Error loading image {img_path}: {e}")
+
     def load_image(self, img_path):
         if not os.path.exists(img_path):
             return
@@ -384,17 +462,17 @@ class EnhancedThumbnailWidget(QWidget):
             draw_img = pil_img.copy()
             draw = ImageDraw.Draw(draw_img)
             
-            # 基本的なアノテーションを描画（以前のコード部分）
+            # 基本的なアノテーションを描画
             if self.annotation and not self.is_deleted:
                 # アノテーションの座標を取得
                 x, y = self.annotation["x"], self.annotation["y"]
                 
                 # 丸を描画
-                circle_size = 15  # サムネイル用の丸のサイズを大きく
+                circle_size = 15  # サムネイル用の丸のサイズ
                 draw.ellipse((x-circle_size, y-circle_size, x+circle_size, y+circle_size), 
-                             outline='red', width=4)
+                            outline='red', width=4)
             
-            # 物体検知アノテーションがある場合は矩形を描画 (新規追加)
+            # 物体検知アノテーションがある場合は矩形を描画
             if self.bbox_annotations and not self.is_deleted:
                 img_width, img_height = pil_img.size
                 
@@ -424,7 +502,7 @@ class EnhancedThumbnailWidget(QWidget):
                     label_text = class_name[0].upper()  # 頭文字のみ
                     
                     # ラベル背景
-                    text_size = 10  # 大まかなテキストサイズ（PILのfont.getsize()の代替）
+                    text_size = 10  # 大まかなテキストサイズ
                     label_bg = (x1, y1-text_size, x1+text_size, y1)
                     draw.rectangle(label_bg, fill=color)
                     
@@ -440,8 +518,25 @@ class EnhancedThumbnailWidget(QWidget):
             pixmap = QPixmap.fromImage(qimg)
             
             if not pixmap.isNull():
-                pixmap = pixmap.scaled(170, 170, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self.img_label.setPixmap(pixmap)
+                # 画像ラベルのサイズを取得
+                label_width = self.img_label.width()
+                label_height = self.img_label.height()
+                
+                # サイズが0の場合は固定サイズを使用
+                if label_width == 0 or label_height == 0:
+                    label_width = 150
+                    label_height = 140
+                
+                # 重要な変更: ラベルサイズと同じサイズでスケーリング
+                scaled_pixmap = pixmap.scaled(
+                    label_width, 
+                    label_height,
+                    Qt.KeepAspectRatio,  # アスペクト比を維持
+                    Qt.SmoothTransformation  # 滑らかな変換
+                )
+                
+                self.img_label.setPixmap(scaled_pixmap)
+                self.img_label.setAlignment(Qt.AlignCenter)  # 中央揃え
                 
                 # 削除済みの場合は半透明にする追加の処理
                 if self.is_deleted:
@@ -506,17 +601,6 @@ def enhanced_update_gallery(self):
                 # 位置情報を事前に特定
                 if annotation and 'loc' in annotation:
                     location_value = annotation['loc']
-
-            # if not is_deleted and img_path in self.annotations:
-            #     annotation = self.annotations[img_path]
-            
-            #     # 位置情報を事前に特定
-            #     if annotation and 'loc' in annotation:
-            #         location_value = annotation['loc']
-            #     # あるいは位置情報専用の辞書を確認
-            #     elif img_path in self.location_annotations:
-            #         location_value = self.location_annotations[img_path]
-
 
             # 物体検知アノテーションを取得 (新規追加)
             bbox_annotations = None

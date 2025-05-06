@@ -932,7 +932,9 @@ class ThumbnailWidget(QWidget):
         # 画像ラベル
         self.img_label = QLabel()
         self.img_label.setAlignment(Qt.AlignCenter)
-        self.img_label.setFixedSize(150, 140)  # 幅を少し広げる
+        #self.img_label.setFixedSize(150, 140)  # 幅を少し広げる
+        self.img_label.setMinimumSize(150, 120)  # 最小サイズを設定
+        self.img_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)  # サイズポリシーを設定
         
         # 削除済みの場合は半透明になるスタイルを追加
         if is_deleted:
@@ -959,45 +961,10 @@ class ThumbnailWidget(QWidget):
         if self.on_click and event.button() == Qt.LeftButton:
             self.on_click(self.index)
 
+    #TODO:enhanced_annotations.pyと統合
     def load_image(self, img_path):
-        if not os.path.exists(img_path):
-            return
-        
-        try:
-            # アノテーションがある場合は、丸を描画したイメージを作成
-            if self.annotation and not self.is_deleted:
-                # PILで画像を開く
-                pil_img = Image.open(img_path)
-                
-                # アノテーションの座標を取得
-                x, y = self.annotation["x"], self.annotation["y"]
-                
-                # PILのDrawオブジェクトを作成し、丸を描画
-                draw = ImageDraw.Draw(pil_img)
-                circle_size = 15  # サムネイル用の丸のサイズを大きく
-                draw.ellipse((x-circle_size, y-circle_size, x+circle_size, y+circle_size), outline='red', width=4)
-                
-                # PILイメージをQImageに変換
-                pil_img = pil_img.convert("RGBA")
-                data = pil_img.tobytes("raw", "RGBA")
-                qimg = QImage(data, pil_img.width, pil_img.height, QImage.Format_RGBA8888)
-                
-                # QImageをQPixmapに変換
-                pixmap = QPixmap.fromImage(qimg)
-            else:
-                # アノテーションがない場合は通常通り画像を読み込む
-                pixmap = QPixmap(img_path)
-            
-            if not pixmap.isNull():
-                pixmap = pixmap.scaled(170, 170, Qt.KeepAspectRatio, Qt.SmoothTransformation)  # サイズを調整
-                self.img_label.setPixmap(pixmap)
-                
-                # 削除済みの場合は半透明にする追加の処理
-                if self.is_deleted:
-                    self.setGraphicsEffect(QGraphicsOpacityEffect(opacity=0.5))
-        except Exception as e:
-            print(f"Error loading image {img_path}: {e}")
-
+        pass
+    
 class ImageAnnotationTool(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1170,7 +1137,7 @@ class ImageAnnotationTool(QMainWindow):
         pilot_layout = QVBoxLayout(self.pilot_container)
 
         # 学習モード
-        pilot_label = QLabel("自動運転:")
+        pilot_label = QLabel("自動運転モデル:")
         pilot_label.setStyleSheet("font-weight: bold;")  # 太文字にするスタイルを追加
         pilot_layout.addWidget(pilot_label)
 
@@ -1268,7 +1235,7 @@ class ImageAnnotationTool(QMainWindow):
 
 
         # ラベル
-        obj_detection_label = QLabel("物体検知:")
+        obj_detection_label = QLabel("物体検知モデル:")
         obj_detection_label.setStyleSheet("font-weight: bold")
         obj_detection_layout.addWidget(obj_detection_label)
 
@@ -1605,10 +1572,10 @@ class ImageAnnotationTool(QMainWindow):
         self.theme_button_group.addButton(self.dark_theme_button)
         self.theme_button_group.setExclusive(True)
 
+        # TODO:テーマやUI調整
         # レイアウトに追加
-        location_layout.addLayout(theme_layout)
+        # location_layout.addLayout(theme_layout)
         
-
         mode_layout_label = QLabel("アノテーションモード:")
         mode_layout_label.setStyleSheet("font-weight: bold;")
         location_layout.addWidget(mode_layout_label)
@@ -1715,12 +1682,13 @@ class ImageAnnotationTool(QMainWindow):
         
         self.gallery_widget = QWidget()
         self.gallery_layout = QGridLayout(self.gallery_widget)
+        self.gallery_layout.setContentsMargins(0, 0, 0, 0)  # マージンをゼロに
         self.gallery_layout.setSpacing(2)
         
         gallery_scroll = QScrollArea()
         gallery_scroll.setWidgetResizable(True)
         gallery_scroll.setWidget(self.gallery_widget)
-        gallery_scroll.setMinimumHeight(200)
+        gallery_scroll.setMinimumHeight(175)
         right_layout.addWidget(gallery_scroll)
         
         # 位置情報ボタンを初期化（8個作成）
@@ -6712,7 +6680,6 @@ class ImageAnnotationTool(QMainWindow):
                     self.run_inference_check(False)
             
             # ギャラリー更新
-            print("3010")
             self.update_gallery()
             
             # スキップ枚数分だけ自動的に次に進める（選択したのが現在の画像より前の場合は戻る）
@@ -9646,121 +9613,212 @@ class ImageAnnotationTool(QMainWindow):
             )
 
     # UI関連
+    #m
     def toggle_theme(self, theme_name):
         """テーマを切り替える"""
         # styles.pyのset_theme関数を呼び出す
         current_theme = set_theme(theme_name)
         
-        # テーマ切り替えに応じてボタンの状態を更新
+        # 1. まずテーマ切り替えボタンの状態とスタイルを更新
         self.light_theme_button.setChecked(current_theme == "light")
         self.dark_theme_button.setChecked(current_theme == "dark")
-        
-        # テーマ変更を適用するには、すべてのウィジェットに新しいスタイルを適用し直す必要がある
-        self.apply_theme_to_widgets()
-        
-        # テーマ切り替えボタンのスタイルを特別に更新
         self.update_theme_button_styles()
+        
+        # 2. テーマに応じた背景色と文字色の基本設定
+        self.adjust_base_colors_for_theme()
+        
+        # 3. 各ウィジェットにスタイルを適用
+        self.apply_theme_to_widgets()
         
         # テーマ変更の通知
         theme_display_name = "ライト" if theme_name == "light" else "ダーク"
         self.statusBar().showMessage(f"テーマを {theme_display_name} に変更しました", 3000)
 
+    def adjust_base_colors_for_theme(self):
+        """テーマに応じた基本的な背景色と文字色を設定する"""
+        current_theme = get_current_theme()
+        
+        if current_theme == "dark":
+            # ダークモードの背景色を設定
+            self.setStyleSheet("background-color: #1F2937;")
+        else:
+            # ライトモードの場合はスタイルシートをクリア
+            self.setStyleSheet("")
+
     def update_theme_button_styles(self):
         """テーマ切り替えボタンのスタイルを現在のテーマに合わせて更新"""
-        current_theme = get_current_theme()  # styles.pyから関数をインポートする必要があります
+        current_theme = get_current_theme()
         
-        if current_theme == "light":
-            # ライトテーマの場合
-            self.light_theme_button.setStyleSheet("""
-                QPushButton {
-                    background-color: #F9FAFB; /* ライトテーマの背景色 */
-                    color: #111827; /* 暗いテキスト */
-                    font-weight: bold;
-                    border: 1px solid #E5E7EB;
-                    border-radius: 4px;
-                    padding: 6px 12px;
-                }
-                QPushButton:checked {
-                    background-color: #E5E7EB; /* 選択時は少し暗い */
-                    border: 2px solid #2563EB; /* 選択時は青いボーダー */
-                }
-            """)
-            
-            self.dark_theme_button.setStyleSheet("""
-                QPushButton {
-                    background-color: #1F2937; /* ダークテーマの背景色 */
-                    color: white; /* 白いテキスト */
-                    font-weight: bold;
-                    border: 1px solid #4B5563;
-                    border-radius: 4px;
-                    padding: 6px 12px;
-                }
-                QPushButton:checked {
-                    background-color: #374151; /* 選択時は少し明るい */
-                    border: 2px solid #3B82F6; /* 選択時は青いボーダー */
-                }
-            """)
-        else:
-            # ダークテーマの場合
-            self.light_theme_button.setStyleSheet("""
-                QPushButton {
-                    background-color: #F9FAFB; /* ライトテーマの背景色 */
-                    color: #111827; /* 暗いテキスト */
-                    font-weight: bold;
-                    border: 1px solid #E5E7EB;
-                    border-radius: 4px;
-                    padding: 6px 12px;
-                }
-                QPushButton:checked {
-                    background-color: #E5E7EB; /* 選択時は少し暗い */
-                    border: 2px solid #3B82F6; /* 選択時は青いボーダー */
-                }
-            """)
-            
-            self.dark_theme_button.setStyleSheet("""
-                QPushButton {
-                    background-color: #1F2937; /* ダークテーマの背景色 */
-                    color: white; /* 白いテキスト */
-                    font-weight: bold;
-                    border: 1px solid #4B5563;
-                    border-radius: 4px;
-                    padding: 6px 12px;
-                }
-                QPushButton:checked {
-                    background-color: #374151; /* 選択時は少し明るい */
-                    border: 2px solid #3B82F6; /* 選択時は青いボーダー */
-                }
-            """)
+        # ライトモードボタンのスタイル
+        light_button_style = """
+            QPushButton {
+                background-color: #F9FAFB; /* ライトテーマの背景色 */
+                color: #111827; /* 暗いテキスト */
+                font-weight: bold;
+                border: 1px solid #E5E7EB;
+                border-radius: 4px;
+                padding: 6px 12px;
+            }
+            QPushButton:checked {
+                background-color: #E5E7EB; /* 選択時は少し暗い */
+                border: 2px solid #2563EB; /* 選択時は青いボーダー */
+            }
+        """
+        
+        # ダークモードボタンのスタイル
+        dark_button_style = """
+            QPushButton {
+                background-color: #1F2937; /* ダークテーマの背景色 */
+                color: white; /* 白いテキスト */
+                font-weight: bold;
+                border: 1px solid #4B5563;
+                border-radius: 4px;
+                padding: 6px 12px;
+            }
+            QPushButton:checked {
+                background-color: #374151; /* 選択時は少し明るい */
+                border: 2px solid #3B82F6; /* 選択時は青いボーダー */
+            }
+        """
+        
+        # 明示的にスタイルを設定（テーマに関係なく）
+        self.light_theme_button.setStyleSheet(light_button_style)
+        self.dark_theme_button.setStyleSheet(dark_button_style)
+        
+        # チェック状態を再設定（現在のテーマに合わせて）
+        self.light_theme_button.setChecked(current_theme == "light")
+        self.dark_theme_button.setChecked(current_theme == "dark")
 
     def apply_theme_to_widgets(self):
         """テーマ変更後に主要なウィジェットにスタイルを再適用する"""
-        # 各種ウィジェットに適用されているスタイルを再適用
-        # ボタン
+        # 基本ボタン
         if hasattr(self, 'load_button'):
             apply_style(self.load_button, 'primary')
         if hasattr(self, 'load_annotation_button'):
             apply_style(self.load_annotation_button, 'primary')
         
-        # モデル関連
+        # モデル関連ボタン
         if hasattr(self, 'model_refresh_button'):
             apply_style(self.model_refresh_button, 'model')
         if hasattr(self, 'model_load_button'):
             apply_style(self.model_load_button, 'model')
             
-        # YOLO関連
+        # 学習関連ボタン
+        if hasattr(self, 'train_model_button'):
+            apply_style(self.train_model_button, 'training')
+        
+        # オートアノテーション関連
+        if hasattr(self, 'auto_annotate_button'):
+            apply_style(self.auto_annotate_button, 'training')
+        if hasattr(self, 'batch_inference_button'):
+            apply_style(self.batch_inference_button, 'special')
+        
+        # YOLO関連ボタン
         if hasattr(self, 'yolo_refresh_button'):
             apply_style(self.yolo_refresh_button, 'model')
         if hasattr(self, 'yolo_load_button'):
             apply_style(self.yolo_load_button, 'model')
+        if hasattr(self, 'train_yolo_button'):
+            apply_style(self.train_yolo_button, 'training')
+        if hasattr(self, 'load_yolo_btn'):
+            apply_style(self.load_yolo_btn, 'primary')
         
-        #TODO:追加修正
-        # その他主要なウィジェットのスタイルを再適用
-        # （ここに他のウィジェットのスタイル適用コードを追加）
+        # 位置情報関連ボタン
+        if hasattr(self, 'location_refresh_button'):
+            apply_style(self.location_refresh_button, 'model')
+        if hasattr(self, 'location_load_button'):
+            apply_style(self.location_load_button, 'model')
+        if hasattr(self, 'train_location_button'):
+            apply_style(self.train_location_button, 'training')
+        
+        # エクスポート関連ボタン
+        for button_name in ['donkey_btn', 'jetracer_btn', 'yolo_btn']:
+            if hasattr(self, button_name):
+                apply_style(getattr(self, button_name), 'export')
+        
+        # 動画作成ボタン
+        if hasattr(self, 'create_video_button'):
+            apply_style(self.create_video_button, 'export')
+        
+        # MLflow関連ボタン
+        if hasattr(self, 'mlflow_compare_button'):
+            apply_style(self.mlflow_compare_button, 'special')
+        
+        # 削除関連ボタン
+        if hasattr(self, 'delete_current_button'):
+            apply_style(self.delete_current_button, 'destructive')
+        if hasattr(self, 'clip_button'):
+            apply_style(self.clip_button, 'destructive')
+        
+        # 復元ボタン
+        if hasattr(self, 'restore_button'):
+            apply_style(self.restore_button, 'primary')
+        if hasattr(self, 'restore_all_button'):
+            apply_style(self.restore_all_button, 'primary')
+        
+        # ナビゲーションボタン
+        for nav_button in ['prev_button', 'next_button', 'prev_multi_button', 'next_multi_button']:
+            if hasattr(self, nav_button):
+                apply_style(getattr(self, nav_button), 'nav')
+        
+        # 再生ボタン
+        for play_button in ['play_button', 'reverse_play_button']:
+            if hasattr(self, play_button):
+                apply_style(getattr(self, play_button), 'nav')
+        
+        # アノテーションモードボタン
+        if hasattr(self, 'auto_mode_button'):
+            # 選択状態に応じてスタイルを変更しない（カスタムスタイルシートが適用されているため）
+            pass
+        if hasattr(self, 'detection_mode_button'):
+            # 選択状態に応じてスタイルを変更しない（カスタムスタイルシートが適用されているため）
+            pass
+        
+        # フォルダブラウズボタン
+        if hasattr(self, 'browse_button'):
+            apply_style(self.browse_button, 'primary')
+        
+        # グループボックス
+        for group_box in self.findChildren(QGroupBox):
+            apply_style(group_box, 'group_box')
+        
+        # コンボボックス
+        for combo_box in self.findChildren(QComboBox):
+            apply_style(combo_box, 'combo_box')
+        
+        # スピンボックス
+        for spin_box in self.findChildren(QSpinBox):
+            apply_style(spin_box, 'spin_box')
+        for double_spin_box in self.findChildren(QDoubleSpinBox):
+            apply_style(double_spin_box, 'spin_box')
+        
+        # チェックボックス
+        for checkbox in self.findChildren(QCheckBox):
+            apply_style(checkbox, 'checkbox')
+        
+        # ラジオボタン
+        for radio_button in self.findChildren(QRadioButton):
+            apply_style(radio_button, 'radio')
+        
+        # スライダー
+        for slider in self.findChildren(QSlider):
+            apply_style(slider, 'slider')
+        
+        # テキスト入力
+        for line_edit in self.findChildren(QLineEdit):
+            apply_style(line_edit, 'text_input')
+        
+        # スクロールエリア
+        for scroll_area in self.findChildren(QScrollArea):
+            apply_style(scroll_area, 'scroll')
+        
+        # テーマ切り替えボタンのスタイルを更新
+        self.update_theme_button_styles()
         
         # テーマに応じた色調整
-        #self.adjust_colors_for_theme()
+        # self.adjust_text_colors_for_theme()
 
-    def adjust_colors_for_theme(self):
+    def adjust_text_colors_for_theme(self):
         """テーマに応じて文字色と背景色を調整する"""
         current_theme = get_current_theme()
         
@@ -9768,44 +9826,96 @@ class ImageAnnotationTool(QMainWindow):
             # ダークモードの場合
             text_color = "white"
             secondary_text_color = "#D1D5DB"  # 薄い白/グレー
-            background_color = "#1F2937"  # ダークモードの背景色
+            
+            # ダークモードの時だけ背景色を設定
+            self.setStyleSheet("background-color: #1F2937;")
+            
+            # すべてのQWidgetとその子クラスを対象に文字色を設定
+            # QLabel
+            for label in self.findChildren(QLabel):
+                # すでに特別なスタイルが適用されている可能性があるラベルをスキップ
+                skip_labels = ["detection_inference_info_label", "inference_info_label", "location_inference_info_label"]
+                if hasattr(label, 'objectName') and label.objectName() in skip_labels:
+                    continue
+                    
+                # スタイルを取得し、文字色を更新
+                current_style = label.styleSheet()
+                new_style = current_style
+                
+                # 文字色指定を追加/更新
+                if "color:" in current_style:
+                    # すでに色指定がある場合は置換
+                    new_style = re.sub(r'color:\s*[^;]+;', f"color: {text_color};", current_style)
+                else:
+                    # 色指定がない場合は追加
+                    new_style = f"{current_style}; color: {text_color};"
+                
+                label.setStyleSheet(new_style)
+            
+            # QCheckBox
+            for checkbox in self.findChildren(QCheckBox):
+                checkbox.setStyleSheet(f"color: {text_color};")
+            
+            # QRadioButton
+            for radio in self.findChildren(QRadioButton):
+                radio.setStyleSheet(f"color: {text_color};")
+            
+            # QGroupBox
+            for group in self.findChildren(QGroupBox):
+                group.setStyleSheet(f"color: {text_color}; border: 1px solid #4B5563;")
+            
+            # QComboBox
+            for combo in self.findChildren(QComboBox):
+                combo.setStyleSheet(f"color: {text_color}; background-color: #374151; selection-background-color: #4B5563;")
+            
+            # QLineEdit
+            for edit in self.findChildren(QLineEdit):
+                edit.setStyleSheet(f"color: {text_color}; background-color: #374151; border: 1px solid #4B5563;")
+            
+            # QSpinBox と QDoubleSpinBox
+            for spin in self.findChildren(QSpinBox):
+                spin.setStyleSheet(f"color: {text_color}; background-color: #374151; border: 1px solid #4B5563;")
+            
+            for dspin in self.findChildren(QDoubleSpinBox):
+                dspin.setStyleSheet(f"color: {text_color}; background-color: #374151; border: 1px solid #4B5563;")
+            
+            # タブウィジェット（存在する場合）
+            for tab in self.findChildren(QTabWidget):
+                tab.setStyleSheet(f"color: {text_color}; background-color: #1F2937;")
+            
+            # スライダー（存在する場合）
+            for slider in self.findChildren(QSlider):
+                slider.setStyleSheet("""
+                    QSlider::groove:horizontal {
+                        border: 1px solid #4B5563;
+                        height: 8px;
+                        background: #374151;
+                        margin: 2px 0;
+                        border-radius: 4px;
+                    }
+                    QSlider::handle:horizontal {
+                        background: #3B82F6;
+                        border: 1px solid #3B82F6;
+                        width: 18px;
+                        height: 18px;
+                        margin: -6px 0;
+                        border-radius: 9px;
+                    }
+                """)
         else:
             # ライトモードの場合
-            text_color = "#111827"  # 暗いテキスト
-            secondary_text_color = "#4B5563"  # やや薄い黒/グレー
-            background_color = "#F9FAFB"  # ライトモードの背景色
-        
-        # メインウィンドウの背景色を設定
-        self.setStyleSheet(f"background-color: {background_color};")
-        
-        # 各種ラベルの文字色を調整
-        label_style = f"color: {text_color};"
-        secondary_label_style = f"color: {secondary_text_color};"
-        
-        # 情報パネルのラベル
-        if hasattr(self, 'current_image_info'):
-            self.current_image_info.setStyleSheet(f"color: {text_color}; font-weight: bold;")
-        
-        if hasattr(self, 'annotation_info_label'):
-            self.annotation_info_label.setStyleSheet(f"color: {text_color};")
-        
-        # 各種タイトルラベル
-        for label in self.findChildren(QLabel):
-            # 特定のラベルは除外（すでに特別なスタイルが設定されている可能性がある）
-            if hasattr(label, 'objectName') and label.objectName() in ["detection_inference_info_label", "inference_info_label"]:
-                continue
-                
-            if hasattr(label, 'font') and label.font().bold():
-                # ボールドフォントのラベル
-                current_style = label.styleSheet()
-                if "color:" not in current_style:  # すでに色指定があるものは除外
-                    label.setStyleSheet(label_style)
-            else:
-                # 通常のラベル
-                current_style = label.styleSheet()
-                if "color:" not in current_style:  # すでに色指定があるものは除外
-                    label.setStyleSheet(secondary_label_style)
-
+            # スタイルシートをクリアして、デフォルトに戻す
+            self.setStyleSheet("")
+            
+            # テーマ切り替えボタン以外のウィジェットのスタイルをデフォルトに戻す
+            excluded_widgets = [self.light_theme_button, self.dark_theme_button]
+            for widget in self.findChildren(QWidget):
+                if widget not in excluded_widgets:
+                    widget.setStyleSheet("")
+            
+        # テーマ切り替えボタンのスタイルを更新
+        self.update_theme_button_styles()
+            
 
 # メインプログラムのセクション
 if __name__ == "__main__":
