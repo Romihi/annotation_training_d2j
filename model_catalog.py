@@ -34,21 +34,12 @@ def load_model_weights(model, weights_path, device):
         print("Loaded state_dict format model")
     return model
 
-
 class BaseModel(nn.Module):
     """すべてのモデルの基底クラス"""
     def __init__(self, name="base"):
         super(BaseModel, self).__init__()
         self.name = name
         self._preprocess = None
-
-        #以下はモデル読み込み側のロジックで実行
-        # モデルを生成した時点でデバイスを決定して保存
-        #self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        #self.to(self.device)  # モデル自体を適切なデバイスに移動
-
-        # 初期化時に推論モードに設定
-        #self.eval()
         
     def get_preprocess(self):
         """デフォルトの前処理を返す"""

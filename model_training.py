@@ -868,8 +868,6 @@ def plot_model_comparison(results):
     plt.savefig('model_efficiency_comparison.png')
     plt.close()
 
-# Add these functions to model_training.py for location classification
-###
 class LocationClassificationDataset(torch.utils.data.Dataset):
     """位置分類用のカスタムデータセット"""
     def __init__(self, image_paths, location_labels, transform=None):
@@ -1577,26 +1575,6 @@ def visualize_location_predictions(
     plt.close()
     print(f'Location predictions visualization saved: {model_name}_location_predictions.png')
 
-# def prepare_location_data_from_annotations(annotations, location_annotations):
-#     """アノテーションから位置分類用のデータを準備する
-
-#     Args:
-#         annotations: 自動運転アノテーション辞書
-#         location_annotations: 位置アノテーション辞書
-
-#     Returns:
-#         画像パスのリスト、位置ラベルのリスト
-#     """
-#     image_paths = []
-#     location_labels = []
-    
-#     # 位置情報があるアノテーションを収集
-#     for img_path, location in location_annotations.items():
-#         if img_path in annotations:  # 自動運転アノテーションもある場合のみ
-#             image_paths.append(img_path)
-#             location_labels.append(location)
-    
-#     return image_paths, location_labels
 def prepare_location_data_from_annotations(annotations, location_annotations, images_list=None):
     """アノテーションから位置分類用のデータを準備する
 

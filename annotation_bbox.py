@@ -3149,7 +3149,7 @@ class ImageAnnotationTool(QMainWindow):
             return
         
         # モデルのパスを取得 - 相対パスからフルパスに変換
-        models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+        # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
         model_path = os.path.join(models_dir, relative_path)
         
         # モデルが存在するか確認
@@ -5090,7 +5090,7 @@ class ImageAnnotationTool(QMainWindow):
         if hasattr(self, 'model_combo') and self.model_combo.currentText() not in ["モデルが見つかりません", "フォルダを選択してください"] and "が見つかりません" not in self.model_combo.currentText():
             # アノテーションフォルダ内のモデルのフルパスを作成
             selected_model = self.model_combo.currentText()
-            models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+            # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
             model_path = os.path.join(models_dir, selected_model)
             
             # モデルが存在するか確認
@@ -5183,7 +5183,7 @@ class ImageAnnotationTool(QMainWindow):
         model_path = None
         if selected_model not in ["モデルが見つかりません", "フォルダを選択してください"] and "が見つかりません" not in selected_model:
             # アノテーションフォルダ内のモデルのフルパスを作成
-            models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+            # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
             model_path = os.path.join(models_dir, selected_model)
             
             # モデルが存在するか確認
@@ -5352,7 +5352,7 @@ class ImageAnnotationTool(QMainWindow):
         # モデルのパスを取得
         model_path = None
         if hasattr(self, 'model_combo') and self.model_combo.currentText() not in ["モデルが見つかりません", "フォルダを選択してください"] and "が見つかりません" not in self.model_combo.currentText():
-            models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+            # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
             model_path = os.path.join(models_dir, selected_model)
             
             if not os.path.exists(model_path):
@@ -6105,7 +6105,7 @@ class ImageAnnotationTool(QMainWindow):
             return
         
         # モデルのパスを取得
-        models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+        # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
         model_path = os.path.join(models_dir, selected_model)
         
         # モデルが存在するか確認
@@ -8162,7 +8162,7 @@ class ImageAnnotationTool(QMainWindow):
         if selected_model and selected_model not in ["モデルが見つかりません", "フォルダを選択してください"] and "が見つかりません" not in selected_model:
             # アノテーションフォルダ内のモデルのフルパスを作成
             annotation_folder = os.path.join(self.folder_path, ANNOTATION_DIR_NAME)
-            models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+            # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
             model_path = os.path.join(models_dir, selected_model)
             
             # モデルが存在するか確認
@@ -8179,18 +8179,43 @@ class ImageAnnotationTool(QMainWindow):
                 
                 load_weights = (weights_reply == QMessageBox.Yes)
         
+        # try:
+        #     # 学習データの準備（スキップ設定を適用）
+        #     image_paths = list(self.annotations.keys())
+        #     if use_skip and skip_count > 1:
+        #         image_paths = image_paths[::skip_count]
+            
+        #     if not image_paths:
+        #         QMessageBox.warning(self, "警告", "学習データがありません。")
+        #         return
+            
+            # annotation_values = [self.annotations[img_path] for img_path in image_paths]
+
+
+        #m
         try:
             # 学習データの準備（スキップ設定を適用）
-            image_paths = list(self.annotations.keys())
-            if use_skip and skip_count > 1:
-                image_paths = image_paths[::skip_count]
+            # インデックスから画像パスへの変換
+            image_paths = []
+            for idx in self.annotations.keys():
+                if isinstance(idx, int) and 0 <= idx < len(self.images):
+                    if not use_skip or idx % skip_count == 0:  # スキップ設定の適用
+                        image_paths.append(self.images[idx])
             
             if not image_paths:
                 QMessageBox.warning(self, "警告", "学習データがありません。")
                 return
             
-            annotation_values = [self.annotations[img_path] for img_path in image_paths]
-            
+            # 対応するアノテーション値を取得
+            annotation_values = []
+            for img_path in image_paths:
+                # パスからインデックスを逆引き
+                idx = self.images.index(img_path)
+                if idx in self.annotations:
+              
+                    annotation_values.append(self.annotations[idx])
+            #m
+
             # データ数の確認と最小バッチサイズの調整
             batch_size = min(32, len(image_paths))  # バッチサイズを調整
             if batch_size < 2:
@@ -8422,7 +8447,7 @@ class ImageAnnotationTool(QMainWindow):
         # モデルのパスを取得
         model_path = None
         if hasattr(self, 'model_combo') and selected_model not in ["モデルが見つかりません", "フォルダを選択してください"] and "が見つかりません" not in selected_model:
-            models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+            # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
             model_path = os.path.join(models_dir, selected_model)
             
             # モデルが存在するか確認
