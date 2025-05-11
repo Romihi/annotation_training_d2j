@@ -219,35 +219,6 @@ class MultiImageDataset(Dataset):
         if isinstance(self.image_paths[idx], list):
             # 既にマルチ画像のパスリストがある場合
             image_paths_for_item = self.image_paths[idx]
-        else:
-            # 単一画像パスの場合は、連続するインデックスから画像を収集
-            image_indices = [max(0, idx - i) for i in range(self.num_inputs - 1, -1, -1)]
-            image_paths_for_item = [self.image_paths[i] for i in image_indices]
-        
-        # すべての画像を読み込み
-        for img_path in image_paths_for_item:
-            img = Image.open(img_path).convert('RGB')
-            
-            # 変換を適用
-            if self.transform:
-                img = self.transform(img)
-            
-            images.append(img)
-        
-        # 現在のインデックスのアノテーションを取得
-        annotation = self.annotations[idx]
-        target = torch.tensor([annotation["angle"], annotation["throttle"]], dtype=torch.float)
-        
-        return images, target
-    #m
-    def __getitem__(self, idx):
-        # 各サンプルでN枚の連続画像を処理
-        images = []
-        
-        # image_paths[idx]が既にリストの場合（マルチカメラモード）
-        if isinstance(self.image_paths[idx], list):
-            # 既にマルチ画像のパスリストがある場合
-            image_paths_for_item = self.image_paths[idx]
             
             # デバッグ用出力（最初の数サンプルのみ）
             if idx < 3:  # 最初の3サンプルだけ出力

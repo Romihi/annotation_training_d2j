@@ -1,9 +1,0 @@
-
-    path: C:\Users\hkior\projects\annotation_training_d2j\data_yolo
-    train: train/images
-    val: val/images
-    test: test/images
-
-    nc: 4
-    names: ['car', 'person', 'sign', 'cone']
-            

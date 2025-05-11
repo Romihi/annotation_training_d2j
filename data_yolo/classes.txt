@@ -1,4 +1,0 @@
-car
-person
-sign
-cone

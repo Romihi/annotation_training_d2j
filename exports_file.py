@@ -139,6 +139,7 @@ def export_to_donkey(
             "user/throttle": annotation["throttle"]
         }
         
+        print(annotation)
         # 位置情報があれば追加
         if 'loc' in annotation:
             catalog_entry["user/loc"] = annotation["loc"]
@@ -360,14 +361,24 @@ def export_to_jetracer(
 def export_to_yolo(
     folder_path: str,
     bbox_annotations: Dict[str, List[Dict[str, Any]]],
-    output_subfolder: str = "yolo_annotations"
+    output_subfolder: str = "data_yolo",
+    split_ratio: float = 0.8,  # Train/val split ratio (80% for training, 20% for validation)
+    include_empty_images: bool = True,  # バウンディングボックスがない画像も含めるかどうか
+    all_images_list: Optional[List[str]] = None,  # バウンディングボックスがない画像も含めるための全画像リスト
+    deleted_indexes: Optional[List[int]] = None,  # 削除済みのインデックスリスト
+    index_to_path_map: Optional[Dict[int, str]] = None  # インデックスからパスへのマッピング
 ) -> str:
-    """バウンディングボックスアノテーションをYOLO形式でエクスポートする
+    """バウンディングボックスアノテーションをYOLO形式でエクスポートする - Ultralytics HUB互換
 
     Args:
         folder_path: 出力先のフォルダパス
         bbox_annotations: バウンディングボックスアノテーション辞書
-        output_subfolder: 出力先のサブフォルダ名（デフォルト: "yolo_annotations"）
+        output_subfolder: 出力先のサブフォルダ名（デフォルト: "data_yolo"）
+        split_ratio: 訓練/検証データの分割比率（デフォルト: 0.8）
+        include_empty_images: バウンディングボックスがない画像も含めるかどうか（デフォルト: True）
+        all_images_list: 全画像リスト（バウンディングボックスがない画像も含める場合に使用）
+        deleted_indexes: 削除済みのインデックスリスト（削除された画像をスキップするために使用）
+        index_to_path_map: インデックスからパスへのマッピング（削除された画像をスキップするために使用）
 
     Returns:
         作成されたデータセット設定ファイル（dataset.yaml）のパス
@@ -375,16 +386,22 @@ def export_to_yolo(
     import os
     import shutil
     import json
+    import random
+    import re
     
     # YOLO形式のアノテーション用フォルダを作成
     yolo_folder = os.path.join(folder_path, output_subfolder)
-    os.makedirs(yolo_folder, exist_ok=True)
     
-    # 画像とラベルのフォルダを作成
-    images_folder = os.path.join(yolo_folder, "images")
-    labels_folder = os.path.join(yolo_folder, "labels")
-    os.makedirs(images_folder, exist_ok=True)
-    os.makedirs(labels_folder, exist_ok=True)
+    # 画像とラベルのフォルダを作成 - Ultralytics HUB の構造に合わせる
+    images_train_folder = os.path.join(yolo_folder, "images", "train")
+    images_val_folder = os.path.join(yolo_folder, "images", "val")
+    labels_train_folder = os.path.join(yolo_folder, "labels", "train")
+    labels_val_folder = os.path.join(yolo_folder, "labels", "val")
+    
+    os.makedirs(images_train_folder, exist_ok=True)
+    os.makedirs(images_val_folder, exist_ok=True)
+    os.makedirs(labels_train_folder, exist_ok=True)
+    os.makedirs(labels_val_folder, exist_ok=True)
     
     # クラスリストを取得
     all_classes = set()
@@ -400,86 +417,254 @@ def export_to_yolo(
         for cls in class_list:
             f.write(f"{cls}\n")
     
-    # データセット設定用のYAMLファイルを作成
-    yaml_content = f"""
-# YOLO形式のデータセット設定
-path: {yolo_folder}  # データセットのルートディレクトリ
-train: images  # 訓練用画像の相対パス
-val: images    # 検証用画像の相対パス
-
-nc: {len(class_list)}  # クラス数
-names: {class_list}  # クラス名
-"""
+    # 削除済みのインデックスがなければ空リストを使用
+    if deleted_indexes is None:
+        deleted_indexes = []
     
-    yaml_file_path = os.path.join(yolo_folder, "dataset.yaml")
-    with open(yaml_file_path, 'w') as f:
-        f.write(yaml_content)
+    # パスからインデックスを抽出する関数（パスからのインデックス抽出に使用）
+    def extract_index_from_path(path):
+        try:
+            # ファイル名を取得
+            basename = os.path.basename(path)
+            # インデックスを抽出（例: 10900_cam_image_array_.jpg から 10900 を抽出）
+            match = re.match(r'^(\d+)_', basename)
+            if match:
+                return int(match.group(1))
+        except:
+            pass
+        return None
+    
+    # 全画像パスのリストを取得
+    img_paths = []
+    
+    if include_empty_images and all_images_list:
+        # バウンディングボックスがない画像も含める場合、all_images_listを使用
+        img_paths = all_images_list
+    else:
+        # バウンディングボックスがある画像のみを使用
+        img_paths = list(bbox_annotations.keys())
+    
+    # 削除された画像を除外
+    filtered_img_paths = []
+    for path in img_paths:
+        # パスからインデックスを抽出
+        index = None
+        
+        # 1. インデックスからパスへのマッピングが提供されている場合
+        if index_to_path_map is not None:
+            # reverse_mapを作成（パスからインデックスへのマッピング）
+            reverse_map = {v: k for k, v in index_to_path_map.items()}
+            if path in reverse_map:
+                index = reverse_map[path]
+        
+        # 2. 上記で見つからない場合はパスからインデックスを抽出
+        if index is None:
+            index = extract_index_from_path(path)
+        
+        # インデックスが見つかり、削除されていない場合のみ追加
+        if index is not None and index not in deleted_indexes:
+            filtered_img_paths.append(path)
+        # インデックスが見つからない場合はとりあえず追加
+        elif index is None:
+            filtered_img_paths.append(path)
+    
+    # 画像を重複なくリストに保持（セットを使用）
+    unique_img_paths = list(set(filtered_img_paths))
+    
+    # ランダムにシャッフル（訓練/検証に分割するため）
+    random.shuffle(unique_img_paths)
+    
+    # 訓練/検証データに分割
+    split_idx = int(len(unique_img_paths) * split_ratio)
+    train_paths = unique_img_paths[:split_idx]
+    val_paths = unique_img_paths[split_idx:]
     
     # 各画像のアノテーションを処理
-    processed_count = 0
+    processed_train_count = 0
+    processed_val_count = 0
     total_bboxes = 0
     
-    for img_path, bboxes in bbox_annotations.items():
-        if not bboxes:
-            continue
-            
+    # 統計情報用の変数
+    train_with_boxes = 0
+    train_no_boxes = 0
+    val_with_boxes = 0
+    val_no_boxes = 0
+    skipped_deleted = 0
+    
+    # 訓練データの処理
+    for img_path in train_paths:
+        # バウンディングボックスの取得
+        bboxes = bbox_annotations.get(img_path, [])
+        
         # 画像ファイル名を取得
         img_filename = os.path.basename(img_path)
         img_basename = os.path.splitext(img_filename)[0]
         
-        # 画像をコピー
-        dst_img_path = os.path.join(images_folder, img_filename)
-        shutil.copy2(img_path, dst_img_path)
-        
-        # YOLOフォーマットのラベルファイルを作成
-        label_path = os.path.join(labels_folder, f"{img_basename}.txt")
-        
-        with open(label_path, 'w') as f:
-            for bbox in bboxes:
-                # クラスIDを取得
-                class_name = bbox.get('class', 'unknown')
-                class_id = class_list.index(class_name)
+        try:
+            # 画像をコピー
+            dst_img_path = os.path.join(images_train_folder, img_filename)
+            shutil.copy2(img_path, dst_img_path)
+            
+            # YOLOフォーマットのラベルファイルを作成（バウンディングボックスがなくても空ファイルを作成）
+            label_path = os.path.join(labels_train_folder, f"{img_basename}.txt")
+            
+            if bboxes:
+                # バウンディングボックスがある場合
+                with open(label_path, 'w') as f:
+                    for bbox in bboxes:
+                        # クラスIDを取得
+                        class_name = bbox.get('class', 'unknown')
+                        class_id = class_list.index(class_name)
+                        
+                        # バウンディングボックスの座標を取得
+                        x1 = bbox['x1']
+                        y1 = bbox['y1']
+                        x2 = bbox['x2']
+                        y2 = bbox['y2']
+                        
+                        # YOLO形式に変換（中心x, 中心y, 幅, 高さ）
+                        x_center = (x1 + x2) / 2
+                        y_center = (y1 + y2) / 2
+                        width = x2 - x1
+                        height = y2 - y1
+                        
+                        # YOLOフォーマットでファイルに書き込み
+                        f.write(f"{class_id} {x_center} {y_center} {width} {height}\n")
+                        total_bboxes += 1
                 
-                # バウンディングボックスの座標を取得
-                x1 = bbox['x1']
-                y1 = bbox['y1']
-                x2 = bbox['x2']
-                y2 = bbox['y2']
-                
-                # YOLO形式に変換（中心x, 中心y, 幅, 高さ）
-                x_center = (x1 + x2) / 2
-                y_center = (y1 + y2) / 2
-                width = x2 - x1
-                height = y2 - y1
-                
-                # YOLOフォーマットでファイルに書き込み
-                f.write(f"{class_id} {x_center} {y_center} {width} {height}\n")
-                total_bboxes += 1
+                train_with_boxes += 1
+            else:
+                # バウンディングボックスがない場合、空のファイルを作成
+                with open(label_path, 'w') as f:
+                    pass  # 空ファイルを作成
+                train_no_boxes += 1
+            
+            processed_train_count += 1
+            
+        except Exception as e:
+            print(f"警告: 訓練画像 {img_path} の処理中にエラーが発生しました: {e}")
+            continue
+    
+    # 検証データの処理
+    for img_path in val_paths:
+        # バウンディングボックスの取得
+        bboxes = bbox_annotations.get(img_path, [])
         
-        processed_count += 1
+        # 画像ファイル名を取得
+        img_filename = os.path.basename(img_path)
+        img_basename = os.path.splitext(img_filename)[0]
+        
+        try:
+            # 画像をコピー
+            dst_img_path = os.path.join(images_val_folder, img_filename)
+            shutil.copy2(img_path, dst_img_path)
+            
+            # YOLOフォーマットのラベルファイルを作成（バウンディングボックスがなくても空ファイルを作成）
+            label_path = os.path.join(labels_val_folder, f"{img_basename}.txt")
+            
+            if bboxes:
+                # バウンディングボックスがある場合
+                with open(label_path, 'w') as f:
+                    for bbox in bboxes:
+                        # クラスIDを取得
+                        class_name = bbox.get('class', 'unknown')
+                        class_id = class_list.index(class_name)
+                        
+                        # バウンディングボックスの座標を取得
+                        x1 = bbox['x1']
+                        y1 = bbox['y1']
+                        x2 = bbox['x2']
+                        y2 = bbox['y2']
+                        
+                        # YOLO形式に変換（中心x, 中心y, 幅, 高さ）
+                        x_center = (x1 + x2) / 2
+                        y_center = (y1 + y2) / 2
+                        width = x2 - x1
+                        height = y2 - y1
+                        
+                        # YOLOフォーマットでファイルに書き込み
+                        f.write(f"{class_id} {x_center} {y_center} {width} {height}\n")
+                        total_bboxes += 1
+                
+                val_with_boxes += 1
+            else:
+                # バウンディングボックスがない場合、空のファイルを作成
+                with open(label_path, 'w') as f:
+                    pass  # 空ファイルを作成
+                val_no_boxes += 1
+            
+            processed_val_count += 1
+            
+        except Exception as e:
+            print(f"警告: 検証画像 {img_path} の処理中にエラーが発生しました: {e}")
+            continue
+    
+    # スキップされた削除済みの画像数を計算
+    if include_empty_images and all_images_list:
+        skipped_deleted = len(all_images_list) - len(filtered_img_paths)
+    
+    # Ultralytics HUB 形式のYAMLファイルを作成
+    # クラス名の辞書形式に変換
+    class_dict = {i: class_name for i, class_name in enumerate(class_list)}
+    
+    yaml_content = f"""# Ultralytics YOLOv8, AGPL-3.0 license
+# {output_subfolder} dataset by Custom Annotation Tool
+# Example usage: yolo train data={output_subfolder}.yaml
+
+# Train/val/test sets
+path:  # dataset root dir (leave empty for HUB)
+train: images/train  # train images (relative to 'path') {processed_train_count} images
+val: images/val  # val images (relative to 'path') {processed_val_count} images
+test:  # test images (optional)
+
+# Classes
+names: 
+"""
+    
+    # クラス名を辞書形式で追加
+    for idx, name in class_dict.items():
+        yaml_content += f"  {idx}: {name}\n"
+    
+    # 空のダウンロードセクションを追加
+    yaml_content += "\n# Download script/URL (optional)\ndownload:\n"
+    
+    yaml_file_path = os.path.join(yolo_folder, f"{output_subfolder}.yaml")
+    with open(yaml_file_path, 'w') as f:
+        f.write(yaml_content)
     
     # README.txtファイルを作成して使用方法を説明
-    readme_content = f"""# YOLO形式アノテーションデータ
+    readme_content = f"""# YOLO形式アノテーションデータ（Ultralytics HUB 互換）
 
 このフォルダには、YOLO形式でエクスポートされたアノテーションデータが含まれています。
+Ultralytics HUB と互換性があります。
 
 ## フォルダ構成
-- images/: アノテーション付き画像
-- labels/: YOLOフォーマットのアノテーションファイル（各画像に対応）
+- images/train/: 訓練用画像 ({processed_train_count}枚)
+- images/val/: 検証用画像 ({processed_val_count}枚)
+- labels/train/: 訓練用アノテーションファイル
+- labels/val/: 検証用アノテーションファイル
 - classes.txt: クラス名のリスト
-- dataset.yaml: YOLOv5/v8用のデータセット設定ファイル
+- {output_subfolder}.yaml: YOLOv8用のデータセット設定ファイル
 
 ## クラス情報
 検出クラス数: {len(class_list)}
 クラス: {', '.join(class_list)}
 
 ## 統計情報
-アノテーション画像数: {processed_count}
-合計バウンディングボックス数: {total_bboxes}
+訓練画像数: {processed_train_count}枚 (バウンディングボックスあり: {train_with_boxes}枚, なし: {train_no_boxes}枚)
+検証画像数: {processed_val_count}枚 (バウンディングボックスあり: {val_with_boxes}枚, なし: {val_no_boxes}枚)
+合計バウンディングボックス数: {total_bboxes}個
+スキップされた削除済み画像数: {skipped_deleted}枚
+
+## 使用方法
+1. このフォルダをYOLOv8のプロジェクトフォルダに配置します。
+2. 次のコマンドで学習を開始できます:
+   yolo train data={output_subfolder}.yaml
 
 ## YOLOフォーマット
 各行の形式: <class_id> <x_center> <y_center> <width> <height>
 ※すべての座標値は画像サイズで正規化されています（0～1の範囲）
+※バウンディングボックスがない画像のラベルファイルは空ファイルとして作成されています
 """
     
     with open(os.path.join(yolo_folder, "README.txt"), 'w') as f:
