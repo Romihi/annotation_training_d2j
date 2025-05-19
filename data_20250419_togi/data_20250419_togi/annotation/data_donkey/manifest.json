@@ -1,5 +1,0 @@
-["cam/image_array", "lidar/image_array", "user/angle", "user/throttle", "user/mode"]
-["image_array", "image_array", "float", "float", "str"]
-{"variants": ["cam", "lidar"], "variant_counts": {"lidar": 3, "cam": 4}, "variant_summary": "lidar: 3\u679a, cam: 4\u679a", "original_indices": [0, 10, 20, 30, 40, 50, 60]}
-{"created_at": 1746111345.1691327, "sessions": {"all_full_ids": ["25-05-01_0"], "last_id": 0, "last_full_id": "25-05-01_0"}}
-{"paths": ["catalog_0.catalog"], "current_index": 7, "max_len": 1000, "deleted_indexes": []}

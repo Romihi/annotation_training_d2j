@@ -19,10 +19,15 @@ def update_annotation_info_label(self):
     
     # 物体検知アノテーション情報
     bbox_info = ""
-    if not is_deleted and current_img_path in self.bbox_annotations and self.bbox_annotations[current_img_path]:
+    if current_img_path in self.bbox_annotations and self.bbox_annotations[current_img_path]:
         bboxes = self.bbox_annotations[current_img_path]
         bbox_info = f"<b>物体検知アノテーション:</b><br>"
         
+
+        # 削除済みの場合は表示を追加
+        if is_deleted:
+            bbox_info = f"<span style='color: #FF5555;'>[削除済み]</span> " + bbox_info
+
         # クラスごとのカウント辞書
         class_counts = {}
         for bbox in bboxes:
@@ -74,11 +79,17 @@ def enhanced_display_current_image(self):
         self.current_image_info.setStyleSheet("color: #333333; font-weight: bold;")
     
     # アノテーション情報の表示
-    if self.current_index in self.annotations and not is_deleted:
+    # if self.current_index in self.annotations and not is_deleted:
+    if self.current_index in self.annotations:
         anno = self.annotations[self.current_index]
         
         # 基本的なアノテーション情報
         annotation_text = f"<b>運転アノテーション情報:</b><br>"
+        if is_deleted:
+            annotation_text = f"<span style='color: #FF5555;'><b>削除済み</b></span><br>" + annotation_text
+
+        # 基本的なアノテーション情報
+        # annotation_text = f"<b>運転アノテーション情報:</b><br>"
         annotation_text += f"angle = <span style='color: #FF6666;'>{anno['angle']:.4f}</span><br>"
         annotation_text += f"throttle = <span style='color: #FF6666;'>{anno['throttle']:.4f}</span>"
         
@@ -100,9 +111,17 @@ def enhanced_display_current_image(self):
         # リッチテキストとして設定
         self.annotation_info_label.setText(annotation_text)
         self.annotation_info_label.setTextFormat(Qt.RichText)
-    elif not is_deleted and current_img_path in self.bbox_annotations and self.bbox_annotations[current_img_path]:
+    # elif not is_deleted and current_img_path in self.bbox_annotations and self.bbox_annotations[current_img_path]:
+    #     # 自動運転アノテーションはないが、物体検知アノテーションはある場合
+    #     bbox_info = update_annotation_info_label(self)
+    elif current_img_path in self.bbox_annotations and self.bbox_annotations[current_img_path]:
         # 自動運転アノテーションはないが、物体検知アノテーションはある場合
         bbox_info = update_annotation_info_label(self)
+        
+        # 削除済みの場合は削除済み表示を追加
+        if is_deleted:
+            bbox_info = f"<span style='color: #FF5555;'><b>削除済み</b></span><br>" + bbox_info
+                
         self.annotation_info_label.setText(bbox_info)
         self.annotation_info_label.setTextFormat(Qt.RichText)
     elif is_deleted:
@@ -118,13 +137,19 @@ def enhanced_display_current_image(self):
     
     # 位置情報ラベルの更新
     location_value = None
-    if not is_deleted:
-        # アノテーションの位置情報を確認
-        if self.current_index in self.annotations and 'loc' in self.annotations[self.current_index]:
-            location_value = self.annotations[self.current_index]['loc']
-        # 位置情報専用の辞書を確認
-        elif self.current_index in self.location_annotations:
-            location_value = self.location_annotations[self.current_index]
+    # アノテーションの位置情報を確認
+    if self.current_index in self.annotations and 'loc' in self.annotations[self.current_index]:
+        location_value = self.annotations[self.current_index]['loc']
+    # 位置情報専用の辞書を確認
+    elif self.current_index in self.location_annotations:
+        location_value = self.location_annotations[self.current_index]
+    # if not is_deleted:
+    #     # アノテーションの位置情報を確認
+    #     if self.current_index in self.annotations and 'loc' in self.annotations[self.current_index]:
+    #         location_value = self.annotations[self.current_index]['loc']
+    #     # 位置情報専用の辞書を確認
+    #     elif self.current_index in self.location_annotations:
+    #         location_value = self.location_annotations[self.current_index]
     
     # 位置情報ラベルの更新
     if location_value is not None and not is_deleted:
@@ -149,7 +174,7 @@ def enhanced_display_current_image(self):
             button.setChecked(False)
     
     # 推論結果の表示も更新（現在の画像に推論結果がある場合）
-    if self.inference_checkbox.isChecked() and not is_deleted:
+    if self.inference_checkbox.isChecked() : #and not is_deleted:
         self.update_inference_display()
     else:
         self.inference_info_label.setText("")
@@ -160,14 +185,14 @@ def enhanced_display_current_image(self):
         self.main_image_view.setPixmap(pixmap)
         
         # アノテーションポイントの設定
-        if not is_deleted and self.current_index in self.annotations :
+        if self.current_index in self.annotations :
             anno = self.annotations[self.current_index]
             self.main_image_view.annotation_point = QPoint(anno['x'], anno['y'])
         else:
             self.main_image_view.annotation_point = None
         
         # 推論ポイントの設定
-        if not is_deleted and self.inference_checkbox.isChecked() and self.current_index in self.inference_results:
+        if self.inference_checkbox.isChecked() and self.current_index in self.inference_results:
             inference = self.inference_results[self.current_index]
             self.main_image_view.inference_point = QPoint(inference['x'], inference['y'])
         else:
@@ -235,7 +260,7 @@ class EnhancedThumbnailWidget(QWidget):
             """)
             info_layout.addWidget(deleted_badge)
         # アノテーション情報
-        elif annotation and not is_deleted:
+        if annotation: # and not is_deleted:
             angle_label = QLabel(f"A: {annotation.get('angle', 0):.2f}")
             angle_label.setStyleSheet("color: #FF6666; font-size: 12px;font-weight: bold;")
             info_layout.addWidget(angle_label)
@@ -263,7 +288,7 @@ class EnhancedThumbnailWidget(QWidget):
                 info_layout.addWidget(loc_badge)
         
         # 物体検知アノテーション情報を追加 (新規追加)
-        if bbox_annotations and not is_deleted:
+        if bbox_annotations : #and not is_deleted:
             # オブジェクト数を表示するバッジ
             obj_count = len(bbox_annotations)
             bbox_badge = QLabel(f"物体: {obj_count}")
@@ -372,84 +397,6 @@ class EnhancedThumbnailWidget(QWidget):
         if self.on_click and event.button() == Qt.LeftButton:
             self.on_click(self.index)
 
-    # def load_image(self, img_path):
-    #     if not os.path.exists(img_path):
-    #         return
-        
-    #     try:
-    #         # PILで画像を開く
-    #         pil_img = Image.open(img_path)
-            
-    #         # 画像のコピーを作成して描画する
-    #         draw_img = pil_img.copy()
-    #         draw = ImageDraw.Draw(draw_img)
-            
-    #         # 基本的なアノテーションを描画（以前のコード部分）
-    #         if self.annotation and not self.is_deleted:
-    #             # アノテーションの座標を取得
-    #             x, y = self.annotation["x"], self.annotation["y"]
-                
-    #             # 丸を描画
-    #             circle_size = 15  # サムネイル用の丸のサイズを大きく
-    #             draw.ellipse((x-circle_size, y-circle_size, x+circle_size, y+circle_size), 
-    #                          outline='red', width=4)
-            
-    #         # 物体検知アノテーションがある場合は矩形を描画 (新規追加)
-    #         if self.bbox_annotations and not self.is_deleted:
-    #             img_width, img_height = pil_img.size
-                
-    #             for bbox in self.bbox_annotations:
-    #                 # クラスに応じた色を定義
-    #                 class_colors = {
-    #                     'car': (255, 0, 0),      # 赤
-    #                     'person': (0, 255, 0),   # 緑
-    #                     'sign': (0, 0, 255),     # 青
-    #                     'cone': (255, 255, 0),   # 黄
-    #                     'unknown': (128, 128, 128)  # グレー
-    #                 }
-                    
-    #                 class_name = bbox.get('class', 'unknown')
-    #                 color = class_colors.get(class_name, (255, 0, 0))
-                    
-    #                 # 正規化された座標を実際の座標に変換
-    #                 x1 = int(bbox['x1'] * img_width)
-    #                 y1 = int(bbox['y1'] * img_height)
-    #                 x2 = int(bbox['x2'] * img_width)
-    #                 y2 = int(bbox['y2'] * img_height)
-                    
-    #                 # 矩形を描画
-    #                 draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
-                    
-    #                 # ラベルを表示 (サムネイルでは小さいのでクラス名の1文字目だけ表示)
-    #                 label_text = class_name[0].upper()  # 頭文字のみ
-                    
-    #                 # ラベル背景
-    #                 text_size = 10  # 大まかなテキストサイズ（PILのfont.getsize()の代替）
-    #                 label_bg = (x1, y1-text_size, x1+text_size, y1)
-    #                 draw.rectangle(label_bg, fill=color)
-                    
-    #                 # テキスト描画
-    #                 draw.text((x1+2, y1-text_size), label_text, fill=(255, 255, 255))
-            
-    #         # 画像をQImageに変換
-    #         draw_img = draw_img.convert("RGBA")
-    #         data = draw_img.tobytes("raw", "RGBA")
-    #         qimg = QImage(data, draw_img.width, draw_img.height, QImage.Format_RGBA8888)
-            
-    #         # QImageをQPixmapに変換してサムネイルに設定
-    #         pixmap = QPixmap.fromImage(qimg)
-            
-    #         if not pixmap.isNull():
-    #             pixmap = pixmap.scaled(170, 170, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-    #             self.img_label.setPixmap(pixmap)
-                
-    #             # 削除済みの場合は半透明にする追加の処理
-    #             if self.is_deleted:
-    #                 self.setGraphicsEffect(QGraphicsOpacityEffect(opacity=0.5))
-            
-    #     except Exception as e:
-    #         print(f"Error loading image {img_path}: {e}")
-
     def load_image(self, img_path):
         if not os.path.exists(img_path):
             return
@@ -463,7 +410,7 @@ class EnhancedThumbnailWidget(QWidget):
             draw = ImageDraw.Draw(draw_img)
             
             # 基本的なアノテーションを描画
-            if self.annotation and not self.is_deleted:
+            if self.annotation:  # and not self.is_deleted:
                 # アノテーションの座標を取得
                 x, y = self.annotation["x"], self.annotation["y"]
                 
@@ -473,7 +420,7 @@ class EnhancedThumbnailWidget(QWidget):
                             outline='red', width=4)
             
             # 物体検知アノテーションがある場合は矩形を描画
-            if self.bbox_annotations and not self.is_deleted:
+            if self.bbox_annotations: # and not self.is_deleted:
                 img_width, img_height = pil_img.size
                 
                 for bbox in self.bbox_annotations:
@@ -595,16 +542,17 @@ def enhanced_update_gallery(self):
             annotation = None
             location_value = None  # Initialize here to prevent the error
             
-            if not is_deleted and idx in self.annotations:
+            if idx in self.annotations:
                 annotation = self.annotations[idx]
             
                 # 位置情報を事前に特定
                 if annotation and 'loc' in annotation:
                     location_value = annotation['loc']
 
-            # 物体検知アノテーションを取得 (新規追加)
+            # 物体検知アノテーションを取得 
             bbox_annotations = None
-            if not is_deleted and img_path in self.bbox_annotations:
+            # if not is_deleted and img_path in self.bbox_annotations:
+            if img_path in self.bbox_annotations:
                 bbox_annotations = self.bbox_annotations[img_path]
             
             # 拡張サムネイルウィジェットを作成
