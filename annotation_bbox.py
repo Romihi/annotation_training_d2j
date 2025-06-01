@@ -10,6 +10,8 @@ import random
 import subprocess
 import inspect
 from datetime import datetime
+import uuid
+import math
 
 import matplotlib
 matplotlib.use('Agg')  # GUIバックエンドを使用しない設定
@@ -38,13 +40,13 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                             QLabel, QPushButton, QFileDialog, QMessageBox,
                             QScrollArea, QGridLayout, QFrame, QLineEdit, QProgressDialog,
                             QCheckBox, QSpinBox, QComboBox, QSlider, QInputDialog, 
-                            QDoubleSpinBox, QGraphicsOpacityEffect, QDialog, QDialogButtonBox,
+                            QDoubleSpinBox, QDialog, QDialogButtonBox,
                             QGroupBox, QRadioButton, QTabWidget, QSizePolicy,QButtonGroup,
-                            QListView, QTreeView, QAbstractItemView,QStyleOptionSlider)
-from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont
+                            QListView, QTreeView, QAbstractItemView,QStyleOptionSlider,QStyle)
+from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont, QPolygon
 from PyQt5.QtCore import Qt, QRect, QPoint, QTimer, QEvent
 
-from PIL import Image, ImageDraw
+from PIL import Image
 
 # カスタムモジュールのインポート
 from model_catalog import get_model, list_available_models
@@ -86,6 +88,7 @@ ANNOTATION_DIR_NAME = "annotation"  # アノテーション関連データフォ
 DATA_DONKEY_DIR_NAME = "data_donkey"  # Donkeycar形式データ保存用フォルダ名
 DATA_JETRACER_DIR_NAME = "data_jetracer"  # Jetracer形式データ保存用フォルダ名
 DATA_YOLO_DIR_NAME = "data_yolo"
+VIDEO_DIR_NAME = "video"
 
 # TODO:後ほど再チェック
 ## 保存先フォルダ関係
@@ -98,7 +101,7 @@ jetracer_dataset_dir = os.path.join(annotation_folder, DATA_JETRACER_DIR_NAME)
 os.makedirs(jetracer_dataset_dir, exist_ok=True)
 yolo_dataset_dir = os.path.join(annotation_folder, DATA_YOLO_DIR_NAME)
 os.makedirs(yolo_dataset_dir, exist_ok=True)
-video_folder = os.path.join(annotation_folder, "video")
+video_folder = os.path.join(annotation_folder, VIDEO_DIR_NAME)
 os.makedirs(video_folder, exist_ok=True)
 
 
@@ -121,31 +124,31 @@ class ImageLabel(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumSize(1000, 800)
         self.annotation_point = None
-        self.show_grid = True  # グリッド表示フラグ
-        self.grid_size = 10    # グリッドの分割数
-        self.inference_point = None  # 推論結果の表示用ポイント
-        self.show_inference = False  # 推論表示フラグ
-        self.zoom_factor = 2.5  # デフォルトの拡大率（250%）
-        self.is_deleted = False  # 削除状態フラグ
+        self.show_grid = True  
+        self.grid_size = 10    
+        self.inference_point = None 
+        self.show_inference = False 
+        self.zoom_factor = 2.5  
+        self.is_deleted = False  
 
         # バウンディングボックス関連
-        self.bbox_start = None  # バウンディングボックスの開始点
-        self.bbox_end = None    # バウンディングボックスの終了点
-        self.bboxes = []        # 作成済みのバウンディングボックス
-        self.current_class = 0  # 現在選択中のクラスインデックス
-        self.is_drawing_bbox = False  # バウンディングボックス描画中フラグ
-        self.selected_bbox_index = None  # 選択されたバウンディングボックスのインデックス
-        self.is_moving_bbox = False      # バウンディングボックス移動中フラグ
-        self.move_start_pos = None       # 移動開始位置
-        self.setMouseTracking(True)  # マウスの移動を追跡
-        self.hovering_bbox_index = None  # ホバー中のバウンディングボックスのインデックス
-        self.is_resizing_bbox = False    # サイズ変更中フラグ
+        self.bbox_start = None  
+        self.bbox_end = None    
+        self.bboxes = []        
+        self.current_class = 0  
+        self.is_drawing_bbox = False 
+        self.selected_bbox_index = None 
+        self.is_moving_bbox = False     
+        self.move_start_pos = None      
+        self.setMouseTracking(True)  
+        self.hovering_bbox_index = None  
+        self.is_resizing_bbox = False    
         self.resize_handle = None        # 操作中のハンドル（"tl", "tr", "bl", "br"）
-        self.resize_start_pos = None     # サイズ変更開始位置
+        self.resize_start_pos = None     
 
         # 修飾キーの状態
-        self.key_b_pressed = False  # bキーが押されているかどうか
-        self.setFocusPolicy(Qt.StrongFocus)  # キーボードフォーカスを受け取れるように
+        self.key_b_pressed = False  
+        self.setFocusPolicy(Qt.StrongFocus)  
         
     def keyPressEvent(self, event):
         # bキーが押されたらフラグを設定
@@ -360,13 +363,8 @@ class ImageLabel(QLabel):
             painter.drawLine(target_rect.x(), int(mid_y), target_rect.x() + target_rect.width(), int(mid_y))
 
             # 目盛り表示
-            # フォント設定
             painter.setFont(QFont("Arial", 10))
-            
-            # 軸の色を設定
             painter.setPen(QPen(QColor(80, 80, 80, 200), 1))
-            
-            # X軸の目盛り表示（上側の水平線）
             painter.drawText(target_rect.x() - 25, target_rect.y() - 5, "-1")  # 左端 (-1)
             painter.drawText(target_rect.x() + target_rect.width() + 5, target_rect.y() - 5, "1")  # 右端 (1)
             
@@ -517,9 +515,25 @@ class ImageLabel(QLabel):
                 painter.setPen(QPen(QColor(0, 0, 255), 4))  # 太さを4に増加
                 circle_size = 15  # 円のサイズを大きく(元は10)
                 painter.drawEllipse(scaled_x - circle_size, scaled_y - circle_size, circle_size*2, circle_size*2)
-        
-            # ここから物体検知推論結果表示の追加部分
-            # 推論結果表示チェックがオンで、detection_inference_resultsデータがある場合に表示
+
+                # 追加: 教師データから推論結果への差分ベクトル矢印を描画
+                if (self.annotation_point and 
+                    hasattr(self.main_window, 'inference_diff_vectors') and 
+                    hasattr(self.main_window, 'show_diff_vectors') and 
+                    self.main_window.show_diff_vectors):  # チェックボックスの状態を確認
+                    
+                    current_index = self.main_window.current_index
+                                        
+                    if current_index in self.main_window.inference_diff_vectors:
+                        # 教師データの座標（スケール済み）
+                        anno_rel_x = self.annotation_point.x() / self.pixmap().width()
+                        anno_rel_y = self.annotation_point.y() / self.pixmap().height()
+                        anno_scaled_x = int(target_rect.x() + anno_rel_x * target_rect.width())
+                        anno_scaled_y = int(target_rect.y() + anno_rel_y * target_rect.height())
+                                                
+                        # 矢印を描画（教師データから推論結果へ）
+                        self.draw_vector_arrow(painter, anno_scaled_x, anno_scaled_y, scaled_x, scaled_y)
+
             if (self.main_window and 
                 hasattr(self.main_window, 'show_detection_inference') and 
                 self.main_window.show_detection_inference and
@@ -704,22 +718,22 @@ class ImageLabel(QLabel):
                                 class_name = bbox.get('class', 'unknown')
                                 self.main_window.statusBar().showMessage(f"'{class_name}' バウンディングボックスを選択しました", 3000)
                             
-                            self.update()  # 再描画
+                            self.update() 
                             return
                     
                     # どのバウンディングボックスにも含まれない場合、新規描画開始
                     self.selected_bbox_index = None
                     self.bbox_start = QPoint(orig_x, orig_y)
                     self.is_drawing_bbox = True
-                    self.bbox_end = self.bbox_start  # 初期点で初期化
-                    self.update()  # 再描画
+                    self.bbox_end = self.bbox_start  
+                    self.update()  
                 else:
                     # バウンディングボックスがない場合、新規描画開始
                     self.selected_bbox_index = None
                     self.bbox_start = QPoint(orig_x, orig_y)
                     self.is_drawing_bbox = True
-                    self.bbox_end = self.bbox_start  # 初期点で初期化
-                    self.update()  # 再描画
+                    self.bbox_end = self.bbox_start  
+                    self.update()
             else:
                 # 自動運転アノテーションモード
                 self.annotation_point = QPoint(orig_x, orig_y)
@@ -736,9 +750,53 @@ class ImageLabel(QLabel):
 
     def leaveEvent(self, event):
         """マウスがウィジェットから離れた時の処理"""
-        self.setCursor(Qt.ArrowCursor)  # 通常のカーソルに戻す
+        self.setCursor(Qt.ArrowCursor)  
         self.hovering_bbox_index = None
         super().leaveEvent(event)
+
+    def draw_vector_arrow(self, painter, start_x, start_y, end_x, end_y):
+        """教師データから推論結果への矢印を描画する"""
+        # 矢印の色とスタイル設定
+        painter.setPen(QPen(QColor(0, 255, 0), 2))  # 緑色
+        painter.setBrush(QBrush(QColor(0, 255, 0)))
+
+        # 矢印の線を描画
+        painter.drawLine(start_x, start_y, end_x, end_y)
+
+        # 矢印の線を描画
+        painter.drawLine(start_x, start_y, end_x, end_y)
+                
+        # ベクトルの角度を計算
+        dx = end_x - start_x
+        dy = end_y - start_y
+        
+        # 矢印が短すぎる場合は描画しない
+        vector_length = math.sqrt(dx*dx + dy*dy)
+        if vector_length < 5:
+            return
+            
+        angle = math.atan2(dy, dx)
+        
+        # 矢印の先端のサイズ
+        arrow_length = 10
+        arrow_angle = math.pi / 6  # 30度
+        
+        # 矢印の先端の座標を計算
+        arrow_x1 = end_x - arrow_length * math.cos(angle - arrow_angle)
+        arrow_y1 = end_y - arrow_length * math.sin(angle - arrow_angle)
+        arrow_x2 = end_x - arrow_length * math.cos(angle + arrow_angle)
+        arrow_y2 = end_y - arrow_length * math.sin(angle + arrow_angle)
+        
+        # 矢印の先端を描画
+        arrow_points = [
+            QPoint(int(end_x), int(end_y)),
+            QPoint(int(arrow_x1), int(arrow_y1)),
+            QPoint(int(arrow_x2), int(arrow_y2))
+        ]
+        
+        from PyQt5.QtGui import QPolygon
+        arrow_polygon = QPolygon(arrow_points)
+        painter.drawPolygon(arrow_polygon)
 
     def check_bbox_hover(self, pos):
         """マウス位置がバウンディングボックス上にあるかチェック"""
@@ -1239,6 +1297,12 @@ class ImageAnnotationTool(QMainWindow):
         self.annotations = {}
         self.annotation_history = []
         self.annotated_count = 0
+
+        # # 動画メタデータ管理の初期化を追加
+        # self.video_metadata_file = os.path.join(APP_DIR_PATH, "video_metadata.json")
+        # self.video_metadata = self.load_video_metadata()
+        # self._model_loaded_at = None  # モデル読み込み時刻記録用
+
         # 現在のアノテーションモード（0=自動運転、1=物体検知）
         self.current_mode = 0
         self.last_selected_bbox_class = None  # 前回選択した物体検知クラス
@@ -1265,13 +1329,14 @@ class ImageAnnotationTool(QMainWindow):
         
         # 推論結果のキャッシュ
         self.inference_results = {}
+        self.inference_diff_vectors = {}
+        self.show_diff_vectors = False  
 
         # YOLO関連の初期化を追加
         self.yolo_model = None  # YOLOモデルのインスタンス
-        self.yolo_confidence_threshold = 0.6  # デフォルトの信頼度閾値
-        # 既存の初期化コードに追加
-        self.bbox_annotations = {}  # 物体検知アノテーション用
-        self.class_names = ["car", "person", "sign", "cone"]  # デフォルトクラス
+        self.yolo_confidence_threshold = 0.6  
+        self.bbox_annotations = {} 
+        self.class_names = ["car", "person", "sign", "cone"]  
 
         # Setup UI
         self.init_ui()
@@ -1306,7 +1371,8 @@ class ImageAnnotationTool(QMainWindow):
         main_layout.addWidget(left_panel)
 
         # Folder selection
-        folder_label = QLabel("データ読込（imagesフォルダを持つ親フォルダ選択:")
+        folder_label = QLabel("データ読込（imagesフォルダの親フォルダ:")
+        folder_label.setStyleSheet("font-weight: bold;")  
         left_layout.addWidget(folder_label)
         
         folder_layout = QHBoxLayout()
@@ -1361,7 +1427,7 @@ class ImageAnnotationTool(QMainWindow):
         left_layout.addWidget(variant_box)
 
         # エクスポートセクション
-        save_label = QLabel("保存:")
+        save_label = QLabel("アノテーションデータ保存:")
         save_label.setStyleSheet("font-weight: bold;")  # 太文字にするスタイルを追加
         left_layout.addWidget(save_label)
 
@@ -1426,10 +1492,11 @@ class ImageAnnotationTool(QMainWindow):
         # モデル操作ボタン（更新と読み込み - 横並び）
         model_buttons_layout = QHBoxLayout()
 
-        # モデルリスト更新ボタン
-        self.model_refresh_button = QPushButton("モデル一覧更新")
-        self.model_refresh_button.clicked.connect(self.refresh_model_list)
-        model_buttons_layout.addWidget(self.model_refresh_button)
+        # モデル学習ボタン（自動運転用）
+        train_model_button = QPushButton("モデル学習・保存")
+        train_model_button.clicked.connect(self.train_and_save_model)
+        apply_style(train_model_button, 'training')
+        model_buttons_layout.addWidget(train_model_button)  
 
         # モデル明示的読み込みボタン
         self.model_load_button = QPushButton("モデル読込")
@@ -1440,12 +1507,6 @@ class ImageAnnotationTool(QMainWindow):
 
         pilot_layout.addLayout(model_buttons_layout)
 
-        # モデル学習ボタン（自動運転用）
-        train_model_button = QPushButton("学習・保存")
-        train_model_button.clicked.connect(self.train_and_save_model)
-        apply_style(train_model_button, 'training')
-        pilot_layout.addWidget(train_model_button)  
-
         # 推論結果表示オプション
         inference_layout = QHBoxLayout()
         self.inference_checkbox = QCheckBox("推論結果表示（青丸）")
@@ -1455,12 +1516,21 @@ class ImageAnnotationTool(QMainWindow):
 
 
         # 一括推論実行ボタンを追加
-        batch_inference_button = QPushButton("全画像の推論実行")
+        batch_inference_button = QPushButton("全画像を推論")
         batch_inference_button.setToolTip("全ての画像に対して推論を実行します")
         batch_inference_button.clicked.connect(self.run_batch_inference)
         inference_layout.addWidget(batch_inference_button)
 
         pilot_layout.addLayout(inference_layout)
+
+        # 追加: 差分ベクトル矢印表示オプション
+        diff_vector_layout = QHBoxLayout()
+        self.diff_vector_checkbox = QCheckBox("差分ベクトル矢印表示（緑矢印）")
+        self.diff_vector_checkbox.setChecked(False)
+        self.diff_vector_checkbox.stateChanged.connect(self.toggle_diff_vector_display)
+        diff_vector_layout.addWidget(self.diff_vector_checkbox)
+        
+        pilot_layout.addLayout(diff_vector_layout)
 
         left_layout.addWidget(self.pilot_container)
                     
@@ -1532,10 +1602,11 @@ class ImageAnnotationTool(QMainWindow):
         # 5. モデル操作ボタン（更新と読み込み - 横並び）
         yolo_model_buttons_layout = QHBoxLayout()
 
-        # モデルリスト更新ボタン
-        self.yolo_refresh_button = QPushButton("モデル一覧更新")
-        self.yolo_refresh_button.clicked.connect(self.refresh_yolo_model_list)
-        yolo_model_buttons_layout.addWidget(self.yolo_refresh_button)
+        # 物体検知モデル学習ボタン
+        train_yolo_button = QPushButton("モデル学習・保存")
+        train_yolo_button.clicked.connect(self.train_and_save_yolo_model)
+        apply_style(train_yolo_button, 'training')
+        yolo_model_buttons_layout.addWidget(train_yolo_button)
 
         # モデル読み込みボタン
         self.yolo_load_button = QPushButton("モデル読込")
@@ -1545,12 +1616,6 @@ class ImageAnnotationTool(QMainWindow):
         yolo_model_buttons_layout.addWidget(self.yolo_load_button)
 
         obj_detection_layout.addLayout(yolo_model_buttons_layout)
-
-        # 物体検知モデル学習ボタン
-        train_yolo_button = QPushButton("YOLOモデル学習・保存")
-        train_yolo_button.clicked.connect(self.train_and_save_yolo_model)
-        apply_style(train_yolo_button, 'training')
-        obj_detection_layout.addWidget(train_yolo_button)
 
         # 物体検知推論結果表示オプション
         detection_inference_layout = QHBoxLayout()
@@ -1566,7 +1631,7 @@ class ImageAnnotationTool(QMainWindow):
         # --- MLflow関連ボタンを追加 ---
         mlflow_layout = QVBoxLayout()
 
-        mlflow_label = QLabel("MLflow:")
+        mlflow_label = QLabel("モデル管理:")
         mlflow_label.setStyleSheet("font-weight: bold;")  # 太文字にするスタイルを追加
         mlflow_layout.addWidget(mlflow_label)
 
@@ -1625,9 +1690,6 @@ class ImageAnnotationTool(QMainWindow):
         self.detection_inference_info_label.setStyleSheet("color: green;")  # 緑色で表示して区別
         info_layout.addWidget(self.detection_inference_info_label)
         
-        # 空白を下に追加
-        # info_layout.addStretch()
-
         # 上部のウィジェットと分布グラフの間にスペーサーを入れる
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
@@ -2175,6 +2237,96 @@ class ImageAnnotationTool(QMainWindow):
                     # 統計情報更新
                     self.update_bbox_stats()
 
+    # def calculate_and_store_diff_vector(self, img_path_or_index):
+    #     """教師データと推論結果の差分ベクトルを計算して保存する"""
+    #     # 教師データの取得
+    #     annotation = None
+    #     if isinstance(img_path_or_index, int) and img_path_or_index in self.annotations:
+    #         annotation = self.annotations[img_path_or_index]
+    #     elif isinstance(img_path_or_index, str) and img_path_or_index in self.annotations:
+    #         annotation = self.annotations[img_path_or_index]
+        
+    #     # 推論結果の取得
+    #     inference = None
+    #     if isinstance(img_path_or_index, int) and img_path_or_index in self.inference_results:
+    #         inference = self.inference_results[img_path_or_index]
+    #     elif isinstance(img_path_or_index, str) and img_path_or_index in self.inference_results:
+    #         inference = self.inference_results[img_path_or_index]
+        
+    #     if annotation and inference:
+    #         # 角度と速度の差分を計算
+    #         if "pilot/angle" in inference and "pilot/throttle" in inference:
+    #             angle_diff = inference["pilot/angle"] - annotation["angle"]
+    #             throttle_diff = inference["pilot/throttle"] - annotation["throttle"]
+    #         else:
+    #             angle_diff = inference["angle"] - annotation["angle"]
+    #             throttle_diff = inference["throttle"] - annotation["throttle"]
+            
+    #         # ベクトルの大きさと角度を計算
+    #         vector_magnitude = math.sqrt(angle_diff**2 + throttle_diff**2)
+    #         vector_angle = math.atan2(throttle_diff, angle_diff)
+            
+    #         # 画像パスまたはインデックスをキーとして差分ベクトルを保存
+    #         key = img_path_or_index
+    #         if isinstance(img_path_or_index, int) and hasattr(self, 'images') and 0 <= img_path_or_index < len(self.images):
+    #             key = self.images[img_path_or_index]
+            
+    #         self.inference_diff_vectors[key] = {
+    #             'angle_diff': angle_diff,
+    #             'throttle_diff': throttle_diff,
+    #             'vector_magnitude': vector_magnitude,
+    #             'vector_angle': vector_angle
+    #         }
+            
+    #         print(f"差分ベクトル計算完了: angle_diff={angle_diff:.4f}, throttle_diff={throttle_diff:.4f}, magnitude={vector_magnitude:.4f}")
+    def calculate_and_store_diff_vector(self, index_or_path):
+        """教師データと推論結果の差分ベクトルを計算して保存する"""
+        # インデックスベースで処理
+        if isinstance(index_or_path, int):
+            index = index_or_path
+        else:
+            # パスからインデックスを取得
+            try:
+                index = self.images.index(index_or_path)
+            except ValueError:
+                print(f"警告: パス {index_or_path} からインデックスを取得できませんでした")
+                return
+        
+        # 教師データの取得（インデックスベース）
+        annotation = None
+        if index in self.annotations:
+            annotation = self.annotations[index]
+        
+        # 推論結果の取得（インデックスベース）
+        inference = None
+        if index in self.inference_results:
+            inference = self.inference_results[index]
+                
+        if annotation and inference:
+            # 角度と速度の差分を計算
+            if "pilot/angle" in inference and "pilot/throttle" in inference:
+                angle_diff = inference["pilot/angle"] - annotation["angle"]
+                throttle_diff = inference["pilot/throttle"] - annotation["throttle"]
+            else:
+                angle_diff = inference["angle"] - annotation["angle"]
+                throttle_diff = inference["throttle"] - annotation["throttle"]
+            
+            # ベクトルの大きさと角度を計算
+            import math
+            vector_magnitude = math.sqrt(angle_diff**2 + throttle_diff**2)
+            vector_angle = math.atan2(throttle_diff, angle_diff)
+            
+            # インデックスをキーとして差分ベクトルを保存
+            self.inference_diff_vectors[index] = {
+                'angle_diff': angle_diff,
+                'throttle_diff': throttle_diff,
+                'vector_magnitude': vector_magnitude,
+                'vector_angle': vector_angle
+            }
+            
+        else:
+            print(f"差分ベクトル計算スキップ: アノテーションまたは推論結果が不足")
+
     def update_bbox_stats(self):
         """
         Update statistics for bounding box annotations
@@ -2232,7 +2384,21 @@ class ImageAnnotationTool(QMainWindow):
             self.statusBar().showMessage("物体検知推論結果表示をオンにしました", 3000)
         else:
             self.statusBar().showMessage("物体検知推論結果表示をオフにしました", 3000)
-    
+
+    def toggle_diff_vector_display(self, state):
+            """差分ベクトル矢印表示の切り替え"""
+            show_diff_vectors = (state == Qt.Checked)
+            self.show_diff_vectors = show_diff_vectors
+            
+            # 画面更新
+            self.main_image_view.update()
+            
+            # 表示状態をステータスバーに反映
+            if show_diff_vectors:
+                self.statusBar().showMessage("差分ベクトル矢印表示をオンにしました", 3000)
+            else:
+                self.statusBar().showMessage("差分ベクトル矢印表示をオフにしました", 3000)
+
     def toggle_location_inference_display(self, state):
         """位置推論表示の切り替え"""
         show_inference = (state == Qt.Checked)
@@ -3151,14 +3317,7 @@ class ImageAnnotationTool(QMainWindow):
             progress.show()
             
             # エクスポート実行
-            try:
-                # exports_fileモジュールから関数をインポート
-                
-                # インデックスからパスへのマッピングを作成（オプショナル）
-                # index_to_path_map = {}
-                # for i, img_path in enumerate(self.images):
-                #     index_to_path_map[i] = img_path
-                
+            try:                
                 # 関数を呼び出し - 削除済みインデックスを渡す
                 yaml_path = export_to_yolo(
                     annotation_folder, 
@@ -4444,7 +4603,7 @@ class ImageAnnotationTool(QMainWindow):
                 anno = self.annotations[self.current_index]
                 
                 # 基本的なアノテーション情報
-                annotation_text = f"<b>運転アノテーション情報:</b><br>"
+                annotation_text = f"<b>操作値アノテーション:</b><br>"
                 annotation_text += f"angle = <span style='color: #FF6666;'>{anno['angle']:.4f}</span><br>"
                 annotation_text += f"throttle = <span style='color: #FF6666;'>{anno['throttle']:.4f}</span>"
                 
@@ -4539,7 +4698,7 @@ class ImageAnnotationTool(QMainWindow):
         annotation_buttons = [
             self.load_annotation_button,       # アノテーションデータを読込ボタン
             self.model_load_button,            # モデル読込ボタン
-            self.model_refresh_button,         # モデル一覧更新ボタン
+            # self.model_refresh_button,         # モデル一覧更新ボタン
             self.inference_checkbox,           # 推論結果表示チェックボックス
         ]
         
@@ -4864,6 +5023,122 @@ class ImageAnnotationTool(QMainWindow):
         if hasattr(self, 'model_combo'):
             self.refresh_model_list()    
 
+    # def run_inference_check(self, all_images=False):
+    #     """推論を実行するメソッド - モデル情報表示を強化、推論実行後に推論表示をオン"""
+    #     if not self.images:
+    #         return
+        
+    #     # 現在のモデル情報を取得
+    #     model_type = self.auto_method_combo.currentText()
+    #     selected_model = self.model_combo.currentText()
+        
+    #     # 推論対象の画像を決定
+    #     if all_images:
+    #         # 既存の推論結果がある場合は確認ダイアログを表示
+    #         if self.inference_results and len(self.inference_results) > 0:
+    #             reply = QMessageBox.question(
+    #                 self, 
+    #                 "推論結果の再計算確認", 
+    #                 f"現在、{len(self.inference_results)}個の推論結果が保存されています。\n"
+    #                 f"一括推論を実行すると、すべての推論結果が現在のモデル '{model_type} ({selected_model})' を使って再計算されます。\n\n"
+    #                 "続行しますか？",
+    #                 QMessageBox.Yes | QMessageBox.No,
+    #                 QMessageBox.Yes
+    #             )
+                
+    #             if reply == QMessageBox.No:
+    #                 return  # 操作をキャンセル
+            
+    #         target_images = self.images
+    #         progress_title = "全画像の推論を実行中..."
+    #     else:
+    #         target_images = [self.images[self.current_index]]
+    #         progress_title = "推論実行中..."
+        
+    #     # モデルのパスを取得 (コンボボックスから選択されたモデル)
+    #     model_path = None
+    #     if hasattr(self, 'model_combo') and self.model_combo.currentText() not in ["モデルが見つかりません", "フォルダを選択してください"] and "が見つかりません" not in self.model_combo.currentText():
+    #         # アノテーションフォルダ内のモデルのフルパスを作成
+    #         selected_model = self.model_combo.currentText()
+    #         # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+    #         model_path = os.path.join(models_dir, selected_model)
+            
+    #         # モデルが存在するか確認
+    #         if not os.path.exists(model_path):
+    #             QMessageBox.warning(self, "警告", f"選択されたモデルが見つかりません: {selected_model}")
+    #             return
+        
+    #     # モデル変更を検出するための状態を保持
+    #     current_model_info = (model_type, model_path)
+    #     force_reload = False
+        
+    #     # モデルが変更された場合のみ強制再読み込み
+    #     if not hasattr(self, '_last_model_info') or self._last_model_info != current_model_info:
+    #         force_reload = True
+    #         self._last_model_info = current_model_info
+        
+    #     try:
+    #         # ステータスバーにメッセージ表示
+    #         model_desc = os.path.basename(model_path) if model_path else '事前学習済み'
+    #         self.statusBar().showMessage(f"推論処理中... モデル: {model_type} ({model_desc})")
+    #         QApplication.processEvents()
+
+    #         # 推論を実行
+    #         if model_type in list_available_models():
+    #             # モデルを使用した推論 - force_reloadはモデル変更時のみTrue
+    #             inference_results = batch_inference(
+    #                 target_images, 
+    #                 method="model", 
+    #                 model_type=model_type,
+    #                 model_path=model_path,
+    #                 force_reload=force_reload
+    #             )
+    #         else:
+    #             QMessageBox.warning(self, "警告", "サポートされていない推論方法です。")
+    #             return
+            
+    #         # 推論結果を保存
+    #         old_count = len(self.inference_results)
+    #         self.inference_results.update(inference_results)
+    #         new_count = len(self.inference_results)
+            
+    #         # 推論表示チェックボックスを自動的にオンにする
+    #         was_checked = self.inference_checkbox.isChecked()
+    #         self.inference_checkbox.setChecked(True)
+            
+    #         # 表示を更新
+    #         self.update_inference_display()
+    #         self.main_image_view.update()
+    #         self.update_gallery()
+
+    #         # ステータスバーのメッセージをクリア
+    #         self.statusBar().clearMessage()
+
+    #         # 全画像の推論の場合はメッセージ表示
+    #         if all_images:
+    #             added_results = new_count - old_count
+    #             updated_results = len(target_images) - added_results
+                
+    #             check_message = ""
+    #             if not was_checked:
+    #                 check_message = "\n\n推論結果表示が自動的にオンになりました。"
+                    
+    #             QMessageBox.information(
+    #                 self, 
+    #                 "推論完了", 
+    #                 f"{len(target_images)}枚の画像に対する推論を完了しました。\n"
+    #                 f"{added_results}個の新しい結果が追加され、{updated_results}個の結果が更新されました。\n\n"
+    #                 f"使用モデル: {model_type} ({model_desc}){check_message}"
+    #             )
+            
+    #     except Exception as e:
+    #         self.statusBar().clearMessage()
+    #         QMessageBox.critical(
+    #             self, 
+    #             "エラー", 
+    #             f"推論中にエラーが発生しました: {str(e)}"
+    #         )
+    
     def run_inference_check(self, all_images=False):
         """推論を実行するメソッド - モデル情報表示を強化、推論実行後に推論表示をオン"""
         if not self.images:
@@ -4938,9 +5213,21 @@ class ImageAnnotationTool(QMainWindow):
                 QMessageBox.warning(self, "警告", "サポートされていない推論方法です。")
                 return
             
-            # 推論結果を保存
+            # 推論結果を保存（インデックスベースに変換）
             old_count = len(self.inference_results)
-            self.inference_results.update(inference_results)
+            
+            # 画像パスからインデックスに変換して保存
+            for img_path, result in inference_results.items():
+                # 画像パスから対応するインデックスを取得
+                try:
+                    img_index = self.images.index(img_path)
+                    self.inference_results[img_index] = result
+                    print(f"推論結果保存: インデックス{img_index} <- {os.path.basename(img_path)}")
+                except ValueError:
+                    print(f"警告: 画像パス {img_path} がself.imagesに見つかりません")
+                    # パスでも保存（後方互換性のため）
+                    self.inference_results[img_path] = result
+            
             new_count = len(self.inference_results)
             
             # 推論表示チェックボックスを自動的にオンにする
@@ -4974,12 +5261,14 @@ class ImageAnnotationTool(QMainWindow):
             
         except Exception as e:
             self.statusBar().clearMessage()
+            import traceback
+            traceback.print_exc()  # エラーの詳細を表示
             QMessageBox.critical(
                 self, 
                 "エラー", 
                 f"推論中にエラーが発生しました: {str(e)}"
             )
-    
+
     def run_batch_inference(self):
         """全ての画像に対して推論を実行する"""
         if not self.images:
@@ -4993,8 +5282,6 @@ class ImageAnnotationTool(QMainWindow):
         # モデルのパスを取得
         model_path = None
         if selected_model not in ["モデルが見つかりません", "フォルダを選択してください"] and "が見つかりません" not in selected_model:
-            # アノテーションフォルダ内のモデルのフルパスを作成
-            # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
             model_path = os.path.join(models_dir, selected_model)
             
             # モデルが存在するか確認
@@ -5044,7 +5331,7 @@ class ImageAnnotationTool(QMainWindow):
         
         try:
             # バッチサイズを設定
-            batch_size = 50  # 大量の画像を一度に処理するとメモリ不足になる可能性があるため
+            batch_size = 50
             total_batches = (len(self.images) + batch_size - 1) // batch_size
             
             # 初期化
@@ -5067,8 +5354,18 @@ class ImageAnnotationTool(QMainWindow):
                 
                 # スキップすべき画像をフィルタリング
                 if not clear_existing:
-                    batch_to_process = [img for img in current_batch if img not in self.inference_results]
-                    skipped_count += len(current_batch) - len(batch_to_process)
+                    # インデックスベースでチェック
+                    batch_to_process = []
+                    for img_path in current_batch:
+                        try:
+                            img_index = self.images.index(img_path)
+                            if img_index not in self.inference_results:
+                                batch_to_process.append(img_path)
+                            else:
+                                skipped_count += 1
+                        except ValueError:
+                            # インデックスが見つからない場合は処理対象に含める
+                            batch_to_process.append(img_path)
                 else:
                     batch_to_process = current_batch
                 
@@ -5094,9 +5391,19 @@ class ImageAnnotationTool(QMainWindow):
                         force_reload=(batch_idx == 0)  # 最初のバッチのみ強制再読込
                     )
                     
-                    # 結果を保存
-                    self.inference_results.update(batch_results)
-                    success_count += len(batch_results)
+                    # 結果をインデックスベースで保存（ここが重要な修正点）
+                    for img_path, result in batch_results.items():
+                        # 画像パスから対応するインデックスを取得
+                        try:
+                            img_index = self.images.index(img_path)
+                            self.inference_results[img_index] = result
+                            success_count += 1
+                            print(f"推論結果保存: インデックス{img_index} <- {os.path.basename(img_path)}")
+                        except ValueError:
+                            print(f"警告: 画像パス {img_path} がself.imagesに見つかりません")
+                            # パスでも保存（後方互換性のため）
+                            self.inference_results[img_path] = result
+                            success_count += 1
                     
                 except Exception as e:
                     print(f"バッチ {batch_idx+1} 処理中にエラー: {e}")
@@ -5261,12 +5568,14 @@ class ImageAnnotationTool(QMainWindow):
         if not self.images:
             return
                 
-        current_img_path = self.images[self.current_index]
+        current_index = self.current_index
+                
+        # 推論結果がある場合、表示を更新（インデックスベースで探す）
+        inference = None
+        if current_index in self.inference_results:
+            inference = self.inference_results[current_index]
         
-        # 推論結果がある場合、表示を更新
-        if current_img_path in self.inference_results:
-            inference = self.inference_results[current_img_path]
-            
+        if inference:
             # 新しいキー形式があればそれを使い、なければ古い形式を使う
             if "pilot/angle" in inference and "pilot/throttle" in inference:
                 angle = inference["pilot/angle"]
@@ -5279,6 +5588,19 @@ class ImageAnnotationTool(QMainWindow):
             inference_text = f"<b>推論結果:</b><br>"
             inference_text += f"angle = <span style='color: #6666FF;'>{angle:.4f}</span><br>"
             inference_text += f"throttle = <span style='color: #6666FF;'>{throttle:.4f}</span>"
+
+
+            # 追加: 差分ベクトルの計算と表示
+            if current_index in self.annotations:
+                self.calculate_and_store_diff_vector(current_index)
+                
+                # 差分ベクトル情報を表示に追加
+                if current_index in self.inference_diff_vectors:
+                    diff_data = self.inference_diff_vectors[current_index]
+                    inference_text += f"<br><br><b>推論-操作値の差分ベクトル:</b><br>"
+                    inference_text += f"angle差分 = <span style='color: #228B22;'>{diff_data['angle_diff']:+.4f}</span><br>"
+                    inference_text += f"throttle差分 = <span style='color: #228B22;'>{diff_data['throttle_diff']:+.4f}</span><br>"
+                    inference_text += f"ベクトル長 = <span style='color: #228B22;'>{diff_data['vector_magnitude']:.4f}</span>"
 
             # 位置情報を取得
             location = None
@@ -5302,13 +5624,14 @@ class ImageAnnotationTool(QMainWindow):
             # ImageLabelに推論ポイントを設定
             self.main_image_view.inference_point = QPoint(inference['x'], inference['y'])
         else:
+            print(f"推論結果が見つかりませんでした")
             # 推論結果がない場合はクリア
             self.inference_info_label.setText("")
             self.main_image_view.inference_point = None
         
         # 推論表示のチェック状態を反映
         self.main_image_view.show_inference = self.inference_checkbox.isChecked()
-                
+
     def keyPressEvent(self, event):
         # Bキーでアノテーションモードを切り替え
         if event.key() == Qt.Key_B:
@@ -6740,49 +7063,185 @@ class ImageAnnotationTool(QMainWindow):
             f"{count}個の削除済みインデックスをすべて復元しました。\n"
             "これらのインデックスにアノテーションを追加できるようになりました。"
         )
-   #TODO:リファクタリング
+
     def export_to_donkey(self):
-        """Donkeycar形式でエクスポートする - 複数画像ソース選択に対応"""
+        """Donkeycar形式でエクスポートする - 共通ダイアログを使用"""
         if not self.annotations:
             QMessageBox.information(self, "情報", "エクスポートするアノテーションがありません。")
             return
         
-        if not self.folder_path:
-            QMessageBox.warning(self, "警告", "画像フォルダが設定されていません。")
-            return
-        
-        if not hasattr(self, 'available_variants') or not self.available_variants:
-            QMessageBox.warning(self, "警告", "利用可能な画像ソースがありません。")
-            return
+        # 共通ダイアログを表示
+        export_config = self.show_export_dialog("donkey")
+        if not export_config:
+            return  # キャンセルされた場合
         
         try:
-            # 画像ソース選択ダイアログを表示
-            source_dialog = QDialog(self)
-            source_dialog.setWindowTitle("エクスポート設定")
-            source_dialog.setMinimumWidth(400)
+            # エクスポート実行
+            catalog_path = export_to_donkey(
+                export_config['output_folder'], 
+                self.annotations, 
+                inference_results=self.inference_results,
+                deleted_indexes=self.deleted_indexes if hasattr(self, 'deleted_indexes') else [],
+                image_map=export_config['image_map'],
+                variant_keys=export_config['variant_keys'],
+                diff_vectors=self.inference_diff_vectors if hasattr(self, 'inference_diff_vectors') else None
+            )
             
-            dialog_layout = QVBoxLayout(source_dialog)
+            if not catalog_path:
+                QMessageBox.warning(
+                    self,
+                    "エクスポート警告",
+                    "エクスポート可能なエントリがありませんでした。"
+                )
+                return
+                    
+            QMessageBox.information(
+                self, 
+                "完了", 
+                f"アノテーションをDonkeycar形式でエクスポートしました。\n"
+                f"選択画像ソース: {', '.join(export_config['selected_variants'])}\n"
+                f"保存先: {export_config['output_folder']}\n"
+                f"エクスポート数: {len(self.annotations)}個"
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"Donkeycarエクスポート中にエラーが発生しました: {str(e)}\n\n"
+                f"詳細: {traceback.format_exc()}"
+            )
+
+    def export_to_jetracer(self):
+        """Jetracer形式でエクスポートする - 共通ダイアログを使用"""
+        if not self.annotations:
+            QMessageBox.information(self, "情報", "エクスポートするアノテーションがありません。")
+            return
+        
+        # 共通ダイアログを表示
+        export_config = self.show_export_dialog("jetracer")
+        if not export_config:
+            return  # キャンセルされた場合
+        
+        try:
+            # Jetracer形式でエクスポート
+            # インデックスベースのアノテーションを画像パスベースに変換
+            path_based_annotations = {}
+            for idx, annotation in self.annotations.items():
+                if isinstance(idx, int) and 0 <= idx < len(self.images):
+                    img_path = self.images[idx]
+                    path_based_annotations[img_path] = annotation
+                elif isinstance(idx, str):
+                    path_based_annotations[idx] = annotation
+            
+            # 推論結果も同様に変換
+            path_based_inference = {}
+            if hasattr(self, 'inference_results') and self.inference_results:
+                for idx, inference in self.inference_results.items():
+                    if isinstance(idx, int) and 0 <= idx < len(self.images):
+                        img_path = self.images[idx]
+                        path_based_inference[img_path] = inference
+                    elif isinstance(idx, str):
+                        path_based_inference[idx] = inference
+            
+            catalog_path = export_to_jetracer(
+                export_config['output_folder'], 
+                path_based_annotations,
+                inference_results=path_based_inference
+            )
+            
+            QMessageBox.information(
+                self, 
+                "完了", 
+                f"アノテーションをJetracer形式でエクスポートしました。\n"
+                f"保存先: {export_config['output_folder']}\n"
+                f"エクスポート数: {len(path_based_annotations)}個"
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"Jetracerエクスポート中にエラーが発生しました: {str(e)}\n\n"
+                f"詳細: {traceback.format_exc()}"
+            )
+
+    def show_export_dialog(self, export_type):
+        """共通のエクスポート設定ダイアログを表示
+        
+        Args:
+            export_type: "donkey" または "jetracer"
+            
+        Returns:
+            設定辞書またはNone（キャンセル時）
+        """
+        # フォルダ名とタイトル
+        if export_type == "donkey":
+            default_folder_name = "data_donkey"
+            dialog_title = "Donkeycarエクスポート設定"
+            format_name = "Donkeycar"
+        else:  # jetracer
+            default_folder_name = "data_jetracer"
+            dialog_title = "Jetracerエクスポート設定"
+            format_name = "Jetracer"
+        
+        # 読み込み元フォルダがある場合はその名前を追加
+        if hasattr(self, 'folder_path') and self.folder_path:
+            parent_folder_name = os.path.basename(self.folder_path)
+            if parent_folder_name:
+                default_folder_name = f"{default_folder_name}_{parent_folder_name}"
+        
+        # ダイアログを作成
+        dialog = QDialog(self)
+        dialog.setWindowTitle(dialog_title)
+        dialog.setMinimumWidth(500)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # 保存先フォルダ選択
+        folder_group = QGroupBox("保存先設定")
+        folder_layout = QVBoxLayout(folder_group)
+        
+        # 保存先フォルダ選択
+        folder_selection_layout = QHBoxLayout()
+        folder_selection_layout.addWidget(QLabel("保存先フォルダ:"))
+        
+        folder_input = QLineEdit()
+        default_output_path = os.path.join(annotation_folder, default_folder_name)
+        folder_input.setText(default_output_path)
+        folder_selection_layout.addWidget(folder_input)
+        
+        browse_folder_button = QPushButton("参照...")
+        browse_folder_button.clicked.connect(lambda: self.browse_output_folder(folder_input))
+        folder_selection_layout.addWidget(browse_folder_button)
+        
+        folder_layout.addLayout(folder_selection_layout)
+        layout.addWidget(folder_group)
+        
+        # 画像ソース選択（Donkeycarの場合のみ）
+        selected_variants = []
+        variant_keys = {}
+        image_map = {}
+        
+        if export_type == "donkey" and hasattr(self, 'available_variants') and self.available_variants:
+            # 画像ソース選択グループ
+            source_group = QGroupBox("画像ソース選択")
+            source_layout = QVBoxLayout(source_group)
             
             # 説明ラベル
             info_label = QLabel("エクスポートする画像ソースを選択してください（複数選択可）：")
-            dialog_layout.addWidget(info_label)
+            source_layout.addWidget(info_label)
             
-            # 画像ソース選択グループ
-            source_group = QGroupBox("画像ソース")
-            source_layout = QVBoxLayout(source_group)
-            
-            # 利用可能な画像ソースに基づいてチェックボックスを作成（複数選択可）
+            # 利用可能な画像ソースに基づいてチェックボックスを作成
             source_checks = {}
             for variant in self.available_variants:
                 check = QCheckBox(f"{variant} ({len(self.variant_images.get(variant, []))}枚)")
                 check.setProperty("variant", variant)
                 # 現在のバリアントは自動的にチェック
-                if variant == self.current_variant:
+                if variant == getattr(self, 'current_variant', None):
                     check.setChecked(True)
                 source_layout.addWidget(check)
                 source_checks[variant] = check
             
-            dialog_layout.addWidget(source_group)
+            layout.addWidget(source_group)
             
             # カタログキー設定
             keys_group = QGroupBox("カタログキー設定")
@@ -6800,77 +7259,57 @@ class ImageAnnotationTool(QMainWindow):
                 key_inputs[variant] = key_input
             
             # 説明ラベル
-            key_note = QLabel("※ Donkeycarのデフォルトキーは 'cam/image_array' です。他のキーを使用する場合は対応が必要です。")
+            key_note = QLabel("※ Donkeycarのデフォルトキーは 'cam/image_array' です。")
             key_note.setStyleSheet("color: #666; font-style: italic;")
             keys_layout.addWidget(key_note)
             
-            dialog_layout.addWidget(keys_group)
-            
-            # 削除したインデックスの情報表示
-            if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
-                deletion_info = QLabel(f"削除済みインデックス数: {len(self.deleted_indexes)}")
-                dialog_layout.addWidget(deletion_info)
-            
-            # ボタン
-            button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-            button_box.accepted.connect(source_dialog.accept)
-            button_box.rejected.connect(source_dialog.reject)
-            dialog_layout.addWidget(button_box)
-            
-            # ダイアログ表示
-            if not source_dialog.exec_():
-                return
-            
+            layout.addWidget(keys_group)
+        
+        # 削除したインデックスの情報表示
+        if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
+            deletion_info = QLabel(f"削除済みインデックス数: {len(self.deleted_indexes)}個（エクスポートから除外されます）")
+            deletion_info.setStyleSheet("color: #666; font-style: italic;")
+            layout.addWidget(deletion_info)
+        
+        # ボタン
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        # ダイアログ表示
+        if not dialog.exec_():
+            return None
+        
+        # 設定値を取得
+        output_folder = folder_input.text().strip()
+        if not output_folder:
+            QMessageBox.warning(self, "警告", "保存先フォルダが指定されていません。")
+            return None
+        
+        # Donkeycarの場合は画像ソース設定を取得
+        if export_type == "donkey" and hasattr(self, 'available_variants') and self.available_variants:
             # 選択された画像ソースを取得
-            selected_variants = []
-            variant_keys = {}  # 各バリアントのキー名
-            
             for variant, check in source_checks.items():
                 if check.isChecked():
                     selected_variants.append(variant)
                     # 対応するキー名を取得
                     variant_keys[variant] = key_inputs[variant].text().strip()
                     if not variant_keys[variant]:
-                        variant_keys[variant] = f"{variant}/image_array"  # デフォルト値
+                        variant_keys[variant] = f"{variant}/image_array"
             
             if not selected_variants:
                 QMessageBox.warning(self, "警告", "画像ソースが選択されていません。")
-                return
+                return None
             
-            # 確認ダイアログ用のメッセージ作成
-            confirm_message = "以下の設定でDonkeycar形式でエクスポートします：\n\n"
-            
-            # 選択されたソースとキー名を表示
-            for variant in selected_variants:
-                confirm_message += f"・画像ソース: {variant} ({len(self.variant_images.get(variant, []))}枚)\n"
-                confirm_message += f"  キー名: {variant_keys[variant]}\n"
-            
-            confirm_message += f"\nアノテーション数: {len(self.annotations)}個"
-            
-            if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
-                confirm_message += f"\n削除済みインデックス数: {len(self.deleted_indexes)}"
-            
-            reply = QMessageBox.question(
-                self, "エクスポート確認", confirm_message + "\n\n続行しますか？",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
-            )
-            
-            if reply == QMessageBox.No:
-                return
-            
-            # 選択されたソースの画像マップを作成
-            # {index: {variant: image_path, ...}, ...}
-            image_map = {}
-            
+            # 画像マップを作成
             for variant in selected_variants:
                 variant_images = self.variant_images.get(variant, [])
                 if not variant_images:
                     continue
                     
                 for img_path in variant_images:
-                    # 画像パスからインデックスを抽出
                     try:
-                        import re
                         basename = os.path.basename(img_path)
                         match = re.match(r'^(\d+)_', basename)
                         if match:
@@ -6880,88 +7319,56 @@ class ImageAnnotationTool(QMainWindow):
                             image_map[idx][variant] = img_path
                     except Exception as e:
                         print(f"インデックス抽出エラー ({img_path}): {e}")
-            
-            if not image_map:
-                QMessageBox.warning(self, "警告", "画像インデックスの抽出に失敗しました。")
-                return
-            
-            # Donkeycar形式でエクスポート
-            output_folder = donkey_dataset_dir
-            
-            # エクスポート関数を実行
-            try:
-                catalog_path = export_to_donkey(
-                    output_folder, 
-                    self.annotations, 
-                    inference_results=self.inference_results,
-                    deleted_indexes=self.deleted_indexes if hasattr(self, 'deleted_indexes') else [],
-                    image_map=image_map,
-                    variant_keys=variant_keys
-                )
-            except Exception as e:
-                QMessageBox.critical(
-                    self, 
-                    "エクスポートエラー", 
-                    f"Donkeycarエクスポート中にエラーが発生しました: {str(e)}\n\n"
-                    f"詳細: {traceback.format_exc()}"
-                )
-                return
-            
-            if not catalog_path:
-                QMessageBox.warning(
-                    self,
-                    "エクスポート警告",
-                    "エクスポート可能なエントリがありませんでした。"
-                )
-                return
-                
-            QMessageBox.information(
-                self, 
-                "完了", 
-                f"アノテーションをDonkeycar形式でエクスポートしました。\n"
-                f"選択画像ソース: {', '.join(selected_variants)}\n"
-                f"保存先: {output_folder}\n"
-                f"エクスポート数: {len(self.annotations)}個"
-            )
-        except Exception as e:
-            QMessageBox.critical(
-                self, 
-                "エラー", 
-                f"エクスポート設定中にエラーが発生しました: {str(e)}\n\n"
-                f"詳細: {traceback.format_exc()}"
-            )
+        else:
+            # Jetracerの場合は単一ソースとして処理
+            selected_variants = ["cam"]  # デフォルト
+        
+        # 確認メッセージ
+        confirm_message = f"以下の設定で{format_name}形式でエクスポートします：\n\n"
+        confirm_message += f"保存先: {output_folder}\n"
+        
+        if export_type == "donkey" and selected_variants:
+            for variant in selected_variants:
+                image_count = len(self.variant_images.get(variant, []))
+                confirm_message += f"・画像ソース: {variant} ({image_count}枚)\n"
+                if variant in variant_keys:
+                    confirm_message += f"  キー名: {variant_keys[variant]}\n"
+        
+        confirm_message += f"\nアノテーション数: {len(self.annotations)}個"
+        
+        if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
+            confirm_message += f"\n削除済みインデックス数: {len(self.deleted_indexes)}個"
+        
+        reply = QMessageBox.question(
+            self, f"{format_name}エクスポート確認", confirm_message + "\n\n続行しますか？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+        )
+        
+        if reply == QMessageBox.No:
+            return None
+        
+        return {
+            'output_folder': output_folder,
+            'selected_variants': selected_variants,
+            'variant_keys': variant_keys,
+            'image_map': image_map,
+            'export_type': export_type
+        }
 
-    def export_to_jetracer(self):
-        """Jetracer形式でエクスポートする"""
-        if not self.annotations:
-            QMessageBox.information(self, "情報", "エクスポートするアノテーションがありません。")
-            return
+    def browse_output_folder(self, folder_input):
+        """出力フォルダを選択するダイアログを表示"""
+        current_path = folder_input.text().strip()
+        if not current_path:
+            current_path = annotation_folder
         
-        if not self.folder_path:
-            QMessageBox.warning(self, "警告", "画像フォルダが設定されていません。")
-            return
+        selected_folder = QFileDialog.getExistingDirectory(
+            self, "エクスポート先フォルダを選択", 
+            current_path,
+            QFileDialog.ShowDirsOnly
+        )
         
-        try:
-            # Jetracer形式でエクスポート
-            output_folder = jetracer_dataset_dir
-            catalog_path = export_to_jetracer(
-                output_folder, 
-                self.annotations, 
-                inference_results=self.inference_results
-            )
-            
-            QMessageBox.information(
-                self, 
-                "完了", 
-                f"アノテーションをJetracer形式でエクスポートしました。\n"
-                f"保存先: {output_folder}"
-            )
-        except Exception as e:
-            QMessageBox.critical(
-                self, 
-                "エラー", 
-                f"エクスポート中にエラーが発生しました: {str(e)}"
-            )
+        if selected_folder:
+            folder_input.setText(selected_folder)
 
     def create_annotation_video(self):
         """アノテーション動画を作成する - フレームレートと画像ソースを選択可能、複数ソースを横に並べる機能付き"""
@@ -7005,6 +7412,11 @@ class ImageAnnotationTool(QMainWindow):
         inference_check.setChecked(self.inference_checkbox.isChecked())  # UIの設定を初期値に
         dialog_layout.addWidget(inference_check)
         
+        # 追加: 差分ベクトル表示設定
+        diff_vector_check = QCheckBox("差分ベクトル矢印を表示する（緑矢印）")
+        diff_vector_check.setChecked(self.diff_vector_checkbox.isChecked())  # UIの設定を初期値に
+        dialog_layout.addWidget(diff_vector_check)
+
         # 出力モード設定のグループボックス
         output_mode_group = QGroupBox("出力モード")
         output_mode_layout = QVBoxLayout(output_mode_group)
@@ -7219,8 +7631,9 @@ class ImageAnnotationTool(QMainWindow):
         fps = fps_spin.value()
         skip_count = skip_spin.value()
         show_inference = inference_check.isChecked()
+        show_diff_vectors = diff_vector_check.isChecked()  # 追加
         is_multi_mode = multi_source_radio.isChecked()
-        
+
         # 選択された画像ソースを取得
         if is_multi_mode:
             # 複数ソースモード
@@ -7307,7 +7720,8 @@ class ImageAnnotationTool(QMainWindow):
                     show_inference=show_inference,
                     skip_count=skip_count,
                     fps=fps,
-                    progress_callback=update_progress
+                    progress_callback=update_progress,
+                    diff_vectors=self.inference_diff_vectors if (hasattr(self, 'inference_diff_vectors') and show_diff_vectors) else None  # 修正
                 )
             else:
                 # 単一ソースモードは従来通り
@@ -7319,9 +7733,10 @@ class ImageAnnotationTool(QMainWindow):
                     skip_count=skip_count, 
                     fps=fps,
                     progress_callback=update_progress,
-                    images_list=selected_images
+                    images_list=selected_images,
+                    diff_vectors=self.inference_diff_vectors if (hasattr(self, 'inference_diff_vectors') and show_diff_vectors) else None  # 修正
                 )
-            
+
             progress.close()
             
             if frames_count > 0:
@@ -8669,11 +9084,17 @@ class ImageAnnotationTool(QMainWindow):
         # モデル操作ボタン
         location_model_buttons_layout = QHBoxLayout()
         
-        # モデルリスト更新ボタン
-        self.location_refresh_button = QPushButton("モデル一覧更新")
-        self.location_refresh_button.clicked.connect(self.refresh_location_model_list)
-        location_model_buttons_layout.addWidget(self.location_refresh_button)
-        
+        # # モデルリスト更新ボタン
+        # self.location_refresh_button = QPushButton("モデル一覧更新")
+        # self.location_refresh_button.clicked.connect(self.refresh_location_model_list)
+        # location_model_buttons_layout.addWidget(self.location_refresh_button)
+
+        # 位置モデル学習ボタン
+        train_location_button = QPushButton("モデル学習・保存")
+        train_location_button.clicked.connect(self.train_and_save_location_model)
+        apply_style(train_location_button, 'training')
+        location_model_buttons_layout.addWidget(train_location_button)
+
         # モデル読み込みボタン
         self.location_load_button = QPushButton("モデル読込")
         self.location_load_button.setToolTip("modelsフォルダのモデルを読込む")
@@ -8682,13 +9103,7 @@ class ImageAnnotationTool(QMainWindow):
         location_model_buttons_layout.addWidget(self.location_load_button)
         
         location_model_layout.addLayout(location_model_buttons_layout)
-        
-        # 位置モデル学習ボタン
-        train_location_button = QPushButton("位置モデル学習・保存")
-        train_location_button.clicked.connect(self.train_and_save_location_model)
-        apply_style(train_location_button, 'training')
-        location_model_layout.addWidget(train_location_button)
-        
+                
         # 位置推論表示チェックボックス
         location_inference_layout = QHBoxLayout()
         self.location_inference_checkbox = QCheckBox("位置推論結果表示")
@@ -9650,55 +10065,51 @@ class DeletedIndexesSlider(QSlider):
         self.deleted_indexes = deleted_indexes
         self.total_count = total_count
         self.update()  # スライダーを再描画
-    
+   
     def paintEvent(self, event):
-        """スライダーの描画をカスタマイズ"""
-        # 最初に標準の描画を実行
+        """削除インデックス表示を上に描くスライダー"""
+        # 最初にスライダー全体を通常通り描画（ハンドルも含む）
         super().paintEvent(event)
-        
-        # 描画準備
+
+        # カスタム描画開始（赤マークを重ねる）
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        
-        try:
-            if not self.deleted_indexes or self.total_count <= 0:
-                return
 
-            # スタイルオプションの初期化
+        try:
+            # スタイルオプション初期化
             option = QStyleOptionSlider()
             self.initStyleOption(option)
 
-            # スライダーのグルーブ（トラック）の位置を取得
+            # トラックの矩形を取得
             groove_rect = self.style().subControlRect(
-                self.style().CC_Slider, 
-                option, 
-                self.style().SC_SliderGroove, 
-                self
+                QStyle.CC_Slider, option, QStyle.SC_SliderGroove, self
             )
 
             track_length = groove_rect.width()
             track_start = groove_rect.x()
             track_height = groove_rect.height()
 
-            # 削除済みインデックスを赤色マークで表示
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(QColor(255, 50, 50, 180)))  # 半透明の赤色
+            # 削除インデックス描画（赤マーク）
+            if self.deleted_indexes and self.total_count > 0:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(QColor(255, 50, 50, 180)))
 
-            for idx in self.deleted_indexes:
-                if 0 <= idx < self.total_count:
-                    position = track_start + (idx / (self.total_count - 1)) * track_length
-                    mark_width = max(3, track_length / self.total_count)
-                    mark_height = track_height + 6
+                for idx in self.deleted_indexes:
+                    if 0 <= idx < self.total_count:
+                        position = track_start + (idx / (self.total_count - 1)) * track_length
+                        mark_width = max(3, track_length / self.total_count)
+                        mark_height = track_height + 6
 
                     painter.drawRect(
                         int(position - mark_width / 2),
-                        int(groove_rect.center().y() - mark_height / 2),
+                        int(groove_rect.center().y()),          
                         int(mark_width),
-                        int(mark_height)
+                        int(mark_height / 2)                    
                     )
 
         finally:
             painter.end()
+
 
 # メインプログラムのセクション
 if __name__ == "__main__":

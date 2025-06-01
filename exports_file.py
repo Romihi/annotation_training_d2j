@@ -13,7 +13,6 @@ import numpy as np
 from PIL import Image, ImageDraw
 from typing import Dict, Any, List, Callable, Optional, Union
 
-#TODO:リファクタリング
 def export_to_donkey(
     folder_path: str, 
     annotations: Dict[Union[str, int], Dict[str, Any]], 
@@ -21,8 +20,10 @@ def export_to_donkey(
     deleted_indexes: Optional[List[int]] = None,
     images_list: Optional[List[str]] = None,  # 互換性のために残す
     image_map: Optional[Dict[int, Dict[str, str]]] = None,  # 新しいパラメータ：{index: {variant: image_path, ...}, ...}
-    variant_keys: Optional[Dict[str, str]] = None  # 新しいパラメータ：{variant: key_name, ...}
+    variant_keys: Optional[Dict[str, str]] = None,  # 新しいパラメータ：{variant: key_name, ...}
+    diff_vectors: Optional[Dict[Union[str, int], Dict[str, Any]]] = None  # 追加: 差分ベクトルデータ
 ) -> str:
+    
     """アノテーションをDonkeycar形式でエクスポートする（1000件ごとに分割） - 複数画像ソース対応
 
     Args:
@@ -162,7 +163,27 @@ def export_to_donkey(
                 # 推論結果に位置情報があれば追加
                 if "loc" in inference or "pilot/loc" in inference:
                     catalog_entry["pilot/loc"] = inference.get("pilot/loc", inference.get("loc", 0))
-        
+
+        # 追加: 差分ベクトル情報を追加
+        if diff_vectors:
+            # インデックスまたはパスで差分ベクトルデータを探す
+            diff_data = None
+            if isinstance(original_index, int) and original_index in diff_vectors:
+                diff_data = diff_vectors[original_index]
+            
+            # パスでも探す（複数のバリアントがある場合）
+            if not diff_data:
+                for variant, img_path in variant_images.items():
+                    if img_path in diff_vectors:
+                        diff_data = diff_vectors[img_path]
+                        break
+            
+            if diff_data:
+                catalog_entry["diff/angle"] = diff_data['angle_diff']
+                catalog_entry["diff/throttle"] = diff_data['throttle_diff']
+                catalog_entry["diff/magnitude"] = diff_data['vector_magnitude']
+                catalog_entry["diff/angle_rad"] = diff_data['vector_angle']
+                        
         # 各バリアントの画像をコピーしてエントリに追加
         for variant, img_path in variant_images.items():
             if not os.path.exists(img_path):
@@ -240,7 +261,8 @@ def export_to_donkey(
     # 位置情報や推論結果のカラムが使用されていれば追加
     has_loc = any('loc' in anno for anno in annotations.values())
     has_pilot = inference_results is not None and len(inference_results) > 0
-    
+    has_diff = diff_vectors is not None and len(diff_vectors) > 0  # 追加
+
     if has_pilot:
         column_names.extend(["pilot/angle", "pilot/throttle"])
         column_types.extend(["float", "float"])
@@ -251,7 +273,12 @@ def export_to_donkey(
         if has_pilot:
             column_names.extend(["pilot/loc"])
             column_types.extend(["int"])
-    
+
+    # 追加: 差分ベクトルのカラムを追加
+    if has_diff:
+        column_names.extend(["diff/angle", "diff/throttle", "diff/magnitude", "diff/angle_rad"])
+        column_types.extend(["float", "float", "float", "float"])
+
     # manifest.json ファイルを作成
     manifest_data = [
         # 列名のリスト
@@ -290,11 +317,11 @@ def export_to_jetracer(
     annotations: Dict[str, Dict[str, Any]], 
     inference_results: Optional[Dict[str, Dict[str, Any]]] = None
 ) -> str:
-    """アノテーションをJetracer形式でエクスポートする
+    """アノテーションをJetracer形式でエクスポートする - 座標をファイル名に埋め込む形式
 
     Args:
         folder_path: 出力先のフォルダパス
-        annotations: アノテーション辞書
+        annotations: アノテーション辞書（キーは画像パス）
         inference_results: 推論結果辞書（オプション）
 
     Returns:
@@ -302,14 +329,36 @@ def export_to_jetracer(
     """
     import time
     from datetime import datetime
+    import shutil
+    import json
+    import os
+    from PIL import Image
     
     # フォルダを作成
     output_folder = folder_path
     os.makedirs(output_folder, exist_ok=True)
     
+    # 最初の画像から画像サイズを取得
+    img_width, img_height = None, None
+    for img_path in annotations.keys():
+        if isinstance(img_path, str) and os.path.exists(img_path):
+            try:
+                with Image.open(img_path) as img:
+                    img_width, img_height = img.size
+                    break
+            except Exception as e:
+                print(f"画像サイズ取得エラー ({img_path}): {e}")
+                continue
+    
+    if img_width is None or img_height is None:
+        print("エラー: 画像サイズを取得できませんでした。")
+        return None
+    
+    print(f"検出された画像サイズ: {img_width}x{img_height}")
+    
     # カタログファイルを作成
     current_date = datetime.now().strftime("%y-%m-%d")
-    session_id = f"{current_date}_{0}"
+    session_id = f"{current_date}_0"
     catalog_path = os.path.join(output_folder, "catalog_0.catalog")
     
     # カタログエントリを作成
@@ -318,44 +367,166 @@ def export_to_jetracer(
     for img_path, annotation in annotations.items():
         if not annotation:
             continue
-            
-        img_name = os.path.basename(img_path)
         
-        # 画像をコピー
-        dest_path = os.path.join(output_folder, img_name)
-        shutil.copy2(img_path, dest_path)
+        # 画像パスが文字列でない場合のエラーハンドリング
+        if not isinstance(img_path, str):
+            print(f"警告: 無効な画像パス形式: {img_path} (型: {type(img_path)})")
+            continue
+            
+        if not os.path.exists(img_path):
+            print(f"警告: 画像ファイルが存在しません: {img_path}")
+            continue
+        
+        # アノテーションから座標情報を取得
+        angle = annotation.get("angle", 0)
+        throttle = annotation.get("throttle", 0)
+        
+        # -1～1の値を画像のピクセル座標に変換
+        # angle: -1(左端) ～ 1(右端) → 0 ～ img_width
+        # throttle: -1(下端) ～ 1(上端) → img_height ～ 0 (Jetracerでは通常Y軸は反転)
+        x_pixel = int((angle + 1) * img_width / 2)
+        y_pixel = int((1 - throttle) * img_height / 2)  # throttleは反転
+        
+        # 範囲チェック
+        x_pixel = max(0, min(x_pixel, img_width - 1))
+        y_pixel = max(0, min(y_pixel, img_height - 1))
+        
+        # Jetracer形式のファイル名を作成: x_y_index_cam_image_array_.jpg
+        index = len(catalog_entries)
+        jetracer_filename = f"{x_pixel}_{y_pixel}_{index}_cam_image_array_.jpg"
+        
+        try:
+            # 画像をJetracer形式のファイル名でコピー
+            dest_path = os.path.join(output_folder, jetracer_filename)
+            shutil.copy2(img_path, dest_path)
+            print(f"コピー完了: {os.path.basename(img_path)} -> {jetracer_filename}")
+        except Exception as e:
+            print(f"警告: 画像のコピー中にエラーが発生しました ({img_path}): {e}")
+            continue
         
         # タイムスタンプ
         timestamp_ms = int(time.time() * 1000)
         
-        # エントリを作成
+        # エントリを作成（カタログファイル用）
         entry = {
-            "_index": len(catalog_entries),
+            "_index": index,
             "_session_id": session_id,
             "_timestamp_ms": timestamp_ms,
-            "cam/image_array": img_name,
-            "user/angle": annotation["angle"],
+            "cam/image_array": jetracer_filename,
+            "user/angle": angle,
             "user/mode": "user",
-            "user/throttle": annotation["throttle"]
+            "user/throttle": throttle,
+            "x_pixel": x_pixel,
+            "y_pixel": y_pixel
         }
+        
+        # 位置情報があれば追加
+        if 'loc' in annotation:
+            entry["user/loc"] = annotation["loc"]
         
         # 推論結果があれば追加
         if inference_results and img_path in inference_results:
             inference = inference_results[img_path]
-            if "auto/angle" in inference and "auto/throttle" in inference:
-                entry["auto/angle"] = inference["auto/angle"]
-                entry["auto/throttle"] = inference["auto/throttle"]
+            if "pilot/angle" in inference and "pilot/throttle" in inference:
+                entry["pilot/angle"] = inference["pilot/angle"]
+                entry["pilot/throttle"] = inference["pilot/throttle"]
             else:
-                entry["auto/angle"] = inference["angle"]
-                entry["auto/throttle"] = inference["throttle"]
+                entry["pilot/angle"] = inference.get("angle", 0)
+                entry["pilot/throttle"] = inference.get("throttle", 0)
+                
+            # 推論結果に位置情報があれば追加
+            if "loc" in inference or "pilot/loc" in inference:
+                entry["pilot/loc"] = inference.get("pilot/loc", inference.get("loc", 0))
         
         catalog_entries.append(entry)
+    
+    if not catalog_entries:
+        print("警告: エクスポート可能なエントリがありません。")
+        return None
     
     # カタログファイルに書き込み
     with open(catalog_path, 'w') as f:
         for entry in catalog_entries:
             f.write(json.dumps(entry) + '\n')
     
+    # Jetracer用の座標情報ファイルを作成
+    coordinates_file = os.path.join(output_folder, "coordinates.txt")
+    with open(coordinates_file, 'w') as f:
+        f.write("# Jetracer座標情報\n")
+        f.write(f"# 画像サイズ: {img_width}x{img_height}\n")
+        f.write("# フォーマット: filename, x_pixel, y_pixel, angle, throttle\n")
+        for entry in catalog_entries:
+            f.write(f"{entry['cam/image_array']}, {entry['x_pixel']}, {entry['y_pixel']}, {entry['user/angle']:.4f}, {entry['user/throttle']:.4f}\n")
+    
+    # README.txtファイルを作成
+    readme_content = f"""# Jetracer形式アノテーションデータ
+
+このフォルダには、Jetracer形式でエクスポートされたアノテーションデータが含まれています。
+
+## ファイル名形式
+画像ファイル名: x_y_index_cam_image_array_.jpg
+例: 200_100_2_cam_image_array_.jpg
+
+- x: X座標のピクセル値 (0～{img_width-1})
+- y: Y座標のピクセル値 (0～{img_height-1})  
+- index: 画像のインデックス番号
+
+## 座標変換
+元のアノテーション値(-1～1)から画像ピクセル座標への変換:
+- angle (-1～1) → X座標 (0～{img_width-1})
+- throttle (-1～1) → Y座標 ({img_height-1}～0) ※Y軸は反転
+
+## ファイル構成
+- *.jpg: アノテーション済み画像
+- catalog_0.catalog: カタログファイル（JSON Lines形式）
+- coordinates.txt: 座標情報の一覧
+- manifest.json: メタデータファイル
+- README.txt: このファイル
+
+## 統計情報
+画像サイズ: {img_width}x{img_height}
+エクスポート画像数: {len(catalog_entries)}枚
+作成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+    
+    with open(os.path.join(output_folder, "README.txt"), 'w', encoding='utf-8') as f:
+        f.write(readme_content)
+    
+    # マニフェストファイルを作成
+    manifest_data = [
+        # 列名のリスト
+        ["cam/image_array", "user/angle", "user/throttle", "user/mode", "x_pixel", "y_pixel"],
+        # データ型のリスト
+        ["image_array", "float", "float", "str", "int", "int"],
+        # 追加設定
+        {
+            "image_size": [img_width, img_height],
+            "coordinate_mapping": "angle->x_pixel, throttle->y_pixel (inverted)"
+        },
+        # セッション情報
+        {
+            "created_at": time.time(),
+            "sessions": {
+                "all_full_ids": [session_id],
+                "last_id": 0,
+                "last_full_id": session_id
+            }
+        },
+        # カタログファイル情報
+        {
+            "paths": ["catalog_0.catalog"],
+            "current_index": len(catalog_entries),
+            "max_len": 1000,
+            "deleted_indexes": []
+        }
+    ]
+    
+    manifest_path = os.path.join(output_folder, "manifest.json")
+    with open(manifest_path, 'w') as f:
+        for item in manifest_data:
+            f.write(json.dumps(item) + '\n')
+    
+    print(f"Jetracerエクスポート完了: {len(catalog_entries)}枚の画像を処理しました")
     return catalog_path
 
 def export_to_yolo(
@@ -672,6 +843,38 @@ Ultralytics HUB と互換性があります。
     
     return yaml_file_path
 
+def draw_arrow_on_image(draw, start_x, start_y, end_x, end_y, color='green', width=2):
+    """PIL.ImageDrawで矢印を描画するヘルパー関数"""
+    import math
+    
+    # 矢印の線を描画
+    draw.line([(start_x, start_y), (end_x, end_y)], fill=color, width=width)
+    
+    # ベクトルの角度を計算
+    dx = end_x - start_x
+    dy = end_y - start_y
+    
+    # 矢印が短すぎる場合は矢印の先端を描画しない
+    vector_length = math.sqrt(dx*dx + dy*dy)
+    if vector_length < 5:
+        return
+        
+    angle = math.atan2(dy, dx)
+    
+    # 矢印の先端のサイズ
+    arrow_length = 10
+    arrow_angle = math.pi / 6  # 30度
+    
+    # 矢印の先端の座標を計算
+    arrow_x1 = end_x - arrow_length * math.cos(angle - arrow_angle)
+    arrow_y1 = end_y - arrow_length * math.sin(angle - arrow_angle)
+    arrow_x2 = end_x - arrow_length * math.cos(angle + arrow_angle)
+    arrow_y2 = end_y - arrow_length * math.sin(angle + arrow_angle)
+    
+    # 矢印の先端を線で描画
+    draw.line([(end_x, end_y), (arrow_x1, arrow_y1)], fill=color, width=width)
+    draw.line([(end_x, end_y), (arrow_x2, arrow_y2)], fill=color, width=width)
+
 def export_to_video(
     annotations: Dict[Union[str, int], Dict[str, Any]], 
     inference_results: Dict[Union[str, int], Dict[str, Any]], 
@@ -680,7 +883,8 @@ def export_to_video(
     skip_count: int = 1,
     fps: int = 30,
     progress_callback: Optional[Callable[[int, int, Optional[str]], None]] = None,
-    images_list: Optional[List[str]] = None  # 画像パスのリストを明示的に指定
+    images_list: Optional[List[str]] = None,  # 画像パスのリストを明示的に指定
+    diff_vectors: Optional[Dict[Union[str, int], Dict[str, Any]]] = None  # 追加: 差分ベクトルデータ
 ) -> int:
     """アノテーションを動画として出力する - インデックスベースのアノテーションに対応
 
@@ -886,6 +1090,25 @@ def export_to_video(
                         p_loc = inference.get("pilot/loc", inference.get("loc", 0))
                         draw.text((width - 150, 50), f"P.Loc: {p_loc}", fill='blue')
             
+           # 追加: 差分ベクトル矢印を描画
+            if annotation and x is not None and y is not None and diff_vectors:
+                # 差分ベクトル情報を取得
+                diff_data = None
+                if index is not None and index in diff_vectors:
+                    diff_data = diff_vectors[index]
+                
+                if diff_data:
+                    # 教師データと推論結果の座標
+                    anno_x, anno_y = annotation["x"], annotation["y"]
+                    
+                    # 矢印を描画（緑色）
+                    draw_arrow_on_image(draw, anno_x, anno_y, x, y, color='green', width=2)
+                    
+                    # 差分ベクトルの情報を表示
+                    draw.text((10, 70), f"Diff Mag: {diff_data['vector_magnitude']:.3f}", fill='green')
+                    draw.text((10, 90), f"Angle Diff: {diff_data['angle_diff']:+.3f}", fill='green')
+                    draw.text((10, 110), f"Throttle Diff: {diff_data['throttle_diff']:+.3f}", fill='green')
+
             # インデックス情報を表示
             draw.text((width // 2 - 50, height - 30), f"Index: {index}", fill='white')
             
@@ -917,7 +1140,7 @@ def export_to_video(
         video.release()
     
     return frames_processed
-
+    
 def export_to_video_multi_source(
     annotations: Dict[Union[str, int], Dict[str, Any]], 
     inference_results: Dict[Union[str, int], Dict[str, Any]], 
@@ -927,7 +1150,8 @@ def export_to_video_multi_source(
     show_inference: bool = True,
     skip_count: int = 1,
     fps: int = 30,
-    progress_callback: Optional[Callable[[int, int, Optional[str]], None]] = None
+    progress_callback: Optional[Callable[[int, int, Optional[str]], None]] = None,
+    diff_vectors: Optional[Dict[Union[str, int], Dict[str, Any]]] = None  # 追加: 差分ベクトルデータ
 ) -> int:
     """複数画像ソースを横に並べて動画として出力する
 
