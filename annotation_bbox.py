@@ -247,7 +247,7 @@ class ImageLabel(QLabel):
             # 通常のカーソルに戻す
             self.setCursor(Qt.ArrowCursor)
             self.update()
-        #m
+        
         elif self.is_resizing_bbox:
             # サイズ変更が完了したのでフラグをリセット
             self.is_resizing_bbox = False
@@ -636,7 +636,6 @@ class ImageLabel(QLabel):
                 # 物体検知アノテーションモード
                 current_img_path = self.main_window.images[self.main_window.current_index]
                 
-                #m
                 # 選択されたバウンディングボックスがある場合、ハンドルのチェック
                 if self.selected_bbox_index is not None and current_img_path in self.main_window.bbox_annotations:
                     bboxes = self.main_window.bbox_annotations[current_img_path]
@@ -1866,7 +1865,6 @@ class ImageAnnotationTool(QMainWindow):
         location_layout = QVBoxLayout(location_panel)
         location_layout.setSpacing(5)
         
-        #m
         # テーマ切り替えエリア
         theme_layout = QHBoxLayout()
         theme_layout.setSpacing(5)
@@ -5725,11 +5723,12 @@ class ImageAnnotationTool(QMainWindow):
         
         # 少し遅延させてから画像読み込みを実行（UIが更新される時間を確保）
         QTimer.singleShot(100, self.load_images)
-        
+
     def load_images(self):
         """
         選択した各フォルダの下のimagesフォルダから画像を読み込む
         アノテーションは自動では読み込まない
+        Jetracer形式のファイル名にも対応（修正版）
         """
         folder_paths_text = self.folder_input.text()
         
@@ -5781,19 +5780,30 @@ class ImageAnnotationTool(QMainWindow):
         
         print(f"{len(all_images)}枚の画像が見つかりました")
         
-        # ファイル名からインデックスを抽出してソート
+        # ファイル名からインデックスを抽出してソート（修正版）
         image_with_indices = []
         for img_path in all_images:
             basename = os.path.basename(img_path)
-            # ファイル名からインデックスを抽出（例: 10900_cam_image_array_.jpg -> 10900）
+            # ファイル名からインデックスを抽出
             try:
-                match = re.match(r'^(\d+)_', basename)
-                if match:
-                    index = int(match.group(1))
+                # Jetracer形式を優先的にチェック: x_y_index_cam_image_array_.jpg -> index
+                # 例: 200_100_2_cam_image_array_.jpg -> 2
+                jetracer_match = re.match(r'^\d+_\d+_(\d+)_', basename)
+                if jetracer_match:
+                    index = int(jetracer_match.group(1))
                     image_with_indices.append((img_path, index))
+                    print(f"Jetracer形式検出: {basename} -> インデックス {index}")
                 else:
-                    # インデックスが抽出できない場合は、高い値（後ろに配置）
-                    image_with_indices.append((img_path, float('inf')))
+                    # 通常形式: 10900_cam_image_array_.jpg -> 10900
+                    normal_match = re.match(r'^(\d+)_', basename)
+                    if normal_match:
+                        index = int(normal_match.group(1))
+                        image_with_indices.append((img_path, index))
+                        print(f"通常形式検出: {basename} -> インデックス {index}")
+                    else:
+                        # インデックスが抽出できない場合は、高い値（後ろに配置）
+                        image_with_indices.append((img_path, float('inf')))
+                        print(f"インデックス抽出失敗: {basename} -> 末尾に配置")
             except Exception as e:
                 print(f"ファイル名からインデックス抽出エラー: {basename} - {e}")
                 # エラーの場合も高い値で後ろに配置
@@ -5805,17 +5815,34 @@ class ImageAnnotationTool(QMainWindow):
         # ソート後の画像パスリストを作成
         images = [img_path for img_path, _ in image_with_indices]
 
-         # --- 追加: 画像グルーピング（インデックス＆キー単位） ---
+        # --- 画像グルーピング（インデックス＆キー単位） ---
         self.image_groups = {}  # { index: { variant: path, ... } }
         self.variant_images = {}  # 各キーの画像リスト
 
         for img_path in images:
             basename = os.path.basename(img_path)
-            m = re.match(r'^(\d+)_([A-Za-z0-9]+)_image_array', basename)
-            if not m:
-                continue
-            idx = int(m.group(1))
-            variant = m.group(2)
+            
+            # Jetracer形式を優先的にチェック: 200_100_2_cam_image_array_.jpg
+            jetracer_match = re.match(r'^\d+_\d+_(\d+)_([A-Za-z0-9]+)_image_array', basename)
+            if jetracer_match:
+                # Jetracer形式の場合
+                idx = int(jetracer_match.group(1))
+                variant = jetracer_match.group(2)
+                print(f"Jetracer形式グルーピング: {basename} -> インデックス {idx}, バリアント {variant}")
+            else:
+                # 通常形式: 10900_cam_image_array_.jpg
+                normal_match = re.match(r'^(\d+)_([A-Za-z0-9]+)_image_array', basename)
+                if normal_match:
+                    # 通常形式の場合
+                    idx = int(normal_match.group(1))
+                    variant = normal_match.group(2)
+                    print(f"通常形式グルーピング: {basename} -> インデックス {idx}, バリアント {variant}")
+                else:
+                    # どちらにもマッチしない場合はスキップまたはデフォルト値を使用
+                    print(f"警告: ファイル名パターンにマッチしません: {basename}")
+                    continue
+            
+            # 画像グループに追加
             self.image_groups.setdefault(idx, {})[variant] = img_path
         
             # キー別に画像リストを作成
@@ -5827,16 +5854,25 @@ class ImageAnnotationTool(QMainWindow):
 
         # キー一覧を更新
         self.available_variants = sorted(self.variant_images.keys())
-        # デフォルトキーを設定
-        if hasattr(self, 'current_variant') and self.current_variant in self.available_variants:
-            # 既に選択されているキーがある場合は保持
-            pass
-        elif 'cam' in self.available_variants:
-            # デフォルトはcam
-            self.current_variant = 'cam'
+        
+        # available_variantsが空の場合のエラーハンドリングを追加
+        if not self.available_variants:
+            # バリアントが見つからない場合、全画像を'unknown'キーとして処理
+            print("警告: 有効なバリアントが見つかりません。全画像を'unknown'キーとして処理します。")
+            self.available_variants = ['unknown']
+            self.variant_images = {'unknown': images}
+            self.current_variant = 'unknown'
         else:
-            # camがなければ最初のキー
-            self.current_variant = self.available_variants[0]
+            # デフォルトキーを設定
+            if hasattr(self, 'current_variant') and self.current_variant in self.available_variants:
+                # 既に選択されているキーがある場合は保持
+                pass
+            elif 'cam' in self.available_variants:
+                # デフォルトはcam
+                self.current_variant = 'cam'
+            else:
+                # camがなければ最初のキー
+                self.current_variant = self.available_variants[0]
 
         # 現在のキーの画像を選択
         images = self.variant_images[self.current_variant]
@@ -6713,8 +6749,6 @@ class ImageAnnotationTool(QMainWindow):
     def update_stats(self):
         self.stats_label.setText(f"アノテーション済み: {self.annotated_count} / {len(self.images)}")
     
-    #mTODO:削除
-    # 置き換え＞enhanced_annotations import apply_enhanced_annotations_display
     def display_current_image(self):
         pass
 
@@ -7183,10 +7217,10 @@ class ImageAnnotationTool(QMainWindow):
             dialog_title = "Jetracerエクスポート設定"
             format_name = "Jetracer"
         
-        # 読み込み元フォルダがある場合はその名前を追加
+        # 読み込み元フォルダがある場合はその名前を追加（重複を避ける）
         if hasattr(self, 'folder_path') and self.folder_path:
             parent_folder_name = os.path.basename(self.folder_path)
-            if parent_folder_name:
+            if parent_folder_name and parent_folder_name not in default_folder_name:
                 default_folder_name = f"{default_folder_name}_{parent_folder_name}"
         
         # ダイアログを作成
@@ -7205,7 +7239,15 @@ class ImageAnnotationTool(QMainWindow):
         folder_selection_layout.addWidget(QLabel("保存先フォルダ:"))
         
         folder_input = QLineEdit()
-        default_output_path = os.path.join(annotation_folder, default_folder_name)
+        # annotationフォルダ内に保存するように修正
+        if hasattr(self, 'folder_path') and self.folder_path:
+            # 親フォルダのannotationフォルダ内に保存
+            annotation_base = os.path.join(self.folder_path, "annotation") 
+        else:
+            # デフォルトの場合
+            annotation_base = annotation_folder
+        
+        default_output_path = os.path.join(annotation_base, default_folder_name)
         folder_input.setText(default_output_path)
         folder_selection_layout.addWidget(folder_input)
         
@@ -7311,12 +7353,20 @@ class ImageAnnotationTool(QMainWindow):
                 for img_path in variant_images:
                     try:
                         basename = os.path.basename(img_path)
-                        match = re.match(r'^(\d+)_', basename)
-                        if match:
-                            idx = int(match.group(1))
-                            if idx not in image_map:
-                                image_map[idx] = {}
-                            image_map[idx][variant] = img_path
+                        # 通常形式とJetracer形式の両方に対応
+                        normal_match = re.match(r'^(\d+)_', basename)
+                        jetracer_match = re.match(r'^\d+_\d+_(\d+)_', basename)
+                        
+                        if normal_match:
+                            idx = int(normal_match.group(1))
+                        elif jetracer_match:
+                            idx = int(jetracer_match.group(1))
+                        else:
+                            continue
+                            
+                        if idx not in image_map:
+                            image_map[idx] = {}
+                        image_map[idx][variant] = img_path
                     except Exception as e:
                         print(f"インデックス抽出エラー ({img_path}): {e}")
         else:
@@ -7771,7 +7821,7 @@ class ImageAnnotationTool(QMainWindow):
                 "エラー", 
                 f"動画作成中にエラーが発生しました: {str(e)}"
             )
-    #m
+
     def create_video_progress_callback(self, progress_dialog):
         """動画作成用の進捗コールバック関数を返す
         
@@ -7828,7 +7878,6 @@ class ImageAnnotationTool(QMainWindow):
         early_stopping_check.setChecked(True)
         basic_layout.addWidget(early_stopping_check)
 
-        #m
         # 学習対象データ選択グループボックス
         data_selection_group = QGroupBox("学習データ選択")
         data_selection_layout = QVBoxLayout()
@@ -7941,8 +7990,6 @@ class ImageAnnotationTool(QMainWindow):
 
         data_selection_group.setLayout(data_selection_layout)
         basic_layout.addWidget(data_selection_group)
-
-        #m
 
         patience_layout = QHBoxLayout()
         patience_layout.addWidget(QLabel("忍耐エポック数:"))
@@ -8166,7 +8213,6 @@ class ImageAnnotationTool(QMainWindow):
         patience = patience_spin.value() if use_early_stopping else 0
         learning_rate = float(lr_combo.currentText())
         
-        #m
         # データ選択設定の取得
         use_all = data_radio_all.isChecked()
         use_skip = data_radio_skip.isChecked()
@@ -8175,8 +8221,7 @@ class ImageAnnotationTool(QMainWindow):
         skip_count = custom_skip_spin.value() if use_skip else 1
         range_start = range_start_spin.value() if use_range else 0
         range_end = range_end_spin.value() if use_range else (len(self.images) - 1)
-        #m
-        
+
         # オーグメンテーション設定の取得
         augmentation_params = {
             'enabled': aug_enable_check.isChecked(),
@@ -9744,7 +9789,6 @@ class ImageAnnotationTool(QMainWindow):
             )
 
     # UI関連
-    #m
     def toggle_theme(self, theme_name):
         """テーマを切り替える"""
         # styles.pyのset_theme関数を呼び出す

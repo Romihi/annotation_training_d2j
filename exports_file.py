@@ -314,34 +314,88 @@ def export_to_donkey(
 
 def export_to_jetracer(
     folder_path: str, 
-    annotations: Dict[str, Dict[str, Any]], 
-    inference_results: Optional[Dict[str, Dict[str, Any]]] = None
+    annotations: Dict[Union[str, int], Dict[str, Any]], 
+    inference_results: Optional[Dict[Union[str, int], Dict[str, Any]]] = None
 ) -> str:
-    """アノテーションをJetracer形式でエクスポートする - 座標をファイル名に埋め込む形式
+    """アノテーションをJetracer形式でエクスポートする - Donkeycar形式のディレクトリ構造に統一
 
     Args:
         folder_path: 出力先のフォルダパス
-        annotations: アノテーション辞書（キーは画像パス）
+        annotations: アノテーション辞書（キーがインデックスまたは画像パス）
         inference_results: 推論結果辞書（オプション）
 
     Returns:
-        作成されたカタログファイルのパス
+        作成されたマニフェストファイルのパス
     """
     import time
     from datetime import datetime
     import shutil
     import json
     import os
+    import re
     from PIL import Image
     
-    # フォルダを作成
+    # 出力フォルダを作成
     output_folder = folder_path
     os.makedirs(output_folder, exist_ok=True)
     
+    # 画像を保存するimagesフォルダを作成（Donkeycar形式に統一）
+    images_folder = os.path.join(output_folder, "images")
+    os.makedirs(images_folder, exist_ok=True)
+    
+    # 現在の日時を取得してセッションIDを作成
+    current_date = datetime.now().strftime("%y-%m-%d")
+    session_id = f"{current_date}_0"
+    
+    # タイムスタンプを記録（マニフェスト用）
+    created_timestamp = time.time()
+    
+    # アノテーション情報をインデックス順に整理（Donkeycar形式と同じロジック）
+    indexed_annotations = []
+    
+    for key, annotation in annotations.items():
+        if not annotation:
+            continue
+        
+        # キーの型に基づいて元のインデックスを取得
+        if isinstance(key, int):
+            original_index = key
+        else:
+            # パスからインデックスを抽出
+            original_index = annotation.get("original_index")
+            if original_index is None:
+                try:
+                    basename = os.path.basename(key)
+                    match = re.match(r'^(\d+)_', basename)
+                    if match:
+                        original_index = int(match.group(1))
+                except:
+                    pass
+            
+        # アノテーション情報とインデックスを保存
+        indexed_annotations.append({
+            "index": original_index,
+            "annotation": annotation,
+            "img_path": key if isinstance(key, str) else None
+        })
+    
+    # インデックスがないエントリに連番を割り当て
+    next_index = 0
+    for entry in indexed_annotations:
+        if entry["index"] is None:
+            while any(e["index"] == next_index for e in indexed_annotations if e["index"] is not None):
+                next_index += 1
+            entry["index"] = next_index
+            next_index += 1
+    
+    # インデックス順にソート
+    indexed_annotations.sort(key=lambda x: x["index"] if x["index"] is not None else float('inf'))
+    
     # 最初の画像から画像サイズを取得
     img_width, img_height = None, None
-    for img_path in annotations.keys():
-        if isinstance(img_path, str) and os.path.exists(img_path):
+    for entry in indexed_annotations:
+        img_path = entry["img_path"]
+        if img_path and isinstance(img_path, str) and os.path.exists(img_path):
             try:
                 with Image.open(img_path) as img:
                     img_width, img_height = img.size
@@ -356,25 +410,17 @@ def export_to_jetracer(
     
     print(f"検出された画像サイズ: {img_width}x{img_height}")
     
-    # カタログファイルを作成
-    current_date = datetime.now().strftime("%y-%m-%d")
-    session_id = f"{current_date}_0"
-    catalog_path = os.path.join(output_folder, "catalog_0.catalog")
-    
-    # カタログエントリを作成
+    # カタログエントリを作成（1000件ごとに分割可能な形式）
     catalog_entries = []
     
-    for img_path, annotation in annotations.items():
-        if not annotation:
-            continue
+    for i, entry in enumerate(indexed_annotations):
+        original_index = entry["index"]
+        annotation = entry["annotation"]
+        img_path = entry["img_path"]
+        assigned_index = i  # 連番を割り当て
         
-        # 画像パスが文字列でない場合のエラーハンドリング
-        if not isinstance(img_path, str):
-            print(f"警告: 無効な画像パス形式: {img_path} (型: {type(img_path)})")
-            continue
-            
-        if not os.path.exists(img_path):
-            print(f"警告: 画像ファイルが存在しません: {img_path}")
+        if not img_path or not os.path.exists(img_path):
+            print(f"警告: インデックス {original_index} の画像が見つかりません。このエントリはスキップします。")
             continue
         
         # アノテーションから座標情報を取得
@@ -392,14 +438,13 @@ def export_to_jetracer(
         y_pixel = max(0, min(y_pixel, img_height - 1))
         
         # Jetracer形式のファイル名を作成: x_y_index_cam_image_array_.jpg
-        index = len(catalog_entries)
-        jetracer_filename = f"{x_pixel}_{y_pixel}_{index}_cam_image_array_.jpg"
+        jetracer_filename = f"{x_pixel}_{y_pixel}_{assigned_index}_cam_image_array_.jpg"
         
         try:
-            # 画像をJetracer形式のファイル名でコピー
-            dest_path = os.path.join(output_folder, jetracer_filename)
+            # 画像をimagesフォルダ内にJetracer形式のファイル名でコピー
+            dest_path = os.path.join(images_folder, jetracer_filename)
             shutil.copy2(img_path, dest_path)
-            print(f"コピー完了: {os.path.basename(img_path)} -> {jetracer_filename}")
+            print(f"コピー完了: {os.path.basename(img_path)} -> images/{jetracer_filename}")
         except Exception as e:
             print(f"警告: 画像のコピー中にエラーが発生しました ({img_path}): {e}")
             continue
@@ -407,12 +452,12 @@ def export_to_jetracer(
         # タイムスタンプ
         timestamp_ms = int(time.time() * 1000)
         
-        # エントリを作成（カタログファイル用）
-        entry = {
-            "_index": index,
+        # カタログエントリを作成（Donkeycar形式に準拠）
+        catalog_entry = {
+            "_index": assigned_index,
             "_session_id": session_id,
             "_timestamp_ms": timestamp_ms,
-            "cam/image_array": jetracer_filename,
+            "cam/image_array": jetracer_filename,  # imagesフォルダ内の相対パス
             "user/angle": angle,
             "user/mode": "user",
             "user/throttle": throttle,
@@ -422,34 +467,119 @@ def export_to_jetracer(
         
         # 位置情報があれば追加
         if 'loc' in annotation:
-            entry["user/loc"] = annotation["loc"]
+            catalog_entry["user/loc"] = annotation["loc"]
         
         # 推論結果があれば追加
-        if inference_results and img_path in inference_results:
-            inference = inference_results[img_path]
-            if "pilot/angle" in inference and "pilot/throttle" in inference:
-                entry["pilot/angle"] = inference["pilot/angle"]
-                entry["pilot/throttle"] = inference["pilot/throttle"]
-            else:
-                entry["pilot/angle"] = inference.get("angle", 0)
-                entry["pilot/throttle"] = inference.get("throttle", 0)
-                
-            # 推論結果に位置情報があれば追加
-            if "loc" in inference or "pilot/loc" in inference:
-                entry["pilot/loc"] = inference.get("pilot/loc", inference.get("loc", 0))
+        if inference_results:
+            inference = None
+            if isinstance(original_index, int) and original_index in inference_results:
+                inference = inference_results[original_index]
+            elif img_path in inference_results:
+                inference = inference_results[img_path]
+            
+            if inference:
+                # 新しいキー形式確認
+                if "pilot/angle" in inference and "pilot/throttle" in inference:
+                    catalog_entry["pilot/angle"] = inference["pilot/angle"]
+                    catalog_entry["pilot/throttle"] = inference["pilot/throttle"]
+                else:
+                    catalog_entry["pilot/angle"] = inference.get("angle", 0)
+                    catalog_entry["pilot/throttle"] = inference.get("throttle", 0)
+                    
+                # 推論結果に位置情報があれば追加
+                if "loc" in inference or "pilot/loc" in inference:
+                    catalog_entry["pilot/loc"] = inference.get("pilot/loc", inference.get("loc", 0))
         
-        catalog_entries.append(entry)
+        catalog_entries.append(catalog_entry)
     
     if not catalog_entries:
         print("警告: エクスポート可能なエントリがありません。")
         return None
     
-    # カタログファイルに書き込み
-    with open(catalog_path, 'w') as f:
-        for entry in catalog_entries:
-            f.write(json.dumps(entry) + '\n')
+    # 1000件ごとに分割してカタログファイルを作成（Donkeycar形式と同じ）
+    catalog_files = []
     
-    # Jetracer用の座標情報ファイルを作成
+    for i in range(0, len(catalog_entries), 1000):
+        batch = catalog_entries[i:i+1000]
+        catalog_path = os.path.join(output_folder, f"catalog_{i//1000}.catalog")
+        catalog_files.append(os.path.basename(catalog_path))
+        
+        batch_line_lengths = []  # このバッチの行長さ
+        
+        with open(catalog_path, 'w') as f:
+            for entry in batch:
+                json_line = json.dumps(entry)
+                f.write(json_line + '\n')
+                batch_line_lengths.append(len(json_line))
+        
+        # カタログマニフェストファイルを作成
+        manifest_path = os.path.join(output_folder, f"catalog_{i//1000}.catalog_manifest")
+        manifest_data = {
+            "created_at": created_timestamp,
+            "line_lengths": batch_line_lengths,
+            "path": os.path.basename(catalog_path),
+            "start_index": i
+        }
+        
+        with open(manifest_path, 'w') as f:
+            json.dump(manifest_data, f)
+    
+    # 推論結果があるかチェック
+    has_pilot = inference_results is not None and len(inference_results) > 0
+    has_loc = any('loc' in anno for anno in annotations.values())
+    
+    # カラム名とデータ型を定義（Donkeycar形式に準拠）
+    column_names = ["cam/image_array", "user/angle", "user/throttle", "user/mode", "x_pixel", "y_pixel"]
+    column_types = ["image_array", "float", "float", "str", "int", "int"]
+    
+    # 位置情報や推論結果のカラムが使用されていれば追加
+    if has_pilot:
+        column_names.extend(["pilot/angle", "pilot/throttle"])
+        column_types.extend(["float", "float"])
+    
+    if has_loc:
+        column_names.extend(["user/loc"])
+        column_types.extend(["int"])
+        if has_pilot:
+            column_names.extend(["pilot/loc"])
+            column_types.extend(["int"])
+    
+    # manifest.json ファイルを作成（Donkeycar形式と完全に統一）
+    manifest_data = [
+        # 列名のリスト
+        column_names,
+        # データ型のリスト
+        column_types,
+        # 追加設定（Jetracer固有の情報を追加）
+        {
+            "image_size": [img_width, img_height],
+            "coordinate_mapping": "angle->x_pixel, throttle->y_pixel (inverted)",
+            "format": "jetracer"
+        },
+        # セッション情報
+        {
+            "created_at": created_timestamp,
+            "sessions": {
+                "all_full_ids": [session_id],
+                "last_id": 0,
+                "last_full_id": session_id
+            }
+        },
+        # カタログファイル情報
+        {
+            "paths": catalog_files,
+            "current_index": len(catalog_entries),
+            "max_len": 1000,
+            "deleted_indexes": []  # Jetracerでは削除インデックスは空
+        }
+    ]
+    
+    manifest_path = os.path.join(output_folder, "manifest.json")
+    with open(manifest_path, 'w') as f:
+        for item in manifest_data:
+            f.write(json.dumps(item) + '\n')
+    
+    # Jetracer用の座標情報ファイルを作成（追加情報として）
     coordinates_file = os.path.join(output_folder, "coordinates.txt")
     with open(coordinates_file, 'w') as f:
         f.write("# Jetracer座標情報\n")
@@ -459,75 +589,63 @@ def export_to_jetracer(
             f.write(f"{entry['cam/image_array']}, {entry['x_pixel']}, {entry['y_pixel']}, {entry['user/angle']:.4f}, {entry['user/throttle']:.4f}\n")
     
     # README.txtファイルを作成
-    readme_content = f"""# Jetracer形式アノテーションデータ
+    readme_content = f"""# Jetracer形式アノテーションデータ（Donkeycar構造準拠）
 
 このフォルダには、Jetracer形式でエクスポートされたアノテーションデータが含まれています。
+ディレクトリ構造とカタログファイル形式はDonkeycar形式に統一されています。
+
+## ディレクトリ構造
+```
+{os.path.basename(output_folder)}/
+├── images/                     # 画像フォルダ（Donkeycar形式に統一）
+│   ├── 200_100_0_cam_image_array_.jpg
+│   ├── 150_120_1_cam_image_array_.jpg
+│   └── ...
+├── catalog_0.catalog          # カタログファイル（JSON Lines形式）
+├── catalog_0.catalog_manifest # カタログマニフェスト
+├── manifest.json              # メインマニフェスト（Donkeycar形式準拠）
+├── coordinates.txt            # 座標情報の一覧（Jetracer固有）
+└── README.txt                 # このファイル
+```
 
 ## ファイル名形式
 画像ファイル名: x_y_index_cam_image_array_.jpg
-例: 200_100_2_cam_image_array_.jpg
+例: images/200_100_2_cam_image_array_.jpg
 
 - x: X座標のピクセル値 (0～{img_width-1})
 - y: Y座標のピクセル値 (0～{img_height-1})  
-- index: 画像のインデックス番号
+- index: 画像のインデックス番号（連番）
 
 ## 座標変換
 元のアノテーション値(-1～1)から画像ピクセル座標への変換:
 - angle (-1～1) → X座標 (0～{img_width-1})
 - throttle (-1～1) → Y座標 ({img_height-1}～0) ※Y軸は反転
 
-## ファイル構成
-- *.jpg: アノテーション済み画像
-- catalog_0.catalog: カタログファイル（JSON Lines形式）
-- coordinates.txt: 座標情報の一覧
-- manifest.json: メタデータファイル
-- README.txt: このファイル
+## カタログファイル形式
+- Donkeycar形式と同じJSON Lines形式
+- 1000件ごとに分割可能
+- `cam/image_array` キーには `images/` フォルダからの相対パス
+
+## 読み込み互換性
+- Donkeycarの読み込み処理と同じ方法で読み込み可能
+- `manifest.json` の第3要素に `"format": "jetracer"` フラグで識別
+- インデックスベースのアノテーション辞書として再構築可能
 
 ## 統計情報
 画像サイズ: {img_width}x{img_height}
 エクスポート画像数: {len(catalog_entries)}枚
 作成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+セッションID: {session_id}
 """
     
     with open(os.path.join(output_folder, "README.txt"), 'w', encoding='utf-8') as f:
         f.write(readme_content)
     
-    # マニフェストファイルを作成
-    manifest_data = [
-        # 列名のリスト
-        ["cam/image_array", "user/angle", "user/throttle", "user/mode", "x_pixel", "y_pixel"],
-        # データ型のリスト
-        ["image_array", "float", "float", "str", "int", "int"],
-        # 追加設定
-        {
-            "image_size": [img_width, img_height],
-            "coordinate_mapping": "angle->x_pixel, throttle->y_pixel (inverted)"
-        },
-        # セッション情報
-        {
-            "created_at": time.time(),
-            "sessions": {
-                "all_full_ids": [session_id],
-                "last_id": 0,
-                "last_full_id": session_id
-            }
-        },
-        # カタログファイル情報
-        {
-            "paths": ["catalog_0.catalog"],
-            "current_index": len(catalog_entries),
-            "max_len": 1000,
-            "deleted_indexes": []
-        }
-    ]
-    
-    manifest_path = os.path.join(output_folder, "manifest.json")
-    with open(manifest_path, 'w') as f:
-        for item in manifest_data:
-            f.write(json.dumps(item) + '\n')
-    
     print(f"Jetracerエクスポート完了: {len(catalog_entries)}枚の画像を処理しました")
-    return catalog_path
+    print(f"出力フォルダ: {output_folder}")
+    print(f"画像フォルダ: {os.path.join(output_folder, 'images')}")
+    
+    return manifest_path
 
 def export_to_yolo(
     folder_path: str,
