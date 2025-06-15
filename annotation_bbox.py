@@ -8,9 +8,7 @@ import shutil
 import time
 import random
 import subprocess
-import inspect
 from datetime import datetime
-import uuid
 import math
 
 import matplotlib
@@ -117,6 +115,7 @@ normalized_path = mlflow_dir.replace("\\", "/")
 session_dir = os.path.join(APP_DIR_PATH, SESSION_DIR_NAME)
 os.makedirs(session_dir, exist_ok=True)
 
+# マウス操作画面表示系
 class ImageLabel(QLabel):
     def __init__(self, parent=None, main_window=None):
         super().__init__(parent)
@@ -146,87 +145,43 @@ class ImageLabel(QLabel):
         self.resize_handle = None        # 操作中のハンドル（"tl", "tr", "bl", "br"）
         self.resize_start_pos = None     
 
-        # 修飾キーの状態
-        self.key_b_pressed = False  
-        self.setFocusPolicy(Qt.StrongFocus)  
-        
-    def keyPressEvent(self, event):
-        # bキーが押されたらフラグを設定
-        if event.key() == Qt.Key_B:
-            self.key_b_pressed = True
-
-        # エラーを修正 - main_image_view の属性をチェック
-        elif event.key() in [Qt.Key_Delete, Qt.Key_Backspace] and hasattr(self, 'main_image_view') and self.main_image_view.selected_bbox_index is not None:
-            # ここで main_image_view の selected_bbox_index を使用
-            print(f"削除キーが押されました。選択されたインデックス: {self.main_image_view.selected_bbox_index}")
-            current_img_path = self.images[self.current_index]
-            if current_img_path in self.bbox_annotations:
-                bboxes = self.bbox_annotations[current_img_path]
-                if 0 <= self.main_image_view.selected_bbox_index < len(bboxes):
-                    # 選択されたバウンディングボックスを削除
-                    del bboxes[self.main_image_view.selected_bbox_index]
-                    # インデックスをリセット
-                    self.main_image_view.selected_bbox_index = None
-                    # 再描画
-                    self.main_image_view.update()
-                    
-                    # バウンディングボックスの統計情報を更新
-                    self.update_bbox_stats()
-                    
-                    # 重要: last_bboxesを更新する（削除後の最新状態を保存）
-                    if hasattr(self, 'last_bboxes'):
-                        # 現在の画像のバウンディングボックスリストを全て取得して保存
-                        self.last_bboxes = [bbox.copy() for bbox in bboxes]
-                        
-                        # last_bboxも更新（互換性のため）
-                        if self.last_bboxes:
-                            self.last_bbox = self.last_bboxes[-1].copy()
-                        else:
-                            self.last_bbox = None
-
-                    print("バウンディングボックスを削除しました")
-                    return  # イベント処理を終了
-        
-        # 親クラスのキーイベント処理を呼び出す
-        super().keyPressEvent(event)
-
-    def keyReleaseEvent(self, event):
-        # bキーが離されたらフラグをクリア
-        if event.key() == Qt.Key_B:
-            self.key_b_pressed = False
-        super().keyReleaseEvent(event)
+        # セグメンテーション関連の新規追加
+        self.segmentation_polygons = []  
+        self.current_segmentation_polygon = []  
+        self.is_drawing_segmentation = False
+        self.segmentation_inference_masks = []          
+        self.selected_segmentation_index = None  
+        self.is_moving_segmentation = False      
+        self.seg_move_start_pos = None           
+        self.hovering_segmentation_index = None 
+        self.close_threshold = 15                # ポリゴン閉じる際の閾値（ピクセル）
+        self.selected_polygon_index = None    # 選択されたポリゴンのインデックス
+        self.selected_vertex_index = None     # 選択された頂点のインデックス
+        self.is_moving_vertex = False         # 頂点移動中フラグ
+        self.hovering_polygon_index = None    # ホバー中のポリゴンのインデックス
+        self.hovering_vertex_index = None     # ホバー中の頂点のインデックス
+        self.vertex_radius = 8                # 頂点の半径（ピクセル）
 
     def mouseReleaseEvent(self, event):
+        # 既存のコードに追加
+        if self.is_moving_segmentation:
+            # セグメンテーション移動が完了
+            self.is_moving_segmentation = False
+            self.seg_move_start_pos = None
+                        
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+            return
+
         if self.is_moving_bbox:
             # 移動が完了したのでフラグをリセット
             self.is_moving_bbox = False
             self.move_start_pos = None
-            
-            # 移動完了メッセージ表示
-            if self.selected_bbox_index is not None:
-                current_img_path = self.main_window.images[self.main_window.current_index]
-                if current_img_path in self.main_window.bbox_annotations:
-                    bboxes = self.main_window.bbox_annotations[current_img_path]
-                    if 0 <= self.selected_bbox_index < len(bboxes):
-                        bbox = bboxes[self.selected_bbox_index]
-                        class_name = bbox.get('class', 'unknown')
-                        # ステータスバーに移動完了メッセージを表示
-                        if hasattr(self.main_window, 'statusBar'):
-                            x1 = bbox['x1']
-                            y1 = bbox['y1']
-                            x2 = bbox['x2']
-                            y2 = bbox['y2']
-                            width = x2 - x1
-                            height = y2 - y1
-                            self.main_window.statusBar().showMessage(
-                                f"'{class_name}' バウンディングボックスを移動しました "
-                                f"[位置: ({x1:.2f}, {y1:.2f}), サイズ: {width:.2f}x{height:.2f}]", 
-                                3000
-                            )
-            
+                        
             # 通常のカーソルに戻す
             self.setCursor(Qt.ArrowCursor)
             self.update()
+
         elif self.is_drawing_bbox and self.pixmap() and self.bbox_start and self.bbox_end:
             # バウンディングボックスの確定処理
             if abs(self.bbox_end.x() - self.bbox_start.x()) > 10 and abs(self.bbox_end.y() - self.bbox_start.y()) > 10:
@@ -583,6 +538,105 @@ class ImageLabel(QLabel):
                         painter.setFont(QFont("Arial", 10, QFont.Bold))
                         painter.drawText(label_rect, Qt.AlignCenter, label_text)
 
+        # セグメンテーションアノテーションの描画
+            if hasattr(self.main_window, 'segmentation_annotations'):
+                current_img_path = self.main_window.images[self.main_window.current_index]
+                if current_img_path in self.main_window.segmentation_annotations:
+                    polygons = self.main_window.segmentation_annotations[current_img_path]
+                    
+                    for i, polygon_data in enumerate(polygons):
+                        class_name = polygon_data.get('class', 'unknown')
+                        points = polygon_data.get('points', [])
+                        
+                        if len(points) >= 3:
+                            # クラスに応じた色を設定
+                            class_colors = {
+                                'car': QColor(255, 0, 0, 120),
+                                'person': QColor(0, 255, 0, 120),
+                                'sign': QColor(0, 0, 255, 120),
+                                'cone': QColor(255, 255, 0, 120),
+                                'unknown': QColor(128, 128, 128, 120)
+                            }
+                            base_color = class_colors.get(class_name, QColor(255, 0, 0, 120))
+                            
+                            # 選択またはホバーされているセグメンテーションの強調表示
+                            is_selected = i == self.selected_segmentation_index
+                            is_hovered = i == self.hovering_segmentation_index
+                            
+                            if is_selected:
+                                # 選択時は濃い色で縁取り
+                                painter.setPen(QPen(base_color.darker(), 4))
+                                painter.setBrush(QBrush(QColor(base_color.red(), base_color.green(), base_color.blue(), 150)))
+                            elif is_hovered:
+                                # ホバー時は少し濃い色
+                                painter.setPen(QPen(base_color.darker(), 3))
+                                painter.setBrush(QBrush(QColor(base_color.red(), base_color.green(), base_color.blue(), 100)))
+                            else:
+                                # 通常時
+                                painter.setPen(QPen(base_color.darker(), 2))
+                                painter.setBrush(QBrush(base_color))
+                            
+                            # ポリゴンの描画
+                            polygon_points = []
+                            for px, py in points:
+                                screen_x = int(target_rect.x() + (px / pix_width) * target_rect.width())
+                                screen_y = int(target_rect.y() + (py / pix_height) * target_rect.height())
+                                polygon_points.append(QPoint(screen_x, screen_y))
+                            
+                            # 塗りつぶし
+                            painter.drawPolygon(polygon_points)
+                            
+                            # 選択されているセグメンテーションには頂点を表示
+                            if is_selected:
+                                painter.setBrush(QBrush(Qt.white))
+                                painter.setPen(QPen(base_color.darker(), 2))
+                                for point in polygon_points:
+                                    painter.drawEllipse(point.x() - 4, point.y() - 4, 8, 8)
+                            
+                            # ラベル表示
+                            if polygon_points:
+                                center_x = sum(p.x() for p in polygon_points) // len(polygon_points)
+                                center_y = sum(p.y() for p in polygon_points) // len(polygon_points)
+                                painter.setPen(QPen(Qt.white, 1))
+                                painter.setFont(QFont("Arial", 10, QFont.Bold))
+                                
+                                # ラベル背景
+                                text_width = painter.fontMetrics().horizontalAdvance(class_name)
+                                painter.fillRect(center_x - text_width//2 - 2, center_y - 10, text_width + 4, 16, base_color.darker())
+                                
+                                painter.drawText(center_x - text_width//2, center_y + 2, class_name)
+            
+            # 現在描画中のポリゴンの表示（修正）
+            if self.is_drawing_segmentation and len(self.current_segmentation_polygon) > 0:
+                painter.setPen(QPen(QColor(255, 255, 0), 3))
+                
+                # 点を線で結ぶ
+                screen_points = []
+                for point in self.current_segmentation_polygon:
+                    screen_x = int(target_rect.x() + (point.x() / pix_width) * target_rect.width())
+                    screen_y = int(target_rect.y() + (point.y() / pix_height) * target_rect.height())
+                    screen_points.append(QPoint(screen_x, screen_y))
+                
+                # 線を描画
+                for i in range(len(screen_points)):
+                    # 点を描画
+                    painter.setBrush(QBrush(QColor(255, 255, 0)))
+                    painter.drawEllipse(screen_points[i].x() - 4, screen_points[i].y() - 4, 8, 8)
+                    
+                    if i < len(screen_points) - 1:
+                        # 線を描画
+                        painter.drawLine(screen_points[i], screen_points[i + 1])
+                
+                # 最初の点と最後の点を点線で結ぶ（閉じる候補を表示）
+                if len(screen_points) >= 3:
+                    painter.setPen(QPen(QColor(255, 255, 0), 2, Qt.DashLine))
+                    painter.drawLine(screen_points[-1], screen_points[0])
+                    
+                    # 最初の点を強調表示
+                    painter.setBrush(QBrush(QColor(255, 255, 255)))
+                    painter.setPen(QPen(QColor(255, 255, 0), 3))
+                    painter.drawEllipse(screen_points[0].x() - 6, screen_points[0].y() - 6, 12, 12)
+
         # 削除済みの場合は半透明の赤オーバーレイを表示
         if self.is_deleted:
             painter.setOpacity(0.25)  # 75%透明
@@ -632,6 +686,7 @@ class ImageLabel(QLabel):
             orig_y = int(rel_y * pix_height)
             
             # 現在のモードに基づいて処理
+            ## 物体検知モード
             if hasattr(self.main_window, 'current_mode') and self.main_window.current_mode == 1:
                 # 物体検知アノテーションモード
                 current_img_path = self.main_window.images[self.main_window.current_index]
@@ -733,6 +788,75 @@ class ImageLabel(QLabel):
                     self.is_drawing_bbox = True
                     self.bbox_end = self.bbox_start  
                     self.update()
+
+            ## セグモード
+            elif hasattr(self.main_window, 'current_mode') and self.main_window.current_mode == 2:
+                # セグメンテーションモード
+                current_img_path = self.main_window.images[self.main_window.current_index]
+                
+                # 既存のセグメンテーションを選択するかチェック
+                if hasattr(self.main_window, 'segmentation_annotations') and current_img_path in self.main_window.segmentation_annotations:
+                    segmentations = self.main_window.segmentation_annotations[current_img_path]
+                    
+                    # 各セグメンテーションについて、クリック位置が内部にあるかチェック
+                    for i, seg_data in enumerate(segmentations):
+                        if self.is_point_in_polygon(orig_x, orig_y, seg_data['points']):
+                            if event.button() == Qt.LeftButton:
+                                # 選択済みのセグメンテーションをクリックした場合
+                                if self.selected_segmentation_index == i:
+                                    # 選択解除が必要かどうかを判断
+                                    if event.modifiers() & Qt.ShiftModifier:
+                                        self.selected_segmentation_index = None
+                                        self.update()
+                                        if hasattr(self.main_window, 'statusBar'):
+                                            self.main_window.statusBar().showMessage("セグメンテーションの選択を解除しました", 3000)
+                                        return
+                                
+                                # 新規選択の場合
+                                self.selected_segmentation_index = i
+                                self.is_moving_segmentation = True
+                                self.seg_move_start_pos = QPoint(orig_x, orig_y)
+                                
+                                # ステータスバーにメッセージ表示
+                                if hasattr(self.main_window, 'statusBar'):
+                                    class_name = seg_data.get('class', 'unknown')
+                                    self.main_window.statusBar().showMessage(f"'{class_name}' セグメンテーションを選択しました", 3000)
+                                
+                                self.update()
+                                return
+                            elif event.button() == Qt.RightButton and self.selected_segmentation_index == i:
+                                # 右クリックで選択中のセグメンテーションを削除
+                                self.main_window.delete_selected_segmentation(i)
+                                return
+                
+                # 新しいポリゴンの描画処理
+                if event.button() == Qt.LeftButton:
+                    if not self.is_drawing_segmentation:
+                        # 新しいポリゴンを開始
+                        self.current_segmentation_polygon = [QPoint(orig_x, orig_y)]
+                        self.is_drawing_segmentation = True
+                        self.selected_segmentation_index = None
+                    else:
+                        # ポリゴンに点を追加
+                        new_point = QPoint(orig_x, orig_y)
+                        
+                        # 最初の点に近い場合はポリゴンを閉じる
+                        if len(self.current_segmentation_polygon) >= 3:
+                            first_point = self.current_segmentation_polygon[0]
+                            distance = ((new_point.x() - first_point.x())**2 + (new_point.y() - first_point.y())**2)**0.5
+                            
+                            if distance <= self.close_threshold:
+                                # ポリゴンを閉じる
+                                self.complete_segmentation_polygon()
+                                return
+                        
+                        self.current_segmentation_polygon.append(new_point)
+                    self.update()
+                elif event.button() == Qt.RightButton and self.is_drawing_segmentation:
+                    # 右クリックでポリゴンを完了（3点以上必要）
+                    if len(self.current_segmentation_polygon) >= 3:
+                        self.complete_segmentation_polygon()
+
             else:
                 # 自動運転アノテーションモード
                 self.annotation_point = QPoint(orig_x, orig_y)
@@ -793,7 +917,6 @@ class ImageLabel(QLabel):
             QPoint(int(arrow_x2), int(arrow_y2))
         ]
         
-        from PyQt5.QtGui import QPolygon
         arrow_polygon = QPolygon(arrow_points)
         painter.drawPolygon(arrow_polygon)
 
@@ -1010,6 +1133,73 @@ class ImageLabel(QLabel):
         elif not self.is_moving_bbox and not self.is_drawing_bbox and not self.is_resizing_bbox:
             self.check_bbox_hover_and_resize_handles(event.pos())
 
+        # セグメンテーション移動処理
+        if self.is_moving_segmentation and self.selected_segmentation_index is not None:
+            if not self.pixmap():
+                return
+                
+            # 座標変換（既存のコードと同様）
+            pos = event.pos()
+            pix_width = self.pixmap().width()
+            pix_height = self.pixmap().height()
+            scaled_width = int(pix_width * self.zoom_factor)
+            scaled_height = int(pix_height * self.zoom_factor)
+            
+            x = (self.width() - scaled_width) // 2
+            y = (self.height() - scaled_height) // 2
+            target_rect = QRect(x, y, scaled_width, scaled_height)
+            
+            if not target_rect.contains(pos):
+                constrained_x = max(target_rect.left(), min(pos.x(), target_rect.right()))
+                constrained_y = max(target_rect.top(), min(pos.y(), target_rect.bottom()))
+                pos = QPoint(constrained_x, constrained_y)
+            
+            rel_x = (pos.x() - target_rect.x()) / target_rect.width()
+            rel_y = (pos.y() - target_rect.y()) / target_rect.height()
+            orig_x = int(rel_x * pix_width)
+            orig_y = int(rel_y * pix_height)
+            
+            # セグメンテーションの移動処理
+            current_img_path = self.main_window.images[self.main_window.current_index]
+            if current_img_path in self.main_window.segmentation_annotations:
+                segmentations = self.main_window.segmentation_annotations[current_img_path]
+                if 0 <= self.selected_segmentation_index < len(segmentations):
+                    # 移動距離を計算
+                    delta_x = orig_x - self.seg_move_start_pos.x()
+                    delta_y = orig_y - self.seg_move_start_pos.y()
+                    
+                    # ポリゴンの全ての点を移動
+                    seg_data = segmentations[self.selected_segmentation_index]
+                    new_points = []
+                    for px, py in seg_data['points']:
+                        new_x = max(0, min(px + delta_x, pix_width))
+                        new_y = max(0, min(py + delta_y, pix_height))
+                        new_points.append((new_x, new_y))
+                    
+                    segmentations[self.selected_segmentation_index]['points'] = new_points
+                    self.seg_move_start_pos = QPoint(orig_x, orig_y)
+                    
+                    # ステータスバーに情報表示
+                    if hasattr(self.main_window, 'statusBar'):
+                        class_name = seg_data.get('class', 'unknown')
+                        self.main_window.statusBar().showMessage(f"'{class_name}' セグメンテーションを移動中...", 500)
+            
+            self.update()
+        
+        # セグメンテーションホバー検出（移動中でない場合のみ）
+        elif not self.is_moving_segmentation and hasattr(self.main_window, 'current_mode') and self.main_window.current_mode == 2:
+            hover_index = self.check_segmentation_hover(event.pos())
+            
+            if hover_index != self.hovering_segmentation_index:
+                self.hovering_segmentation_index = hover_index
+                
+                if hover_index is not None:
+                    self.setCursor(Qt.OpenHandCursor)
+                else:
+                    self.setCursor(Qt.ArrowCursor)
+                
+                self.update()
+
     def check_bbox_hover_and_resize_handles(self, pos):
         """バウンディングボックスのホバー状態とリサイズハンドルのチェック"""
         if not self.pixmap() or not hasattr(self.main_window, 'current_mode'):
@@ -1114,6 +1304,84 @@ class ImageLabel(QLabel):
             
             self.update()  # 再描画
 
+    def complete_segmentation_polygon(self):
+        """ポリゴンを完了してクラス選択を行う"""
+        if len(self.current_segmentation_polygon) >= 3:
+            # クラス選択ダイアログ
+            class_name = self.main_window.select_object_class()
+            if class_name:
+                # ポリゴンを保存
+                polygon_data = {
+                    'class': class_name,
+                    'points': [(p.x(), p.y()) for p in self.current_segmentation_polygon]
+                }
+                self.main_window.add_segmentation_annotation(polygon_data)
+        
+        # 描画状態をリセット
+        self.current_segmentation_polygon = []
+        self.is_drawing_segmentation = False
+        self.update()
+
+    def is_point_in_polygon(self, x, y, polygon_points):
+        """点がポリゴン内にあるかを判定（Ray casting algorithm）"""
+        if len(polygon_points) < 3:
+            return False
+        
+        n = len(polygon_points)
+        inside = False
+        
+        p1x, p1y = polygon_points[0]
+        for i in range(1, n + 1):
+            p2x, p2y = polygon_points[i % n]
+            if y > min(p1y, p2y):
+                if y <= max(p1y, p2y):
+                    if x <= max(p1x, p2x):
+                        if p1y != p2y:
+                            xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                        if p1x == p2x or x <= xinters:
+                            inside = not inside
+            p1x, p1y = p2x, p2y
+        
+        return inside
+
+    def check_segmentation_hover(self, pos):
+        """マウス位置がセグメンテーション上にあるかチェック"""
+        if not self.pixmap() or not hasattr(self.main_window, 'current_mode'):
+            return None
+        
+        if self.main_window.current_mode != 2:
+            return None
+        
+        # 座標変換
+        pix_width = self.pixmap().width()
+        pix_height = self.pixmap().height()
+        scaled_width = int(pix_width * self.zoom_factor)
+        scaled_height = int(pix_height * self.zoom_factor)
+        
+        x = (self.width() - scaled_width) // 2
+        y = (self.height() - scaled_height) // 2
+        target_rect = QRect(x, y, scaled_width, scaled_height)
+        
+        if not target_rect.contains(pos):
+            return None
+        
+        rel_x = (pos.x() - target_rect.x()) / target_rect.width()
+        rel_y = (pos.y() - target_rect.y()) / target_rect.height()
+        orig_x = int(rel_x * pix_width)
+        orig_y = int(rel_y * pix_height)
+        
+        # 現在の画像のセグメンテーションをチェック
+        current_img_path = self.main_window.images[self.main_window.current_index]
+        if current_img_path in self.main_window.segmentation_annotations:
+            segmentations = self.main_window.segmentation_annotations[current_img_path]
+            
+            for i, seg_data in enumerate(segmentations):
+                if self.is_point_in_polygon(orig_x, orig_y, seg_data['points']):
+                    return i
+        
+        return None
+
+# 下部ギャラリー系
 class ThumbnailWidget(QWidget):
     def __init__(self, parent=None, img_path="", index=0, is_selected=False, 
                  annotation=None, on_click=None, location_value=None, is_deleted=False):
@@ -1282,6 +1550,7 @@ class ThumbnailWidget(QWidget):
     def load_image(self, img_path):
         pass
     
+# データ操作全体系
 class ImageAnnotationTool(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1308,6 +1577,13 @@ class ImageAnnotationTool(QMainWindow):
         self.last_bbox = None  # 前回作成したバウンディングボックスの情報
         self.last_bboxes = []  # 前回の画像の全てのバウンディングボックスを保存するリスト（新規追加）
         self.auto_apply_last_bbox = False  # 前回のバウンディングボックスを自動適用するかどうか
+
+        # セグメンテーション関連の初期化
+        self.segmentation_annotations = {}  # セグメンテーションアノテーション用
+        self.current_polygon = []  # 現在描画中のポリゴン
+        self.is_drawing_polygon = False  # ポリゴン描画中フラグ
+        self.segmentation_inference_results = {}  # セグメンテーション推論結果
+        self.yolo_seg_model = None  # YOLOセグメンテーションモデル
 
         # 削除インデックス
         self.deleted_indexes = []
@@ -1344,7 +1620,6 @@ class ImageAnnotationTool(QMainWindow):
         self.update_stats()
         self.display_current_image()
         self.update_gallery()
-        #self.update_distribution_graph()  
         self.update_slider_deleted_indexes()
 
         if hasattr(self, 'prev_multi_button') and hasattr(self, 'next_multi_button'):
@@ -1444,11 +1719,21 @@ class ImageAnnotationTool(QMainWindow):
         apply_style(jetracer_btn, 'export')
         export_layout.addWidget(jetracer_btn)
 
+        ###TODO:統合
+        # # YOLOエクスポートボタンを統合エクスポートボタンに変更
+        # yolo_all_btn = QPushButton("YOLO統合形式")
+        # yolo_all_btn.clicked.connect(self.export_all_to_yolo)
+        # export_layout.addWidget(yolo_all_btn)
+
         # YOLOフォーマット保存ボタンを追加
         yolo_btn = QPushButton("YOLO")
         yolo_btn.clicked.connect(self.export_to_yolo)
         apply_style(yolo_btn, 'export')
         export_layout.addWidget(yolo_btn)
+
+        seg_btn = QPushButton("セグ形式")
+        seg_btn.clicked.connect(self.export_segmentation_to_yolo)
+        export_layout.addWidget(seg_btn)
 
         left_layout.addLayout(export_layout)
 
@@ -1522,7 +1807,7 @@ class ImageAnnotationTool(QMainWindow):
 
         pilot_layout.addLayout(inference_layout)
 
-        # 追加: 差分ベクトル矢印表示オプション
+        # 差分ベクトル矢印表示オプション
         diff_vector_layout = QHBoxLayout()
         self.diff_vector_checkbox = QCheckBox("差分ベクトル矢印表示（緑矢印）")
         self.diff_vector_checkbox.setChecked(False)
@@ -1597,6 +1882,43 @@ class ImageAnnotationTool(QMainWindow):
         self.yolo_saved_model_combo.setMinimumWidth(180)
         self.yolo_saved_model_combo.setStyleSheet("combobox-popup: 0;")
         obj_detection_layout.addWidget(self.yolo_saved_model_combo)
+
+        ###TODO:YOLOモデルコンボと統合見直し
+        # YOLOモデルタイプ選択の拡張（既存のyolo_model_comboの下に追加）
+        model_type_layout = QHBoxLayout()
+        model_type_layout.addWidget(QLabel("YOLOタスク:"))
+        self.yolo_task_combo = QComboBox()
+        self.yolo_task_combo.addItems(["detect", "segment"])
+        self.yolo_task_combo.currentTextChanged.connect(self.on_yolo_task_changed)
+        model_type_layout.addWidget(self.yolo_task_combo)
+        obj_detection_layout.addLayout(model_type_layout)
+
+        # セグメンテーション用モデル選択コンボボックス
+        self.yolo_seg_model_combo = QComboBox()
+        self.yolo_seg_model_combo.setMinimumWidth(180)
+        self.yolo_seg_model_combo.setVisible(False)  # 初期は非表示
+        obj_detection_layout.addWidget(self.yolo_seg_model_combo)
+
+        # セグメンテーション用モデル操作ボタン
+        seg_model_buttons_layout = QHBoxLayout()
+        self.yolo_seg_refresh_button = QPushButton("セグモデル一覧更新")
+        self.yolo_seg_refresh_button.clicked.connect(self.refresh_yolo_seg_model_list)
+        self.yolo_seg_refresh_button.setVisible(False)
+
+        self.yolo_seg_load_button = QPushButton("セグモデル読込")
+        self.yolo_seg_load_button.clicked.connect(self.load_yolo_seg_model)
+        self.yolo_seg_load_button.setVisible(False)
+
+        seg_model_buttons_layout.addWidget(self.yolo_seg_refresh_button)
+        seg_model_buttons_layout.addWidget(self.yolo_seg_load_button)
+        obj_detection_layout.addLayout(seg_model_buttons_layout)
+
+        # セグメンテーション推論結果表示チェックボックス
+        self.segmentation_inference_checkbox = QCheckBox("セグメンテーション推論結果表示")
+        self.segmentation_inference_checkbox.setChecked(False)
+        self.segmentation_inference_checkbox.stateChanged.connect(self.toggle_segmentation_inference_display)
+        self.segmentation_inference_checkbox.setVisible(False)
+        obj_detection_layout.addWidget(self.segmentation_inference_checkbox)
 
         # 5. モデル操作ボタン（更新と読み込み - 横並び）
         yolo_model_buttons_layout = QHBoxLayout()
@@ -1907,29 +2229,21 @@ class ImageAnnotationTool(QMainWindow):
         
         self.auto_mode_button = QPushButton("自動運転")
         self.auto_mode_button.setCheckable(True)
-        self.auto_mode_button.setChecked(True)  # デフォルトは自動運転モード
+        self.auto_mode_button.setChecked(True)
         self.auto_mode_button.clicked.connect(self.toggle_annotation_mode)
-        self.auto_mode_button.setStyleSheet("""
-            QPushButton:checked {
-                background-color: #4CAF50;
-                color: white;
-                font-weight: bold;
-            }
-        """)
-        mode_layout.addWidget(self.auto_mode_button)
 
         self.detection_mode_button = QPushButton("物体検知")
         self.detection_mode_button.setCheckable(True)
-        self.detection_mode_button.setChecked(False)  # 初期状態では未選択
         self.detection_mode_button.clicked.connect(self.toggle_annotation_mode)
-        self.detection_mode_button.setStyleSheet("""
-            QPushButton:checked {
-                background-color: #2196F3;
-                color: white;
-                font-weight: bold;
-            }
-        """)
+
+        # 新規追加: セグメンテーションモードボタン
+        self.segmentation_mode_button = QPushButton("セグメンテーション")
+        self.segmentation_mode_button.setCheckable(True)
+        self.segmentation_mode_button.clicked.connect(self.toggle_annotation_mode)
+
+        mode_layout.addWidget(self.auto_mode_button)
         mode_layout.addWidget(self.detection_mode_button)
+        mode_layout.addWidget(self.segmentation_mode_button)  # 追加
 
         location_layout.addLayout(mode_layout)
 
@@ -1944,6 +2258,13 @@ class ImageAnnotationTool(QMainWindow):
         self.apply_last_bbox_checkbox.setToolTip("前回作成したバウンディングボックスを現在の画像にも適用します")
         self.apply_last_bbox_checkbox.stateChanged.connect(self.toggle_auto_apply_bbox)
         location_layout.addWidget(self.apply_last_bbox_checkbox)
+
+        # セグメンテーション用の前回適用チェックボックス
+        self.apply_last_segmentation_checkbox = QCheckBox("前回のセグメンテーションを適用")
+        self.apply_last_segmentation_checkbox.setChecked(False)
+        self.apply_last_segmentation_checkbox.setToolTip("前回作成したセグメンテーションを現在の画像にも適用します")
+        self.apply_last_segmentation_checkbox.stateChanged.connect(self.toggle_auto_apply_segmentation)
+        location_layout.addWidget(self.apply_last_segmentation_checkbox)
 
         # スキップ枚数設定
         skip_layout = QHBoxLayout()
@@ -2037,8 +2358,62 @@ class ImageAnnotationTool(QMainWindow):
         except Exception as e:
             print(f"物体検知アノテーション表示拡張の適用に失敗しました: {e}")
 
-        self.update_theme_button_styles()  # 初期スタイルを適用
+    def update_ui(self):
+            """アノテーション変更後のUI更新を一括処理"""
+            # メイン画像表示を更新
+            if hasattr(self, 'main_image_view'):
+                self.main_image_view.update()
+            
+            if hasattr(self, 'update_slider_deleted_indexes'):
+                self.update_slider_deleted_indexes()
 
+            # ギャラリー表示を更新
+            if hasattr(self, 'update_gallery'):
+                self.update_gallery()
+            
+            # 情報パネルを更新
+            if hasattr(self, 'display_current_image'):
+                self.display_current_image()
+            
+            # 推論情報パネルを更新（推論表示がONの場合のみ）
+            if (hasattr(self, 'inference_checkbox') and 
+                hasattr(self, 'update_inference_display') and 
+                self.inference_checkbox.isChecked()):
+                self.update_inference_display()
+            
+            # 物体検知推論情報パネルを更新（表示がONの場合のみ）
+            if (hasattr(self, 'detection_inference_checkbox') and 
+                hasattr(self, 'update_detection_info_panel') and 
+                self.detection_inference_checkbox.isChecked()):
+                self.update_detection_info_panel()
+            
+            # 自動運転推論情報パネルを更新（推論表示がONの場合のみ）
+            if (hasattr(self, 'inference_checkbox') and 
+                hasattr(self, 'update_driving_info_panel') and 
+                self.inference_checkbox.isChecked()):
+                self.update_driving_info_panel()
+
+            # 位置情報パネルを更新（表示がONの場合のみ）
+            if (hasattr(self, 'location_inference_checkbox') and 
+                hasattr(self, 'update_location_info_panel') and 
+                self.location_inference_checkbox.isChecked()):
+                self.update_location_info_panel()
+
+            # 統計情報を更新
+            if hasattr(self, 'update_bbox_stats'):
+                self.update_bbox_stats()
+            
+            if hasattr(self, 'update_segmentation_stats'):
+                self.update_segmentation_stats()
+            
+            # 分布グラフを更新（自動運転アノテーションがある場合）
+            if hasattr(self, 'update_distribution_graph') and hasattr(self, 'annotations') and self.annotations:
+                self.update_distribution_graph()
+            
+            # 位置情報ボタンのカウント表示を更新
+            if hasattr(self, 'update_location_button_counts'):
+                self.update_location_button_counts()
+                
     # 初期化/ファイル読込
     def save_session_info(self):
         """現在の作業セッション情報を保存する"""
@@ -2189,16 +2564,43 @@ class ImageAnnotationTool(QMainWindow):
             print(f"分布グラフ作成中にエラー: {str(e)}")
             traceback.print_exc()
             self.distribution_label.setText(f"グラフ作成エラー: {str(e)}")
-            
+
+    def update_segmentation_stats(self):
+        """セグメンテーションアノテーションの統計情報を更新"""
+        seg_count = len(self.segmentation_annotations) if hasattr(self, 'segmentation_annotations') else 0
+        
+        # 統計ラベルの更新（既存のstats_labelを拡張）
+        if hasattr(self, 'stats_label'):
+            current_text = self.stats_label.text()
+            if "Segmentations:" not in current_text:
+                self.stats_label.setText(f"{current_text} | Segmentations: {seg_count}")
+
     def eventFilter(self, obj, event):
         # キーイベントを処理
-        if event.type() == QEvent.KeyPress and hasattr(self, 'main_image_view') and self.main_image_view.selected_bbox_index is not None:
+        if event.type() == QEvent.KeyPress:
             key = event.key()
-            if key in [Qt.Key_Delete, Qt.Key_Backspace]:
-                # 削除キーが押された場合、選択されたバウンディングボックスを削除
-                self.delete_selected_bbox()
-                return True  # イベントを消費
-        
+
+            # Bキーでアノテーションモード切り替え
+            if key == Qt.Key_B:
+                self.toggle_annotation_mode()
+                return True
+
+            # 左右矢印キーでの画像移動
+            elif key == Qt.Key_Left:
+                self.skip_images(-10)
+                return True
+            elif key == Qt.Key_Right:
+                self.skip_images(10)
+                return True
+
+            # 削除キーが押された場合、選択されたバウンディングボックスを削除
+            elif key in [Qt.Key_Delete, Qt.Key_Backspace]:
+                if self.main_image_view.selected_bbox_index is not None:
+                        self.delete_selected_bbox()
+                if self.main_image_view.selected_segmentation_index is not None:
+                        self.delete_selected_segmentation()
+                return True  
+
         # 親クラスのイベントフィルタを呼び出す
         return super().eventFilter(obj, event)
 
@@ -2230,10 +2632,72 @@ class ImageAnnotationTool(QMainWindow):
                     del bboxes[selected_index]
                     # 選択インデックスをリセット
                     self.main_image_view.selected_bbox_index = None
-                    # 画面更新
-                    self.main_image_view.update()
-                    # 統計情報更新
-                    self.update_bbox_stats()
+
+                    self.update_ui()
+
+    def delete_selected_segmentation(self, index=None):
+        """選択されたセグメンテーションを削除する"""
+        if not self.images or not hasattr(self, 'segmentation_annotations'):
+            return
+        
+        current_img_path = self.images[self.current_index]
+        
+        if index is None:
+            index = self.main_image_view.selected_segmentation_index
+        
+        if current_img_path in self.segmentation_annotations and index is not None:
+            segmentations = self.segmentation_annotations[current_img_path]
+            if 0 <= index < len(segmentations):
+                # ボックス情報を取得
+                seg_data = segmentations[index]
+                class_name = seg_data.get('class', 'unknown')
+                
+                # 削除実行
+                del segmentations[index]
+                # 選択をクリア
+                self.main_image_view.selected_segmentation_index = None
+                # 画面更新
+                self.update_ui()
+                
+    def add_segmentation_annotation(self, polygon_data):
+        """セグメンテーションアノテーションを追加（前回のセグメンテーション保存機能付き）"""
+        if not self.images:
+            return
+        
+        current_img_path = self.images[self.current_index]
+        
+        if current_img_path not in self.segmentation_annotations:
+            self.segmentation_annotations[current_img_path] = []
+        
+        self.segmentation_annotations[current_img_path].append(polygon_data)
+        
+        # 前回のセグメンテーションとして保存
+        self.last_segmentation = polygon_data.copy()
+        
+        # 現在のすべてのセグメンテーションを保存
+        self.last_segmentations = [seg.copy() for seg in self.segmentation_annotations[current_img_path]]
+        
+        self.update_ui()
+        
+    def toggle_auto_apply_segmentation(self, state):
+        """前回のセグメンテーションを自動適用するかどうかを設定"""
+        self.auto_apply_last_segmentation = (state == Qt.Checked)
+        
+        # 現在の画像に対して、前回のセグメンテーションを適用
+        if self.auto_apply_last_segmentation and hasattr(self, 'last_segmentation') and self.last_segmentation and self.images:
+            current_img_path = self.images[self.current_index]
+            
+            # 削除済みの場合は適用しない
+            if hasattr(self, 'deleted_indexes') and self.current_index in self.deleted_indexes:
+                return
+            
+            # すでにアノテーションがある場合は確認
+            if current_img_path in self.segmentation_annotations and self.segmentation_annotations[current_img_path]:
+                return
+            
+            # 前回のセグメンテーションを適用
+            self.add_segmentation_annotation(self.last_segmentation.copy())
+            
 
     # def calculate_and_store_diff_vector(self, img_path_or_index):
     #     """教師データと推論結果の差分ベクトルを計算して保存する"""
@@ -2375,28 +2839,16 @@ class ImageAnnotationTool(QMainWindow):
 
         # 画面更新
         self.update_detection_info_panel()        
-        self.main_image_view.update()
+        self.update_ui()
         
-        # 表示状態をステータスバーに反映
-        if show_inference:
-            self.statusBar().showMessage("物体検知推論結果表示をオンにしました", 3000)
-        else:
-            self.statusBar().showMessage("物体検知推論結果表示をオフにしました", 3000)
-
     def toggle_diff_vector_display(self, state):
             """差分ベクトル矢印表示の切り替え"""
             show_diff_vectors = (state == Qt.Checked)
             self.show_diff_vectors = show_diff_vectors
             
             # 画面更新
-            self.main_image_view.update()
+            self.update_ui()
             
-            # 表示状態をステータスバーに反映
-            if show_diff_vectors:
-                self.statusBar().showMessage("差分ベクトル矢印表示をオンにしました", 3000)
-            else:
-                self.statusBar().showMessage("差分ベクトル矢印表示をオフにしました", 3000)
-
     def toggle_location_inference_display(self, state):
         """位置推論表示の切り替え"""
         show_inference = (state == Qt.Checked)
@@ -2405,15 +2857,8 @@ class ImageAnnotationTool(QMainWindow):
         self.show_location_inference = show_inference
 
         # 画面更新
-        self.update_location_info_panel()
-        self.main_image_view.update()
+        self.update_ui()
         
-        # 表示状態をステータスバーに反映
-        if show_inference:
-            self.statusBar().showMessage("位置推論結果表示をオンにしました", 3000)
-        else:
-            self.statusBar().showMessage("位置推論結果表示をオフにしました", 3000)
-
     # mlflow関連
     def initialize_mlflow(self):
         """MLflowの初期化と設定を行う - Windows環境対応（修正版）"""
@@ -3257,39 +3702,187 @@ class ImageAnnotationTool(QMainWindow):
             self.object_detection_container.setVisible(True)
 
     def toggle_annotation_mode(self, checked=None):
-        """アノテーションモードを切り替える"""
-        # 送信元ボタンを確認（クリックされたボタン）
+        # 既存のコードを修正して3つのモードに対応
         sender = self.sender()
         
         if sender == self.auto_mode_button:
-            # 自動運転モードが選択された
+            self.current_mode = 0
             self.auto_mode_button.setChecked(True)
             self.detection_mode_button.setChecked(False)
-            self.current_mode = 0  # 0 = 自動運転モード
+            self.segmentation_mode_button.setChecked(False)
             self.statusBar().showMessage("自動運転アノテーションモードに切り替えました。", 3000)
         elif sender == self.detection_mode_button:
-            # 物体検知モードが選択された
+            self.current_mode = 1
             self.auto_mode_button.setChecked(False)
             self.detection_mode_button.setChecked(True)
-            self.current_mode = 1  # 1 = 物体検知モード
+            self.segmentation_mode_button.setChecked(False)
             self.statusBar().showMessage("物体検知アノテーションモードに切り替えました。", 3000)
+        elif sender == self.segmentation_mode_button:
+            self.current_mode = 2  # 新規追加
+            self.auto_mode_button.setChecked(False)
+            self.detection_mode_button.setChecked(False)
+            self.segmentation_mode_button.setChecked(True)
+            self.statusBar().showMessage("セグメンテーションアノテーションモードに切り替えました。", 3000)
         else:
-            # Bキーで呼び出された場合は現在のモードを反転
-            if hasattr(self, 'current_mode') and self.current_mode == 1:
-                # 物体検知から自動運転へ
-                self.current_mode = 0
+            # Bキーでの切り替え（3つのモードをサイクル）
+            self.current_mode = (self.current_mode + 1) % 3
+            if self.current_mode == 0:
                 self.auto_mode_button.setChecked(True)
                 self.detection_mode_button.setChecked(False)
+                self.segmentation_mode_button.setChecked(False)
                 self.statusBar().showMessage("自動運転アノテーションモードに切り替えました。", 3000)
-            else:
-                # 自動運転から物体検知へ
-                self.current_mode = 1
+            elif self.current_mode == 1:
                 self.auto_mode_button.setChecked(False)
                 self.detection_mode_button.setChecked(True)
+                self.segmentation_mode_button.setChecked(False)
                 self.statusBar().showMessage("物体検知アノテーションモードに切り替えました。", 3000)
+            else:
+                self.auto_mode_button.setChecked(False)
+                self.detection_mode_button.setChecked(False)
+                self.segmentation_mode_button.setChecked(True)
+                self.statusBar().showMessage("セグメンテーションアノテーションモードに切り替えました。", 3000)
+        
+        self.main_image_view.update()   
+
+    def add_segmentation_annotation(self, polygon_data):
+        """セグメンテーションアノテーションを追加"""
+        if not self.images:
+            return
+        
+        current_img_path = self.images[self.current_index]
+        
+        if current_img_path not in self.segmentation_annotations:
+            self.segmentation_annotations[current_img_path] = []
+        
+        self.segmentation_annotations[current_img_path].append(polygon_data)
         
         # UI更新
         self.main_image_view.update()
+        self.update_gallery()
+        
+        # メッセージ表示
+        class_name = polygon_data.get('class', 'unknown')
+        self.statusBar().showMessage(f"'{class_name}' のセグメンテーションを追加しました", 3000)
+
+    def on_yolo_task_changed(self, task):
+        """YOLOタスク変更時の処理"""
+        is_segmentation = (task == "segment")
+        
+        # セグメンテーション関連UIの表示/非表示
+        self.yolo_seg_model_combo.setVisible(is_segmentation)
+        self.yolo_seg_refresh_button.setVisible(is_segmentation)
+        self.yolo_seg_load_button.setVisible(is_segmentation)
+        self.segmentation_inference_checkbox.setVisible(is_segmentation)
+        
+        # 物体検知関連UIの表示/非表示
+        self.yolo_saved_model_combo.setVisible(not is_segmentation)
+        self.yolo_refresh_button.setVisible(not is_segmentation)
+        self.yolo_load_button.setVisible(not is_segmentation)
+        self.detection_inference_checkbox.setVisible(not is_segmentation)
+        
+        if is_segmentation:
+            self.refresh_yolo_seg_model_list()
+
+    def refresh_yolo_seg_model_list(self):
+        """セグメンテーションモデルリストを更新"""
+        if not hasattr(self, 'yolo_seg_model_combo'):
+            return
+                    
+        self.yolo_seg_model_combo.clear()
+        
+        if not hasattr(self, 'folder_path') or not self.folder_path:
+            self.yolo_seg_model_combo.addItem("フォルダを選択してください")
+            return
+        
+        models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+        
+        if not os.path.exists(models_dir):
+            os.makedirs(models_dir, exist_ok=True)
+            self.yolo_seg_model_combo.addItem("セグメンテーションモデルが見つかりません")
+            return
+        
+        # セグメンテーションモデル（*seg*を含むファイル）を検索
+        seg_model_files = []
+        
+        for file in os.listdir(models_dir):
+            if file.endswith('.pt') and ('seg' in file.lower() or 'segment' in file.lower()):
+                seg_model_files.append(file)
+        
+        # サブフォルダも検索
+        for root, dirs, files in os.walk(models_dir):
+            if root == models_dir:
+                continue
+                
+            for file in files:
+                if file.endswith('.pt') and ('best' in file.lower() or 'last' in file.lower()):
+                    full_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(full_path, models_dir)
+                    
+                    parent_folder = os.path.dirname(rel_path)
+                    if 'seg' in parent_folder.lower() or 'segment' in parent_folder.lower():
+                        seg_model_files.append(rel_path)
+        
+        if not seg_model_files:
+            self.yolo_seg_model_combo.addItem("セグメンテーションモデルが見つかりません")
+            return
+        
+        seg_model_files.sort(reverse=True)
+        
+        for model_file in seg_model_files:
+            self.yolo_seg_model_combo.addItem(os.path.basename(model_file), model_file)
+
+    def load_yolo_seg_model(self):
+        """セグメンテーションモデルを読み込む"""
+        if not self.images:
+            QMessageBox.warning(self, "警告", "画像が読み込まれていません。")
+            return
+        
+        current_index = self.yolo_seg_model_combo.currentIndex()
+        selected_model_display = self.yolo_seg_model_combo.currentText()
+        relative_path = self.yolo_seg_model_combo.itemData(current_index)
+        
+        if not relative_path or "が見つかりません" in selected_model_display:
+            QMessageBox.warning(self, "警告", "有効なセグメンテーションモデルが選択されていません。")
+            return
+        
+        models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+        model_path = os.path.join(models_dir, relative_path)
+        
+        if not os.path.exists(model_path):
+            QMessageBox.warning(self, "警告", f"選択されたモデルが見つかりません: {model_path}")
+            return
+        
+        try:
+            from ultralytics import YOLO
+            self.yolo_seg_model = YOLO(model_path)
+            self.yolo_seg_confidence_threshold = 0.6
+            self.yolo_seg_model_file = model_path
+            
+            # 推論結果表示チェックボックスを自動的にオンにする
+            if hasattr(self, 'segmentation_inference_checkbox'):
+                self.segmentation_inference_checkbox.setChecked(True)
+            
+            self.statusBar().showMessage(f"セグメンテーションモデル '{os.path.basename(model_path)}' を読み込みました", 5000)
+            
+        except Exception as e:
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"セグメンテーションモデルの読み込み中にエラーが発生しました: {str(e)}"
+            )
+
+    def toggle_segmentation_inference_display(self, state):
+        """セグメンテーション推論表示の切り替え"""
+        show_inference = (state == Qt.Checked)
+        self.show_segmentation_inference = show_inference
+        
+        # 画面更新
+        self.main_image_view.update()
+        
+        if show_inference:
+            self.statusBar().showMessage("セグメンテーション推論結果表示をオンにしました", 3000)
+        else:
+            self.statusBar().showMessage("セグメンテーション推論結果表示をオフにしました", 3000)
 
     # yolo 関数
     def on_yolo_model_type_changed(self, index):
@@ -3374,6 +3967,208 @@ class ImageAnnotationTool(QMainWindow):
                 f"エクスポート準備中にエラーが発生しました: {str(e)}"
             )
 
+    def export_segmentation_to_yolo(self):
+        """セグメンテーションアノテーションをYOLO形式でエクスポートする"""
+        if not hasattr(self, 'segmentation_annotations') or not self.segmentation_annotations:
+            QMessageBox.information(self, "情報", "エクスポートするセグメンテーションアノテーションがありません。")
+            return
+        
+        annotation_folder = os.path.join(self.folder_path, ANNOTATION_DIR_NAME)
+        os.makedirs(annotation_folder, exist_ok=True)
+        
+        try:
+            # プログレスダイアログを表示
+            progress = QProgressDialog("セグメンテーションデータをエクスポート中...", "キャンセル", 0, len(self.segmentation_annotations), self)
+            progress.setWindowTitle("エクスポート")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+            
+            # クラス名を取得
+            classes = [cls.strip() for cls in self.classes_input.text().split(',') if cls.strip()]
+            
+            # エクスポート実行
+            from exports_file import export_segmentation_to_yolo
+            yaml_path = export_segmentation_to_yolo(annotation_folder, self.segmentation_annotations, classes)
+            
+            progress.setValue(len(self.segmentation_annotations))
+            progress.close()
+            
+            # 統計情報を計算
+            total_polygons = sum(len(annotations) for annotations in self.segmentation_annotations.values())
+            
+            QMessageBox.information(
+                self, 
+                "エクスポート完了", 
+                f"セグメンテーションアノテーションをYOLO形式でエクスポートしました。\n"
+                f"保存先: {annotation_folder}\n"
+                f"処理画像数: {len(self.segmentation_annotations)}\n"
+                f"セグメンテーション数: {total_polygons}\n"
+                f"クラス: {', '.join(classes)}"
+            )
+            
+        except Exception as e:
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"セグメンテーションエクスポート中にエラーが発生しました: {str(e)}"
+            )
+    ### TODO:統合
+    def export_all_to_yolo(self):
+        """物体検知とセグメンテーションを統合してYOLO形式でエクスポートする"""
+        has_bbox = hasattr(self, 'bbox_annotations') and self.bbox_annotations
+        has_seg = hasattr(self, 'segmentation_annotations') and self.segmentation_annotations
+        
+        if not has_bbox and not has_seg:
+            QMessageBox.information(self, "情報", "エクスポートするアノテーションがありません。")
+            return
+        
+        # アノテーションフォルダを作成
+        annotation_folder = os.path.join(self.folder_path, ANNOTATION_DIR_NAME)
+        yolo_export_folder = os.path.join(annotation_folder, "yolo_unified")
+        os.makedirs(yolo_export_folder, exist_ok=True)
+        
+        try:
+            # プログレスダイアログを表示
+            total_images = len(set(list(self.bbox_annotations.keys() if has_bbox else []) + 
+                                list(self.segmentation_annotations.keys() if has_seg else [])))
+            progress = QProgressDialog("YOLO統合データをエクスポート中...", "キャンセル", 0, total_images, self)
+            progress.setWindowTitle("エクスポート")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+            
+            # クラス名を取得
+            classes = [cls.strip() for cls in self.classes_input.text().split(',') if cls.strip()]
+            
+            # エクスポート実行
+            yaml_path = self.export_unified_yolo_format(yolo_export_folder, classes, progress)
+            
+            progress.setValue(total_images)
+            progress.close()
+            
+            # 統計情報を計算
+            bbox_count = sum(len(bboxes) for bboxes in self.bbox_annotations.values()) if has_bbox else 0
+            seg_count = sum(len(segs) for segs in self.segmentation_annotations.values()) if has_seg else 0
+            
+            QMessageBox.information(
+                self, 
+                "エクスポート完了", 
+                f"アノテーションをYOLO統合形式でエクスポートしました。\n"
+                f"保存先: {yolo_export_folder}\n"
+                f"処理画像数: {total_images}\n"
+                f"バウンディングボックス数: {bbox_count}\n"
+                f"セグメンテーション数: {seg_count}\n"
+                f"クラス: {', '.join(classes)}"
+            )
+            
+        except Exception as e:
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"YOLO統合エクスポート中にエラーが発生しました: {str(e)}"
+            )
+
+    def export_unified_yolo_format(self, output_folder, classes, progress=None):
+        """物体検知とセグメンテーションを統合してYOLO形式でエクスポート"""
+        import shutil
+        
+        # フォルダ構造を作成
+        images_dir = os.path.join(output_folder, 'images')
+        labels_dir = os.path.join(output_folder, 'labels')
+        os.makedirs(images_dir, exist_ok=True)
+        os.makedirs(labels_dir, exist_ok=True)
+        
+        # 全ての画像を取得
+        all_images = set()
+        if hasattr(self, 'bbox_annotations'):
+            all_images.update(self.bbox_annotations.keys())
+        if hasattr(self, 'segmentation_annotations'):
+            all_images.update(self.segmentation_annotations.keys())
+        
+        all_images = list(all_images)
+        
+        for i, img_path in enumerate(all_images):
+            if progress and progress.wasCanceled():
+                break
+            
+            if progress:
+                progress.setValue(i)
+                progress.setLabelText(f"処理中: {os.path.basename(img_path)}")
+                QApplication.processEvents()
+            
+            # 画像をコピー
+            img_filename = os.path.basename(img_path)
+            shutil.copy2(img_path, os.path.join(images_dir, img_filename))
+            
+            # ラベルファイルを作成
+            label_filename = os.path.splitext(img_filename)[0] + '.txt'
+            label_path = os.path.join(labels_dir, label_filename)
+            
+            # 画像サイズを取得
+            img = Image.open(img_path)
+            img_width, img_height = img.size
+            
+            with open(label_path, 'w') as f:
+                # バウンディングボックスの処理
+                if hasattr(self, 'bbox_annotations') and img_path in self.bbox_annotations:
+                    for bbox in self.bbox_annotations[img_path]:
+                        class_name = bbox.get('class', 'unknown')
+                        if class_name in classes:
+                            class_id = classes.index(class_name)
+                            
+                            # YOLO形式に変換 (中心x, 中心y, 幅, 高さ)
+                            center_x = (bbox['x1'] + bbox['x2']) / 2
+                            center_y = (bbox['y1'] + bbox['y2']) / 2
+                            width = bbox['x2'] - bbox['x1']
+                            height = bbox['y2'] - bbox['y1']
+                            
+                            f.write(f"{class_id} {center_x:.6f} {center_y:.6f} {width:.6f} {height:.6f}\n")
+                
+                # セグメンテーションの処理
+                if hasattr(self, 'segmentation_annotations') and img_path in self.segmentation_annotations:
+                    for seg in self.segmentation_annotations[img_path]:
+                        class_name = seg.get('class', 'unknown')
+                        points = seg.get('points', [])
+                        
+                        if class_name in classes and len(points) >= 3:
+                            class_id = classes.index(class_name)
+                            
+                            # ポリゴンの座標を正規化
+                            normalized_points = []
+                            for x, y in points:
+                                norm_x = x / img_width
+                                norm_y = y / img_height
+                                normalized_points.extend([norm_x, norm_y])
+                            
+                            # YOLO セグメンテーション形式
+                            line = f"{class_id} " + " ".join(f"{coord:.6f}" for coord in normalized_points)
+                            f.write(line + '\n')
+        
+        # classes.txtを作成
+        classes_path = os.path.join(output_folder, 'classes.txt')
+        with open(classes_path, 'w') as f:
+            for class_name in classes:
+                f.write(f"{class_name}\n")
+        
+        # dataset.yamlを作成
+        yaml_content = f"""path: {output_folder}
+    train: images
+    val: images
+    test: images
+
+    nc: {len(classes)}
+    names: {classes}
+
+    # 物体検知とセグメンテーションの統合データセット
+    # バウンディングボックス: class_id center_x center_y width height
+    # セグメンテーション: class_id x1 y1 x2 y2 x3 y3 ...
+    """
+        
+        yaml_path = os.path.join(output_folder, 'dataset.yaml')
+        with open(yaml_path, 'w') as f:
+            f.write(yaml_content)
+        
+        return yaml_path
+
     def delete_selected_bbox(self):
         """選択されたバウンディングボックスを削除する"""
         if not self.images or not hasattr(self, 'main_image_view'):
@@ -3409,9 +4204,7 @@ class ImageAnnotationTool(QMainWindow):
                         self.last_bbox = None
 
                 # 画面更新
-                self.main_image_view.update()
-                # 統計情報更新
-                self.update_bbox_stats()
+                self.update_ui()
                 
                 # 確認メッセージ
                 self.statusBar().showMessage(f"'{class_name}' のバウンディングボックスを削除しました", 3000)
@@ -4471,6 +5264,58 @@ class ImageAnnotationTool(QMainWindow):
                 f"YOLOモデル学習中にエラーが発生しました: {str(e)}"
             )
 
+    ###TODO:統合
+    def train_and_save_unified_yolo_model(self):
+        """物体検知とセグメンテーションを統合したYOLOモデルを学習し保存する"""
+        has_bbox = hasattr(self, 'bbox_annotations') and self.bbox_annotations
+        has_seg = hasattr(self, 'segmentation_annotations') and self.segmentation_annotations
+        
+        if not has_bbox and not has_seg:
+            QMessageBox.warning(self, "警告", "学習用のアノテーションがありません。")
+            return
+        
+        # 学習タイプの選択ダイアログ
+        task_dialog = QDialog(self)
+        task_dialog.setWindowTitle("学習タスク選択")
+        task_layout = QVBoxLayout(task_dialog)
+        
+        task_layout.addWidget(QLabel("学習するタスクを選択してください:"))
+        
+        detect_radio = QRadioButton("物体検知のみ (バウンディングボックス)")
+        segment_radio = QRadioButton("セグメンテーションのみ (ポリゴン)")
+        both_radio = QRadioButton("統合学習 (検知とセグメンテーション)")
+        
+        detect_radio.setEnabled(has_bbox)
+        segment_radio.setEnabled(has_seg)
+        both_radio.setEnabled(has_bbox and has_seg)
+        
+        if has_bbox and has_seg:
+            both_radio.setChecked(True)
+        elif has_bbox:
+            detect_radio.setChecked(True)
+        elif has_seg:
+            segment_radio.setChecked(True)
+        
+        task_layout.addWidget(detect_radio)
+        task_layout.addWidget(segment_radio)
+        task_layout.addWidget(both_radio)
+        
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(task_dialog.accept)
+        button_box.rejected.connect(task_dialog.reject)
+        task_layout.addWidget(button_box)
+        
+        if not task_dialog.exec_():
+            return
+        
+        # 選択されたタスクに基づいて学習を実行
+        if detect_radio.isChecked():
+            self.train_detection_only()
+        elif segment_radio.isChecked():
+            self.train_segmentation_only()
+        else:
+            self.train_unified_model()
+
     def export_annotations_to_yolo(self, train_dir, val_dir, classes):
         """アノテーションデータをYOLO形式にエクスポート"""
         # アノテーションをトレーニング用とバリデーション用に分割
@@ -4993,7 +5838,7 @@ class ImageAnnotationTool(QMainWindow):
                 if current_img_path not in self.detection_inference_results:
                     self.update_detection_info_panel()
             
-            self.update_gallery()
+            self.update_ui()
 
     def toggle_inference_display(self, state):
         show_inference = (state == Qt.Checked)
@@ -5530,8 +6375,7 @@ class ImageAnnotationTool(QMainWindow):
             self.location_inference_checkbox.setChecked(True)
             
             # 表示を更新
-            self.update_location_info_panel()
-            self.main_image_view.update()
+            self.update_ui()
 
             # ステータスバーのメッセージをクリア
             self.statusBar().clearMessage()
@@ -5629,41 +6473,7 @@ class ImageAnnotationTool(QMainWindow):
         
         # 推論表示のチェック状態を反映
         self.main_image_view.show_inference = self.inference_checkbox.isChecked()
-
-    def keyPressEvent(self, event):
-        # Bキーでアノテーションモードを切り替え
-        if event.key() == Qt.Key_B:
-            self.toggle_annotation_mode()
-        # 左右キーでの10枚移動（既存の機能）
-        elif event.key() == Qt.Key_Left:
-            self.skip_images(-10)
-        elif event.key() == Qt.Key_Right:
-            self.skip_images(10)
-        else:
-            super().keyPressEvent(event)
             
-    def handle_delete_key(self):
-        """Delete/Backspace キーの処理を行う"""
-        if self.selected_bbox_index is not None:
-            current_img_path = self.main_window.images[self.main_window.current_index]
-            if current_img_path in self.main_window.bbox_annotations:
-                bboxes = self.main_window.bbox_annotations[current_img_path]
-                if 0 <= self.selected_bbox_index < len(bboxes):
-                    # 選択されたバウンディングボックスを削除
-                    del bboxes[self.selected_bbox_index]
-                    # インデックスをリセット
-                    self.selected_bbox_index = None
-                    # 再描画
-                    self.update()
-                    
-                    # バウンディングボックスの統計情報を更新
-                    self.main_window.update_bbox_stats()
-                    
-                    print("バウンディングボックスを削除しました")
-                    return True  # キーが処理されたことを示す
-        
-        return False  # キーが処理されなかったことを示す
-
     def browse_folder(self):
         """
         画像フォルダを選択するダイアログを表示
@@ -6394,9 +7204,8 @@ class ImageAnnotationTool(QMainWindow):
             
             # 推論表示を更新
             self.update_inference_display()
-            self.main_image_view.update()
-            self.update_gallery()  # ギャラリー表示も更新
-            
+            self.update_ui()
+
             progress.setValue(100)
             QApplication.processEvents()
             
@@ -6885,6 +7694,18 @@ class ImageAnnotationTool(QMainWindow):
                 if self.last_bboxes:
                     self.last_bbox = self.last_bboxes[-1].copy()
 
+        # スキップ前に現在の画像のセグメンテーション情報を確認し、すべてのセグメンテーションを記録
+        if hasattr(self, 'segmentation_annotations') and len(self.images) > 0:
+            current_img_path = self.images[self.current_index]
+            if current_img_path in self.segmentation_annotations and self.segmentation_annotations[current_img_path]:
+                # すべてのセグメンテーションをリストとして保存
+                self.last_segmentations = [seg.copy() for seg in self.segmentation_annotations[current_img_path]]
+                print(f"スキップ時にセグメンテーション情報を更新: {len(self.last_segmentations)}個のセグメンテーション")
+                
+                # 互換性のため、最後のセグメンテーションも個別に保存
+                if self.last_segmentations:
+                    self.last_segmentation = self.last_segmentations[-1].copy()
+
         # 自動位置設定をする前の現在の位置情報を保存
         old_current_location = self.current_location
         
@@ -6931,6 +7752,24 @@ class ImageAnnotationTool(QMainWindow):
                     # 後方互換性のため、単一ボックスの場合も処理
                     self.add_bbox_annotation(self.last_bbox.copy())
                     self.statusBar().showMessage(f"前回の '{self.last_bbox['class']}' バウンディングボックスを適用しました", 3000)
+
+        # 前回のセグメンテーションを自動適用（最後に追加）
+        if hasattr(self, 'auto_apply_last_segmentation') and  self.auto_apply_last_segmentation:
+            # 現在の画像にセグメンテーションがない場合に適用
+            if new_img_path not in self.segmentation_annotations or not self.segmentation_annotations[new_img_path]:
+                # last_segmentationsが存在すればそれを使用、なければlast_segmentationを使用
+                if hasattr(self, 'last_segmentations') and self.last_segmentations:
+                    # すべてのセグメンテーションを適用
+                    for seg in self.last_segmentations:
+                        self.add_segmentation_annotation(seg.copy())
+                    
+                    # ステータスバーに表示
+                    self.statusBar().showMessage(f"前回の {len(self.last_segmentations)}個のセグメンテーションを適用しました", 3000)
+                
+                elif hasattr(self, 'last_segmentation') and self.last_segmentation:
+                    # 後方互換性のため、単一セグメンテーションの場合も処理
+                    self.add_segmentation_annotation(self.last_segmentation.copy())
+                    self.statusBar().showMessage(f"前回の '{self.last_segmentation['class']}' セグメンテーションを適用しました", 3000)
 
         # 画像表示を更新
         self.display_current_image()
@@ -9329,88 +10168,6 @@ class ImageAnnotationTool(QMainWindow):
         
         return False
 
-    # 位置推論表示更新
-    def update_location_inference_display(self):
-        """位置推論表示を更新する - 上位3クラスのみ表示"""
-        if not self.images:
-            return
-        
-        current_img_path = self.images[self.current_index]
-    
-        if hasattr(self, 'location_inference_checkbox') and self.location_inference_checkbox.isChecked():
-            if current_img_path in self.location_inference_results:
-                # 推論結果を取得
-                result = self.location_inference_results[current_img_path]
-                pred_class = result['pred_class']
-                confidence = result['confidence']
-                all_probs = result.get('all_probs', [])
-                
-                # 情報テキストを構築
-                inference_text = "<b>位置推論結果:</b><br>"
-                
-                # 一番高いクラスは背景色付きで表示
-                loc_color = get_location_color(pred_class)
-                
-                # 予測クラスを背景色付きで表示
-                inference_text += f"<div style='background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 5px; border-radius: 5px; margin: 5px 0;'>"
-                inference_text += f"予測位置: {pred_class} (確信度: {confidence:.4f})</div>"
-                
-                # 上位3クラスの予測結果を表示（すでに確率でソートされている前提）
-                if all_probs:
-                    # 確率が高い順にインデックスをソート
-                    sorted_indices = sorted(range(len(all_probs)), key=lambda i: all_probs[i], reverse=True)
-                    
-                    # 上位3つ（または全部、少ない方）を取得
-                    top_k = min(3, len(sorted_indices))
-                    top_indices = sorted_indices[:top_k]
-                    
-                    inference_text += "<br>上位クラス:<br>"
-                    
-                    for i, idx in enumerate(top_indices):
-                        # すでに表示したクラスは飛ばす
-                        if idx == pred_class and i > 0:
-                            continue
-                        
-                        # 位置によって色を変える
-                        color = get_location_color(idx).name()
-                        
-                        # 各クラスの予測確率
-                        inference_text += f"{i+1}. 位置 {idx}: <span style='color: {color}; font-weight: bold;'>{all_probs[idx]:.4f}</span><br>"
-                
-                # テキストをラベルに設定
-                if hasattr(self, 'location_inference_info_label'):
-                    self.location_inference_info_label.setText(inference_text)
-                    self.location_inference_info_label.setTextFormat(Qt.RichText)
-                else:
-                    # ラベルがない場合は新規作成
-                    self.location_inference_info_label = QLabel(inference_text)
-                    self.location_inference_info_label.setWordWrap(True)
-                    self.location_inference_info_label.setStyleSheet("color: purple;")
-                    
-                    # レイアウトに追加（推論結果表示の下）
-                    if hasattr(self, 'detection_inference_info_label') and self.detection_inference_info_label.parent():
-                        parent_layout = self.detection_inference_info_label.parent().layout()
-                        if parent_layout:
-                            parent_layout.addWidget(self.location_inference_info_label)
-                    elif hasattr(self, 'inference_info_label') and self.inference_info_label.parent():
-                        parent_layout = self.inference_info_label.parent().layout()
-                        if parent_layout:
-                            parent_layout.addWidget(self.location_inference_info_label)
-                
-                return True
-                    
-            # モデルがロードされていて推論結果がない場合は実行
-            elif hasattr(self, 'location_model_manager') and self.location_model_manager.is_model_loaded():
-                self.run_location_inference()
-                # 再帰的に呼び出して表示を更新
-                return self.update_location_inference_display()
-        else:
-            # 表示がオフの場合はラベルをクリア
-            if hasattr(self, 'location_inference_info_label'):
-                self.location_inference_info_label.setText("")
-        
-        return False
-    
     # 位置モデル学習
     def train_and_save_location_model(self):
         """位置モデルを学習して保存する"""
@@ -9788,314 +10545,94 @@ class ImageAnnotationTool(QMainWindow):
                 f"一括位置推論実行中にエラーが発生しました: {str(e)}"
             )
 
-    # UI関連
-    def toggle_theme(self, theme_name):
-        """テーマを切り替える"""
-        # styles.pyのset_theme関数を呼び出す
-        current_theme = set_theme(theme_name)
+    # 位置推論表示更新
+    def update_location_inference_display(self):
+        """位置推論表示を更新する - 上位3クラスのみ表示"""
+        if not self.images:
+            return
         
-        # 1. まずテーマ切り替えボタンの状態とスタイルを更新
-        self.light_theme_button.setChecked(current_theme == "light")
-        self.dark_theme_button.setChecked(current_theme == "dark")
-        self.update_theme_button_styles()
-        
-        # 2. テーマに応じた背景色と文字色の基本設定
-        self.adjust_base_colors_for_theme()
-        
-        # 3. 各ウィジェットにスタイルを適用
-        self.apply_theme_to_widgets()
-        
-        # テーマ変更の通知
-        theme_display_name = "ライト" if theme_name == "light" else "ダーク"
-        self.statusBar().showMessage(f"テーマを {theme_display_name} に変更しました", 3000)
-
-    def adjust_base_colors_for_theme(self):
-        """テーマに応じた基本的な背景色と文字色を設定する"""
-        current_theme = get_current_theme()
-        
-        if current_theme == "dark":
-            # ダークモードの背景色を設定
-            self.setStyleSheet("background-color: #1F2937;")
-        else:
-            # ライトモードの場合はスタイルシートをクリア
-            self.setStyleSheet("")
-
-    def update_theme_button_styles(self):
-        """テーマ切り替えボタンのスタイルを現在のテーマに合わせて更新"""
-        current_theme = get_current_theme()
-        
-        # ライトモードボタンのスタイル
-        light_button_style = """
-            QPushButton {
-                background-color: #F9FAFB; /* ライトテーマの背景色 */
-                color: #111827; /* 暗いテキスト */
-                font-weight: bold;
-                border: 1px solid #E5E7EB;
-                border-radius: 4px;
-                padding: 6px 12px;
-            }
-            QPushButton:checked {
-                background-color: #E5E7EB; /* 選択時は少し暗い */
-                border: 2px solid #2563EB; /* 選択時は青いボーダー */
-            }
-        """
-        
-        # ダークモードボタンのスタイル
-        dark_button_style = """
-            QPushButton {
-                background-color: #1F2937; /* ダークテーマの背景色 */
-                color: white; /* 白いテキスト */
-                font-weight: bold;
-                border: 1px solid #4B5563;
-                border-radius: 4px;
-                padding: 6px 12px;
-            }
-            QPushButton:checked {
-                background-color: #374151; /* 選択時は少し明るい */
-                border: 2px solid #3B82F6; /* 選択時は青いボーダー */
-            }
-        """
-        
-        # 明示的にスタイルを設定（テーマに関係なく）
-        self.light_theme_button.setStyleSheet(light_button_style)
-        self.dark_theme_button.setStyleSheet(dark_button_style)
-        
-        # チェック状態を再設定（現在のテーマに合わせて）
-        self.light_theme_button.setChecked(current_theme == "light")
-        self.dark_theme_button.setChecked(current_theme == "dark")
-
-    def apply_theme_to_widgets(self):
-        """テーマ変更後に主要なウィジェットにスタイルを再適用する"""
-        # 基本ボタン
-        if hasattr(self, 'load_button'):
-            apply_style(self.load_button, 'primary')
-        if hasattr(self, 'load_annotation_button'):
-            apply_style(self.load_annotation_button, 'primary')
-        
-        # モデル関連ボタン
-        if hasattr(self, 'model_refresh_button'):
-            apply_style(self.model_refresh_button, 'model')
-        if hasattr(self, 'model_load_button'):
-            apply_style(self.model_load_button, 'model')
-            
-        # 学習関連ボタン
-        if hasattr(self, 'train_model_button'):
-            apply_style(self.train_model_button, 'training')
-        
-        # オートアノテーション関連
-        if hasattr(self, 'auto_annotate_button'):
-            apply_style(self.auto_annotate_button, 'training')
-        if hasattr(self, 'batch_inference_button'):
-            apply_style(self.batch_inference_button, 'special')
-        
-        # YOLO関連ボタン
-        if hasattr(self, 'yolo_refresh_button'):
-            apply_style(self.yolo_refresh_button, 'model')
-        if hasattr(self, 'yolo_load_button'):
-            apply_style(self.yolo_load_button, 'model')
-        if hasattr(self, 'train_yolo_button'):
-            apply_style(self.train_yolo_button, 'training')
-        if hasattr(self, 'load_yolo_btn'):
-            apply_style(self.load_yolo_btn, 'primary')
-        
-        # 位置情報関連ボタン
-        if hasattr(self, 'location_refresh_button'):
-            apply_style(self.location_refresh_button, 'model')
-        if hasattr(self, 'location_load_button'):
-            apply_style(self.location_load_button, 'model')
-        if hasattr(self, 'train_location_button'):
-            apply_style(self.train_location_button, 'training')
-        
-        # エクスポート関連ボタン
-        for button_name in ['donkey_btn', 'jetracer_btn', 'yolo_btn']:
-            if hasattr(self, button_name):
-                apply_style(getattr(self, button_name), 'export')
-        
-        # 動画作成ボタン
-        if hasattr(self, 'create_video_button'):
-            apply_style(self.create_video_button, 'export')
-        
-        # MLflow関連ボタン
-        if hasattr(self, 'mlflow_compare_button'):
-            apply_style(self.mlflow_compare_button, 'special')
-        
-        # 削除関連ボタン
-        if hasattr(self, 'delete_current_button'):
-            apply_style(self.delete_current_button, 'destructive')
-        if hasattr(self, 'clip_button'):
-            apply_style(self.clip_button, 'destructive')
-        
-        # 復元ボタン
-        if hasattr(self, 'restore_button'):
-            apply_style(self.restore_button, 'primary')
-        if hasattr(self, 'restore_all_button'):
-            apply_style(self.restore_all_button, 'primary')
-        
-        # ナビゲーションボタン
-        for nav_button in ['prev_button', 'next_button', 'prev_multi_button', 'next_multi_button']:
-            if hasattr(self, nav_button):
-                apply_style(getattr(self, nav_button), 'nav')
-        
-        # 再生ボタン
-        for play_button in ['play_button', 'reverse_play_button']:
-            if hasattr(self, play_button):
-                apply_style(getattr(self, play_button), 'nav')
-        
-        # アノテーションモードボタン
-        if hasattr(self, 'auto_mode_button'):
-            # 選択状態に応じてスタイルを変更しない（カスタムスタイルシートが適用されているため）
-            pass
-        if hasattr(self, 'detection_mode_button'):
-            # 選択状態に応じてスタイルを変更しない（カスタムスタイルシートが適用されているため）
-            pass
-        
-        # フォルダブラウズボタン
-        if hasattr(self, 'browse_button'):
-            apply_style(self.browse_button, 'primary')
-        
-        # グループボックス
-        for group_box in self.findChildren(QGroupBox):
-            apply_style(group_box, 'group_box')
-        
-        # コンボボックス
-        for combo_box in self.findChildren(QComboBox):
-            apply_style(combo_box, 'combo_box')
-        
-        # スピンボックス
-        for spin_box in self.findChildren(QSpinBox):
-            apply_style(spin_box, 'spin_box')
-        for double_spin_box in self.findChildren(QDoubleSpinBox):
-            apply_style(double_spin_box, 'spin_box')
-        
-        # チェックボックス
-        for checkbox in self.findChildren(QCheckBox):
-            apply_style(checkbox, 'checkbox')
-        
-        # ラジオボタン
-        for radio_button in self.findChildren(QRadioButton):
-            apply_style(radio_button, 'radio')
-        
-        # スライダー
-        for slider in self.findChildren(QSlider):
-            apply_style(slider, 'slider')
-        
-        # テキスト入力
-        for line_edit in self.findChildren(QLineEdit):
-            apply_style(line_edit, 'text_input')
-        
-        # スクロールエリア
-        for scroll_area in self.findChildren(QScrollArea):
-            apply_style(scroll_area, 'scroll')
-        
-        # テーマ切り替えボタンのスタイルを更新
-        self.update_theme_button_styles()
-        
-        # テーマに応じた色調整
-        # self.adjust_text_colors_for_theme()
-
-    def adjust_text_colors_for_theme(self):
-        """テーマに応じて文字色と背景色を調整する"""
-        current_theme = get_current_theme()
-        
-        if current_theme == "dark":
-            # ダークモードの場合
-            text_color = "white"
-            secondary_text_color = "#D1D5DB"  # 薄い白/グレー
-            
-            # ダークモードの時だけ背景色を設定
-            self.setStyleSheet("background-color: #1F2937;")
-            
-            # すべてのQWidgetとその子クラスを対象に文字色を設定
-            # QLabel
-            for label in self.findChildren(QLabel):
-                # すでに特別なスタイルが適用されている可能性があるラベルをスキップ
-                skip_labels = ["detection_inference_info_label", "inference_info_label", "location_inference_info_label"]
-                if hasattr(label, 'objectName') and label.objectName() in skip_labels:
-                    continue
+        current_img_path = self.images[self.current_index]
+    
+        if hasattr(self, 'location_inference_checkbox') and self.location_inference_checkbox.isChecked():
+            if current_img_path in self.location_inference_results:
+                # 推論結果を取得
+                result = self.location_inference_results[current_img_path]
+                pred_class = result['pred_class']
+                confidence = result['confidence']
+                all_probs = result.get('all_probs', [])
+                
+                # 情報テキストを構築
+                inference_text = "<b>位置推論結果:</b><br>"
+                
+                # 一番高いクラスは背景色付きで表示
+                loc_color = get_location_color(pred_class)
+                
+                # 予測クラスを背景色付きで表示
+                inference_text += f"<div style='background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 5px; border-radius: 5px; margin: 5px 0;'>"
+                inference_text += f"予測位置: {pred_class} (確信度: {confidence:.4f})</div>"
+                
+                # 上位3クラスの予測結果を表示（すでに確率でソートされている前提）
+                if all_probs:
+                    # 確率が高い順にインデックスをソート
+                    sorted_indices = sorted(range(len(all_probs)), key=lambda i: all_probs[i], reverse=True)
                     
-                # スタイルを取得し、文字色を更新
-                current_style = label.styleSheet()
-                new_style = current_style
+                    # 上位3つ（または全部、少ない方）を取得
+                    top_k = min(3, len(sorted_indices))
+                    top_indices = sorted_indices[:top_k]
+                    
+                    inference_text += "<br>上位クラス:<br>"
+                    
+                    for i, idx in enumerate(top_indices):
+                        # すでに表示したクラスは飛ばす
+                        if idx == pred_class and i > 0:
+                            continue
+                        
+                        # 位置によって色を変える
+                        color = get_location_color(idx).name()
+                        
+                        # 各クラスの予測確率
+                        inference_text += f"{i+1}. 位置 {idx}: <span style='color: {color}; font-weight: bold;'>{all_probs[idx]:.4f}</span><br>"
                 
-                # 文字色指定を追加/更新
-                if "color:" in current_style:
-                    # すでに色指定がある場合は置換
-                    new_style = re.sub(r'color:\s*[^;]+;', f"color: {text_color};", current_style)
+                # テキストをラベルに設定
+                if hasattr(self, 'location_inference_info_label'):
+                    self.location_inference_info_label.setText(inference_text)
+                    self.location_inference_info_label.setTextFormat(Qt.RichText)
                 else:
-                    # 色指定がない場合は追加
-                    new_style = f"{current_style}; color: {text_color};"
+                    # ラベルがない場合は新規作成
+                    self.location_inference_info_label = QLabel(inference_text)
+                    self.location_inference_info_label.setWordWrap(True)
+                    self.location_inference_info_label.setStyleSheet("color: purple;")
+                    
+                    # レイアウトに追加（推論結果表示の下）
+                    if hasattr(self, 'detection_inference_info_label') and self.detection_inference_info_label.parent():
+                        parent_layout = self.detection_inference_info_label.parent().layout()
+                        if parent_layout:
+                            parent_layout.addWidget(self.location_inference_info_label)
+                    elif hasattr(self, 'inference_info_label') and self.inference_info_label.parent():
+                        parent_layout = self.inference_info_label.parent().layout()
+                        if parent_layout:
+                            parent_layout.addWidget(self.location_inference_info_label)
                 
-                label.setStyleSheet(new_style)
-            
-            # QCheckBox
-            for checkbox in self.findChildren(QCheckBox):
-                checkbox.setStyleSheet(f"color: {text_color};")
-            
-            # QRadioButton
-            for radio in self.findChildren(QRadioButton):
-                radio.setStyleSheet(f"color: {text_color};")
-            
-            # QGroupBox
-            for group in self.findChildren(QGroupBox):
-                group.setStyleSheet(f"color: {text_color}; border: 1px solid #4B5563;")
-            
-            # QComboBox
-            for combo in self.findChildren(QComboBox):
-                combo.setStyleSheet(f"color: {text_color}; background-color: #374151; selection-background-color: #4B5563;")
-            
-            # QLineEdit
-            for edit in self.findChildren(QLineEdit):
-                edit.setStyleSheet(f"color: {text_color}; background-color: #374151; border: 1px solid #4B5563;")
-            
-            # QSpinBox と QDoubleSpinBox
-            for spin in self.findChildren(QSpinBox):
-                spin.setStyleSheet(f"color: {text_color}; background-color: #374151; border: 1px solid #4B5563;")
-            
-            for dspin in self.findChildren(QDoubleSpinBox):
-                dspin.setStyleSheet(f"color: {text_color}; background-color: #374151; border: 1px solid #4B5563;")
-            
-            # タブウィジェット（存在する場合）
-            for tab in self.findChildren(QTabWidget):
-                tab.setStyleSheet(f"color: {text_color}; background-color: #1F2937;")
-            
-            # スライダー（存在する場合）
-            for slider in self.findChildren(QSlider):
-                slider.setStyleSheet("""
-                    QSlider::groove:horizontal {
-                        border: 1px solid #4B5563;
-                        height: 8px;
-                        background: #374151;
-                        margin: 2px 0;
-                        border-radius: 4px;
-                    }
-                    QSlider::handle:horizontal {
-                        background: #3B82F6;
-                        border: 1px solid #3B82F6;
-                        width: 18px;
-                        height: 18px;
-                        margin: -6px 0;
-                        border-radius: 9px;
-                    }
-                """)
+                return True
+                    
+            # モデルがロードされていて推論結果がない場合は実行
+            elif hasattr(self, 'location_model_manager') and self.location_model_manager.is_model_loaded():
+                self.run_location_inference()
+                # 再帰的に呼び出して表示を更新
+                return self.update_location_inference_display()
         else:
-            # ライトモードの場合
-            # スタイルシートをクリアして、デフォルトに戻す
-            self.setStyleSheet("")
-            
-            # テーマ切り替えボタン以外のウィジェットのスタイルをデフォルトに戻す
-            excluded_widgets = [self.light_theme_button, self.dark_theme_button]
-            for widget in self.findChildren(QWidget):
-                if widget not in excluded_widgets:
-                    widget.setStyleSheet("")
-            
-        # テーマ切り替えボタンのスタイルを更新
-        self.update_theme_button_styles()
-
+            # 表示がオフの場合はラベルをクリア
+            if hasattr(self, 'location_inference_info_label'):
+                self.location_inference_info_label.setText("")
+        
+        return False
+    
     def update_slider_deleted_indexes(self):
         """スライダーの削除済みインデックス表示を更新"""
         if hasattr(self, 'image_slider') and isinstance(self.image_slider, DeletedIndexesSlider):
             self.image_slider.setDeletedIndexes(self.deleted_indexes, len(self.images))
 
+# 追加機能切り出し　削除表示
 class DeletedIndexesSlider(QSlider):
     """削除済みインデックスを視覚的に表示するカスタムスライダー"""
     

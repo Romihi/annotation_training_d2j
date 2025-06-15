@@ -212,16 +212,17 @@ def enhanced_display_current_image(self):
 class EnhancedThumbnailWidget(QWidget):
     def __init__(self, parent=None, img_path="", index=0, is_selected=False, 
                  annotation=None, on_click=None, location_value=None, is_deleted=False,
-                 bbox_annotations=None):  # bbox_annotations parameter added
+                 bbox_annotations=None, segmentation_annotations=None): 
         super().__init__(parent)
         self.img_path = img_path
         self.index = index
         self.on_click = on_click
         self.is_selected = is_selected
-        self.annotation = annotation  # アノテーション情報
-        self.location_value = location_value  # 変更: 辞書ではなく直接位置情報の値を受け取る
-        self.is_deleted = is_deleted  # 削除済みフラグ
-        self.bbox_annotations = bbox_annotations  # 物体検知アノテーション情報を追加
+        self.annotation = annotation  
+        self.location_value = location_value  
+        self.is_deleted = is_deleted  
+        self.bbox_annotations = bbox_annotations  
+        self.segmentation_annotations = segmentation_annotations  
         
         # サムネイル全体のサイズも調整
         self.setMinimumWidth(210)
@@ -319,7 +320,40 @@ class EnhancedThumbnailWidget(QWidget):
                 class_label = QLabel(f"{class_name}: {count}")
                 class_label.setStyleSheet("font-size: 10px; color: #333;")
                 info_layout.addWidget(class_label)
-        
+
+        # セグメンテーションアノテーション情報を追加（物体検知アノテーション情報の後に）
+        if segmentation_annotations and not is_deleted:
+            # セグメンテーション数を表示するバッジ
+            seg_count = len(segmentation_annotations)
+            seg_badge = QLabel(f"セグ: {seg_count}")
+            seg_badge.setAlignment(Qt.AlignCenter)
+            seg_badge.setStyleSheet("""
+                background-color: #9C27B0;
+                color: white;
+                font-weight: bold;
+                border-radius: 10px;
+                min-width: 20px;
+                min-height: 20px;
+                padding: 1px;
+                font-size: 10px;
+            """)
+            info_layout.addWidget(seg_badge)
+            
+            # クラスごとのカウントを集計
+            seg_class_counts = {}
+            for seg in segmentation_annotations:
+                class_name = seg.get('class', 'unknown')
+                seg_class_counts[class_name] = seg_class_counts.get(class_name, 0) + 1
+            
+            # 主要なクラスを最大2つまで表示
+            for i, (class_name, count) in enumerate(seg_class_counts.items()):
+                if i >= 2:  # 最大2クラスまで表示
+                    break
+                    
+                seg_class_label = QLabel(f"S-{class_name}: {count}")
+                seg_class_label.setStyleSheet("font-size: 10px; color: #9C27B0;")
+                info_layout.addWidget(seg_class_label)
+
         # 残りのスペースを埋めるスペーサー
         info_layout.addStretch()
         
@@ -419,6 +453,45 @@ class EnhancedThumbnailWidget(QWidget):
                 draw.ellipse((x-circle_size, y-circle_size, x+circle_size, y+circle_size), 
                             outline='red', width=4)
             
+           # セグメンテーションアノテーションの描画（新規追加）
+            if self.segmentation_annotations and not self.is_deleted:
+                for seg_data in self.segmentation_annotations:
+                    class_name = seg_data.get('class', 'unknown')
+                    points = seg_data.get('points', [])
+                    
+                    if len(points) >= 3:
+                        # クラスに応じた色を定義
+                        class_colors = {
+                            'car': (255, 0, 0, 120),      # 赤
+                            'person': (0, 255, 0, 120),   # 緑
+                            'sign': (0, 0, 255, 120),     # 青
+                            'cone': (255, 255, 0, 120),   # 黄
+                            'unknown': (128, 128, 128, 120)  # グレー
+                        }
+                        
+                        color = class_colors.get(class_name, (255, 0, 0, 120))
+                        
+                        # ポリゴンを描画（アウトライン）
+                        outline_color = (color[0], color[1], color[2])  # アルファ値なし
+                        draw.polygon(points, outline=outline_color, width=2)
+                        
+                        # ラベルを表示（中心点に）
+                        if points:
+                            center_x = sum(p[0] for p in points) // len(points)
+                            center_y = sum(p[1] for p in points) // len(points)
+                            
+                            # ラベル背景を描画
+                            label_text = class_name[0].upper()  # 頭文字のみ
+                            text_size = 12
+                            
+                            # 背景矩形
+                            label_bg = (center_x-text_size//2, center_y-text_size//2, 
+                                    center_x+text_size//2, center_y+text_size//2)
+                            draw.rectangle(label_bg, fill=outline_color)
+                            
+                            # テキスト描画
+                            draw.text((center_x-4, center_y-6), label_text, fill=(255, 255, 255))
+
             # 物体検知アノテーションがある場合は矩形を描画
             if self.bbox_annotations: # and not self.is_deleted:
                 img_width, img_height = pil_img.size
@@ -537,11 +610,11 @@ def enhanced_update_gallery(self):
             
             # 削除されたインデックスの場合、削除済みフラグをセット
             is_deleted = hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes
-            
-            # アノテーション情報を取得
             annotation = None
-            location_value = None  # Initialize here to prevent the error
-            
+            location_value = None 
+            bbox_annotations = None
+            segmentation_annotations = None  
+
             if idx in self.annotations:
                 annotation = self.annotations[idx]
             
@@ -549,12 +622,14 @@ def enhanced_update_gallery(self):
                 if annotation and 'loc' in annotation:
                     location_value = annotation['loc']
 
-            # 物体検知アノテーションを取得 
-            bbox_annotations = None
-            # if not is_deleted and img_path in self.bbox_annotations:
             if img_path in self.bbox_annotations:
                 bbox_annotations = self.bbox_annotations[img_path]
-            
+
+            # セグメンテーションアノテーションを取得（新規追加）
+            if hasattr(self, 'segmentation_annotations') and img_path in self.segmentation_annotations:
+                segmentation_annotations = self.segmentation_annotations[img_path]
+  
+
             # 拡張サムネイルウィジェットを作成
             thumb = EnhancedThumbnailWidget(
                 img_path=img_path,
@@ -564,8 +639,9 @@ def enhanced_update_gallery(self):
                 on_click=self.select_image,
                 location_value=location_value,
                 is_deleted=is_deleted,
-                bbox_annotations=bbox_annotations  # 物体検知アノテーションを追加
-            )
+                bbox_annotations=bbox_annotations,
+                segmentation_annotations=segmentation_annotations  
+                )
             
             # col_count列のグリッドで配置
             row = i // col_count

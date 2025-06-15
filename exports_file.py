@@ -1495,3 +1495,74 @@ def export_to_video_multi_source(
         video.release()
     
     return frames_processed
+
+def export_segmentation_to_yolo(output_folder, segmentation_annotations, class_names=None):
+    """セグメンテーションアノテーションをYOLO形式でエクスポート"""
+    if class_names is None:
+        # 全クラスを収集
+        all_classes = set()
+        for annotations in segmentation_annotations.values():
+            for annotation in annotations:
+                all_classes.add(annotation.get('class', 'unknown'))
+        class_names = sorted(list(all_classes))
+    
+    # フォルダ構造を作成
+    images_dir = os.path.join(output_folder, 'images')
+    labels_dir = os.path.join(output_folder, 'labels')
+    os.makedirs(images_dir, exist_ok=True)
+    os.makedirs(labels_dir, exist_ok=True)
+    
+    # 各画像のアノテーションを処理
+    for img_path, annotations in segmentation_annotations.items():
+        # 画像をコピー
+        img_filename = os.path.basename(img_path)
+        shutil.copy2(img_path, os.path.join(images_dir, img_filename))
+        
+        # ラベルファイルを作成
+        label_filename = os.path.splitext(img_filename)[0] + '.txt'
+        label_path = os.path.join(labels_dir, label_filename)
+        
+        # 画像サイズを取得
+        img = Image.open(img_path)
+        img_width, img_height = img.size
+        
+        with open(label_path, 'w') as f:
+            for annotation in annotations:
+                class_name = annotation.get('class', 'unknown')
+                points = annotation.get('points', [])
+                
+                if class_name in class_names and len(points) >= 3:
+                    class_id = class_names.index(class_name)
+                    
+                    # ポリゴンの座標を正規化
+                    normalized_points = []
+                    for x, y in points:
+                        norm_x = x / img_width
+                        norm_y = y / img_height
+                        normalized_points.extend([norm_x, norm_y])
+                    
+                    # YOLO形式: class_id x1 y1 x2 y2 x3 y3 ...
+                    line = f"{class_id} " + " ".join(f"{coord:.6f}" for coord in normalized_points)
+                    f.write(line + '\n')
+    
+    # classes.txtを作成
+    classes_path = os.path.join(output_folder, 'classes.txt')
+    with open(classes_path, 'w') as f:
+        for class_name in class_names:
+            f.write(f"{class_name}\n")
+    
+    # dataset.yamlを作成
+    yaml_content = f"""path: {output_folder}
+train: images
+val: images
+test: images
+
+nc: {len(class_names)}
+names: {class_names}
+"""
+    
+    yaml_path = os.path.join(output_folder, 'dataset.yaml')
+    with open(yaml_path, 'w') as f:
+        f.write(yaml_content)
+    
+    return yaml_path
