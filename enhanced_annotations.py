@@ -350,7 +350,7 @@ class EnhancedThumbnailWidget(QWidget):
                 if i >= 2:  # 最大2クラスまで表示
                     break
                     
-                seg_class_label = QLabel(f"S-{class_name}: {count}")
+                seg_class_label = QLabel(f"{class_name}: {count}")
                 seg_class_label.setStyleSheet("font-size: 10px; color: #9C27B0;")
                 info_layout.addWidget(seg_class_label)
 

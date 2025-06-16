@@ -163,6 +163,28 @@ class ImageLabel(QLabel):
         self.vertex_radius = 8                # 頂点の半径（ピクセル）
 
     def mouseReleaseEvent(self, event):
+        # 頂点移動完了処理を追加（既存のコードの前に追加）
+        if self.is_moving_vertex:
+            # 頂点移動が完了
+            self.is_moving_vertex = False
+            
+            # 選択状態は維持（頂点の選択は解除しない）
+            
+            # ステータスバーに完了メッセージ
+            if hasattr(self.main_window, 'statusBar') and self.selected_polygon_index is not None:
+                current_img_path = self.main_window.images[self.main_window.current_index]
+                if current_img_path in self.main_window.segmentation_annotations:
+                    segmentations = self.main_window.segmentation_annotations[current_img_path]
+                    if 0 <= self.selected_polygon_index < len(segmentations):
+                        class_name = segmentations[self.selected_polygon_index].get('class', 'unknown')
+                        self.main_window.statusBar().showMessage(
+                            f"'{class_name}' の頂点編集が完了しました", 3000
+                        )
+            
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+            return
+
         # 既存のコードに追加
         if self.is_moving_segmentation:
             # セグメンテーション移動が完了
@@ -539,103 +561,119 @@ class ImageLabel(QLabel):
                         painter.drawText(label_rect, Qt.AlignCenter, label_text)
 
         # セグメンテーションアノテーションの描画
-            if hasattr(self.main_window, 'segmentation_annotations'):
-                current_img_path = self.main_window.images[self.main_window.current_index]
-                if current_img_path in self.main_window.segmentation_annotations:
-                    polygons = self.main_window.segmentation_annotations[current_img_path]
+        if hasattr(self.main_window, 'segmentation_annotations'):
+            current_img_path = self.main_window.images[self.main_window.current_index]
+            if current_img_path in self.main_window.segmentation_annotations:
+                polygons = self.main_window.segmentation_annotations[current_img_path]
+                
+                for i, polygon_data in enumerate(polygons):
+                    class_name = polygon_data.get('class', 'unknown')
+                    points = polygon_data.get('points', [])
                     
-                    for i, polygon_data in enumerate(polygons):
-                        class_name = polygon_data.get('class', 'unknown')
-                        points = polygon_data.get('points', [])
+                    if len(points) >= 3:
+                        # クラスに応じた色を設定
+                        class_colors = {
+                            'car': QColor(255, 0, 0, 120),
+                            'person': QColor(0, 255, 0, 120),
+                            'sign': QColor(0, 0, 255, 120),
+                            'cone': QColor(255, 255, 0, 120),
+                            'unknown': QColor(128, 128, 128, 120)
+                        }
+                        base_color = class_colors.get(class_name, QColor(255, 0, 0, 120))
                         
-                        if len(points) >= 3:
-                            # クラスに応じた色を設定
-                            class_colors = {
-                                'car': QColor(255, 0, 0, 120),
-                                'person': QColor(0, 255, 0, 120),
-                                'sign': QColor(0, 0, 255, 120),
-                                'cone': QColor(255, 255, 0, 120),
-                                'unknown': QColor(128, 128, 128, 120)
-                            }
-                            base_color = class_colors.get(class_name, QColor(255, 0, 0, 120))
+                        # 選択またはホバーされているセグメンテーションの強調表示
+                        is_selected = i == self.selected_segmentation_index
+                        is_hovered = i == self.hovering_segmentation_index
+                        
+                        if is_selected:
+                            # 選択時は濃い色で縁取り
+                            painter.setPen(QPen(base_color.darker(), 4))
+                            painter.setBrush(QBrush(QColor(base_color.red(), base_color.green(), base_color.blue(), 150)))
+                        elif is_hovered:
+                            # ホバー時は少し濃い色
+                            painter.setPen(QPen(base_color.darker(), 3))
+                            painter.setBrush(QBrush(QColor(base_color.red(), base_color.green(), base_color.blue(), 100)))
+                        else:
+                            # 通常時
+                            painter.setPen(QPen(base_color.darker(), 2))
+                            painter.setBrush(QBrush(base_color))
+                        
+                        # ポリゴンの描画
+                        polygon_points = []
+                        for px, py in points:
+                            screen_x = int(target_rect.x() + (px / pix_width) * target_rect.width())
+                            screen_y = int(target_rect.y() + (py / pix_height) * target_rect.height())
+                            polygon_points.append(QPoint(screen_x, screen_y))
+                        
+                        # 塗りつぶし
+                        painter.drawPolygon(polygon_points)
+                        
+                        # 選択されているセグメンテーションには頂点を表示
+                        if is_selected:
+                            painter.setBrush(QBrush(Qt.white))
+                            painter.setPen(QPen(base_color.darker(), 2))
+                            for point in polygon_points:
+                                painter.drawEllipse(point.x() - 4, point.y() - 4, 8, 8)
+                        
+                        # ラベル表示
+                        if polygon_points:
+                            center_x = sum(p.x() for p in polygon_points) // len(polygon_points)
+                            center_y = sum(p.y() for p in polygon_points) // len(polygon_points)
+                            painter.setPen(QPen(Qt.white, 1))
+                            painter.setFont(QFont("Arial", 10, QFont.Bold))
                             
-                            # 選択またはホバーされているセグメンテーションの強調表示
-                            is_selected = i == self.selected_segmentation_index
-                            is_hovered = i == self.hovering_segmentation_index
+                            # ラベル背景
+                            text_width = painter.fontMetrics().horizontalAdvance(class_name)
+                            painter.fillRect(center_x - text_width//2 - 2, center_y - 10, text_width + 4, 16, base_color.darker())
                             
-                            if is_selected:
-                                # 選択時は濃い色で縁取り
-                                painter.setPen(QPen(base_color.darker(), 4))
-                                painter.setBrush(QBrush(QColor(base_color.red(), base_color.green(), base_color.blue(), 150)))
-                            elif is_hovered:
-                                # ホバー時は少し濃い色
-                                painter.setPen(QPen(base_color.darker(), 3))
-                                painter.setBrush(QBrush(QColor(base_color.red(), base_color.green(), base_color.blue(), 100)))
-                            else:
-                                # 通常時
-                                painter.setPen(QPen(base_color.darker(), 2))
-                                painter.setBrush(QBrush(base_color))
-                            
-                            # ポリゴンの描画
-                            polygon_points = []
-                            for px, py in points:
-                                screen_x = int(target_rect.x() + (px / pix_width) * target_rect.width())
-                                screen_y = int(target_rect.y() + (py / pix_height) * target_rect.height())
-                                polygon_points.append(QPoint(screen_x, screen_y))
-                            
-                            # 塗りつぶし
-                            painter.drawPolygon(polygon_points)
-                            
-                            # 選択されているセグメンテーションには頂点を表示
-                            if is_selected:
-                                painter.setBrush(QBrush(Qt.white))
-                                painter.setPen(QPen(base_color.darker(), 2))
-                                for point in polygon_points:
-                                    painter.drawEllipse(point.x() - 4, point.y() - 4, 8, 8)
-                            
-                            # ラベル表示
-                            if polygon_points:
-                                center_x = sum(p.x() for p in polygon_points) // len(polygon_points)
-                                center_y = sum(p.y() for p in polygon_points) // len(polygon_points)
-                                painter.setPen(QPen(Qt.white, 1))
-                                painter.setFont(QFont("Arial", 10, QFont.Bold))
-                                
-                                # ラベル背景
-                                text_width = painter.fontMetrics().horizontalAdvance(class_name)
-                                painter.fillRect(center_x - text_width//2 - 2, center_y - 10, text_width + 4, 16, base_color.darker())
-                                
-                                painter.drawText(center_x - text_width//2, center_y + 2, class_name)
+                            painter.drawText(center_x - text_width//2, center_y + 2, class_name)
+        
+        # 現在描画中のポリゴンの表示（修正）
+        if self.is_drawing_segmentation and len(self.current_segmentation_polygon) > 0:
+            painter.setPen(QPen(QColor(255, 255, 0), 3))
             
-            # 現在描画中のポリゴンの表示（修正）
-            if self.is_drawing_segmentation and len(self.current_segmentation_polygon) > 0:
+            # 点を線で結ぶ
+            screen_points = []
+            for point in self.current_segmentation_polygon:
+                screen_x = int(target_rect.x() + (point.x() / pix_width) * target_rect.width())
+                screen_y = int(target_rect.y() + (point.y() / pix_height) * target_rect.height())
+                screen_points.append(QPoint(screen_x, screen_y))
+            
+            # 線を描画
+            for i in range(len(screen_points)):
+                # 点を描画
+                painter.setBrush(QBrush(QColor(255, 255, 0)))
+                painter.drawEllipse(screen_points[i].x() - 4, screen_points[i].y() - 4, 8, 8)
+                
+                if i < len(screen_points) - 1:
+                    # 線を描画
+                    painter.drawLine(screen_points[i], screen_points[i + 1])
+            
+            # 最初の点と最後の点を点線で結ぶ（閉じる候補を表示）
+            if len(screen_points) >= 3:
+                painter.setPen(QPen(QColor(255, 255, 0), 2, Qt.DashLine))
+                painter.drawLine(screen_points[-1], screen_points[0])
+                
+                # 最初の点を強調表示
+                painter.setBrush(QBrush(QColor(255, 255, 255)))
                 painter.setPen(QPen(QColor(255, 255, 0), 3))
-                
-                # 点を線で結ぶ
-                screen_points = []
-                for point in self.current_segmentation_polygon:
-                    screen_x = int(target_rect.x() + (point.x() / pix_width) * target_rect.width())
-                    screen_y = int(target_rect.y() + (point.y() / pix_height) * target_rect.height())
-                    screen_points.append(QPoint(screen_x, screen_y))
-                
-                # 線を描画
-                for i in range(len(screen_points)):
-                    # 点を描画
-                    painter.setBrush(QBrush(QColor(255, 255, 0)))
-                    painter.drawEllipse(screen_points[i].x() - 4, screen_points[i].y() - 4, 8, 8)
-                    
-                    if i < len(screen_points) - 1:
-                        # 線を描画
-                        painter.drawLine(screen_points[i], screen_points[i + 1])
-                
-                # 最初の点と最後の点を点線で結ぶ（閉じる候補を表示）
-                if len(screen_points) >= 3:
-                    painter.setPen(QPen(QColor(255, 255, 0), 2, Qt.DashLine))
-                    painter.drawLine(screen_points[-1], screen_points[0])
-                    
-                    # 最初の点を強調表示
-                    painter.setBrush(QBrush(QColor(255, 255, 255)))
-                    painter.setPen(QPen(QColor(255, 255, 0), 3))
-                    painter.drawEllipse(screen_points[0].x() - 6, screen_points[0].y() - 6, 12, 12)
+                painter.drawEllipse(screen_points[0].x() - 6, screen_points[0].y() - 6, 12, 12)
+
+        # 選択されているセグメンテーションには頂点を表示
+        if is_selected:
+            painter.setBrush(QBrush(Qt.white))
+            painter.setPen(QPen(base_color.darker(), 2))
+            for vertex_index, point in enumerate(polygon_points):
+                # 選択された頂点は特別な色で表示
+                if (self.selected_polygon_index == i and 
+                    self.selected_vertex_index == vertex_index):
+                    painter.setBrush(QBrush(QColor(255, 255, 0)))  # 黄色で強調
+                    painter.setPen(QPen(Qt.black, 3))
+                    painter.drawEllipse(point.x() - 6, point.y() - 6, 12, 12)
+                else:
+                    painter.setBrush(QBrush(Qt.white))
+                    painter.setPen(QPen(base_color.darker(), 2))
+                    painter.drawEllipse(point.x() - 4, point.y() - 4, 8, 8)
 
         # 削除済みの場合は半透明の赤オーバーレイを表示
         if self.is_deleted:
@@ -793,7 +831,28 @@ class ImageLabel(QLabel):
             elif hasattr(self.main_window, 'current_mode') and self.main_window.current_mode == 2:
                 # セグメンテーションモード
                 current_img_path = self.main_window.images[self.main_window.current_index]
+
+                ###
+                # 既存のセグメンテーションの頂点をクリックしたかチェック
+                clicked_vertex = self.check_vertex_click(orig_x, orig_y)
                 
+                if clicked_vertex is not None:
+                    # 頂点がクリックされた場合
+                    polygon_index, vertex_index = clicked_vertex
+                    self.selected_polygon_index = polygon_index
+                    self.selected_vertex_index = vertex_index
+                    self.is_moving_vertex = True
+                    
+                    # 選択されたセグメンテーションも更新
+                    self.selected_segmentation_index = polygon_index
+                    
+                    # ステータスバーに表示
+                    if hasattr(self.main_window, 'statusBar'):
+                        self.main_window.statusBar().showMessage(f"頂点を編集中... (頂点 {vertex_index+1})", 3000)
+                    
+                    self.update()
+                    return
+
                 # 既存のセグメンテーションを選択するかチェック
                 if hasattr(self.main_window, 'segmentation_annotations') and current_img_path in self.main_window.segmentation_annotations:
                     segmentations = self.main_window.segmentation_annotations[current_img_path]
@@ -1133,6 +1192,54 @@ class ImageLabel(QLabel):
         elif not self.is_moving_bbox and not self.is_drawing_bbox and not self.is_resizing_bbox:
             self.check_bbox_hover_and_resize_handles(event.pos())
 
+        # 頂点移動処理を追加（セグメンテーション移動処理の前に追加）
+        if self.is_moving_vertex and self.selected_polygon_index is not None and self.selected_vertex_index is not None:
+            if not self.pixmap():
+                return
+                
+            # 座標変換
+            pos = event.pos()
+            pix_width = self.pixmap().width()
+            pix_height = self.pixmap().height()
+            scaled_width = int(pix_width * self.zoom_factor)
+            scaled_height = int(pix_height * self.zoom_factor)
+            
+            x = (self.width() - scaled_width) // 2
+            y = (self.height() - scaled_height) // 2
+            target_rect = QRect(x, y, scaled_width, scaled_height)
+            
+            if not target_rect.contains(pos):
+                constrained_x = max(target_rect.left(), min(pos.x(), target_rect.right()))
+                constrained_y = max(target_rect.top(), min(pos.y(), target_rect.bottom()))
+                pos = QPoint(constrained_x, constrained_y)
+            
+            rel_x = (pos.x() - target_rect.x()) / target_rect.width()
+            rel_y = (pos.y() - target_rect.y()) / target_rect.height()
+            orig_x = int(rel_x * pix_width)
+            orig_y = int(rel_y * pix_height)
+            
+            # 頂点の位置を更新
+            current_img_path = self.main_window.images[self.main_window.current_index]
+            if current_img_path in self.main_window.segmentation_annotations:
+                segmentations = self.main_window.segmentation_annotations[current_img_path]
+                if 0 <= self.selected_polygon_index < len(segmentations):
+                    points = segmentations[self.selected_polygon_index]['points']
+                    if 0 <= self.selected_vertex_index < len(points):
+                        # 画像境界内に制限
+                        new_x = max(0, min(orig_x, pix_width))
+                        new_y = max(0, min(orig_y, pix_height))
+                        points[self.selected_vertex_index] = (new_x, new_y)
+                        
+                        # ステータスバーに情報表示
+                        if hasattr(self.main_window, 'statusBar'):
+                            class_name = segmentations[self.selected_polygon_index].get('class', 'unknown')
+                            self.main_window.statusBar().showMessage(
+                                f"'{class_name}' 頂点 {self.selected_vertex_index+1} を移動中... ({new_x}, {new_y})", 500
+                            )
+            
+            self.update()
+            return
+
         # セグメンテーション移動処理
         if self.is_moving_segmentation and self.selected_segmentation_index is not None:
             if not self.pixmap():
@@ -1381,6 +1488,31 @@ class ImageLabel(QLabel):
         
         return None
 
+    def check_vertex_click(self, x, y):
+        """指定された座標が既存のセグメンテーションの頂点上にあるかチェック"""
+        if not hasattr(self.main_window, 'segmentation_annotations'):
+            return None
+        
+        current_img_path = self.main_window.images[self.main_window.current_index]
+        if current_img_path not in self.main_window.segmentation_annotations:
+            return None
+        
+        segmentations = self.main_window.segmentation_annotations[current_img_path]
+        
+        # 各セグメンテーションの各頂点をチェック
+        for polygon_index, seg_data in enumerate(segmentations):
+            points = seg_data.get('points', [])
+            
+            for vertex_index, (px, py) in enumerate(points):
+                # 頂点との距離を計算
+                distance = ((x - px) ** 2 + (y - py) ** 2) ** 0.5
+                
+                # 頂点の半径内にクリックがある場合
+                if distance <= self.vertex_radius:
+                    return (polygon_index, vertex_index)
+        
+        return None
+
 # 下部ギャラリー系
 class ThumbnailWidget(QWidget):
     def __init__(self, parent=None, img_path="", index=0, is_selected=False, 
@@ -1584,6 +1716,7 @@ class ImageAnnotationTool(QMainWindow):
         self.is_drawing_polygon = False  # ポリゴン描画中フラグ
         self.segmentation_inference_results = {}  # セグメンテーション推論結果
         self.yolo_seg_model = None  # YOLOセグメンテーションモデル
+        self.last_segmentations = []
 
         # 削除インデックス
         self.deleted_indexes = []
@@ -2606,34 +2739,44 @@ class ImageAnnotationTool(QMainWindow):
 
     def delete_selected_bbox(self):
         """選択されたバウンディングボックスを削除する"""
-        if not self.images:
+        if not self.images or not hasattr(self, 'main_image_view'):
+            return
+        
+        selected_index = self.main_image_view.selected_bbox_index
+        if selected_index is None:
+            # 選択されていない場合は何もしない
             return
         
         current_img_path = self.images[self.current_index]
-        selected_index = self.main_image_view.selected_bbox_index
-        
         if current_img_path in self.bbox_annotations and selected_index is not None:
             bboxes = self.bbox_annotations[current_img_path]
             if 0 <= selected_index < len(bboxes):
-                # 確認ダイアログ
+                # ボックス情報を取得
                 bbox = bboxes[selected_index]
                 class_name = bbox.get('class', 'unknown')
-                
-                reply = QMessageBox.question(
-                    self, 
-                    "バウンディングボックス削除", 
-                    f"選択された '{class_name}' のバウンディングボックスを削除しますか？",
-                    QMessageBox.Yes | QMessageBox.No, 
-                    QMessageBox.No
-                )
-                
-                if reply == QMessageBox.Yes:
-                    # バウンディングボックスを削除
-                    del bboxes[selected_index]
-                    # 選択インデックスをリセット
-                    self.main_image_view.selected_bbox_index = None
+                                
+                # 削除実行
+                del bboxes[selected_index]
+                # 選択をクリア
+                self.main_image_view.selected_bbox_index = None
 
-                    self.update_ui()
+                # 重要: last_bboxesを更新する（削除後の最新状態を保存）
+                if hasattr(self, 'last_bboxes'):
+                    # 現在の画像のバウンディングボックスリストを全て取得して保存
+                    self.last_bboxes = [bbox.copy() for bbox in bboxes]
+                    
+                    # last_bboxも更新（互換性のため）
+                    if self.last_bboxes:
+                        self.last_bbox = self.last_bboxes[-1].copy()
+                    else:
+                        self.last_bbox = None
+
+                # 画面更新
+                self.update_ui()
+                
+                # 確認メッセージ
+                self.statusBar().showMessage(f"'{class_name}' のバウンディングボックスを削除しました", 3000)
+
 
     def delete_selected_segmentation(self, index=None):
         """選択されたセグメンテーションを削除する"""
@@ -2648,17 +2791,32 @@ class ImageAnnotationTool(QMainWindow):
         if current_img_path in self.segmentation_annotations and index is not None:
             segmentations = self.segmentation_annotations[current_img_path]
             if 0 <= index < len(segmentations):
-                # ボックス情報を取得
-                seg_data = segmentations[index]
-                class_name = seg_data.get('class', 'unknown')
+                # 現在情報を取得
+                seg = segmentations[index]
+                class_name = seg.get('class', 'unknown')
                 
                 # 削除実行
                 del segmentations[index]
                 # 選択をクリア
                 self.main_image_view.selected_segmentation_index = None
+
+                # 削除後の最新状態を保存
+                if hasattr(self, 'last_segmentations'):
+                    # 現在のリストを全て取得して保存
+                    self.last_segmentations = [seg.copy() for seg in segmentations]
+
+                    # last_bboxも更新（互換性のため）
+                    if self.last_segmentations:
+                        self.last_segmentation = self.last_segmentations[-1].copy()
+                    else:
+                        self.last_segmentation = None
+
                 # 画面更新
                 self.update_ui()
-                
+
+                # 確認メッセージ
+                self.statusBar().showMessage(f"'{class_name}' のセグメンテーションを削除しました", 3000)
+
     def add_segmentation_annotation(self, polygon_data):
         """セグメンテーションアノテーションを追加（前回のセグメンテーション保存機能付き）"""
         if not self.images:
@@ -4168,46 +4326,6 @@ class ImageAnnotationTool(QMainWindow):
             f.write(yaml_content)
         
         return yaml_path
-
-    def delete_selected_bbox(self):
-        """選択されたバウンディングボックスを削除する"""
-        if not self.images or not hasattr(self, 'main_image_view'):
-            return
-        
-        selected_index = self.main_image_view.selected_bbox_index
-        if selected_index is None:
-            # 選択されていない場合は何もしない
-            return
-        
-        current_img_path = self.images[self.current_index]
-        if current_img_path in self.bbox_annotations and selected_index is not None:
-            bboxes = self.bbox_annotations[current_img_path]
-            if 0 <= selected_index < len(bboxes):
-                # ボックス情報を取得
-                bbox = bboxes[selected_index]
-                class_name = bbox.get('class', 'unknown')
-                                
-                # 削除実行
-                del bboxes[selected_index]
-                # 選択をクリア
-                self.main_image_view.selected_bbox_index = None
-
-                # 重要: last_bboxesを更新する（削除後の最新状態を保存）
-                if hasattr(self, 'last_bboxes'):
-                    # 現在の画像のバウンディングボックスリストを全て取得して保存
-                    self.last_bboxes = [bbox.copy() for bbox in bboxes]
-                    
-                    # last_bboxも更新（互換性のため）
-                    if self.last_bboxes:
-                        self.last_bbox = self.last_bboxes[-1].copy()
-                    else:
-                        self.last_bbox = None
-
-                # 画面更新
-                self.update_ui()
-                
-                # 確認メッセージ
-                self.statusBar().showMessage(f"'{class_name}' のバウンディングボックスを削除しました", 3000)
 
     def refresh_yolo_model_list(self):
         """保存されているYOLOモデルのリストを更新 - サブフォルダとweightsフォルダ内も検索し、直下のモデルも含める - 選択したタイプでフィルタリング"""
