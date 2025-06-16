@@ -1943,21 +1943,22 @@ class ImageAnnotationTool(QMainWindow):
         apply_style(jetracer_btn, 'export')
         export_layout.addWidget(jetracer_btn)
 
-        ###TODO:統合
-        # # YOLOエクスポートボタンを統合エクスポートボタンに変更
-        # yolo_all_btn = QPushButton("YOLO統合形式")
-        # yolo_all_btn.clicked.connect(self.export_all_to_yolo)
-        # export_layout.addWidget(yolo_all_btn)
-
-        # YOLOフォーマット保存ボタンを追加
+        # 統合YOLOエクスポートボタン（修正）
         yolo_btn = QPushButton("YOLO")
-        yolo_btn.clicked.connect(self.export_to_yolo)
+        yolo_btn.clicked.connect(self.export_to_yolo_unified)
         apply_style(yolo_btn, 'export')
         export_layout.addWidget(yolo_btn)
 
-        seg_btn = QPushButton("セグ形式")
-        seg_btn.clicked.connect(self.export_segmentation_to_yolo)
-        export_layout.addWidget(seg_btn)
+        ###
+        # # YOLOフォーマット保存ボタンを追加
+        # yolo_btn = QPushButton("YOLO")
+        # yolo_btn.clicked.connect(self.export_to_yolo)
+        # apply_style(yolo_btn, 'export')
+        # export_layout.addWidget(yolo_btn)
+
+        # seg_btn = QPushButton("セグ形式")
+        # seg_btn.clicked.connect(self.export_segmentation_to_yolo)
+        # export_layout.addWidget(seg_btn)
 
         left_layout.addLayout(export_layout)
 
@@ -4143,124 +4144,699 @@ class ImageAnnotationTool(QMainWindow):
         # モデルリストを更新
         self.refresh_yolo_model_list()
 
-    def export_to_yolo(self):
-        """バウンディングボックスアノテーションをYOLO形式でエクスポートする - 削除済み画像をスキップ"""
-        if not hasattr(self, 'bbox_annotations'):
-            QMessageBox.information(self, "情報", "エクスポートするバウンディングボックスアノテーションがありません。")
+    def export_to_yolo_unified(self):
+        """統合YOLO形式でエクスポートする - バウンディングボックスとセグメンテーションを統合"""
+        # アノテーション状況を確認（修正版）
+        has_bbox = bool(getattr(self, 'bbox_annotations', {}))
+        has_seg = bool(getattr(self, 'segmentation_annotations', {}))
+                
+        if not has_bbox and not has_seg:
+            QMessageBox.information(self, "情報", "エクスポートするアノテーションがありません。")
             return
         
+        # 統合YOLOエクスポートダイアログを表示
+        export_config = self.show_yolo_unified_export_dialog(has_bbox, has_seg)
+        if not export_config:
+            return  # キャンセルされた場合
+        
         try:
-            # プログレスダイアログを表示
-            progress = QProgressDialog("YOLOフォーマットでエクスポート中...", "キャンセル", 0, len(self.images), self)
-            progress.setWindowTitle("エクスポート")
-            progress.setWindowModality(Qt.WindowModal)
-            progress.show()
-            
             # エクスポート実行
-            try:                
-                # 関数を呼び出し - 削除済みインデックスを渡す
-                yaml_path = export_to_yolo(
-                    annotation_folder, 
-                    self.bbox_annotations,
-                    include_empty_images=True,  # バウンディングボックスがない画像も含める
-                    all_images_list=self.images,  # 全画像リストを渡す
-                    deleted_indexes=self.deleted_indexes,  # 削除済みインデックスを渡す
-                    # index_to_path_map=index_to_path_map  # インデックスからパスへのマッピングを渡す
-                )
-                
-                progress.setValue(len(self.images))
-                
-                # エクスポート成功メッセージ
-                yolo_folder = os.path.dirname(yaml_path)
-                
-                # クラス情報の取得
-                all_classes = set()
-                for bboxes in self.bbox_annotations.values():
-                    for bbox in bboxes:
-                        all_classes.add(bbox.get('class', 'unknown'))
-                class_list = sorted(list(all_classes))
-                
-                # バウンディングボックス数とバウンディングボックスがない画像の数をカウント
-                total_bboxes = sum(len(bboxes) for bboxes in self.bbox_annotations.values())
-                images_with_boxes = len(self.bbox_annotations)
-                images_without_boxes = len(self.images) - images_with_boxes - len(self.deleted_indexes)
-                skipped_deleted = len(self.deleted_indexes)
-                
-                QMessageBox.information(
-                    self, 
-                    "エクスポート完了", 
-                    f"バウンディングボックスアノテーションをYOLO形式でエクスポートしました。\n"
-                    f"保存先: {yolo_folder}\n"
-                    f"処理画像数: {len(self.images) - skipped_deleted}枚\n"
-                    f"  - バウンディングボックスあり: {images_with_boxes}枚\n"
-                    f"  - バウンディングボックスなし: {images_without_boxes}枚\n"
-                    f"  - スキップされた削除済み画像: {skipped_deleted}枚\n"
-                    f"バウンディングボックス数: {total_bboxes}個\n"
-                    f"クラス: {', '.join(class_list)}"
-                )
+            self.execute_yolo_unified_export(export_config)
             
-            except Exception as e:
-                QMessageBox.critical(
-                    self, 
-                    "エラー", 
-                    f"YOLOフォーマットでのエクスポート中にエラーが発生しました: {str(e)}"
-                )
-            
-            finally:
-                progress.close()
-                
         except Exception as e:
             QMessageBox.critical(
                 self, 
                 "エラー", 
-                f"エクスポート準備中にエラーが発生しました: {str(e)}"
+                f"YOLO統合エクスポート中にエラーが発生しました: {str(e)}"
             )
 
-    def export_segmentation_to_yolo(self):
-        """セグメンテーションアノテーションをYOLO形式でエクスポートする"""
-        if not hasattr(self, 'segmentation_annotations') or not self.segmentation_annotations:
-            QMessageBox.information(self, "情報", "エクスポートするセグメンテーションアノテーションがありません。")
-            return
+    def show_yolo_unified_export_dialog(self, has_bbox, has_seg):
+        """統合YOLOエクスポートダイアログを表示
         
-        annotation_folder = os.path.join(self.folder_path, ANNOTATION_DIR_NAME)
-        os.makedirs(annotation_folder, exist_ok=True)
+        Args:
+            has_bbox: バウンディングボックスアノテーションの有無
+            has_seg: セグメンテーションアノテーションの有無
+            
+        Returns:
+            設定辞書またはNone（キャンセル時）
+        """
+        # ダイアログを作成
+        dialog = QDialog(self)
+        dialog.setWindowTitle("YOLO統合エクスポート設定")
+        dialog.setMinimumWidth(550)
+        dialog.setMinimumHeight(400)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # タイトル情報
+        title_label = QLabel("YOLOアノテーションエクスポート")
+        title_label.setStyleSheet("font-size: 16px; font-weight: bold; margin-bottom: 10px;")
+        layout.addWidget(title_label)
+        
+        # アノテーション状況の表示
+        status_group = QGroupBox("アノテーション状況")
+        status_layout = QVBoxLayout(status_group)
+        
+        # バウンディングボックス状況
+        if has_bbox:
+            bbox_count = sum(len(bboxes) for bboxes in self.bbox_annotations.values())
+            bbox_images = len(self.bbox_annotations)
+            bbox_status = QLabel(f"✓ バウンディングボックス: {bbox_count}個 ({bbox_images}枚の画像)")
+            bbox_status.setStyleSheet("color: #2E7D32; font-weight: bold;")
+        else:
+            bbox_status = QLabel("✗ バウンディングボックス: なし")
+            bbox_status.setStyleSheet("color: #D32F2F;")
+        status_layout.addWidget(bbox_status)
+        
+        # セグメンテーション状況
+        if has_seg:
+            seg_count = sum(len(segs) for segs in self.segmentation_annotations.values())
+            seg_images = len(self.segmentation_annotations)
+            seg_status = QLabel(f"✓ セグメンテーション: {seg_count}個 ({seg_images}枚の画像)")
+            seg_status.setStyleSheet("color: #2E7D32; font-weight: bold;")
+        else:
+            seg_status = QLabel("✗ セグメンテーション: なし")
+            seg_status.setStyleSheet("color: #D32F2F;")
+        status_layout.addWidget(seg_status)
+        
+        layout.addWidget(status_group)
+        
+        # エクスポート形式選択
+        export_group = QGroupBox("エクスポート形式選択")
+        export_layout = QVBoxLayout(export_group)
+        
+        # バウンディングボックスエクスポートチェックボックス
+        bbox_check = QCheckBox("バウンディングボックス (物体検知用)")
+        bbox_check.setChecked(has_bbox)  # アノテーションがある場合は自動でチェック
+        bbox_check.setEnabled(has_bbox)  # アノテーションがない場合は無効
+        if has_bbox:
+            bbox_check.setToolTip(f"{bbox_count}個のバウンディングボックスをエクスポートします")
+        else:
+            bbox_check.setToolTip("バウンディングボックスアノテーションがありません")
+        export_layout.addWidget(bbox_check)
+        
+        # セグメンテーションエクスポートチェックボックス
+        seg_check = QCheckBox("セグメンテーション (インスタンスセグメンテーション用)")
+        seg_check.setChecked(has_seg)  # アノテーションがある場合は自動でチェック
+        seg_check.setEnabled(has_seg)  # アノテーションがない場合は無効
+        if has_seg:
+            seg_check.setToolTip(f"{seg_count}個のセグメンテーションをエクスポートします")
+        else:
+            seg_check.setToolTip("セグメンテーションアノテーションがありません")
+        export_layout.addWidget(seg_check)
+        
+        # 統合エクスポートオプション
+        if has_bbox and has_seg:
+            unified_check = QCheckBox("統合形式 (1つのデータセットに両方を含める)")
+            unified_check.setChecked(False)  # デフォルトは個別エクスポート
+            unified_check.setToolTip("バウンディングボックスとセグメンテーションを1つのYOLOデータセットに統合します")
+            export_layout.addWidget(unified_check)
+        else:
+            unified_check = QCheckBox("統合形式 (利用不可)")
+            unified_check.setChecked(False)
+            unified_check.setEnabled(False)
+            unified_check.setToolTip("両方のアノテーション形式が必要です")
+            export_layout.addWidget(unified_check)
+        
+        layout.addWidget(export_group)
+        
+        # クラス設定
+        class_group = QGroupBox("クラス設定")
+        class_layout = QVBoxLayout(class_group)
+        
+        classes_layout = QHBoxLayout()
+        classes_layout.addWidget(QLabel("検知クラス:"))
+        classes_input = QLineEdit("car,person,sign,cone")
+        classes_input.setPlaceholderText("カンマ区切りでクラス名を入力")
+        classes_layout.addWidget(classes_input)
+        class_layout.addLayout(classes_layout)
+        
+        layout.addWidget(class_group)
+        
+        # 保存先設定
+        folder_group = QGroupBox("保存先設定")
+        folder_layout = QVBoxLayout(folder_group)
+        
+        # 自動保存先の生成
+        if hasattr(self, 'folder_path') and self.folder_path:
+            annotation_base = os.path.join(self.folder_path, "annotation")
+        else:
+            annotation_base = annotation_folder
+        
+        default_output_path = os.path.join(annotation_base, "data_yolo")
+        
+        folder_selection_layout = QHBoxLayout()
+        folder_selection_layout.addWidget(QLabel("保存先フォルダ:"))
+        
+        folder_input = QLineEdit()
+        folder_input.setText(default_output_path)
+        folder_selection_layout.addWidget(folder_input)
+        
+        browse_folder_button = QPushButton("参照...")
+        browse_folder_button.clicked.connect(lambda: self.browse_output_folder(folder_input))
+        folder_selection_layout.addWidget(browse_folder_button)
+        
+        folder_layout.addLayout(folder_selection_layout)
+        layout.addWidget(folder_group)
+        
+        # 削除したインデックスの情報表示
+        if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
+            deletion_info = QLabel(f"削除済みインデックス数: {len(self.deleted_indexes)}個（エクスポートから除外されます）")
+            deletion_info.setStyleSheet("color: #666; font-style: italic; margin-top: 10px;")
+            layout.addWidget(deletion_info)
+        
+        # ボタン
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        # ダイアログ表示
+        if not dialog.exec_():
+            return None
+        
+        # 設定値を取得
+        output_folder = folder_input.text().strip()
+        if not output_folder:
+            QMessageBox.warning(self, "警告", "保存先フォルダが指定されていません。")
+            return None
+        
+        # エクスポート形式の確認
+        export_bbox = bbox_check.isChecked()
+        export_seg = seg_check.isChecked()
+        export_unified = unified_check.isChecked() if has_bbox and has_seg else False
+        
+        if not export_bbox and not export_seg:
+            QMessageBox.warning(self, "警告", "エクスポートする形式が選択されていません。")
+            return None
+        
+        # クラス設定の取得
+        classes = [cls.strip() for cls in classes_input.text().split(',') if cls.strip()]
+        if not classes:
+            QMessageBox.warning(self, "警告", "クラスが設定されていません。")
+            return None
+        
+        # 確認メッセージの生成
+        confirm_message = "以下の設定でYOLO形式でエクスポートします：\n\n"
+        confirm_message += f"保存先: {output_folder}\n"
+        confirm_message += f"クラス: {', '.join(classes)}\n\n"
+        
+        export_items = []
+        if export_bbox:
+            bbox_count = sum(len(bboxes) for bboxes in self.bbox_annotations.values())
+            export_items.append(f"バウンディングボックス: {bbox_count}個")
+        if export_seg:
+            seg_count = sum(len(segs) for segs in self.segmentation_annotations.values())
+            export_items.append(f"セグメンテーション: {seg_count}個")
+        
+        confirm_message += "エクスポート内容:\n"
+        for item in export_items:
+            confirm_message += f"・{item}\n"
+        
+        if export_unified:
+            confirm_message += "\n※ 統合形式で1つのデータセットに保存されます"
+        else:
+            confirm_message += "\n※ 各形式別々のデータセットとして保存されます"
+        
+        if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
+            confirm_message += f"\n\n削除済みインデックス: {len(self.deleted_indexes)}個（除外）"
+        
+        reply = QMessageBox.question(
+            self, "YOLO統合エクスポート確認", confirm_message + "\n\n続行しますか？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+        )
+        
+        if reply == QMessageBox.No:
+            return None
+        
+        return {
+            'output_folder': output_folder,
+            'classes': classes,
+            'export_bbox': export_bbox,
+            'export_seg': export_seg,
+            'export_unified': export_unified,
+            'has_bbox': has_bbox,
+            'has_seg': has_seg
+        }
+
+    def execute_yolo_unified_export(self, config):
+        """統合YOLOエクスポートを実行"""
+        output_folder = config['output_folder']
+        classes = config['classes']
+        export_bbox = config['export_bbox']
+        export_seg = config['export_seg']
+        export_unified = config['export_unified']
+        
+        # プログレスダイアログを表示
+        total_steps = (1 if export_bbox else 0) + (1 if export_seg else 0) + (1 if export_unified else 0)
+        progress = QProgressDialog("YOLOエクスポート準備中...", "キャンセル", 0, total_steps * 100, self)
+        progress.setWindowTitle("エクスポート実行中")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
         
         try:
-            # プログレスダイアログを表示
-            progress = QProgressDialog("セグメンテーションデータをエクスポート中...", "キャンセル", 0, len(self.segmentation_annotations), self)
-            progress.setWindowTitle("エクスポート")
-            progress.setWindowModality(Qt.WindowModal)
-            progress.show()
+            current_step = 0
+            results = []
             
-            # クラス名を取得
-            classes = [cls.strip() for cls in self.classes_input.text().split(',') if cls.strip()]
+            if export_unified:
+                # 統合エクスポート
+                progress.setLabelText("統合YOLO形式でエクスポート中...")
+                progress.setValue(current_step * 100)
+                
+                unified_folder = os.path.join(output_folder, "unified")
+                yaml_path = self.export_unified_yolo_format(unified_folder, classes, progress)
+                
+                if yaml_path:
+                    results.append(f"統合形式: {unified_folder}")
+                
+                current_step += 1
             
-            # エクスポート実行
-            from exports_file import export_segmentation_to_yolo
-            yaml_path = export_segmentation_to_yolo(annotation_folder, self.segmentation_annotations, classes)
+            else:
+                # 個別エクスポート（統一されたフォルダ構造）
+                if export_bbox:
+                    progress.setLabelText("バウンディングボックス形式でエクスポート中...")
+                    progress.setValue(current_step * 100)
+                    
+                    bbox_folder = os.path.join(output_folder, "detection")
+                    os.makedirs(bbox_folder, exist_ok=True)
+                    
+                    # 統一されたバウンディングボックスエクスポート
+                    yaml_path = self.export_bbox_yolo_format(bbox_folder, classes, progress)
+                    
+                    if yaml_path:
+                        results.append(f"物体検知: {bbox_folder}")
+                    
+                    current_step += 1
+                    progress.setValue(current_step * 100)
+                
+                if export_seg:
+                    progress.setLabelText("セグメンテーション形式でエクスポート中...")
+                    progress.setValue(current_step * 100)
+                    
+                    seg_folder = os.path.join(output_folder, "segmentation")
+                    os.makedirs(seg_folder, exist_ok=True)
+                    
+                    # 既存のセグメンテーションエクスポート関数を使用
+                    from exports_file import export_segmentation_to_yolo
+                    yaml_path = export_segmentation_to_yolo(
+                        seg_folder,
+                        self.segmentation_annotations,
+                        classes
+                    )
+                    
+                    if yaml_path:
+                        results.append(f"セグメンテーション: {seg_folder}")
+                    
+                    current_step += 1
+                    progress.setValue(current_step * 100)
             
-            progress.setValue(len(self.segmentation_annotations))
             progress.close()
             
-            # 統計情報を計算
-            total_polygons = sum(len(annotations) for annotations in self.segmentation_annotations.values())
-            
-            QMessageBox.information(
-                self, 
-                "エクスポート完了", 
-                f"セグメンテーションアノテーションをYOLO形式でエクスポートしました。\n"
-                f"保存先: {annotation_folder}\n"
-                f"処理画像数: {len(self.segmentation_annotations)}\n"
-                f"セグメンテーション数: {total_polygons}\n"
-                f"クラス: {', '.join(classes)}"
-            )
-            
+            # 結果表示
+            if results:
+                # 統計情報の計算
+                bbox_count = sum(len(bboxes) for bboxes in self.bbox_annotations.values()) if export_bbox and hasattr(self, 'bbox_annotations') else 0
+                seg_count = sum(len(segs) for segs in self.segmentation_annotations.values()) if export_seg and hasattr(self, 'segmentation_annotations') else 0
+                
+                result_message = "YOLOエクスポートが完了しました。\n\n"
+                result_message += "保存先:\n"
+                for result in results:
+                    result_message += f"・{result}\n"
+                
+                result_message += f"\nエクスポート統計:\n"
+                if export_bbox:
+                    result_message += f"・バウンディングボックス: {bbox_count}個\n"
+                if export_seg:
+                    result_message += f"・セグメンテーション: {seg_count}個\n"
+                result_message += f"・クラス: {', '.join(classes)}"
+                
+                QMessageBox.information(self, "エクスポート完了", result_message)
+            else:
+                QMessageBox.warning(self, "警告", "エクスポートに失敗しました。")
+        
         except Exception as e:
-            QMessageBox.critical(
-                self, 
-                "エラー", 
-                f"セグメンテーションエクスポート中にエラーが発生しました: {str(e)}"
-            )
+            progress.close()
+            raise e
+
+    def export_bbox_yolo_format(self, output_folder, classes, progress=None):
+        """バウンディングボックスをYOLO形式でエクスポート（セグメンテーションと同じ構造）"""
+        import shutil
+        
+        # セグメンテーションと同じフォルダ構造を作成
+        images_dir = os.path.join(output_folder, 'images')
+        labels_dir = os.path.join(output_folder, 'labels')
+        os.makedirs(images_dir, exist_ok=True)
+        os.makedirs(labels_dir, exist_ok=True)
+        
+        # 削除されたインデックスを除外
+        deleted_indexes = getattr(self, 'deleted_indexes', set())
+        
+        # アノテーションがある画像のリストを作成
+        annotated_images = list(self.bbox_annotations.keys()) if hasattr(self, 'bbox_annotations') else []
+        
+        # 削除されたインデックスに対応する画像を除外
+        if hasattr(self, 'images') and deleted_indexes:
+            excluded_images = {self.images[i] for i in deleted_indexes if i < len(self.images)}
+            annotated_images = [img for img in annotated_images if img not in excluded_images]
+        
+        total_images = len(annotated_images)
+        
+        for i, img_path in enumerate(annotated_images):
+            if progress and progress.wasCanceled():
+                break
+            
+            if progress:
+                progress_value = int((i / total_images) * 100) if total_images > 0 else 100
+                progress.setValue(progress_value)
+                progress.setLabelText(f"バウンディングボックスエクスポート中: {os.path.basename(img_path)}")
+                QApplication.processEvents()
+            
+            # 画像をコピー
+            img_filename = os.path.basename(img_path)
+            try:
+                shutil.copy2(img_path, os.path.join(images_dir, img_filename))
+            except Exception as e:
+                print(f"画像コピーエラー: {img_path} - {e}")
+                continue
+            
+            # ラベルファイルを作成
+            label_filename = os.path.splitext(img_filename)[0] + '.txt'
+            label_path = os.path.join(labels_dir, label_filename)
+            
+            # 画像サイズを取得
+            try:
+                from PIL import Image
+                img = Image.open(img_path)
+                img_width, img_height = img.size
+            except Exception as e:
+                print(f"画像読み込みエラー: {img_path} - {e}")
+                continue
+            
+            # バウンディングボックスのラベルを作成
+            with open(label_path, 'w') as f:
+                if img_path in self.bbox_annotations:
+                    for bbox in self.bbox_annotations[img_path]:
+                        class_name = bbox.get('class', 'unknown')
+                        if class_name in classes:
+                            class_id = classes.index(class_name)
+                            
+                            # YOLO形式に変換（正規化された座標）
+                            center_x = ((bbox['x1'] + bbox['x2']) / 2) / img_width
+                            center_y = ((bbox['y1'] + bbox['y2']) / 2) / img_height
+                            width = (bbox['x2'] - bbox['x1']) / img_width
+                            height = (bbox['y2'] - bbox['y1']) / img_height
+                            
+                            f.write(f"{class_id} {center_x:.6f} {center_y:.6f} {width:.6f} {height:.6f}\n")
+        
+        # classes.txtを作成
+        classes_path = os.path.join(output_folder, 'classes.txt')
+        with open(classes_path, 'w', encoding='utf-8') as f:
+            for class_name in classes:
+                f.write(f"{class_name}\n")
+        
+        # dataset.yamlを作成
+        yaml_content = f"""path: {output_folder}
+    train: images
+    val: images
+    test: images
+
+    nc: {len(classes)}
+    names: {classes}
+
+    # バウンディングボックス検知用データセット
+    # フォーマット: class_id center_x center_y width height (全て正規化済み)
+    """
+        
+        yaml_path = os.path.join(output_folder, 'dataset.yaml')
+        with open(yaml_path, 'w', encoding='utf-8') as f:
+            f.write(yaml_content)
+        
+        return yaml_path
+    
+    def show_unified_export_dialog(self, export_type):
+        """統一エクスポート設定ダイアログを表示
+        
+        Args:
+            export_type: "donkey", "jetracer", "yolo_bbox", "yolo_seg"
+            
+        Returns:
+            設定辞書またはNone（キャンセル時）
+        """
+        # フォルダ名とタイトル
+        type_config = {
+            "donkey": {
+                "folder_name": "data_donkey",
+                "title": "Donkeycarエクスポート設定",
+                "format_name": "Donkeycar"
+            },
+            "jetracer": {
+                "folder_name": "data_jetracer", 
+                "title": "Jetracerエクスポート設定",
+                "format_name": "Jetracer"
+            },
+            "yolo_bbox": {
+                "folder_name": "data_yolo_bbox",
+                "title": "YOLO物体検知エクスポート設定", 
+                "format_name": "YOLO物体検知"
+            },
+            "yolo_seg": {
+                "folder_name": "data_yolo_seg",
+                "title": "YOLOセグメンテーションエクスポート設定",
+                "format_name": "YOLOセグメンテーション"
+            }
+        }
+        
+        config = type_config.get(export_type, type_config["donkey"])
+        default_folder_name = config["folder_name"]
+        dialog_title = config["title"]
+        format_name = config["format_name"]
+        
+        # 読み込み元フォルダがある場合はその名前を追加（重複を避ける）
+        if hasattr(self, 'folder_path') and self.folder_path:
+            parent_folder_name = os.path.basename(self.folder_path)
+            if parent_folder_name and parent_folder_name not in default_folder_name:
+                default_folder_name = f"{default_folder_name}_{parent_folder_name}"
+        
+        # ダイアログを作成
+        dialog = QDialog(self)
+        dialog.setWindowTitle(dialog_title)
+        dialog.setMinimumWidth(500)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # 保存先フォルダ選択
+        folder_group = QGroupBox("保存先設定")
+        folder_layout = QVBoxLayout(folder_group)
+        
+        # 保存先フォルダ選択
+        folder_selection_layout = QHBoxLayout()
+        folder_selection_layout.addWidget(QLabel("保存先フォルダ:"))
+        
+        folder_input = QLineEdit()
+        # annotationフォルダ内に保存するように修正
+        if hasattr(self, 'folder_path') and self.folder_path:
+            # 親フォルダのannotationフォルダ内に保存
+            annotation_base = os.path.join(self.folder_path, "annotation") 
+        else:
+            # デフォルトの場合
+            annotation_base = annotation_folder
+        
+        default_output_path = os.path.join(annotation_base, default_folder_name)
+        folder_input.setText(default_output_path)
+        folder_selection_layout.addWidget(folder_input)
+        
+        browse_folder_button = QPushButton("参照...")
+        browse_folder_button.clicked.connect(lambda: self.browse_output_folder(folder_input))
+        folder_selection_layout.addWidget(browse_folder_button)
+        
+        folder_layout.addLayout(folder_selection_layout)
+        layout.addWidget(folder_group)
+        
+        # クラス設定（YOLOエクスポートの場合）
+        classes = []
+        if export_type in ["yolo_bbox", "yolo_seg"]:
+            class_group = QGroupBox("クラス設定")
+            class_layout = QVBoxLayout(class_group)
+            
+            # クラス設定
+            classes_layout = QHBoxLayout()
+            classes_layout.addWidget(QLabel("検知クラス:"))
+            classes_input = QLineEdit("car,person,sign,cone")
+            classes_input.setPlaceholderText("カンマ区切りでクラス名を入力")
+            classes_layout.addWidget(classes_input)
+            class_layout.addLayout(classes_layout)
+            
+            layout.addWidget(class_group)
+        
+        # 画像ソース選択（Donkeycarの場合のみ）
+        selected_variants = []
+        variant_keys = {}
+        image_map = {}
+        
+        if export_type == "donkey" and hasattr(self, 'available_variants') and self.available_variants:
+            # 画像ソース選択グループ
+            source_group = QGroupBox("画像ソース選択")
+            source_layout = QVBoxLayout(source_group)
+            
+            # 説明ラベル
+            info_label = QLabel("エクスポートする画像ソースを選択してください（複数選択可）：")
+            source_layout.addWidget(info_label)
+            
+            # 利用可能な画像ソースに基づいてチェックボックスを作成
+            source_checks = {}
+            for variant in self.available_variants:
+                check = QCheckBox(f"{variant} ({len(self.variant_images.get(variant, []))}枚)")
+                check.setProperty("variant", variant)
+                # 現在のバリアントは自動的にチェック
+                if variant == getattr(self, 'current_variant', None):
+                    check.setChecked(True)
+                source_layout.addWidget(check)
+                source_checks[variant] = check
+            
+            layout.addWidget(source_group)
+            
+            # カタログキー設定
+            keys_group = QGroupBox("カタログキー設定")
+            keys_layout = QVBoxLayout(keys_group)
+            
+            # 各ソースタイプのキー名設定
+            key_inputs = {}
+            for variant in self.available_variants:
+                key_layout = QHBoxLayout()
+                key_layout.addWidget(QLabel(f"{variant} キー名:"))
+                default_key = f"{variant}/image_array"
+                key_input = QLineEdit(default_key)
+                key_layout.addWidget(key_input)
+                keys_layout.addLayout(key_layout)
+                key_inputs[variant] = key_input
+            
+            # 説明ラベル
+            key_note = QLabel("※ Donkeycarのデフォルトキーは 'cam/image_array' です。")
+            key_note.setStyleSheet("color: #666; font-style: italic;")
+            keys_layout.addWidget(key_note)
+            
+            layout.addWidget(keys_group)
+        
+        # 削除したインデックスの情報表示
+        if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
+            deletion_info = QLabel(f"削除済みインデックス数: {len(self.deleted_indexes)}個（エクスポートから除外されます）")
+            deletion_info.setStyleSheet("color: #666; font-style: italic;")
+            layout.addWidget(deletion_info)
+        
+        # ボタン
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        # ダイアログ表示
+        if not dialog.exec_():
+            return None
+        
+        # 設定値を取得
+        output_folder = folder_input.text().strip()
+        if not output_folder:
+            QMessageBox.warning(self, "警告", "保存先フォルダが指定されていません。")
+            return None
+        
+        # クラス設定の取得（YOLOエクスポートの場合）
+        if export_type in ["yolo_bbox", "yolo_seg"]:
+            classes = [cls.strip() for cls in classes_input.text().split(',') if cls.strip()]
+            if not classes:
+                QMessageBox.warning(self, "警告", "クラスが設定されていません。")
+                return None
+        
+        # Donkeycarの場合は画像ソース設定を取得
+        if export_type == "donkey" and hasattr(self, 'available_variants') and self.available_variants:
+            # 選択された画像ソースを取得
+            for variant, check in source_checks.items():
+                if check.isChecked():
+                    selected_variants.append(variant)
+                    # 対応するキー名を取得
+                    variant_keys[variant] = key_inputs[variant].text().strip()
+                    if not variant_keys[variant]:
+                        variant_keys[variant] = f"{variant}/image_array"
+            
+            if not selected_variants:
+                QMessageBox.warning(self, "警告", "画像ソースが選択されていません。")
+                return None
+            
+            # 画像マップを作成
+            for variant in selected_variants:
+                variant_images = self.variant_images.get(variant, [])
+                if not variant_images:
+                    continue
+                    
+                for img_path in variant_images:
+                    try:
+                        basename = os.path.basename(img_path)
+                        # 通常形式とJetracer形式の両方に対応
+                        normal_match = re.match(r'^(\d+)_', basename)
+                        jetracer_match = re.match(r'^\d+_\d+_(\d+)_', basename)
+                        
+                        if normal_match:
+                            idx = int(normal_match.group(1))
+                        elif jetracer_match:
+                            idx = int(jetracer_match.group(1))
+                        else:
+                            continue
+                            
+                        if idx not in image_map:
+                            image_map[idx] = {}
+                        image_map[idx][variant] = img_path
+                    except Exception as e:
+                        print(f"インデックス抽出エラー ({img_path}): {e}")
+        else:
+            # 他のエクスポート形式の場合はデフォルト値を設定
+            selected_variants = ["cam"]  # デフォルト
+        
+        # 確認メッセージ
+        confirm_message = f"以下の設定で{format_name}形式でエクスポートします：\n\n"
+        confirm_message += f"保存先: {output_folder}\n"
+        
+        if export_type == "donkey" and selected_variants:
+            for variant in selected_variants:
+                image_count = len(self.variant_images.get(variant, []))
+                confirm_message += f"・画像ソース: {variant} ({image_count}枚)\n"
+                if variant in variant_keys:
+                    confirm_message += f"  キー名: {variant_keys[variant]}\n"
+        
+        if export_type in ["yolo_bbox", "yolo_seg"]:
+            confirm_message += f"クラス: {', '.join(classes)}\n"
+        
+        if export_type == "donkey":
+            confirm_message += f"\nアノテーション数: {len(self.annotations)}個"
+        elif export_type == "yolo_bbox":
+            confirm_message += f"\nバウンディングボックス数: {sum(len(bboxes) for bboxes in self.bbox_annotations.values())}個"
+        elif export_type == "yolo_seg":
+            confirm_message += f"\nセグメンテーション数: {sum(len(segs) for segs in self.segmentation_annotations.values())}個"
+        
+        if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
+            confirm_message += f"\n削除済みインデックス数: {len(self.deleted_indexes)}個"
+        
+        reply = QMessageBox.question(
+            self, f"{format_name}エクスポート確認", confirm_message + "\n\n続行しますか？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+        )
+        
+        if reply == QMessageBox.No:
+            return None
+        
+        return {
+            'output_folder': output_folder,
+            'selected_variants': selected_variants,
+            'variant_keys': variant_keys,
+            'image_map': image_map,
+            'export_type': export_type,
+            'classes': classes if export_type in ["yolo_bbox", "yolo_seg"] else []
+        }
+
+    # 既存のshow_export_dialog関数をリネーム（後方互換性のため）
+    def show_export_dialog(self, export_type):
+        """既存のshow_export_dialog関数 - 統一ダイアログに移行"""
+        # donkey/jetracerの場合は統一ダイアログを使用
+        return self.show_unified_export_dialog(export_type)
+ 
     ### TODO:統合
     def export_all_to_yolo(self):
         """物体検知とセグメンテーションを統合してYOLO形式でエクスポートする"""
@@ -8245,213 +8821,6 @@ class ImageAnnotationTool(QMainWindow):
                 f"Jetracerエクスポート中にエラーが発生しました: {str(e)}\n\n"
                 f"詳細: {traceback.format_exc()}"
             )
-
-    def show_export_dialog(self, export_type):
-        """共通のエクスポート設定ダイアログを表示
-        
-        Args:
-            export_type: "donkey" または "jetracer"
-            
-        Returns:
-            設定辞書またはNone（キャンセル時）
-        """
-        # フォルダ名とタイトル
-        if export_type == "donkey":
-            default_folder_name = "data_donkey"
-            dialog_title = "Donkeycarエクスポート設定"
-            format_name = "Donkeycar"
-        else:  # jetracer
-            default_folder_name = "data_jetracer"
-            dialog_title = "Jetracerエクスポート設定"
-            format_name = "Jetracer"
-        
-        # 読み込み元フォルダがある場合はその名前を追加（重複を避ける）
-        if hasattr(self, 'folder_path') and self.folder_path:
-            parent_folder_name = os.path.basename(self.folder_path)
-            if parent_folder_name and parent_folder_name not in default_folder_name:
-                default_folder_name = f"{default_folder_name}_{parent_folder_name}"
-        
-        # ダイアログを作成
-        dialog = QDialog(self)
-        dialog.setWindowTitle(dialog_title)
-        dialog.setMinimumWidth(500)
-        
-        layout = QVBoxLayout(dialog)
-        
-        # 保存先フォルダ選択
-        folder_group = QGroupBox("保存先設定")
-        folder_layout = QVBoxLayout(folder_group)
-        
-        # 保存先フォルダ選択
-        folder_selection_layout = QHBoxLayout()
-        folder_selection_layout.addWidget(QLabel("保存先フォルダ:"))
-        
-        folder_input = QLineEdit()
-        # annotationフォルダ内に保存するように修正
-        if hasattr(self, 'folder_path') and self.folder_path:
-            # 親フォルダのannotationフォルダ内に保存
-            annotation_base = os.path.join(self.folder_path, "annotation") 
-        else:
-            # デフォルトの場合
-            annotation_base = annotation_folder
-        
-        default_output_path = os.path.join(annotation_base, default_folder_name)
-        folder_input.setText(default_output_path)
-        folder_selection_layout.addWidget(folder_input)
-        
-        browse_folder_button = QPushButton("参照...")
-        browse_folder_button.clicked.connect(lambda: self.browse_output_folder(folder_input))
-        folder_selection_layout.addWidget(browse_folder_button)
-        
-        folder_layout.addLayout(folder_selection_layout)
-        layout.addWidget(folder_group)
-        
-        # 画像ソース選択（Donkeycarの場合のみ）
-        selected_variants = []
-        variant_keys = {}
-        image_map = {}
-        
-        if export_type == "donkey" and hasattr(self, 'available_variants') and self.available_variants:
-            # 画像ソース選択グループ
-            source_group = QGroupBox("画像ソース選択")
-            source_layout = QVBoxLayout(source_group)
-            
-            # 説明ラベル
-            info_label = QLabel("エクスポートする画像ソースを選択してください（複数選択可）：")
-            source_layout.addWidget(info_label)
-            
-            # 利用可能な画像ソースに基づいてチェックボックスを作成
-            source_checks = {}
-            for variant in self.available_variants:
-                check = QCheckBox(f"{variant} ({len(self.variant_images.get(variant, []))}枚)")
-                check.setProperty("variant", variant)
-                # 現在のバリアントは自動的にチェック
-                if variant == getattr(self, 'current_variant', None):
-                    check.setChecked(True)
-                source_layout.addWidget(check)
-                source_checks[variant] = check
-            
-            layout.addWidget(source_group)
-            
-            # カタログキー設定
-            keys_group = QGroupBox("カタログキー設定")
-            keys_layout = QVBoxLayout(keys_group)
-            
-            # 各ソースタイプのキー名設定
-            key_inputs = {}
-            for variant in self.available_variants:
-                key_layout = QHBoxLayout()
-                key_layout.addWidget(QLabel(f"{variant} キー名:"))
-                default_key = f"{variant}/image_array"
-                key_input = QLineEdit(default_key)
-                key_layout.addWidget(key_input)
-                keys_layout.addLayout(key_layout)
-                key_inputs[variant] = key_input
-            
-            # 説明ラベル
-            key_note = QLabel("※ Donkeycarのデフォルトキーは 'cam/image_array' です。")
-            key_note.setStyleSheet("color: #666; font-style: italic;")
-            keys_layout.addWidget(key_note)
-            
-            layout.addWidget(keys_group)
-        
-        # 削除したインデックスの情報表示
-        if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
-            deletion_info = QLabel(f"削除済みインデックス数: {len(self.deleted_indexes)}個（エクスポートから除外されます）")
-            deletion_info.setStyleSheet("color: #666; font-style: italic;")
-            layout.addWidget(deletion_info)
-        
-        # ボタン
-        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        button_box.accepted.connect(dialog.accept)
-        button_box.rejected.connect(dialog.reject)
-        layout.addWidget(button_box)
-        
-        # ダイアログ表示
-        if not dialog.exec_():
-            return None
-        
-        # 設定値を取得
-        output_folder = folder_input.text().strip()
-        if not output_folder:
-            QMessageBox.warning(self, "警告", "保存先フォルダが指定されていません。")
-            return None
-        
-        # Donkeycarの場合は画像ソース設定を取得
-        if export_type == "donkey" and hasattr(self, 'available_variants') and self.available_variants:
-            # 選択された画像ソースを取得
-            for variant, check in source_checks.items():
-                if check.isChecked():
-                    selected_variants.append(variant)
-                    # 対応するキー名を取得
-                    variant_keys[variant] = key_inputs[variant].text().strip()
-                    if not variant_keys[variant]:
-                        variant_keys[variant] = f"{variant}/image_array"
-            
-            if not selected_variants:
-                QMessageBox.warning(self, "警告", "画像ソースが選択されていません。")
-                return None
-            
-            # 画像マップを作成
-            for variant in selected_variants:
-                variant_images = self.variant_images.get(variant, [])
-                if not variant_images:
-                    continue
-                    
-                for img_path in variant_images:
-                    try:
-                        basename = os.path.basename(img_path)
-                        # 通常形式とJetracer形式の両方に対応
-                        normal_match = re.match(r'^(\d+)_', basename)
-                        jetracer_match = re.match(r'^\d+_\d+_(\d+)_', basename)
-                        
-                        if normal_match:
-                            idx = int(normal_match.group(1))
-                        elif jetracer_match:
-                            idx = int(jetracer_match.group(1))
-                        else:
-                            continue
-                            
-                        if idx not in image_map:
-                            image_map[idx] = {}
-                        image_map[idx][variant] = img_path
-                    except Exception as e:
-                        print(f"インデックス抽出エラー ({img_path}): {e}")
-        else:
-            # Jetracerの場合は単一ソースとして処理
-            selected_variants = ["cam"]  # デフォルト
-        
-        # 確認メッセージ
-        confirm_message = f"以下の設定で{format_name}形式でエクスポートします：\n\n"
-        confirm_message += f"保存先: {output_folder}\n"
-        
-        if export_type == "donkey" and selected_variants:
-            for variant in selected_variants:
-                image_count = len(self.variant_images.get(variant, []))
-                confirm_message += f"・画像ソース: {variant} ({image_count}枚)\n"
-                if variant in variant_keys:
-                    confirm_message += f"  キー名: {variant_keys[variant]}\n"
-        
-        confirm_message += f"\nアノテーション数: {len(self.annotations)}個"
-        
-        if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
-            confirm_message += f"\n削除済みインデックス数: {len(self.deleted_indexes)}個"
-        
-        reply = QMessageBox.question(
-            self, f"{format_name}エクスポート確認", confirm_message + "\n\n続行しますか？",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
-        )
-        
-        if reply == QMessageBox.No:
-            return None
-        
-        return {
-            'output_folder': output_folder,
-            'selected_variants': selected_variants,
-            'variant_keys': variant_keys,
-            'image_map': image_map,
-            'export_type': export_type
-        }
 
     def browse_output_folder(self, folder_input):
         """出力フォルダを選択するダイアログを表示"""
