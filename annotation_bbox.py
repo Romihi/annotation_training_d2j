@@ -608,12 +608,27 @@ class ImageLabel(QLabel):
                         # 塗りつぶし
                         painter.drawPolygon(polygon_points)
                         
-                        # 選択されているセグメンテーションには頂点を表示
+                        # 選択されているセグメンテーションには頂点を表示 - ここに移動
                         if is_selected:
-                            painter.setBrush(QBrush(Qt.white))
-                            painter.setPen(QPen(base_color.darker(), 2))
-                            for point in polygon_points:
-                                painter.drawEllipse(point.x() - 4, point.y() - 4, 8, 8)
+                            for vertex_index, point in enumerate(polygon_points):
+                                # 頂点の状態に応じて色とサイズを変更
+                                if (self.selected_polygon_index == i and 
+                                    self.selected_vertex_index == vertex_index):
+                                    # 選択された頂点（編集中）
+                                    painter.setBrush(QBrush(QColor(255, 255, 0)))  # 黄色
+                                    painter.setPen(QPen(Qt.black, 3))
+                                    painter.drawEllipse(point.x() - 6, point.y() - 6, 12, 12)
+                                elif (self.hovering_polygon_index == i and 
+                                    self.hovering_vertex_index == vertex_index):
+                                    # ホバー中の頂点
+                                    painter.setBrush(QBrush(QColor(255, 165, 0)))  # オレンジ色
+                                    painter.setPen(QPen(base_color.darker(), 2))
+                                    painter.drawEllipse(point.x() - 5, point.y() - 5, 10, 10)  # 少し大きく
+                                else:
+                                    # 通常の頂点
+                                    painter.setBrush(QBrush(Qt.white))
+                                    painter.setPen(QPen(base_color.darker(), 2))
+                                    painter.drawEllipse(point.x() - 4, point.y() - 4, 8, 8)
                         
                         # ラベル表示
                         if polygon_points:
@@ -627,7 +642,7 @@ class ImageLabel(QLabel):
                             painter.fillRect(center_x - text_width//2 - 2, center_y - 10, text_width + 4, 16, base_color.darker())
                             
                             painter.drawText(center_x - text_width//2, center_y + 2, class_name)
-        
+
         # 現在描画中のポリゴンの表示（修正）
         if self.is_drawing_segmentation and len(self.current_segmentation_polygon) > 0:
             painter.setPen(QPen(QColor(255, 255, 0), 3))
@@ -658,22 +673,6 @@ class ImageLabel(QLabel):
                 painter.setBrush(QBrush(QColor(255, 255, 255)))
                 painter.setPen(QPen(QColor(255, 255, 0), 3))
                 painter.drawEllipse(screen_points[0].x() - 6, screen_points[0].y() - 6, 12, 12)
-
-        # 選択されているセグメンテーションには頂点を表示
-        if is_selected:
-            painter.setBrush(QBrush(Qt.white))
-            painter.setPen(QPen(base_color.darker(), 2))
-            for vertex_index, point in enumerate(polygon_points):
-                # 選択された頂点は特別な色で表示
-                if (self.selected_polygon_index == i and 
-                    self.selected_vertex_index == vertex_index):
-                    painter.setBrush(QBrush(QColor(255, 255, 0)))  # 黄色で強調
-                    painter.setPen(QPen(Qt.black, 3))
-                    painter.drawEllipse(point.x() - 6, point.y() - 6, 12, 12)
-                else:
-                    painter.setBrush(QBrush(Qt.white))
-                    painter.setPen(QPen(base_color.darker(), 2))
-                    painter.drawEllipse(point.x() - 4, point.y() - 4, 8, 8)
 
         # 削除済みの場合は半透明の赤オーバーレイを表示
         if self.is_deleted:
@@ -831,24 +830,21 @@ class ImageLabel(QLabel):
             elif hasattr(self.main_window, 'current_mode') and self.main_window.current_mode == 2:
                 # セグメンテーションモード
                 current_img_path = self.main_window.images[self.main_window.current_index]
-
-                ###
-                # 既存のセグメンテーションの頂点をクリックしたかチェック
-                clicked_vertex = self.check_vertex_click(orig_x, orig_y)
                 
-                if clicked_vertex is not None:
+                # ホバー中の頂点がある場合はそれを優先
+                if (self.hovering_polygon_index is not None and 
+                    self.hovering_vertex_index is not None):
                     # 頂点がクリックされた場合
-                    polygon_index, vertex_index = clicked_vertex
-                    self.selected_polygon_index = polygon_index
-                    self.selected_vertex_index = vertex_index
+                    self.selected_polygon_index = self.hovering_polygon_index
+                    self.selected_vertex_index = self.hovering_vertex_index
                     self.is_moving_vertex = True
                     
                     # 選択されたセグメンテーションも更新
-                    self.selected_segmentation_index = polygon_index
+                    self.selected_segmentation_index = self.hovering_polygon_index
                     
                     # ステータスバーに表示
                     if hasattr(self.main_window, 'statusBar'):
-                        self.main_window.statusBar().showMessage(f"頂点を編集中... (頂点 {vertex_index+1})", 3000)
+                        self.main_window.statusBar().showMessage(f"頂点を編集中... (頂点 {self.hovering_vertex_index+1})", 3000)
                     
                     self.update()
                     return
@@ -934,7 +930,20 @@ class ImageLabel(QLabel):
         """マウスがウィジェットから離れた時の処理"""
         self.setCursor(Qt.ArrowCursor)  
         self.hovering_bbox_index = None
+        
+        # セグメンテーション関連のホバー状態もクリア
+        self.hovering_segmentation_index = None
+        self.hovering_polygon_index = None
+        self.hovering_vertex_index = None
+        
+        self.update()  # 画面を更新してホバー効果を消す
         super().leaveEvent(event)
+    
+    # def leaveEvent(self, event):
+    #     """マウスがウィジェットから離れた時の処理"""
+    #     self.setCursor(Qt.ArrowCursor)  
+    #     self.hovering_bbox_index = None
+    #     super().leaveEvent(event)
 
     def draw_vector_arrow(self, painter, start_x, start_y, end_x, end_y):
         """教師データから推論結果への矢印を描画する"""
@@ -1240,6 +1249,60 @@ class ImageLabel(QLabel):
             self.update()
             return
 
+        # セグメンテーションホバー検出（移動中でない場合のみ）- 既存のコードを修正
+        elif (not self.is_moving_segmentation and not self.is_moving_vertex and 
+            hasattr(self.main_window, 'current_mode') and self.main_window.current_mode == 2):
+            
+            # 座標変換
+            if not self.pixmap():
+                return
+                
+            pos = event.pos()
+            pix_width = self.pixmap().width()
+            pix_height = self.pixmap().height()
+            scaled_width = int(pix_width * self.zoom_factor)
+            scaled_height = int(pix_height * self.zoom_factor)
+            
+            x = (self.width() - scaled_width) // 2
+            y = (self.height() - scaled_height) // 2
+            target_rect = QRect(x, y, scaled_width, scaled_height)
+            
+            if not target_rect.contains(pos):
+                # マウスが画像外の場合はホバー状態をクリア
+                if self.hovering_vertex_index is not None or self.hovering_polygon_index is not None:
+                    self.hovering_vertex_index = None
+                    self.hovering_polygon_index = None
+                    self.setCursor(Qt.ArrowCursor)
+                    self.update()
+                return
+            
+            rel_x = (pos.x() - target_rect.x()) / target_rect.width()
+            rel_y = (pos.y() - target_rect.y()) / target_rect.height()
+            orig_x = int(rel_x * pix_width)
+            orig_y = int(rel_y * pix_height)
+            
+            # 頂点のホバー検出
+            hovered_vertex = self.check_vertex_hover(orig_x, orig_y)
+            
+            # ホバー状態が変化した場合の処理
+            if hovered_vertex != (self.hovering_polygon_index, self.hovering_vertex_index):
+                if hovered_vertex is not None:
+                    self.hovering_polygon_index, self.hovering_vertex_index = hovered_vertex
+                    self.setCursor(Qt.PointingHandCursor)  # 手のカーソルに変更
+                else:
+                    # 頂点ホバーがない場合、セグメンテーション全体のホバーをチェック
+                    hover_index = self.check_segmentation_hover(event.pos())
+                    self.hovering_polygon_index = hover_index
+                    self.hovering_vertex_index = None
+                    
+                    if hover_index is not None:
+                        self.setCursor(Qt.OpenHandCursor)
+                    else:
+                        self.setCursor(Qt.ArrowCursor)
+                
+                self.update()
+
+
         # セグメンテーション移動処理
         if self.is_moving_segmentation and self.selected_segmentation_index is not None:
             if not self.pixmap():
@@ -1306,6 +1369,34 @@ class ImageLabel(QLabel):
                     self.setCursor(Qt.ArrowCursor)
                 
                 self.update()
+
+    def check_vertex_hover(self, x, y):
+        """指定された座標が既存のセグメンテーションの頂点上にホバーしているかチェック"""
+        if not hasattr(self.main_window, 'segmentation_annotations'):
+            return None
+        
+        current_img_path = self.main_window.images[self.main_window.current_index]
+        if current_img_path not in self.main_window.segmentation_annotations:
+            return None
+        
+        segmentations = self.main_window.segmentation_annotations[current_img_path]
+        
+        # ホバー検出の範囲を少し大きくする
+        hover_radius = self.vertex_radius + 2
+        
+        # 各セグメンテーションの各頂点をチェック
+        for polygon_index, seg_data in enumerate(segmentations):
+            points = seg_data.get('points', [])
+            
+            for vertex_index, (px, py) in enumerate(points):
+                # 頂点との距離を計算
+                distance = ((x - px) ** 2 + (y - py) ** 2) ** 0.5
+                
+                # ホバー半径内にマウスがある場合
+                if distance <= hover_radius:
+                    return (polygon_index, vertex_index)
+        
+        return None
 
     def check_bbox_hover_and_resize_handles(self, pos):
         """バウンディングボックスのホバー状態とリサイズハンドルのチェック"""
