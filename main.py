@@ -15,7 +15,6 @@ import matplotlib
 matplotlib.use('Agg')  # GUIバックエンドを使用しない設定
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 import io
 
 import torch
@@ -46,6 +45,22 @@ from PyQt5.QtCore import Qt, QRect, QPoint, QTimer, QEvent
 
 from PIL import Image
 
+# ユーティリティのインポート
+#from utils.color_utils import get_location_color, get_class_color, get_segmentation_color
+from utils.file_utils import (
+    get_image_files, extract_index_from_filename, 
+    extract_variant_info, ensure_directory_exists
+)
+from utils.geometry_utils import (
+    estimate_location_from_angle,
+    normalize_coordinates, denormalize_coordinates,
+    is_point_in_polygon, calculate_bbox_center, calculate_bbox_dimensions
+)
+from utils.image_utils import (
+    pil_to_qimage, pil_to_qpixmap, 
+    load_image_safely, get_image_size
+)
+
 # カスタムモジュールのインポート
 from model_catalog import get_model, list_available_models
 from inference_utils import batch_inference
@@ -60,13 +75,7 @@ from model_training import generate_augmentation_samples
 # TODO:ボタンのスタイルを実装、他のUIの移植については後ほど検討
 from styles import get_location_color, apply_style, set_theme, get_current_theme, PRIMARY_STYLE, MODEL_STYLE, TRAINING_STYLE, EXPORT_STYLE, SPECIAL_STYLE, DESTRUCTIVE_STYLE, NAV_STYLE
 
-try:
-    from enhanced_annotations import apply_enhanced_annotations_display
-    print("物体検知アノテーション表示拡張モジュールを読み込みました")
-    use_yolo = True
-except ImportError:
-    print("警告: enhanced_annotations.pyが見つかりません。物体検知アノテーション表示拡張は無効です")
-    use_yolo = False
+from enhanced_annotations import apply_enhanced_annotations_display
 
 
 import traceback
@@ -76,44 +85,8 @@ def exception_hook(exc_type, exc_value, exc_traceback):
 
 sys.excepthook = exception_hook
 
-
-# グローバル設定変数
-## アプリケーション関連のパス設定
-APP_DIR_PATH = os.path.dirname(os.path.abspath(__file__))  # スクリプトのあるディレクトリを基準
-SESSION_DIR_NAME = "sessions"  # セッション情報の保存フォルダ名
-MODELS_DIR_NAME = "models"     # モデル保存用のフォルダ名
-ANNOTATION_DIR_NAME = "annotation"  # アノテーション関連データフォルダ名
-DATA_DONKEY_DIR_NAME = "data_donkey"  # Donkeycar形式データ保存用フォルダ名
-DATA_JETRACER_DIR_NAME = "data_jetracer"  # Jetracer形式データ保存用フォルダ名
-DATA_YOLO_DIR_NAME = "data_yolo"
-VIDEO_DIR_NAME = "video"
-
-# TODO:後ほど再チェック
-## 保存先フォルダ関係
-### アノテーション関連
-annotation_folder = os.path.join(APP_DIR_PATH, ANNOTATION_DIR_NAME)
-os.makedirs(annotation_folder, exist_ok=True)
-donkey_dataset_dir = os.path.join(annotation_folder, DATA_DONKEY_DIR_NAME)
-os.makedirs(donkey_dataset_dir, exist_ok=True)
-jetracer_dataset_dir = os.path.join(annotation_folder, DATA_JETRACER_DIR_NAME)
-os.makedirs(jetracer_dataset_dir, exist_ok=True)
-yolo_dataset_dir = os.path.join(annotation_folder, DATA_YOLO_DIR_NAME)
-os.makedirs(yolo_dataset_dir, exist_ok=True)
-video_folder = os.path.join(annotation_folder, VIDEO_DIR_NAME)
-os.makedirs(video_folder, exist_ok=True)
-
-
-### モデル関連
-models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
-os.makedirs(models_dir, exist_ok=True)
-mlflow_dir = os.path.join(APP_DIR_PATH, "mlruns")
-os.makedirs(mlflow_dir, exist_ok=True)
-# パスの正規化 - すべてのバックスラッシュをフォワードスラッシュに変換
-normalized_path = mlflow_dir.replace("\\", "/")
-
-### アプリ関連
-session_dir = os.path.join(APP_DIR_PATH, SESSION_DIR_NAME)
-os.makedirs(session_dir, exist_ok=True)
+# グローバル設定変数（移植中）
+from config import *
 
 # マウス操作画面表示系
 class ImageLabel(QLabel):
@@ -121,13 +94,13 @@ class ImageLabel(QLabel):
         super().__init__(parent)
         self.main_window = main_window
         self.setAlignment(Qt.AlignCenter)
-        self.setMinimumSize(1000, 800)
+        self.setMinimumSize(MAIN_IMAGE_MIN_WIDTH, MAIN_IMAGE_MIN_HEIGHT)
         self.annotation_point = None
         self.show_grid = True  
-        self.grid_size = 10    
+        self.grid_size = DEFAULT_GRID_SIZE    
         self.inference_point = None 
         self.show_inference = False 
-        self.zoom_factor = 2.5  
+        self.zoom_factor = DEFAULT_ZOOM_FACTOR  
         self.is_deleted = False  
 
         # バウンディングボックス関連
@@ -142,7 +115,7 @@ class ImageLabel(QLabel):
         self.setMouseTracking(True)  
         self.hovering_bbox_index = None  
         self.is_resizing_bbox = False    
-        self.resize_handle = None        # 操作中のハンドル（"tl", "tr", "bl", "br"）
+        self.resize_handle = None 
         self.resize_start_pos = None     
 
         # セグメンテーション関連の新規追加
@@ -154,109 +127,15 @@ class ImageLabel(QLabel):
         self.is_moving_segmentation = False      
         self.seg_move_start_pos = None           
         self.hovering_segmentation_index = None 
-        self.close_threshold = 15                # ポリゴン閉じる際の閾値（ピクセル）
-        self.selected_polygon_index = None    # 選択されたポリゴンのインデックス
-        self.selected_vertex_index = None     # 選択された頂点のインデックス
-        self.is_moving_vertex = False         # 頂点移動中フラグ
-        self.hovering_polygon_index = None    # ホバー中のポリゴンのインデックス
-        self.hovering_vertex_index = None     # ホバー中の頂点のインデックス
-        self.vertex_radius = 8                # 頂点の半径（ピクセル）
+        self.close_threshold = SEGMENTATION_CLOSE_THRESHOLD
+        self.selected_polygon_index = None    
+        self.selected_vertex_index = None     
+        self.is_moving_vertex = False         
+        self.hovering_polygon_index = None    
+        self.hovering_vertex_index = None     
+        self.vertex_radius = SEGMENTATION_VERTEX_RADIUS
 
-    def mouseReleaseEvent(self, event):
-        # 頂点移動完了処理を追加（既存のコードの前に追加）
-        if self.is_moving_vertex:
-            # 頂点移動が完了
-            self.is_moving_vertex = False
-            
-            # 選択状態は維持（頂点の選択は解除しない）
-            
-            # ステータスバーに完了メッセージ
-            if hasattr(self.main_window, 'statusBar') and self.selected_polygon_index is not None:
-                current_img_path = self.main_window.images[self.main_window.current_index]
-                if current_img_path in self.main_window.segmentation_annotations:
-                    segmentations = self.main_window.segmentation_annotations[current_img_path]
-                    if 0 <= self.selected_polygon_index < len(segmentations):
-                        class_name = segmentations[self.selected_polygon_index].get('class', 'unknown')
-                        self.main_window.statusBar().showMessage(
-                            f"'{class_name}' の頂点編集が完了しました", 3000
-                        )
-            
-            self.setCursor(Qt.ArrowCursor)
-            self.update()
-            return
-
-        # 既存のコードに追加
-        if self.is_moving_segmentation:
-            # セグメンテーション移動が完了
-            self.is_moving_segmentation = False
-            self.seg_move_start_pos = None
-                        
-            self.setCursor(Qt.ArrowCursor)
-            self.update()
-            return
-
-        if self.is_moving_bbox:
-            # 移動が完了したのでフラグをリセット
-            self.is_moving_bbox = False
-            self.move_start_pos = None
-                        
-            # 通常のカーソルに戻す
-            self.setCursor(Qt.ArrowCursor)
-            self.update()
-
-        elif self.is_drawing_bbox and self.pixmap() and self.bbox_start and self.bbox_end:
-            # バウンディングボックスの確定処理
-            if abs(self.bbox_end.x() - self.bbox_start.x()) > 10 and abs(self.bbox_end.y() - self.bbox_start.y()) > 10:
-                class_name = self.main_window.select_object_class()
-                if class_name:
-                    bbox = {
-                        'x1': min(self.bbox_start.x(), self.bbox_end.x()) / self.pixmap().width(),
-                        'y1': min(self.bbox_start.y(), self.bbox_end.y()) / self.pixmap().height(),
-                        'x2': max(self.bbox_start.x(), self.bbox_end.x()) / self.pixmap().width(),
-                        'y2': max(self.bbox_start.y(), self.bbox_end.y()) / self.pixmap().height(),
-                        'class': class_name
-                    }
-                    self.main_window.add_bbox_annotation(bbox)
-            
-            self.is_drawing_bbox = False
-            self.bbox_start = None
-            self.bbox_end = None
-            # 通常のカーソルに戻す
-            self.setCursor(Qt.ArrowCursor)
-            self.update()
-        
-        elif self.is_resizing_bbox:
-            # サイズ変更が完了したのでフラグをリセット
-            self.is_resizing_bbox = False
-            self.resize_handle = None
-            self.resize_start_pos = None
-            
-            # サイズ変更完了メッセージ表示
-            if self.selected_bbox_index is not None:
-                current_img_path = self.main_window.images[self.main_window.current_index]
-                if current_img_path in self.main_window.bbox_annotations:
-                    bboxes = self.main_window.bbox_annotations[current_img_path]
-                    if 0 <= self.selected_bbox_index < len(bboxes):
-                        bbox = bboxes[self.selected_bbox_index]
-                        class_name = bbox.get('class', 'unknown')
-                        # ステータスバーにサイズ変更完了メッセージを表示
-                        if hasattr(self.main_window, 'statusBar'):
-                            x1 = bbox['x1']
-                            y1 = bbox['y1']
-                            x2 = bbox['x2']
-                            y2 = bbox['y2']
-                            width = x2 - x1
-                            height = y2 - y1
-                            self.main_window.statusBar().showMessage(
-                                f"'{class_name}' バウンディングボックスのサイズを変更しました "
-                                f"[位置: ({x1:.2f}, {y1:.2f}), サイズ: {width:.2f}x{height:.2f}]", 
-                                3000
-                            )
-            
-            # 通常のカーソルに戻す
-            self.setCursor(Qt.ArrowCursor)
-            self.update()
-
+    #　paintEventはリファクタリング済 ~
     def paintEvent(self, event):
         super().paintEvent(event)
         
@@ -270,107 +149,84 @@ class ImageLabel(QLabel):
 
         painter = QPainter(self)
         
+        self.draw_initial_frame(painter)
+
+        # 各機能毎に描画
+        self.draw_grid(painter, self.target_rect)
+        self.draw_background_frame(painter, self.target_rect)
+        self.draw_control_points(painter, self.target_rect)
+        self.draw_bbox(self.pix_width, self.pix_height, painter, self.target_rect)
+        self.draw_segmentation(self.pix_width, self.pix_height, painter, self.target_rect)
+
+        painter.end()
+
+    def draw_initial_frame(self, painter):
         # 元の画像のサイズ
-        pix_width = self.pixmap().width()
-        pix_height = self.pixmap().height()
+        self.pix_width = self.pixmap().width()
+        self.pix_height = self.pixmap().height()
         
         # ズーム係数を使用して拡大後のサイズを計算
-        scaled_width = int(pix_width * self.zoom_factor)
-        scaled_height = int(pix_height * self.zoom_factor)
+        self.scaled_width = int(self.pix_width * self.zoom_factor)
+        self.scaled_height = int(self.pix_height * self.zoom_factor)
         
         # 中央に配置するための座標計算
-        x = (self.width() - scaled_width) // 2
-        y = (self.height() - scaled_height) // 2
-        
-        # 削除済みの場合は赤い枠を表示
+        self.x = (self.width() - self.scaled_width) // 2
+        self.y = (self.height() - self.scaled_height) // 2
+
+        # 画像を拡大して描画
+        self.target_rect = QRect(self.x, self.y, self.scaled_width, self.scaled_height)
+        painter.drawPixmap(self.target_rect, self.pixmap())
+
+    def draw_background_frame(self, painter, target_rect):
+        """削除状態や位置番号などの背景フレームを描画する"""
+        scaled_width = target_rect.width()
+        scaled_height = target_rect.height()
+        x = target_rect.x()
+        y = target_rect.y()
+
         if self.is_deleted:
             painter.setPen(QPen(QColor(255, 85, 85), 6))  # 赤い枠線
             border_rect = QRect(x-6, y-6, scaled_width+12, scaled_height+12)
             painter.drawRect(border_rect)
-            
-            # 削除済みバッジを表示
+
             badge_rect = QRect(x - 100, y, 80, 40)
             painter.fillRect(badge_rect, QColor(255, 85, 85))
             painter.setPen(QPen(Qt.white, 2))
             painter.setFont(QFont("Arial", 12, QFont.Bold))
             painter.drawText(badge_rect, Qt.AlignCenter, "削除済み")
-        # 画像の位置情報があれば、その色で枠を描画
+
+            # 削除済みの場合は半透明の赤オーバーレイを表示
+            painter.setOpacity(0.25)  # 75%透明
+            painter.fillRect(target_rect, QColor(255, 0, 0))
+            
+            # 中央に削除済みテキストを表示
+            painter.setOpacity(1.0)  # 不透明に戻す
+            painter.setPen(QPen(Qt.white, 2))
+            painter.setFont(QFont("Arial", 24, QFont.Bold))
+            
+            painter.drawText(
+                target_rect, 
+                Qt.AlignCenter, 
+                "削除済み\nクリックで再アノテーション"
+            )
+
         elif self.main_window and hasattr(self.main_window, 'current_location') and self.main_window.current_location is not None:
             loc_value = self.main_window.current_location
             loc_color = get_location_color(loc_value)
-            
-            # 太い枠線を描画
+
             painter.setPen(QPen(loc_color, 6))
             border_rect = QRect(x-3, y-3, scaled_width+6, scaled_height+6)
             painter.drawRect(border_rect)
-            
-            # 位置番号を左側に表示する枠を描画
+
             badge_size = 40
             badge_rect = QRect(x - badge_size - 10, y, badge_size, badge_size)
             painter.fillRect(badge_rect, loc_color)
             painter.setPen(QPen(Qt.white, 2))
             painter.setFont(QFont("Arial", 16, QFont.Bold))
             painter.drawText(badge_rect, Qt.AlignCenter, str(loc_value))
-        
-        # 画像を拡大して描画
-        target_rect = QRect(x, y, scaled_width, scaled_height)
-        painter.drawPixmap(target_rect, self.pixmap())
-        
-        # グリッド表示
-        if self.show_grid:
-            painter.setPen(QPen(QColor(100, 100, 100, 100), 1))  # 半透明グレー
-            
-            # 横線（X座標のグリッド）
-            step_x = target_rect.width() / self.grid_size
-            for i in range(1, self.grid_size):
-                x_pos = target_rect.x() + i * step_x
-                painter.drawLine(int(x_pos), target_rect.y(), int(x_pos), target_rect.y() + target_rect.height())
-                
-            # 縦線（Y座標のグリッド）
-            step_y = target_rect.height() / self.grid_size
-            for i in range(1, self.grid_size):
-                y_pos = target_rect.y() + i * step_y
-                painter.drawLine(target_rect.x(), int(y_pos), target_rect.x() + target_rect.width(), int(y_pos))
-            
-            # 中央の十字線（より目立たせる）
-            painter.setPen(QPen(QColor(200, 200, 200, 150), 2))
-            mid_x = target_rect.x() + target_rect.width() / 2
-            mid_y = target_rect.y() + target_rect.height() / 2
-            painter.drawLine(int(mid_x), target_rect.y(), int(mid_x), target_rect.y() + target_rect.height())
-            painter.drawLine(target_rect.x(), int(mid_y), target_rect.x() + target_rect.width(), int(mid_y))
 
-            # 目盛り表示
-            painter.setFont(QFont("Arial", 10))
-            painter.setPen(QPen(QColor(80, 80, 80, 200), 1))
-            painter.drawText(target_rect.x() - 25, target_rect.y() - 5, "-1")  # 左端 (-1)
-            painter.drawText(target_rect.x() + target_rect.width() + 5, target_rect.y() - 5, "1")  # 右端 (1)
-            
-            # 中間の目盛り (X軸)
-            for i in range(1, self.grid_size):
-                value = -1 + (2.0 * i / self.grid_size)
-                x_pos = target_rect.x() + i * (target_rect.width() / self.grid_size)
-                # 0の場合は特別に表示
-                if abs(value) < 0.1:  # ほぼ0
-                    painter.drawText(int(x_pos) - 5, target_rect.y() - 5, "0")
-                elif i % 2 == 0:  # 偶数の目盛りのみ値を表示
-                    painter.drawText(int(x_pos) - 15, target_rect.y() - 5, f"{value:.1f}")
-            
-            # Y軸の目盛り表示（左側の垂直線）
-            painter.drawText(target_rect.x() - 35, target_rect.y() + 15, "-1")  # 上端 (-1)
-            painter.drawText(target_rect.x() - 35, target_rect.y() + target_rect.height(), "1")  # 下端 (1)
-            
-            # 中間の目盛り (Y軸)
-            for i in range(1, self.grid_size):
-                value = -1 + (2.0 * i / self.grid_size)
-                y_pos = target_rect.y() + i * (target_rect.height() / self.grid_size)
-                # 0の場合は特別に表示
-                if abs(value) < 0.1:  # ほぼ0
-                    painter.drawText(target_rect.x() - 35, int(y_pos) + 5, "0")
-                elif i % 2 == 0:  # 偶数の目盛りのみ値を表示
-                    painter.drawText(target_rect.x() - 35, int(y_pos) + 5, f"{value:.1f}")
-
-
-        # 常にバウンディングボックスを表示（モードに関わらず）
+    def draw_bbox(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
+        """バウンディングボックスの描画と編集"""
         if self.main_window and hasattr(self.main_window, 'bbox_annotations'):
             current_img_path = self.main_window.images[self.main_window.current_index]
             if current_img_path in self.main_window.bbox_annotations:
@@ -379,14 +235,8 @@ class ImageLabel(QLabel):
                 for i, bbox in enumerate(bboxes):
                     # クラスに応じた色を設定
                     class_name = bbox.get('class', 'unknown')
-                    class_colors = {
-                        'car': QColor(255, 0, 0, 180),     # 赤
-                        'person': QColor(0, 255, 0, 180),  # 緑
-                        'sign': QColor(0, 0, 255, 180),    # 青
-                        'cone': QColor(255, 255, 0, 180),  # 黄
-                        'unknown': QColor(128, 128, 128, 180) # グレー
-                    }
-                    color = class_colors.get(class_name, QColor(255, 0, 0, 180))
+                    class_colors = CLASS_COLORS
+                    color = QColor(*class_colors.get(class_name, (255, 0, 0, 180)))
                     
                     # 選択またはホバーされているバウンディングボックスかどうかで線の太さを変更
                     is_selected = i == self.selected_bbox_index
@@ -466,101 +316,189 @@ class ImageLabel(QLabel):
                     abs(end_x - start_x),
                     abs(end_y - start_y)
                 ))
+
+        # 推論結果のバウンディングボックスを表示
+        if (self.main_window and 
+            hasattr(self.main_window, 'show_detection_inference') and 
+            self.main_window.show_detection_inference and
+            hasattr(self.main_window, 'detection_inference_results')):
             
-            # アノテーションポイントの描画（運転制御アノテーション）
-            if self.annotation_point:
-                rel_x = self.annotation_point.x() / self.pixmap().width()
-                rel_y = self.annotation_point.y() / self.pixmap().height()
+            current_img_path = self.main_window.images[self.main_window.current_index]
+            if current_img_path in self.main_window.detection_inference_results:
+                inference_bboxes = self.main_window.detection_inference_results[current_img_path]
                 
-                scaled_x = int(target_rect.x() + rel_x * target_rect.width())
-                scaled_y = int(target_rect.y() + rel_y * target_rect.height())
+                for i, bbox in enumerate(inference_bboxes):
+                    # クラスに応じた色を設定 (推論結果は別の透明度で表示)
+                    class_name = bbox.get('class', 'unknown')
+                    class_colors = SEGMENTATION_CLASS_COLORS
+                    color = QColor(*class_colors.get(class_name, (255, 0, 0, 120)))
+                    
+                    # 推論結果は点線で表示
+                    pen_width = 2
+                    pen_style = Qt.DashLine
+                    
+                    # 正規化された座標を画面座標に変換
+                    x1 = int(target_rect.x() + bbox['x1'] * target_rect.width())
+                    y1 = int(target_rect.y() + bbox['y1'] * target_rect.height())
+                    x2 = int(target_rect.x() + bbox['x2'] * target_rect.width())
+                    y2 = int(target_rect.y() + bbox['y2'] * target_rect.height())
+                    
+                    # バウンディングボックスを描画
+                    painter.setPen(QPen(color, pen_width, pen_style))
+                    painter.drawRect(QRect(x1, y1, x2-x1, y2-y1))
+                    
+                    # ラベルテキストを作成（信頼度情報がある場合は追加）
+                    label_text = f"推論:{class_name}"
+                    if 'confidence' in bbox:
+                        label_text += f" {bbox['confidence']:.2f}"
+                    
+                    # クラスラベルの背景を描画
+                    label_rect = QRect(x1, y1-20, len(label_text)*8+10, 20)
+                    painter.fillRect(label_rect, color)
+                    
+                    # クラス名を描画
+                    painter.setPen(QPen(Qt.white, 1))
+                    painter.setFont(QFont("Arial", 10, QFont.Bold))
+                    painter.drawText(label_rect, Qt.AlignCenter, label_text)
+
+    def draw_grid(self, painter: QPainter, target_rect: QRect):
+        """ズーム済み領域にグリッドと目盛りを描画"""
+        if not self.show_grid:
+            return
+
+        grid_size = self.grid_size
+        step_x = target_rect.width() / grid_size
+        step_y = target_rect.height() / grid_size
+
+        # グレーの薄い線で描画
+        painter.setPen(QPen(QColor(100, 100, 100, 100), 1))
+        for i in range(1, grid_size):
+            x_pos = target_rect.x() + i * step_x
+            y_pos = target_rect.y() + i * step_y
+            painter.drawLine(int(x_pos), target_rect.y(), int(x_pos), target_rect.y() + target_rect.height())
+            painter.drawLine(target_rect.x(), int(y_pos), target_rect.x() + target_rect.width(), int(y_pos))
+
+        # 中央線
+        painter.setPen(QPen(QColor(200, 200, 200, 150), 2))
+        mid_x = target_rect.x() + target_rect.width() // 2
+        mid_y = target_rect.y() + target_rect.height() // 2
+        painter.drawLine(mid_x, target_rect.y(), mid_x, target_rect.y() + target_rect.height())
+        painter.drawLine(target_rect.x(), mid_y, target_rect.x() + target_rect.width(), mid_y)
+
+        # 目盛り表示
+        painter.setFont(QFont("Arial", 10))
+        painter.setPen(QPen(QColor(80, 80, 80, 200), 1))
+        painter.drawText(target_rect.x() - 25, target_rect.y() - 5, "-1")
+        painter.drawText(target_rect.x() + target_rect.width() + 5, target_rect.y() - 5, "1")
+
+        for i in range(1, grid_size):
+            value = -1 + (2.0 * i / grid_size)
+            x_pos = target_rect.x() + i * step_x
+            if abs(value) < 0.1:
+                painter.drawText(int(x_pos) - 5, target_rect.y() - 5, "0")
+            elif i % 2 == 0:
+                painter.drawText(int(x_pos) - 15, target_rect.y() - 5, f"{value:.1f}")
+
+        painter.drawText(target_rect.x() - 35, target_rect.y() + 15, "-1")
+        painter.drawText(target_rect.x() - 35, target_rect.y() + target_rect.height(), "1")
+
+        for i in range(1, grid_size):
+            value = -1 + (2.0 * i / grid_size)
+            y_pos = target_rect.y() + i * step_y
+            if abs(value) < 0.1:
+                painter.drawText(target_rect.x() - 35, int(y_pos) + 5, "0")
+            elif i % 2 == 0:
+                painter.drawText(target_rect.x() - 35, int(y_pos) + 5, f"{value:.1f}")
+
+    def draw_control_points(self, painter: QPainter, target_rect: QRect):
+        """アノテーション点、推論点、ベクトル矢印を描画"""
+        if not self.pixmap():
+            return
+
+        pix_width = self.pixmap().width()
+        pix_height = self.pixmap().height()
+
+        # 赤：アノテーション点（教師データ）
+        if self.annotation_point:
+            rel_x = self.annotation_point.x() / pix_width
+            rel_y = self.annotation_point.y() / pix_height
+            scaled_x = int(target_rect.x() + rel_x * target_rect.width())
+            scaled_y = int(target_rect.y() + rel_y * target_rect.height())
+
+            painter.setPen(QPen(QColor(255, 0, 0), 4))
+            painter.drawEllipse(scaled_x - 15, scaled_y - 15, 30, 30)
+
+        # 青：推論点（推論結果）
+        if self.show_inference and self.inference_point:
+            rel_x = self.inference_point.x() / pix_width
+            rel_y = self.inference_point.y() / pix_height
+            scaled_x = int(target_rect.x() + rel_x * target_rect.width())
+            scaled_y = int(target_rect.y() + rel_y * target_rect.height())
+
+            painter.setPen(QPen(QColor(0, 0, 255), 4))
+            painter.drawEllipse(scaled_x - 15, scaled_y - 15, 30, 30)
+
+            # 緑のベクトル：教師 → 推論
+            if (
+                self.annotation_point and
+                hasattr(self.main_window, 'inference_diff_vectors') and
+                hasattr(self.main_window, 'show_diff_vectors') and
+                self.main_window.show_diff_vectors
+            ):
+                current_index = self.main_window.current_index
+                if current_index in self.main_window.inference_diff_vectors:
+                    anno_rel_x = self.annotation_point.x() / pix_width
+                    anno_rel_y = self.annotation_point.y() / pix_height
+                    anno_scaled_x = int(target_rect.x() + anno_rel_x * target_rect.width())
+                    anno_scaled_y = int(target_rect.y() + anno_rel_y * target_rect.height())
+
+                    self.draw_vector_arrow(painter, anno_scaled_x, anno_scaled_y, scaled_x, scaled_y)
+
+    def draw_vector_arrow(self, painter, start_x, start_y, end_x, end_y):
+        """教師データから推論結果への矢印を描画する"""
+        # 矢印の色とスタイル設定
+        painter.setPen(QPen(QColor(0, 255, 0), 2))  # 緑色
+        painter.setBrush(QBrush(QColor(0, 255, 0)))
+
+        # 矢印の線を描画
+        painter.drawLine(start_x, start_y, end_x, end_y)
+
+        # 矢印の線を描画
+        painter.drawLine(start_x, start_y, end_x, end_y)
                 
-                # 赤い円の描画 - より大きく太く
-                painter.setPen(QPen(QColor(255, 0, 0), 4))  # 太さを4に増加
-                circle_size = 15  # 円のサイズを大きく(元は10)
-                painter.drawEllipse(scaled_x - circle_size, scaled_y - circle_size, circle_size*2, circle_size*2)
+        # ベクトルの角度を計算
+        dx = end_x - start_x
+        dy = end_y - start_y
+        
+        # 矢印が短すぎる場合は描画しない
+        vector_length = math.sqrt(dx*dx + dy*dy)
+        if vector_length < 5:
+            return
             
-            # 推論ポイントの描画
-            if self.show_inference and self.inference_point:
-                rel_x = self.inference_point.x() / self.pixmap().width()
-                rel_y = self.inference_point.y() / self.pixmap().height()
-                
-                scaled_x = int(target_rect.x() + rel_x * target_rect.width())
-                scaled_y = int(target_rect.y() + rel_y * target_rect.height())
-                
-                # 青い円の描画 - より大きく太く
-                painter.setPen(QPen(QColor(0, 0, 255), 4))  # 太さを4に増加
-                circle_size = 15  # 円のサイズを大きく(元は10)
-                painter.drawEllipse(scaled_x - circle_size, scaled_y - circle_size, circle_size*2, circle_size*2)
+        angle = math.atan2(dy, dx)
+        
+        # 矢印の先端のサイズ
+        arrow_length = 10
+        arrow_angle = math.pi / 6  # 30度
+        
+        # 矢印の先端の座標を計算
+        arrow_x1 = end_x - arrow_length * math.cos(angle - arrow_angle)
+        arrow_y1 = end_y - arrow_length * math.sin(angle - arrow_angle)
+        arrow_x2 = end_x - arrow_length * math.cos(angle + arrow_angle)
+        arrow_y2 = end_y - arrow_length * math.sin(angle + arrow_angle)
+        
+        # 矢印の先端を描画
+        arrow_points = [
+            QPoint(int(end_x), int(end_y)),
+            QPoint(int(arrow_x1), int(arrow_y1)),
+            QPoint(int(arrow_x2), int(arrow_y2))
+        ]
+        
+        arrow_polygon = QPolygon(arrow_points)
+        painter.drawPolygon(arrow_polygon)
 
-                # 追加: 教師データから推論結果への差分ベクトル矢印を描画
-                if (self.annotation_point and 
-                    hasattr(self.main_window, 'inference_diff_vectors') and 
-                    hasattr(self.main_window, 'show_diff_vectors') and 
-                    self.main_window.show_diff_vectors):  # チェックボックスの状態を確認
-                    
-                    current_index = self.main_window.current_index
-                                        
-                    if current_index in self.main_window.inference_diff_vectors:
-                        # 教師データの座標（スケール済み）
-                        anno_rel_x = self.annotation_point.x() / self.pixmap().width()
-                        anno_rel_y = self.annotation_point.y() / self.pixmap().height()
-                        anno_scaled_x = int(target_rect.x() + anno_rel_x * target_rect.width())
-                        anno_scaled_y = int(target_rect.y() + anno_rel_y * target_rect.height())
-                                                
-                        # 矢印を描画（教師データから推論結果へ）
-                        self.draw_vector_arrow(painter, anno_scaled_x, anno_scaled_y, scaled_x, scaled_y)
-
-            if (self.main_window and 
-                hasattr(self.main_window, 'show_detection_inference') and 
-                self.main_window.show_detection_inference and
-                hasattr(self.main_window, 'detection_inference_results')):
-                
-                current_img_path = self.main_window.images[self.main_window.current_index]
-                if current_img_path in self.main_window.detection_inference_results:
-                    inference_bboxes = self.main_window.detection_inference_results[current_img_path]
-                    
-                    for i, bbox in enumerate(inference_bboxes):
-                        # クラスに応じた色を設定 (推論結果は別の透明度で表示)
-                        class_name = bbox.get('class', 'unknown')
-                        class_colors = {
-                            'car': QColor(255, 0, 0, 120),     # 赤 (半透明)
-                            'person': QColor(0, 255, 0, 120),  # 緑 (半透明)
-                            'sign': QColor(0, 0, 255, 120),    # 青 (半透明)
-                            'cone': QColor(255, 255, 0, 120),  # 黄 (半透明)
-                            'unknown': QColor(128, 128, 128, 120) # グレー (半透明)
-                        }
-                        color = class_colors.get(class_name, QColor(255, 0, 0, 120))
-                        
-                        # 推論結果は点線で表示
-                        pen_width = 2
-                        pen_style = Qt.DashLine
-                        
-                        # 正規化された座標を画面座標に変換
-                        x1 = int(target_rect.x() + bbox['x1'] * target_rect.width())
-                        y1 = int(target_rect.y() + bbox['y1'] * target_rect.height())
-                        x2 = int(target_rect.x() + bbox['x2'] * target_rect.width())
-                        y2 = int(target_rect.y() + bbox['y2'] * target_rect.height())
-                        
-                        # バウンディングボックスを描画
-                        painter.setPen(QPen(color, pen_width, pen_style))
-                        painter.drawRect(QRect(x1, y1, x2-x1, y2-y1))
-                        
-                        # ラベルテキストを作成（信頼度情報がある場合は追加）
-                        label_text = f"推論:{class_name}"
-                        if 'confidence' in bbox:
-                            label_text += f" {bbox['confidence']:.2f}"
-                        
-                        # クラスラベルの背景を描画
-                        label_rect = QRect(x1, y1-20, len(label_text)*8+10, 20)
-                        painter.fillRect(label_rect, color)
-                        
-                        # クラス名を描画
-                        painter.setPen(QPen(Qt.white, 1))
-                        painter.setFont(QFont("Arial", 10, QFont.Bold))
-                        painter.drawText(label_rect, Qt.AlignCenter, label_text)
-
-        # セグメンテーションアノテーションの描画
+    def draw_segmentation(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
+        """セグメンテーションポリゴンの描画と編集"""
         if hasattr(self.main_window, 'segmentation_annotations'):
             current_img_path = self.main_window.images[self.main_window.current_index]
             if current_img_path in self.main_window.segmentation_annotations:
@@ -572,15 +510,10 @@ class ImageLabel(QLabel):
                     
                     if len(points) >= 3:
                         # クラスに応じた色を設定
-                        class_colors = {
-                            'car': QColor(255, 0, 0, 120),
-                            'person': QColor(0, 255, 0, 120),
-                            'sign': QColor(0, 0, 255, 120),
-                            'cone': QColor(255, 255, 0, 120),
-                            'unknown': QColor(128, 128, 128, 120)
-                        }
-                        base_color = class_colors.get(class_name, QColor(255, 0, 0, 120))
-                        
+                        class_colors = SEGMENTATION_CLASS_COLORS
+                        base_color = QColor(*class_colors.get(class_name, (255, 0, 0, 120)))
+
+
                         # 選択またはホバーされているセグメンテーションの強調表示
                         is_selected = i == self.selected_segmentation_index
                         is_hovered = i == self.hovering_segmentation_index
@@ -674,53 +607,24 @@ class ImageLabel(QLabel):
                 painter.setPen(QPen(QColor(255, 255, 0), 3))
                 painter.drawEllipse(screen_points[0].x() - 6, screen_points[0].y() - 6, 12, 12)
 
-        # 削除済みの場合は半透明の赤オーバーレイを表示
-        if self.is_deleted:
-            painter.setOpacity(0.25)  # 75%透明
-            painter.fillRect(target_rect, QColor(255, 0, 0))
-            
-            # 中央に削除済みテキストを表示
-            painter.setOpacity(1.0)  # 不透明に戻す
-            painter.setPen(QPen(Qt.white, 2))
-            painter.setFont(QFont("Arial", 24, QFont.Bold))
-            
-            painter.drawText(
-                target_rect, 
-                Qt.AlignCenter, 
-                "削除済み\nクリックで再アノテーション"
-            )
-        
-        painter.end()
+    # ~
 
     def mousePressEvent(self, event):
         if self.pixmap() and self.main_window:
             # クリック位置を取得
             pos = event.pos()
-            
-            # 元の画像のサイズ
-            pix_width = self.pixmap().width()
-            pix_height = self.pixmap().height()
-            
-            # ズーム係数を使用して拡大後のサイズを計算
-            scaled_width = int(pix_width * self.zoom_factor)
-            scaled_height = int(pix_height * self.zoom_factor)
-            
-            # 表示領域の計算
-            x = (self.width() - scaled_width) // 2
-            y = (self.height() - scaled_height) // 2
-            target_rect = QRect(x, y, scaled_width, scaled_height)
-            
+                        
             # クリック位置が画像内かチェック
-            if not target_rect.contains(pos):
+            if not self.target_rect.contains(pos):
                 return
             
             # 画像内の相対位置を計算
-            rel_x = (pos.x() - target_rect.x()) / target_rect.width()
-            rel_y = (pos.y() - target_rect.y()) / target_rect.height()
+            rel_x = (pos.x() - self.target_rect.x()) / self.target_rect.width()
+            rel_y = (pos.y() - self.target_rect.y()) / self.target_rect.height()
             
             # 元の画像の座標に変換
-            orig_x = int(rel_x * pix_width)
-            orig_y = int(rel_y * pix_height)
+            orig_x = int(rel_x * self.pix_width)
+            orig_y = int(rel_y * self.pix_height)
             
             # 現在のモードに基づいて処理
             ## 物体検知モード
@@ -735,10 +639,10 @@ class ImageLabel(QLabel):
                         bbox = bboxes[self.selected_bbox_index]
                         
                         # バウンディングボックスの座標を取得
-                        x1 = int(bbox['x1'] * pix_width)
-                        y1 = int(bbox['y1'] * pix_height)
-                        x2 = int(bbox['x2'] * pix_width)
-                        y2 = int(bbox['y2'] * pix_height)
+                        x1 = int(bbox['x1'] * self.pix_width)
+                        y1 = int(bbox['y1'] * self.pix_height)
+                        x2 = int(bbox['x2'] * self.pix_width)
+                        y2 = int(bbox['y2'] * self.pix_height)
                         
                         # ハンドルのサイズ
                         handle_size = 10  # ハンドルの検出範囲を大きくする
@@ -782,10 +686,10 @@ class ImageLabel(QLabel):
                     # 各バウンディングボックスについて、クリック位置が内部にあるかチェック
                     for i, bbox in enumerate(bboxes):
                         # バウンディングボックスの座標を計算
-                        x1 = int(bbox['x1'] * pix_width)
-                        y1 = int(bbox['y1'] * pix_height)
-                        x2 = int(bbox['x2'] * pix_width)
-                        y2 = int(bbox['y2'] * pix_height)
+                        x1 = int(bbox['x1'] * self.pix_width)
+                        y1 = int(bbox['y1'] * self.pix_height)
+                        x2 = int(bbox['x2'] * self.pix_width)
+                        y2 = int(bbox['y2'] * self.pix_height)
                         
                         # クリック位置がバウンディングボックス内にあるか
                         if x1 <= orig_x <= x2 and y1 <= orig_y <= y2:
@@ -803,12 +707,7 @@ class ImageLabel(QLabel):
                             self.selected_bbox_index = i
                             self.is_moving_bbox = True
                             self.move_start_pos = QPoint(orig_x, orig_y)
-                            
-                            # ステータスバーにメッセージ表示
-                            if hasattr(self.main_window, 'statusBar'):
-                                class_name = bbox.get('class', 'unknown')
-                                self.main_window.statusBar().showMessage(f"'{class_name}' バウンディングボックスを選択しました", 3000)
-                            
+                                                        
                             self.update() 
                             return
                     
@@ -855,7 +754,7 @@ class ImageLabel(QLabel):
                     
                     # 各セグメンテーションについて、クリック位置が内部にあるかチェック
                     for i, seg_data in enumerate(segmentations):
-                        if self.is_point_in_polygon(orig_x, orig_y, seg_data['points']):
+                        if is_point_in_polygon(orig_x, orig_y, seg_data['points']):
                             if event.button() == Qt.LeftButton:
                                 # 選択済みのセグメンテーションをクリックした場合
                                 if self.selected_segmentation_index == i:
@@ -871,12 +770,7 @@ class ImageLabel(QLabel):
                                 self.selected_segmentation_index = i
                                 self.is_moving_segmentation = True
                                 self.seg_move_start_pos = QPoint(orig_x, orig_y)
-                                
-                                # ステータスバーにメッセージ表示
-                                if hasattr(self.main_window, 'statusBar'):
-                                    class_name = seg_data.get('class', 'unknown')
-                                    self.main_window.statusBar().showMessage(f"'{class_name}' セグメンテーションを選択しました", 3000)
-                                
+                                                                
                                 self.update()
                                 return
                             elif event.button() == Qt.RightButton and self.selected_segmentation_index == i:
@@ -902,7 +796,13 @@ class ImageLabel(QLabel):
                             
                             if distance <= self.close_threshold:
                                 # ポリゴンを閉じる
-                                self.complete_segmentation_polygon()
+                                polygon_data = self.complete_segmentation_polygon()
+                                self.main_window.add_segmentation_annotation(polygon_data)
+    
+                                # 描画状態をリセット
+                                self.current_segmentation_polygon = []
+                                self.is_drawing_segmentation = False
+                                self.update()
                                 return
                         
                         self.current_segmentation_polygon.append(new_point)
@@ -910,7 +810,13 @@ class ImageLabel(QLabel):
                 elif event.button() == Qt.RightButton and self.is_drawing_segmentation:
                     # 右クリックでポリゴンを完了（3点以上必要）
                     if len(self.current_segmentation_polygon) >= 3:
-                        self.complete_segmentation_polygon()
+                        polygon_data = self.complete_segmentation_polygon()
+                        self.main_window.add_segmentation_annotation(polygon_data)
+
+                        # 描画状態をリセット
+                        self.current_segmentation_polygon = []
+                        self.is_drawing_segmentation = False
+                        self.update()
 
             else:
                 # 自動運転アノテーションモード
@@ -926,120 +832,78 @@ class ImageLabel(QLabel):
                 else:
                     self.main_window.skip_images(1)  # デフォルトは1枚
 
-    def leaveEvent(self, event):
-        """マウスがウィジェットから離れた時の処理"""
-        self.setCursor(Qt.ArrowCursor)  
-        self.hovering_bbox_index = None
-        
-        # セグメンテーション関連のホバー状態もクリア
-        self.hovering_segmentation_index = None
-        self.hovering_polygon_index = None
-        self.hovering_vertex_index = None
-        
-        self.update()  # 画面を更新してホバー効果を消す
-        super().leaveEvent(event)
-    
-    # def leaveEvent(self, event):
-    #     """マウスがウィジェットから離れた時の処理"""
-    #     self.setCursor(Qt.ArrowCursor)  
-    #     self.hovering_bbox_index = None
-    #     super().leaveEvent(event)
-
-    def draw_vector_arrow(self, painter, start_x, start_y, end_x, end_y):
-        """教師データから推論結果への矢印を描画する"""
-        # 矢印の色とスタイル設定
-        painter.setPen(QPen(QColor(0, 255, 0), 2))  # 緑色
-        painter.setBrush(QBrush(QColor(0, 255, 0)))
-
-        # 矢印の線を描画
-        painter.drawLine(start_x, start_y, end_x, end_y)
-
-        # 矢印の線を描画
-        painter.drawLine(start_x, start_y, end_x, end_y)
-                
-        # ベクトルの角度を計算
-        dx = end_x - start_x
-        dy = end_y - start_y
-        
-        # 矢印が短すぎる場合は描画しない
-        vector_length = math.sqrt(dx*dx + dy*dy)
-        if vector_length < 5:
+    def mouseReleaseEvent(self, event):
+        # 頂点移動完了処理を追加（既存のコードの前に追加）
+        if self.is_moving_vertex:
+            # 頂点移動が完了
+            self.is_moving_vertex = False
+            
+            # 選択状態は維持（頂点の選択は解除しない）
+            
+            # ステータスバーに完了メッセージ
+            if hasattr(self.main_window, 'statusBar') and self.selected_polygon_index is not None:
+                current_img_path = self.main_window.images[self.main_window.current_index]
+                if current_img_path in self.main_window.segmentation_annotations:
+                    segmentations = self.main_window.segmentation_annotations[current_img_path]
+                    if 0 <= self.selected_polygon_index < len(segmentations):
+                        class_name = segmentations[self.selected_polygon_index].get('class', 'unknown')
+                        self.main_window.statusBar().showMessage(
+                            f"'{class_name}' の頂点編集が完了しました", 3000
+                        )
+            
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
             return
-            
-        angle = math.atan2(dy, dx)
-        
-        # 矢印の先端のサイズ
-        arrow_length = 10
-        arrow_angle = math.pi / 6  # 30度
-        
-        # 矢印の先端の座標を計算
-        arrow_x1 = end_x - arrow_length * math.cos(angle - arrow_angle)
-        arrow_y1 = end_y - arrow_length * math.sin(angle - arrow_angle)
-        arrow_x2 = end_x - arrow_length * math.cos(angle + arrow_angle)
-        arrow_y2 = end_y - arrow_length * math.sin(angle + arrow_angle)
-        
-        # 矢印の先端を描画
-        arrow_points = [
-            QPoint(int(end_x), int(end_y)),
-            QPoint(int(arrow_x1), int(arrow_y1)),
-            QPoint(int(arrow_x2), int(arrow_y2))
-        ]
-        
-        arrow_polygon = QPolygon(arrow_points)
-        painter.drawPolygon(arrow_polygon)
 
-    def check_bbox_hover(self, pos):
-        """マウス位置がバウンディングボックス上にあるかチェック"""
-        if not self.pixmap() or not hasattr(self.main_window, 'current_mode'):
-            return None
-        
-        # 物体検知モードでない場合は処理しない
-        if self.main_window.current_mode != 1:
-            return None
-        
-        # 元の画像のサイズ
-        pix_width = self.pixmap().width()
-        pix_height = self.pixmap().height()
-        
-        # ズーム係数を使用して拡大後のサイズを計算
-        scaled_width = int(pix_width * self.zoom_factor)
-        scaled_height = int(pix_height * self.zoom_factor)
-        
-        # 表示領域の計算
-        x = (self.width() - scaled_width) // 2
-        y = (self.height() - scaled_height) // 2
-        target_rect = QRect(x, y, scaled_width, scaled_height)
-        
-        # マウス位置が画像内かチェック
-        if not target_rect.contains(pos):
-            return None
-        
-        # 画像内の相対位置を計算
-        rel_x = (pos.x() - target_rect.x()) / target_rect.width()
-        rel_y = (pos.y() - target_rect.y()) / target_rect.height()
-        
-        # 元の画像の座標に変換
-        orig_x = int(rel_x * pix_width)
-        orig_y = int(rel_y * pix_height)
-        
-        # 現在の画像のバウンディングボックスをチェック
-        current_img_path = self.main_window.images[self.main_window.current_index]
-        if current_img_path in self.main_window.bbox_annotations:
-            bboxes = self.main_window.bbox_annotations[current_img_path]
+        # 既存のコードに追加
+        if self.is_moving_segmentation:
+            # セグメンテーション移動が完了
+            self.is_moving_segmentation = False
+            self.seg_move_start_pos = None
+                        
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+            return
+
+        if self.is_moving_bbox:
+            # 移動が完了したのでフラグをリセット
+            self.is_moving_bbox = False
+            self.move_start_pos = None
+                        
+            # 通常のカーソルに戻す
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+
+        elif self.is_drawing_bbox and self.pixmap() and self.bbox_start and self.bbox_end:
+            # バウンディングボックスの確定処理
+            if abs(self.bbox_end.x() - self.bbox_start.x()) > 10 and abs(self.bbox_end.y() - self.bbox_start.y()) > 10:
+                class_name = self.main_window.select_object_class()
+                if class_name:
+                    bbox = {
+                        'x1': min(self.bbox_start.x(), self.bbox_end.x()) / self.pixmap().width(),
+                        'y1': min(self.bbox_start.y(), self.bbox_end.y()) / self.pixmap().height(),
+                        'x2': max(self.bbox_start.x(), self.bbox_end.x()) / self.pixmap().width(),
+                        'y2': max(self.bbox_start.y(), self.bbox_end.y()) / self.pixmap().height(),
+                        'class': class_name
+                    }
+                    self.main_window.add_bbox_annotation(bbox)
             
-            # 各バウンディングボックスについて、マウス位置が内部にあるかチェック
-            for i, bbox in enumerate(bboxes):
-                # バウンディングボックスの座標を計算
-                x1 = int(bbox['x1'] * pix_width)
-                y1 = int(bbox['y1'] * pix_height)
-                x2 = int(bbox['x2'] * pix_width)
-                y2 = int(bbox['y2'] * pix_height)
-                
-                # マウス位置がバウンディングボックス内にあるか
-                if x1 <= orig_x <= x2 and y1 <= orig_y <= y2:
-                    return i
+            self.is_drawing_bbox = False
+            self.bbox_start = None
+            self.bbox_end = None
+            # 通常のカーソルに戻す
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
         
-        return None
+        elif self.is_resizing_bbox:
+            # サイズ変更が完了したのでフラグをリセット
+            self.is_resizing_bbox = False
+            self.resize_handle = None
+            self.resize_start_pos = None
+                        
+            # 通常のカーソルに戻す
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
 
     def mouseMoveEvent(self, event):
         """マウス移動時の処理 - ハンドルによるサイズ変更機能を追加"""
@@ -1370,6 +1234,60 @@ class ImageLabel(QLabel):
                 
                 self.update()
 
+    def leaveEvent(self, event):
+        """マウスがウィジェットから離れた時の処理"""
+        self.setCursor(Qt.ArrowCursor)  
+        self.hovering_bbox_index = None
+        
+        # セグメンテーション関連のホバー状態もクリア
+        self.hovering_segmentation_index = None
+        self.hovering_polygon_index = None
+        self.hovering_vertex_index = None
+        
+        self.update()  # 画面を更新してホバー効果を消す
+        super().leaveEvent(event)
+    
+    # 各種アノテーションに対するホバーは一旦変更しない
+    def check_bbox_hover(self, pos):
+        """マウス位置がバウンディングボックス上にあるかチェック"""
+        if not self.pixmap() or not hasattr(self.main_window, 'current_mode'):
+            return None
+        
+        # 物体検知モードでない場合は処理しない
+        if self.main_window.current_mode != 1:
+            return None
+        
+        # マウス位置が画像内かチェック
+        if not self.target_rect.contains(pos):
+            return None
+        
+        # 画像内の相対位置を計算
+        rel_x = (pos.x() - self.target_rect.x()) / self.target_rect.width()
+        rel_y = (pos.y() - self.target_rect.y()) / self.target_rect.height()
+        
+        # 元の画像の座標に変換
+        orig_x = int(rel_x * self.pix_width)
+        orig_y = int(rel_y * self.pix_height)
+        
+        # 現在の画像のバウンディングボックスをチェック
+        current_img_path = self.main_window.images[self.main_window.current_index]
+        if current_img_path in self.main_window.bbox_annotations:
+            bboxes = self.main_window.bbox_annotations[current_img_path]
+            
+            # 各バウンディングボックスについて、マウス位置が内部にあるかチェック
+            for i, bbox in enumerate(bboxes):
+                # バウンディングボックスの座標を計算
+                x1 = int(bbox['x1'] * self.pix_width)
+                y1 = int(bbox['y1'] * self.pix_height)
+                x2 = int(bbox['x2'] * self.pix_width)
+                y2 = int(bbox['y2'] * self.pix_height)
+                
+                # マウス位置がバウンディングボックス内にあるか
+                if x1 <= orig_x <= x2 and y1 <= orig_y <= y2:
+                    return i
+        
+        return None
+
     def check_vertex_hover(self, x, y):
         """指定された座標が既存のセグメンテーションの頂点上にホバーしているかチェック"""
         if not hasattr(self.main_window, 'segmentation_annotations'):
@@ -1406,33 +1324,20 @@ class ImageLabel(QLabel):
         # 物体検知モードでない場合は処理しない
         if self.main_window.current_mode != 1:
             return
-        
-        # 元の画像のサイズ
-        pix_width = self.pixmap().width()
-        pix_height = self.pixmap().height()
-        
-        # ズーム係数を使用して拡大後のサイズを計算
-        scaled_width = int(pix_width * self.zoom_factor)
-        scaled_height = int(pix_height * self.zoom_factor)
-        
-        # 表示領域の計算
-        x = (self.width() - scaled_width) // 2
-        y = (self.height() - scaled_height) // 2
-        target_rect = QRect(x, y, scaled_width, scaled_height)
-        
+                
         # マウス位置が画像内かチェック
-        if not target_rect.contains(pos):
+        if not self.target_rect.contains(pos):
             self.setCursor(Qt.ArrowCursor)
             self.hovering_bbox_index = None
             return
         
         # 画像内の相対位置を計算
-        rel_x = (pos.x() - target_rect.x()) / target_rect.width()
-        rel_y = (pos.y() - target_rect.y()) / target_rect.height()
+        rel_x = (pos.x() - self.target_rect.x()) / self.target_rect.width()
+        rel_y = (pos.y() - self.target_rect.y()) / self.target_rect.height()
         
         # 元の画像の座標に変換
-        orig_x = int(rel_x * pix_width)
-        orig_y = int(rel_y * pix_height)
+        orig_x = int(rel_x * self.pix_width)
+        orig_y = int(rel_y * self.pix_height)
         
         # 選択されたバウンディングボックスがある場合、ハンドルのチェック
         if self.selected_bbox_index is not None:
@@ -1443,10 +1348,10 @@ class ImageLabel(QLabel):
                     bbox = bboxes[self.selected_bbox_index]
                     
                     # バウンディングボックスの座標を取得
-                    x1 = int(bbox['x1'] * pix_width)
-                    y1 = int(bbox['y1'] * pix_height)
-                    x2 = int(bbox['x2'] * pix_width)
-                    y2 = int(bbox['y2'] * pix_height)
+                    x1 = int(bbox['x1'] * self.pix_width)
+                    y1 = int(bbox['y1'] * self.pix_height)
+                    x2 = int(bbox['x2'] * self.pix_width)
+                    y2 = int(bbox['y2'] * self.pix_height)
                     
                     # ハンドルのサイズ
                     handle_size = 10  # ハンドルの検出範囲
@@ -1480,10 +1385,10 @@ class ImageLabel(QLabel):
             # 各バウンディングボックスについて、マウス位置が内部にあるかチェック
             for i, bbox in enumerate(bboxes):
                 # バウンディングボックスの座標を計算
-                x1 = int(bbox['x1'] * pix_width)
-                y1 = int(bbox['y1'] * pix_height)
-                x2 = int(bbox['x2'] * pix_width)
-                y2 = int(bbox['y2'] * pix_height)
+                x1 = int(bbox['x1'] * self.pix_width)
+                y1 = int(bbox['y1'] * self.pix_height)
+                x2 = int(bbox['x2'] * self.pix_width)
+                y2 = int(bbox['y2'] * self.pix_height)
                 
                 # マウス位置がバウンディングボックス内にあるか
                 if x1 <= orig_x <= x2 and y1 <= orig_y <= y2:
@@ -1513,34 +1418,7 @@ class ImageLabel(QLabel):
                     'class': class_name,
                     'points': [(p.x(), p.y()) for p in self.current_segmentation_polygon]
                 }
-                self.main_window.add_segmentation_annotation(polygon_data)
-        
-        # 描画状態をリセット
-        self.current_segmentation_polygon = []
-        self.is_drawing_segmentation = False
-        self.update()
-
-    def is_point_in_polygon(self, x, y, polygon_points):
-        """点がポリゴン内にあるかを判定（Ray casting algorithm）"""
-        if len(polygon_points) < 3:
-            return False
-        
-        n = len(polygon_points)
-        inside = False
-        
-        p1x, p1y = polygon_points[0]
-        for i in range(1, n + 1):
-            p2x, p2y = polygon_points[i % n]
-            if y > min(p1y, p2y):
-                if y <= max(p1y, p2y):
-                    if x <= max(p1x, p2x):
-                        if p1y != p2y:
-                            xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
-                        if p1x == p2x or x <= xinters:
-                            inside = not inside
-            p1x, p1y = p2x, p2y
-        
-        return inside
+        return polygon_data
 
     def check_segmentation_hover(self, pos):
         """マウス位置がセグメンテーション上にあるかチェック"""
@@ -1549,24 +1427,14 @@ class ImageLabel(QLabel):
         
         if self.main_window.current_mode != 2:
             return None
-        
-        # 座標変換
-        pix_width = self.pixmap().width()
-        pix_height = self.pixmap().height()
-        scaled_width = int(pix_width * self.zoom_factor)
-        scaled_height = int(pix_height * self.zoom_factor)
-        
-        x = (self.width() - scaled_width) // 2
-        y = (self.height() - scaled_height) // 2
-        target_rect = QRect(x, y, scaled_width, scaled_height)
-        
-        if not target_rect.contains(pos):
+                
+        if not self.target_rect.contains(pos):
             return None
         
-        rel_x = (pos.x() - target_rect.x()) / target_rect.width()
-        rel_y = (pos.y() - target_rect.y()) / target_rect.height()
-        orig_x = int(rel_x * pix_width)
-        orig_y = int(rel_y * pix_height)
+        rel_x = (pos.x() - self.target_rect.x()) / self.target_rect.width()
+        rel_y = (pos.y() - self.target_rect.y()) / self.target_rect.height()
+        orig_x = int(rel_x * self.pix_width)
+        orig_y = int(rel_y * self.pix_height)
         
         # 現在の画像のセグメンテーションをチェック
         current_img_path = self.main_window.images[self.main_window.current_index]
@@ -1574,33 +1442,8 @@ class ImageLabel(QLabel):
             segmentations = self.main_window.segmentation_annotations[current_img_path]
             
             for i, seg_data in enumerate(segmentations):
-                if self.is_point_in_polygon(orig_x, orig_y, seg_data['points']):
+                if is_point_in_polygon(orig_x, orig_y, seg_data['points']):
                     return i
-        
-        return None
-
-    def check_vertex_click(self, x, y):
-        """指定された座標が既存のセグメンテーションの頂点上にあるかチェック"""
-        if not hasattr(self.main_window, 'segmentation_annotations'):
-            return None
-        
-        current_img_path = self.main_window.images[self.main_window.current_index]
-        if current_img_path not in self.main_window.segmentation_annotations:
-            return None
-        
-        segmentations = self.main_window.segmentation_annotations[current_img_path]
-        
-        # 各セグメンテーションの各頂点をチェック
-        for polygon_index, seg_data in enumerate(segmentations):
-            points = seg_data.get('points', [])
-            
-            for vertex_index, (px, py) in enumerate(points):
-                # 頂点との距離を計算
-                distance = ((x - px) ** 2 + (y - py) ** 2) ** 0.5
-                
-                # 頂点の半径内にクリックがある場合
-                if distance <= self.vertex_radius:
-                    return (polygon_index, vertex_index)
         
         return None
 
@@ -1757,10 +1600,7 @@ class ThumbnailWidget(QWidget):
         
         # 画像パネルをメインレイアウトに追加
         self.layout.addWidget(image_panel)
-        
-        # 画像を読み込む
-        self.load_image(img_path)
-        
+                
         # ウィジェット全体の枠線はなし
         self.setStyleSheet("border: none;")
 
@@ -1768,16 +1608,15 @@ class ThumbnailWidget(QWidget):
         # クリック時にon_click関数を呼び出す
         if self.on_click and event.button() == Qt.LeftButton:
             self.on_click(self.index)
-
-    #TODO:enhanced_annotations.pyと統合
-    def load_image(self, img_path):
-        pass
     
 # データ操作全体系
 class ImageAnnotationTool(QMainWindow):
     def __init__(self):
         super().__init__()
         
+        from managers import AnnotationDataManager
+        self.data_manager = AnnotationDataManager()
+
         # Initialize state
         self.folder_path = ""
         self.folder_paths = []       
@@ -1788,11 +1627,6 @@ class ImageAnnotationTool(QMainWindow):
         self.annotations = {}
         self.annotation_history = []
         self.annotated_count = 0
-
-        # # 動画メタデータ管理の初期化を追加
-        # self.video_metadata_file = os.path.join(APP_DIR_PATH, "video_metadata.json")
-        # self.video_metadata = self.load_video_metadata()
-        # self._model_loaded_at = None  # モデル読み込み時刻記録用
 
         # 現在のアノテーションモード（0=自動運転、1=物体検知）
         self.current_mode = 0
@@ -1841,7 +1675,6 @@ class ImageAnnotationTool(QMainWindow):
         self.init_ui()
 
         # Update UI
-        self.update_stats()
         self.display_current_image()
         self.update_gallery()
         self.update_slider_deleted_indexes()
@@ -1855,7 +1688,7 @@ class ImageAnnotationTool(QMainWindow):
 
     def init_ui(self):
         self.setWindowTitle("画像アノテーションツール")
-        self.setGeometry(100, 100, 1600, 900)
+        self.setGeometry(MAIN_WINDOW_X, MAIN_WINDOW_Y, MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT)
 
         # Main widget and layout
         central_widget = QWidget()
@@ -1865,7 +1698,7 @@ class ImageAnnotationTool(QMainWindow):
         # Left panel for controls
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
-        left_panel.setMaximumWidth(300)
+        left_panel.setMaximumWidth(LEFT_PANEL_MAX_WIDTH)
         main_layout.addWidget(left_panel)
 
         # Folder selection
@@ -1949,24 +1782,12 @@ class ImageAnnotationTool(QMainWindow):
         apply_style(yolo_btn, 'export')
         export_layout.addWidget(yolo_btn)
 
-        ###
-        # # YOLOフォーマット保存ボタンを追加
-        # yolo_btn = QPushButton("YOLO")
-        # yolo_btn.clicked.connect(self.export_to_yolo)
-        # apply_style(yolo_btn, 'export')
-        # export_layout.addWidget(yolo_btn)
-
-        # seg_btn = QPushButton("セグ形式")
-        # seg_btn.clicked.connect(self.export_segmentation_to_yolo)
-        # export_layout.addWidget(seg_btn)
-
         left_layout.addLayout(export_layout)
 
         ## 動画作成ボタン
         create_video_button = QPushButton("アノテーション動画作成")
         create_video_button.clicked.connect(self.create_annotation_video)
         left_layout.addWidget(create_video_button)
-        
 
         # 自動運転コンテナ
         self.pilot_container = QWidget()
@@ -2073,7 +1894,6 @@ class ImageAnnotationTool(QMainWindow):
         ### 位置推論モデル追加
         self.add_location_model_section()
 
-
         # ラベル
         obj_detection_label = QLabel("物体検知モデル:")
         obj_detection_label.setStyleSheet("font-weight: bold")
@@ -2178,7 +1998,7 @@ class ImageAnnotationTool(QMainWindow):
         mlflow_layout = QVBoxLayout()
 
         mlflow_label = QLabel("モデル管理:")
-        mlflow_label.setStyleSheet("font-weight: bold;")  # 太文字にするスタイルを追加
+        mlflow_label.setStyleSheet("font-weight: bold;") 
         mlflow_layout.addWidget(mlflow_label)
 
         # MLflow比較ボタン
@@ -2412,39 +2232,6 @@ class ImageAnnotationTool(QMainWindow):
         location_layout = QVBoxLayout(location_panel)
         location_layout.setSpacing(5)
         
-        # テーマ切り替えエリア
-        theme_layout = QHBoxLayout()
-        theme_layout.setSpacing(5)
-
-        theme_label = QLabel("テーマ:")
-        theme_label.setStyleSheet("font-weight: bold;")
-        theme_layout.addWidget(theme_label)
-
-        # テーマ切り替えボタン
-        self.light_theme_button = QPushButton("ライト")
-        self.light_theme_button.setCheckable(True)
-        self.light_theme_button.setChecked(True)  # デフォルトはライトテーマ
-        self.light_theme_button.clicked.connect(lambda: self.toggle_theme("light"))
-        apply_style(self.light_theme_button, 'primary')  # スタイル適用
-        theme_layout.addWidget(self.light_theme_button)
-
-        self.dark_theme_button = QPushButton("ダーク")
-        self.dark_theme_button.setCheckable(True)
-        self.dark_theme_button.setChecked(False)
-        self.dark_theme_button.clicked.connect(lambda: self.toggle_theme("dark"))
-        apply_style(self.dark_theme_button, 'primary')  # スタイル適用
-        theme_layout.addWidget(self.dark_theme_button)
-
-        # グループ化してボタンを排他的にする
-        self.theme_button_group = QButtonGroup(self)
-        self.theme_button_group.addButton(self.light_theme_button)
-        self.theme_button_group.addButton(self.dark_theme_button)
-        self.theme_button_group.setExclusive(True)
-
-        # TODO:テーマやUI調整
-        # レイアウトに追加
-        # location_layout.addLayout(theme_layout)
-        
         mode_layout_label = QLabel("アノテーションモード:")
         mode_layout_label.setStyleSheet("font-weight: bold;")
         location_layout.addWidget(mode_layout_label)
@@ -2556,7 +2343,7 @@ class ImageAnnotationTool(QMainWindow):
         gallery_scroll = QScrollArea()
         gallery_scroll.setWidgetResizable(True)
         gallery_scroll.setWidget(self.gallery_widget)
-        gallery_scroll.setMinimumHeight(175)
+        gallery_scroll.setMinimumHeight(GALLERY_MIN_HEIGHT)
         right_layout.addWidget(gallery_scroll)
         
         # 位置情報ボタンを初期化（8個作成）
@@ -2577,11 +2364,8 @@ class ImageAnnotationTool(QMainWindow):
         self.auto_mode_button.setChecked(True)
         self.detection_mode_button.setChecked(False)
 
-        # 物体検知アノテーションの表示追加
-        try:
-            apply_enhanced_annotations_display(self)
-        except Exception as e:
-            print(f"物体検知アノテーション表示拡張の適用に失敗しました: {e}")
+        # TODO:enhanced_annotationsの組み込み
+        apply_enhanced_annotations_display(self)
 
     def update_ui(self):
             """アノテーション変更後のUI更新を一括処理"""
@@ -2908,26 +2692,6 @@ class ImageAnnotationTool(QMainWindow):
 
                 # 確認メッセージ
                 self.statusBar().showMessage(f"'{class_name}' のセグメンテーションを削除しました", 3000)
-
-    def add_segmentation_annotation(self, polygon_data):
-        """セグメンテーションアノテーションを追加（前回のセグメンテーション保存機能付き）"""
-        if not self.images:
-            return
-        
-        current_img_path = self.images[self.current_index]
-        
-        if current_img_path not in self.segmentation_annotations:
-            self.segmentation_annotations[current_img_path] = []
-        
-        self.segmentation_annotations[current_img_path].append(polygon_data)
-        
-        # 前回のセグメンテーションとして保存
-        self.last_segmentation = polygon_data.copy()
-        
-        # 現在のすべてのセグメンテーションを保存
-        self.last_segmentations = [seg.copy() for seg in self.segmentation_annotations[current_img_path]]
-        
-        self.update_ui()
         
     def toggle_auto_apply_segmentation(self, state):
         """前回のセグメンテーションを自動適用するかどうかを設定"""
@@ -2948,49 +2712,6 @@ class ImageAnnotationTool(QMainWindow):
             # 前回のセグメンテーションを適用
             self.add_segmentation_annotation(self.last_segmentation.copy())
             
-
-    # def calculate_and_store_diff_vector(self, img_path_or_index):
-    #     """教師データと推論結果の差分ベクトルを計算して保存する"""
-    #     # 教師データの取得
-    #     annotation = None
-    #     if isinstance(img_path_or_index, int) and img_path_or_index in self.annotations:
-    #         annotation = self.annotations[img_path_or_index]
-    #     elif isinstance(img_path_or_index, str) and img_path_or_index in self.annotations:
-    #         annotation = self.annotations[img_path_or_index]
-        
-    #     # 推論結果の取得
-    #     inference = None
-    #     if isinstance(img_path_or_index, int) and img_path_or_index in self.inference_results:
-    #         inference = self.inference_results[img_path_or_index]
-    #     elif isinstance(img_path_or_index, str) and img_path_or_index in self.inference_results:
-    #         inference = self.inference_results[img_path_or_index]
-        
-    #     if annotation and inference:
-    #         # 角度と速度の差分を計算
-    #         if "pilot/angle" in inference and "pilot/throttle" in inference:
-    #             angle_diff = inference["pilot/angle"] - annotation["angle"]
-    #             throttle_diff = inference["pilot/throttle"] - annotation["throttle"]
-    #         else:
-    #             angle_diff = inference["angle"] - annotation["angle"]
-    #             throttle_diff = inference["throttle"] - annotation["throttle"]
-            
-    #         # ベクトルの大きさと角度を計算
-    #         vector_magnitude = math.sqrt(angle_diff**2 + throttle_diff**2)
-    #         vector_angle = math.atan2(throttle_diff, angle_diff)
-            
-    #         # 画像パスまたはインデックスをキーとして差分ベクトルを保存
-    #         key = img_path_or_index
-    #         if isinstance(img_path_or_index, int) and hasattr(self, 'images') and 0 <= img_path_or_index < len(self.images):
-    #             key = self.images[img_path_or_index]
-            
-    #         self.inference_diff_vectors[key] = {
-    #             'angle_diff': angle_diff,
-    #             'throttle_diff': throttle_diff,
-    #             'vector_magnitude': vector_magnitude,
-    #             'vector_angle': vector_angle
-    #         }
-            
-    #         print(f"差分ベクトル計算完了: angle_diff={angle_diff:.4f}, throttle_diff={throttle_diff:.4f}, magnitude={vector_magnitude:.4f}")
     def calculate_and_store_diff_vector(self, index_or_path):
         """教師データと推論結果の差分ベクトルを計算して保存する"""
         # インデックスベースで処理
@@ -3663,7 +3384,6 @@ class ImageAnnotationTool(QMainWindow):
                 self.slider_value_label.setText("0/0")
             
             # UI更新
-            self.update_stats()
             self.display_current_image()
             self.update_gallery()   
             self.update_slider_deleted_indexes()
@@ -4010,10 +3730,6 @@ class ImageAnnotationTool(QMainWindow):
         self.main_image_view.update()
         self.update_gallery()
         
-        # メッセージ表示
-        class_name = polygon_data.get('class', 'unknown')
-        self.statusBar().showMessage(f"'{class_name}' のセグメンテーションを追加しました", 3000)
-
     def on_yolo_task_changed(self, task):
         """YOLOタスク変更時の処理"""
         is_segmentation = (task == "segment")
@@ -4026,7 +3742,6 @@ class ImageAnnotationTool(QMainWindow):
         
         # 物体検知関連UIの表示/非表示
         self.yolo_saved_model_combo.setVisible(not is_segmentation)
-        self.yolo_refresh_button.setVisible(not is_segmentation)
         self.yolo_load_button.setVisible(not is_segmentation)
         self.detection_inference_checkbox.setVisible(not is_segmentation)
         
@@ -5533,13 +5248,7 @@ class ImageAnnotationTool(QMainWindow):
             
             for class_name, count in class_counts.items():
                 # クラスに応じた色を設定
-                class_colors = {
-                    'car': "#FF0000",     # 赤
-                    'person': "#00FF00",  # 緑
-                    'sign': "#0000FF",    # 青
-                    'cone': "#FFFF00",    # 黄
-                    'unknown': "#808080"  # グレー
-                }
+                class_colors = DETECTION_INFERENCE_TEXT_COLORS
                 color = class_colors.get(class_name, "#FF0000")
                 
                 inference_text += f"<span style='color: {color}; font-weight: bold;'>● {class_name}</span>: {count}個<br>"
@@ -6259,10 +5968,6 @@ class ImageAnnotationTool(QMainWindow):
         # ギャラリーを更新
         self.update_gallery()
         
-        # メッセージ表示
-        class_name = bbox.get('class', 'unknown')
-        self.statusBar().showMessage(f"'{class_name}' のバウンディングボックスを追加しました", 3000)
-
     def add_session_check_to_init_ui(self):
         """init_uiメソッドの最後に追加する初期セッション確認コード"""
         # 保存されたセッション情報を読み込む
@@ -6404,7 +6109,6 @@ class ImageAnnotationTool(QMainWindow):
         self.deleted_indexes = sorted(list(set(self.deleted_indexes)))
                 
         # UI更新
-        self.update_stats()
         self.display_current_image()
         self.update_gallery()
         if hasattr(self, 'update_location_button_counts'):
@@ -6496,7 +6200,6 @@ class ImageAnnotationTool(QMainWindow):
         self.annotated_count = len(self.annotations)
         
         # UI更新
-        self.update_stats()
         self.display_current_image()
         self.update_gallery()
         self.update_location_button_counts()
@@ -6572,7 +6275,6 @@ class ImageAnnotationTool(QMainWindow):
                 return
             
             # Update UI
-            self.update_stats()
             self.display_current_image()
             self.update_gallery()
             self.update_slider_deleted_indexes()
@@ -6650,122 +6352,6 @@ class ImageAnnotationTool(QMainWindow):
         # モデル選択部分を更新
         if hasattr(self, 'model_combo'):
             self.refresh_model_list()    
-
-    # def run_inference_check(self, all_images=False):
-    #     """推論を実行するメソッド - モデル情報表示を強化、推論実行後に推論表示をオン"""
-    #     if not self.images:
-    #         return
-        
-    #     # 現在のモデル情報を取得
-    #     model_type = self.auto_method_combo.currentText()
-    #     selected_model = self.model_combo.currentText()
-        
-    #     # 推論対象の画像を決定
-    #     if all_images:
-    #         # 既存の推論結果がある場合は確認ダイアログを表示
-    #         if self.inference_results and len(self.inference_results) > 0:
-    #             reply = QMessageBox.question(
-    #                 self, 
-    #                 "推論結果の再計算確認", 
-    #                 f"現在、{len(self.inference_results)}個の推論結果が保存されています。\n"
-    #                 f"一括推論を実行すると、すべての推論結果が現在のモデル '{model_type} ({selected_model})' を使って再計算されます。\n\n"
-    #                 "続行しますか？",
-    #                 QMessageBox.Yes | QMessageBox.No,
-    #                 QMessageBox.Yes
-    #             )
-                
-    #             if reply == QMessageBox.No:
-    #                 return  # 操作をキャンセル
-            
-    #         target_images = self.images
-    #         progress_title = "全画像の推論を実行中..."
-    #     else:
-    #         target_images = [self.images[self.current_index]]
-    #         progress_title = "推論実行中..."
-        
-    #     # モデルのパスを取得 (コンボボックスから選択されたモデル)
-    #     model_path = None
-    #     if hasattr(self, 'model_combo') and self.model_combo.currentText() not in ["モデルが見つかりません", "フォルダを選択してください"] and "が見つかりません" not in self.model_combo.currentText():
-    #         # アノテーションフォルダ内のモデルのフルパスを作成
-    #         selected_model = self.model_combo.currentText()
-    #         # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
-    #         model_path = os.path.join(models_dir, selected_model)
-            
-    #         # モデルが存在するか確認
-    #         if not os.path.exists(model_path):
-    #             QMessageBox.warning(self, "警告", f"選択されたモデルが見つかりません: {selected_model}")
-    #             return
-        
-    #     # モデル変更を検出するための状態を保持
-    #     current_model_info = (model_type, model_path)
-    #     force_reload = False
-        
-    #     # モデルが変更された場合のみ強制再読み込み
-    #     if not hasattr(self, '_last_model_info') or self._last_model_info != current_model_info:
-    #         force_reload = True
-    #         self._last_model_info = current_model_info
-        
-    #     try:
-    #         # ステータスバーにメッセージ表示
-    #         model_desc = os.path.basename(model_path) if model_path else '事前学習済み'
-    #         self.statusBar().showMessage(f"推論処理中... モデル: {model_type} ({model_desc})")
-    #         QApplication.processEvents()
-
-    #         # 推論を実行
-    #         if model_type in list_available_models():
-    #             # モデルを使用した推論 - force_reloadはモデル変更時のみTrue
-    #             inference_results = batch_inference(
-    #                 target_images, 
-    #                 method="model", 
-    #                 model_type=model_type,
-    #                 model_path=model_path,
-    #                 force_reload=force_reload
-    #             )
-    #         else:
-    #             QMessageBox.warning(self, "警告", "サポートされていない推論方法です。")
-    #             return
-            
-    #         # 推論結果を保存
-    #         old_count = len(self.inference_results)
-    #         self.inference_results.update(inference_results)
-    #         new_count = len(self.inference_results)
-            
-    #         # 推論表示チェックボックスを自動的にオンにする
-    #         was_checked = self.inference_checkbox.isChecked()
-    #         self.inference_checkbox.setChecked(True)
-            
-    #         # 表示を更新
-    #         self.update_inference_display()
-    #         self.main_image_view.update()
-    #         self.update_gallery()
-
-    #         # ステータスバーのメッセージをクリア
-    #         self.statusBar().clearMessage()
-
-    #         # 全画像の推論の場合はメッセージ表示
-    #         if all_images:
-    #             added_results = new_count - old_count
-    #             updated_results = len(target_images) - added_results
-                
-    #             check_message = ""
-    #             if not was_checked:
-    #                 check_message = "\n\n推論結果表示が自動的にオンになりました。"
-                    
-    #             QMessageBox.information(
-    #                 self, 
-    #                 "推論完了", 
-    #                 f"{len(target_images)}枚の画像に対する推論を完了しました。\n"
-    #                 f"{added_results}個の新しい結果が追加され、{updated_results}個の結果が更新されました。\n\n"
-    #                 f"使用モデル: {model_type} ({model_desc}){check_message}"
-    #             )
-            
-    #     except Exception as e:
-    #         self.statusBar().clearMessage()
-    #         QMessageBox.critical(
-    #             self, 
-    #             "エラー", 
-    #             f"推論中にエラーが発生しました: {str(e)}"
-    #         )
     
     def run_inference_check(self, all_images=False):
         """推論を実行するメソッド - モデル情報表示を強化、推論実行後に推論表示をオン"""
@@ -7144,7 +6730,7 @@ class ImageAnnotationTool(QMainWindow):
                     location = result["loc"]
                 else:
                     # 位置情報がない場合、何らかのロジックで判断（例：角度から推定）
-                    location = self.estimate_location_from_angle(result.get("angle", 0))
+                    location = estimate_location_from_angle(result.get("angle", 0))
                 
                 # 位置情報付きの結果を保存
                 self.location_inference_results[img_path] = {
@@ -7251,7 +6837,6 @@ class ImageAnnotationTool(QMainWindow):
             # ImageLabelに推論ポイントを設定
             self.main_image_view.inference_point = QPoint(inference['x'], inference['y'])
         else:
-            print(f"推論結果が見つかりませんでした")
             # 推論結果がない場合はクリア
             self.inference_info_label.setText("")
             self.main_image_view.inference_point = None
@@ -7514,15 +7099,13 @@ class ImageAnnotationTool(QMainWindow):
             self.slider_value_label.setText("0/0")
         
         # Update UI
-        self.update_stats()
         self.display_current_image()
         self.update_gallery()
         self.update_slider_deleted_indexes()
         
         # モデルリストを更新
         self.refresh_model_list()
-        if use_yolo:
-            self.refresh_yolo_model_list()
+        self.refresh_yolo_model_list()
 
         # 位置ボタンのカウント表示を更新
         self.update_location_button_counts()
@@ -7637,7 +7220,6 @@ class ImageAnnotationTool(QMainWindow):
             
             if annotations_loaded:
                 # Update UI
-                self.update_stats()
                 self.display_current_image()
                 self.update_gallery()
                 self.update_distribution_graph()  # 追加：分布グラフを更新
@@ -7693,7 +7275,6 @@ class ImageAnnotationTool(QMainWindow):
             self.deleted_indexes = []
         
         # UI更新
-        self.update_stats()
         self.display_current_image()
         self.update_gallery()
         self.update_slider_deleted_indexes()
@@ -7842,7 +7423,6 @@ class ImageAnnotationTool(QMainWindow):
                 return
             
             # Update UI
-            self.update_stats()
             self.display_current_image()
             self.update_gallery()
             self.update_slider_deleted_indexes()
@@ -8339,9 +7919,6 @@ class ImageAnnotationTool(QMainWindow):
         self.new_location_input.setValue(location_value)
         self.add_location_button()
         return True
-
-    def update_stats(self):
-        self.stats_label.setText(f"アノテーション済み: {self.annotated_count} / {len(self.images)}")
     
     def display_current_image(self):
         pass
@@ -8381,7 +7958,7 @@ class ImageAnnotationTool(QMainWindow):
         display_indices = prev_indices + [current_idx] + next_indices
         
         # ギャラリーのグリッドレイアウトを調整
-        col_count = 5  # 一行あたりの列数
+        col_count = GALLERY_COL_COUNT 
         
         # ギャラリーにサムネイルを追加
         for i, idx in enumerate(display_indices):
@@ -8473,7 +8050,6 @@ class ImageAnnotationTool(QMainWindow):
             if current_img_path in self.bbox_annotations and self.bbox_annotations[current_img_path]:
                 # すべてのバウンディングボックスをリストとして保存
                 self.last_bboxes = [bbox.copy() for bbox in self.bbox_annotations[current_img_path]]
-                print(f"スキップ時にバウンディングボックス情報を更新: {len(self.last_bboxes)}個のボックス")
                 
                 # 互換性のため、最後のボックスも個別に保存
                 if self.last_bboxes:
@@ -8579,16 +8155,6 @@ class ImageAnnotationTool(QMainWindow):
         self.update_gallery()
         self.update_inference_display()
 
-    def get_normalized_coordinates(self, click_x, click_y, img_width, img_height):
-        """Convert pixel coordinates to normalized coordinates"""
-        # Convert x from pixels to -1 (left) to 1 (right)
-        angle = (click_x / img_width) * 2 - 1
-        
-        # Convert y from pixels to 1 (top) to -1 (bottom)
-        throttle = -((click_y / img_height) * 2 - 1)
-        
-        return angle, throttle
-    
     def handle_annotation(self, x, y):
         """画像のアノテーションを処理する - 削除済み画像への再アノテーションをサポート"""
         if not self.images:
@@ -8601,7 +8167,7 @@ class ImageAnnotationTool(QMainWindow):
         width, height = img.size
         
         # Get normalized coordinates
-        angle, throttle = self.get_normalized_coordinates(x, y, width, height)
+        angle, throttle = normalize_coordinates(x, y, width, height)
         
         # Store current state in history before changing
         if current_img_path in self.annotations:
@@ -8644,13 +8210,12 @@ class ImageAnnotationTool(QMainWindow):
         self.update_location_button_counts()
 
         # Update UI
-        self.update_stats()
+        ###
+        self.update_ui()
         self.display_current_image()
-        print("アノテーション実行")
         self.update_gallery()
         self.update_distribution_graph()
         self.update_slider_deleted_indexes()
-
 
     def restore_deleted_annotation(self):
         """現在表示中の削除済みの画像を復元する（削除状態を解除する）"""
@@ -9256,7 +8821,6 @@ class ImageAnnotationTool(QMainWindow):
             return not progress_dialog.wasCanceled()
         
         return update_progress
-
 
     def train_and_save_model(self):
         if not self.annotations:
@@ -10151,7 +9715,6 @@ class ImageAnnotationTool(QMainWindow):
                 progress.setLabelText("UI表示を更新中...")
                 progress.setValue(98)
                 QApplication.processEvents()
-                self.update_stats()
                 self.display_current_image()
                 self.update_gallery()
                 self.update_distribution_graph()
@@ -10276,7 +9839,7 @@ class ImageAnnotationTool(QMainWindow):
             # 画像を配置（最初はオリジナル）
             original_img = samples[0]
             original_label = QLabel()
-            original_pixmap = QPixmap.fromImage(self.pil_to_qimage(original_img))
+            original_pixmap = QPixmap.fromImage(pil_to_qimage(original_img))
             original_label.setPixmap(original_pixmap.scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation))
             original_label.setAlignment(Qt.AlignCenter)
             
@@ -10291,7 +9854,7 @@ class ImageAnnotationTool(QMainWindow):
             for i, sample in enumerate(samples[1:], 1):
                 img, description = sample
                 sample_label = QLabel()
-                sample_pixmap = QPixmap.fromImage(self.pil_to_qimage(img))
+                sample_pixmap = QPixmap.fromImage(pil_to_qimage(img))
                 sample_label.setPixmap(sample_pixmap.scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation))
                 sample_label.setAlignment(Qt.AlignCenter)
                 
@@ -10344,22 +9907,6 @@ class ImageAnnotationTool(QMainWindow):
             'erase_max_ratio': self.aug_erase_max_ratio.value()
         }
 
-    def pil_to_qimage(self, pil_image):
-        """PIL Imageをqtで使用可能なQImageに変換する"""
-        
-        # RGBに変換して確実にフォーマットを統一
-        if pil_image.mode != 'RGB':
-            pil_image = pil_image.convert('RGB')
-        
-        # NumPy配列に変換
-        img_array = np.array(pil_image)
-        
-        # QImageに変換（RGBフォーマット）
-        height, width, channels = img_array.shape
-        bytes_per_line = channels * width
-        
-        return QImage(img_array.data, width, height, bytes_per_line, QImage.Format_RGB888)
-
     def update_detection_info_panel(self):
         """物体検知推論結果の情報パネルを更新する"""
         if not self.images:
@@ -10383,13 +9930,7 @@ class ImageAnnotationTool(QMainWindow):
                 
                 for class_name, count in class_counts.items():
                     # クラスに応じた色を設定
-                    class_colors = {
-                        'car': "#FF0000",     # 赤
-                        'person': "#00FF00",  # 緑
-                        'sign': "#0000FF",    # 青
-                        'cone': "#FFFF00",    # 黄
-                        'unknown': "#808080"  # グレー
-                    }
+                    class_colors = DETECTION_INFERENCE_TEXT_COLORS
                     color = class_colors.get(class_name, "#FF0000")
                     
                     inference_text += f"<span style='color: {color}; font-weight: bold;'>● {class_name}</span>: {count}個<br>"
@@ -10414,23 +9955,6 @@ class ImageAnnotationTool(QMainWindow):
                 self.detection_inference_info_label.setText("")
         
         return False
-
-### location 系
-    def estimate_location_from_angle(self, angle):
-        """角度から位置情報を推定する（簡易的な実装）"""
-        # 角度の範囲に基づいて位置を推定
-        # 例: -1.0～1.0の範囲を8つの位置に分割
-        angle_range = 2.0  # -1.0～1.0
-        section_size = angle_range / 8
-        
-        # 角度を位置番号に変換（0～7）
-        normalized_angle = angle + 1.0  # 0～2.0に正規化
-        location = int(normalized_angle / section_size)
-        
-        # 範囲外の値を調整
-        location = max(0, min(location, 7))
-        
-        return location
 
     def init_location_buttons(self):
         """初期位置情報ボタンを設定する"""
@@ -10546,11 +10070,6 @@ class ImageAnnotationTool(QMainWindow):
         # モデル操作ボタン
         location_model_buttons_layout = QHBoxLayout()
         
-        # # モデルリスト更新ボタン
-        # self.location_refresh_button = QPushButton("モデル一覧更新")
-        # self.location_refresh_button.clicked.connect(self.refresh_location_model_list)
-        # location_model_buttons_layout.addWidget(self.location_refresh_button)
-
         # 位置モデル学習ボタン
         train_location_button = QPushButton("モデル学習・保存")
         train_location_button.clicked.connect(self.train_and_save_location_model)
@@ -10761,9 +10280,8 @@ class ImageAnnotationTool(QMainWindow):
             QMessageBox.warning(self, "警告", f"位置モデルを学習するには少なくとも2つの異なる位置ラベルが必要です。現在: {actual_classes}種類")
             return
         
-        #TODO:8クラス以下以上柔軟対応させるか検討
         # 常に8クラスを使用（実際のクラス数に関わらず）
-        num_classes = 8
+        num_classes = LOCATION_DEFAULT_NUM_CLASSES
         
         # 選択されたモデル
         model_type = self.location_model_combo.currentText()

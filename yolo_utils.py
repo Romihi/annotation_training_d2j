@@ -1,13 +1,10 @@
 # yolo_utils.py
 """YOLOv8を使用した物体検知のユーティリティ関数"""
 import os
-import json
 import time
 import numpy as np
 import torch
 from PIL import Image, ImageDraw
-import cv2
-from pathlib import Path
 from PyQt5.QtWidgets import (QLabel)
 from PyQt5.QtGui import QPainter, QPen, QColor, QBrush, QFont
 from PyQt5.QtCore import Qt, QRect
