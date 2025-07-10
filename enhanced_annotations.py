@@ -14,16 +14,18 @@ def update_annotation_info_label(self):
     if not self.images:
         return ""
         
-    current_img_path = self.images[self.current_index]
-    is_deleted = hasattr(self, 'deleted_indexes') and self.current_index in self.deleted_indexes
+    # インデックスベースに変更
+    current_index = self.current_index
+    is_deleted = hasattr(self, 'deleted_indexes') and current_index in self.deleted_indexes
     
     # 物体検知アノテーション情報
     bbox_info = ""
-    if current_img_path in self.bbox_annotations and self.bbox_annotations[current_img_path]:
-        bboxes = self.bbox_annotations[current_img_path]
+    # 修正: パスベース → インデックスベース
+    if (current_index in self.bbox_annotations and 
+        self.bbox_annotations[current_index]):
+        bboxes = self.bbox_annotations[current_index]
         bbox_info = f"<b>物体検知アノテーション:</b><br>"
         
-
         # 削除済みの場合は表示を追加
         if is_deleted:
             bbox_info = f"<span style='color: #FF5555;'>[削除済み]</span> " + bbox_info
@@ -60,16 +62,17 @@ def enhanced_display_current_image(self):
         return
     
     current_img_path = self.images[self.current_index]
-    is_deleted = hasattr(self, 'deleted_indexes') and self.current_index in self.deleted_indexes
+    current_index = self.current_index  # インデックスを明確に定義
+    is_deleted = hasattr(self, 'deleted_indexes') and current_index in self.deleted_indexes
 
     # スライダーの表示を更新
-    self.slider_value_label.setText(f"{self.current_index + 1}/{len(self.images)}")
+    self.slider_value_label.setText(f"{current_index + 1}/{len(self.images)}")
 
     # 画像情報表示の更新
     filename = os.path.basename(current_img_path)
     status_text = " [削除済み]" if is_deleted else ""
     self.current_image_info.setText(
-        f"画像 {self.current_index + 1} of {len(self.images)}:{status_text}\n{filename}"
+        f"画像 {current_index + 1} of {len(self.images)}:{status_text}\n{filename}"
     )
     
     # 削除済みの場合は赤字で表示
@@ -79,17 +82,14 @@ def enhanced_display_current_image(self):
         self.current_image_info.setStyleSheet("color: #333333; font-weight: bold;")
     
     # アノテーション情報の表示
-    # if self.current_index in self.annotations and not is_deleted:
-    if self.current_index in self.annotations:
-        anno = self.annotations[self.current_index]
+    if current_index in self.annotations:
+        anno = self.annotations[current_index]
         
         # 基本的なアノテーション情報
         annotation_text = f"<b>運転アノテーション情報:</b><br>"
         if is_deleted:
             annotation_text = f"<span style='color: #FF5555;'><b>削除済み</b></span><br>" + annotation_text
 
-        # 基本的なアノテーション情報
-        # annotation_text = f"<b>運転アノテーション情報:</b><br>"
         annotation_text += f"angle = <span style='color: #FF6666;'>{anno['angle']:.4f}</span><br>"
         annotation_text += f"throttle = <span style='color: #FF6666;'>{anno['throttle']:.4f}</span>"
         
@@ -111,10 +111,9 @@ def enhanced_display_current_image(self):
         # リッチテキストとして設定
         self.annotation_info_label.setText(annotation_text)
         self.annotation_info_label.setTextFormat(Qt.RichText)
-    # elif not is_deleted and current_img_path in self.bbox_annotations and self.bbox_annotations[current_img_path]:
-    #     # 自動運転アノテーションはないが、物体検知アノテーションはある場合
-    #     bbox_info = update_annotation_info_label(self)
-    elif current_img_path in self.bbox_annotations and self.bbox_annotations[current_img_path]:
+    # 修正: インデックスベースでバウンディングボックスをチェック
+    elif (current_index in self.bbox_annotations and 
+          self.bbox_annotations[current_index]):
         # 自動運転アノテーションはないが、物体検知アノテーションはある場合
         bbox_info = update_annotation_info_label(self)
         
@@ -143,14 +142,7 @@ def enhanced_display_current_image(self):
     # 位置情報専用の辞書を確認
     elif self.current_index in self.location_annotations:
         location_value = self.location_annotations[self.current_index]
-    # if not is_deleted:
-    #     # アノテーションの位置情報を確認
-    #     if self.current_index in self.annotations and 'loc' in self.annotations[self.current_index]:
-    #         location_value = self.annotations[self.current_index]['loc']
-    #     # 位置情報専用の辞書を確認
-    #     elif self.current_index in self.location_annotations:
-    #         location_value = self.location_annotations[self.current_index]
-    
+
     # 位置情報ラベルの更新
     if location_value is not None and not is_deleted:
         # 位置情報ラベルの更新（self.current_locationは更新しない）
@@ -622,13 +614,14 @@ def enhanced_update_gallery(self):
                 if annotation and 'loc' in annotation:
                     location_value = annotation['loc']
 
-            if img_path in self.bbox_annotations:
-                bbox_annotations = self.bbox_annotations[img_path]
+            # 修正: インデックスベースでバウンディングボックスを取得
+            if idx in self.bbox_annotations:
+                bbox_annotations = self.bbox_annotations[idx]
 
-            # セグメンテーションアノテーションを取得（新規追加）
-            if hasattr(self, 'segmentation_annotations') and img_path in self.segmentation_annotations:
-                segmentation_annotations = self.segmentation_annotations[img_path]
-  
+            # 修正: インデックスベースでセグメンテーションアノテーションを取得
+            if (hasattr(self, 'segmentation_annotations') and 
+                idx in self.segmentation_annotations):
+                segmentation_annotations = self.segmentation_annotations[idx]
 
             # 拡張サムネイルウィジェットを作成
             thumb = EnhancedThumbnailWidget(
@@ -653,7 +646,6 @@ def enhanced_update_gallery(self):
 def apply_enhanced_annotations_display(self):
     """物体検知アノテーション表示強化を適用する"""
     # 1. display_current_imageメソッドを置き換え
-    self._original_display_current_image = self.display_current_image
     self.display_current_image = lambda: enhanced_display_current_image(self)
     
     # 2. update_galleryメソッドを置き換え

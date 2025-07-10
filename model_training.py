@@ -15,6 +15,8 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from typing import Dict, List, Any, Optional, Tuple, Callable
 from datetime import datetime
+import traceback
+
 
 from model_catalog import get_model, AnnotationDataset
 
@@ -868,6 +870,188 @@ def plot_model_comparison(results):
     plt.savefig('model_efficiency_comparison.png')
     plt.close()
 
+class LocationModelManager:
+    def __init__(self, app_dir_path, models_dir_name):
+        self.APP_DIR_PATH = app_dir_path
+        self.MODELS_DIR_NAME = models_dir_name
+        self.model = None
+        self.model_type = None
+        self.model_path = None
+        self.num_classes = 8  # 固定で8クラス
+        
+    def get_model_list(self, model_type=None):
+        """利用可能な位置モデルのリストを取得 - モデルタイプでフィルタリング
+
+        Args:
+            model_type (str, optional): フィルタリングするモデルタイプ。指定しない場合はすべての位置モデルを返す。
+
+        Returns:
+            list: 位置モデルのファイル名リスト（モデルタイプでフィルタリング済み）
+        """
+        models_dir = os.path.join(self.APP_DIR_PATH, self.MODELS_DIR_NAME)
+        os.makedirs(models_dir, exist_ok=True)
+        
+        # モデルファイルを検索
+        all_model_files = [f for f in os.listdir(models_dir) if f.endswith('.pth')]
+        
+        # 位置モデルでフィルタリング
+        model_files = []
+        for model_file in all_model_files:
+            # まず位置モデルかどうかをチェック
+            if any(keyword in model_file.lower() for keyword in ['location', 'loc_model']):
+                # モデルタイプが指定されている場合はさらにフィルタリング
+                if model_type:
+                    # モデルタイプがファイル名に含まれているか確認
+                    if model_type.lower() in model_file.lower():
+                        model_files.append(model_file)
+                else:
+                    # モデルタイプが指定されていない場合はすべての位置モデルを追加
+                    model_files.append(model_file)
+        
+        # モデルファイルを日付順にソート（新しいものが上）
+        model_files.sort(reverse=True)
+        
+        return model_files
+
+    def load_model(self, model_type, model_path, progress_callback=None):
+        """位置モデルを読み込む"""
+        try:
+            # 進捗表示コールバック
+            if progress_callback:
+                progress_callback(30, "モデルチェックポイントを読み込み中...")
+            
+            # モデルチェックポイントをロード
+            checkpoint = torch.load(model_path, map_location='cpu')
+            
+            # クラス数を取得（チェックポイントから）
+            num_classes = None
+            if 'model_state_dict' in checkpoint:
+                # classifierの重みを確認
+                for key, value in checkpoint['model_state_dict'].items():
+                    if 'classifier.weight' in key:
+                        num_classes = value.shape[0]  # 出力層の最初の次元がクラス数
+                        break
+                    if 'regressor.weight' in key:
+                        num_classes = value.shape[0]
+                        break
+            else:
+                # 直接state_dictの場合
+                for key, value in checkpoint.items():
+                    if 'classifier.weight' in key:
+                        num_classes = value.shape[0]
+                        break
+                    if 'regressor.weight' in key:
+                        num_classes = value.shape[0]
+                        break
+            
+            # クラス数がまだ特定できない場合はデフォルト値
+            if num_classes is None:
+                num_classes = checkpoint.get('num_classes', 8)  # デフォルト8
+            
+            self.num_classes = num_classes
+            
+            if progress_callback:
+                progress_callback(50, f"モデル '{model_type}' をロード中... (クラス数: {num_classes})")
+            
+            # モデルを初期化
+            if model_type == 'donkey_location':
+                from model_catalog import DonkeyLocationModel
+                self.model = DonkeyLocationModel(num_classes=num_classes)
+            elif model_type == 'resnet18_location':
+                from model_catalog import ResNet18LocationModel
+                self.model = ResNet18LocationModel(num_classes=num_classes)
+            else:
+                # その他のモデル対応
+                from model_catalog import get_model
+                self.model = get_model(model_type, num_classes=num_classes)
+            
+            if progress_callback:
+                progress_callback(70, "モデルの重みをロード中...")
+            
+            # モデルの重みをロード
+            if 'model_state_dict' in checkpoint:
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                self.model.load_state_dict(checkpoint)
+            
+            # デバイスを設定
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            self.model.to(device)
+            self.model.eval()
+            
+            # モデル情報を保存
+            self.model_path = model_path
+            self.model_type = model_type
+            
+            return True, num_classes
+            
+        except Exception as e:
+            traceback.print_exc()
+            return False, str(e)
+    
+    def run_inference(self, img_path):
+        """指定された画像に対して位置推論を実行"""
+        if self.model is None:
+            return None
+        
+        try:
+            # 画像を読み込む
+            img = Image.open(img_path).convert('RGB')
+            
+            # モデルの前処理を取得
+            if not hasattr(self.model, '_preprocess') or self.model._preprocess is None:
+                self.model._preprocess = self.model.get_preprocess()
+            
+            # 前処理を適用
+            tensor_image = self.model._preprocess(img)
+            tensor_image = tensor_image.unsqueeze(0)
+            
+            # デバイスを取得
+            device = next(self.model.parameters()).device
+            tensor_image = tensor_image.to(device)
+            
+            # 推論実行
+            with torch.no_grad():
+                logits = self.model(tensor_image)
+                probs = torch.softmax(logits, dim=1)
+                
+                # クラスインデックスと確率を取得
+                max_prob, pred_class = torch.max(probs, dim=1)
+                
+                # 全クラスの確率をリストとして取得
+                all_probs = probs[0].cpu().numpy().tolist()
+            
+            # 推論結果を返す
+            return {
+                'pred_class': pred_class.item(),
+                'confidence': max_prob.item(),
+                'all_probs': all_probs
+            }
+            
+        except Exception as e:
+            print(f"位置推論実行エラー: {e}")
+            traceback.print_exc()
+            return None
+    
+    def batch_inference(self, img_paths, progress_callback=None):
+        """複数の画像に対してバッチ推論を実行"""
+        results = {}
+        total = len(img_paths)
+        
+        for i, img_path in enumerate(img_paths):
+            if progress_callback:
+                progress_callback(i, total, f"画像 {i+1}/{total} を処理中...")
+            
+            result = self.run_inference(img_path)
+            if result:
+                results[img_path] = result
+        
+        return results
+    
+    def is_model_loaded(self):
+        """位置モデルが読み込まれているかチェック"""
+        return hasattr(self, 'model') and self.model is not None
+
 class LocationClassificationDataset(torch.utils.data.Dataset):
     """位置分類用のカスタムデータセット"""
     def __init__(self, image_paths, location_labels, transform=None):
@@ -1311,321 +1495,6 @@ def plot_location_training_results(results, save_dir, timestamp):
     plt.close()
     
     print(f'Training plot saved: {plot_path}')
-
-def evaluate_location_model(
-    model_name: str,
-    test_loader: DataLoader,
-    num_classes: int = 8,
-    model_path: Optional[str] = None,
-    device: Optional[torch.device] = None
-) -> Dict[str, Any]:
-    """位置分類モデルを評価する
-
-    Args:
-        model_name: 評価するモデル名
-        test_loader: テストデータローダー
-        num_classes: クラス数
-        model_path: 評価するモデルのパス (Noneの場合は新しくロード)
-        device: 使用するデバイス (Noneの場合は自動選択)
-
-    Returns:
-        評価結果の辞書
-    """
-    # デバイスの設定
-    if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # モデルのロード
-    if 'donkey_location' in model_name:
-        model = get_model(model_name, pretrained=False)
-        model.classifier = nn.Linear(50, num_classes)  # 出力層を置き換え
-    elif 'resnet18_location' in model_name:
-        model = get_model(model_name, pretrained=False)
-        if hasattr(model, 'regressor'):
-            in_features = model.regressor.in_features if hasattr(model.regressor, 'in_features') else model.regressor[0].in_features
-            model.regressor = nn.Linear(in_features, num_classes)
-    else:
-        # その他のモデル対応
-        model = get_model(model_name, pretrained=False)
-    
-    if model_path:
-        # モデルのチェックポイントをロード
-        checkpoint = torch.load(model_path, map_location=device)
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            model.load_state_dict(checkpoint)
-        
-        print(f'Model loaded from: {model_path}')
-    
-    model = model.to(device)
-    model.eval()
-    
-    # 評価指標
-    criterion = nn.CrossEntropyLoss()
-    test_loss = 0.0
-    correct = 0
-    total = 0
-    
-    # 混同行列の初期化
-    confusion_matrix = torch.zeros(num_classes, num_classes)
-    
-    # 推論時間の計測
-    start_time = time.time()
-    
-    with torch.no_grad():
-        for inputs, targets in tqdm(test_loader, desc='Evaluating'):
-            inputs, targets = inputs.to(device), targets.to(device)
-            
-            # 推論
-            outputs = model(inputs)
-            
-            # 損失の計算
-            loss = criterion(outputs, targets)
-            test_loss += loss.item() * inputs.size(0)
-            
-            # 予測クラスの取得
-            _, predicted = torch.max(outputs, 1)
-            
-            # 正解数のカウント
-            total += targets.size(0)
-            correct += (predicted == targets).sum().item()
-            
-            # 混同行列の更新
-            for t, p in zip(targets.view(-1), predicted.view(-1)):
-                confusion_matrix[t.long(), p.long()] += 1
-    
-    # 評価指標の計算
-    test_loss /= total
-    accuracy = 100.0 * correct / total
-    
-    # クラスごとの精度
-    class_accuracy = 100.0 * confusion_matrix.diag() / confusion_matrix.sum(1)
-    
-    # 推論時間
-    inference_time = time.time() - start_time
-    avg_inference_time_per_sample = inference_time / total
-    
-    # 評価結果
-    eval_results = {
-        'model_name': model_name,
-        'loss': test_loss,
-        'accuracy': accuracy,
-        'class_accuracy': class_accuracy.cpu().numpy(),
-        'confusion_matrix': confusion_matrix.cpu().numpy(),
-        'inference_time': inference_time,
-        'inference_time_per_sample': avg_inference_time_per_sample,
-        'num_samples': total
-    }
-    
-    # 結果の表示
-    print(f'Evaluation Results for {model_name}:')
-    print(f'Loss: {test_loss:.6f}')
-    print(f'Accuracy: {accuracy:.2f}%')
-    print(f'Total Inference Time: {inference_time:.4f} seconds')
-    print(f'Average Inference Time per Sample: {avg_inference_time_per_sample*1000:.4f} ms')
-    
-    return eval_results
-
-def visualize_location_predictions(
-    model_name: str,
-    test_loader: DataLoader,
-    num_classes: int = 8,
-    model_path: Optional[str] = None,
-    num_samples: int = 5,
-    device: Optional[torch.device] = None
-):
-    """位置分類モデルの予測を視覚化する
-
-    Args:
-        model_name: 評価するモデル名
-        test_loader: テストデータローダー
-        num_classes: クラス数
-        model_path: 評価するモデルのパス (Noneの場合は新しくロード)
-        num_samples: 視覚化するサンプル数
-        device: 使用するデバイス (Noneの場合は自動選択)
-    """
-    # デバイスの設定
-    if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # モデルのロード
-    if 'donkey_location' in model_name:
-        model = get_model(model_name, pretrained=False)
-        model.classifier = nn.Linear(50, num_classes)  # 出力層を置き換え
-    elif 'resnet18_location' in model_name:
-        model = get_model(model_name, pretrained=False)
-        if hasattr(model, 'regressor'):
-            in_features = model.regressor.in_features if hasattr(model.regressor, 'in_features') else model.regressor[0].in_features
-            model.regressor = nn.Linear(in_features, num_classes)
-    else:
-        # その他のモデル対応
-        model = get_model(model_name, pretrained=False)
-    
-    if model_path and os.path.exists(model_path):
-        checkpoint = torch.load(model_path, map_location=device)
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            model.load_state_dict(checkpoint)
-            
-        print(f'Model loaded from: {model_path}')
-    
-    model = model.to(device)
-    model.eval()
-    
-    # データの取得
-    data_iter = iter(test_loader)
-    inputs, targets = next(data_iter)
-    
-    # サンプル数の調整
-    num_samples = min(num_samples, inputs.size(0))
-    
-    # 予測
-    with torch.no_grad():
-        inputs_device = inputs[:num_samples].to(device)
-        outputs = model(inputs_device)
-        probabilities = torch.softmax(outputs, dim=1)
-        _, predicted = torch.max(probabilities, 1)
-    
-    # ターゲットをNumPyに変換
-    targets = targets[:num_samples].cpu().numpy()
-    predicted = predicted.cpu().numpy()
-    probabilities = probabilities.cpu().numpy()
-    
-    # 予測の視覚化
-    fig, axs = plt.subplots(num_samples, 1, figsize=(10, 3*num_samples))
-    if num_samples == 1:
-        axs = [axs]  # 1つの場合は配列に変換
-    
-    # 色のマップ - 位置番号ごとに異なる色で表示
-    # get_location_colorと一致した色をRGBで定義
-    color_map = [
-        (1.0, 0.0, 0.0),      # 赤 - 位置0
-        (0.0, 0.6, 0.0),      # 緑 - 位置1
-        (0.0, 0.0, 1.0),      # 青 - 位置2
-        (1.0, 0.65, 0.0),     # オレンジ - 位置3
-        (0.5, 0.0, 0.5),      # 紫 - 位置4
-        (0.0, 0.5, 0.5),      # ティール - 位置5
-        (1.0, 0.0, 1.0),      # マゼンタ - 位置6
-        (0.5, 0.5, 0.0)       # オリーブ - 位置7
-    ]
-    
-    for i in range(num_samples):
-        # 画像の表示
-        img = inputs[i].numpy().transpose(1, 2, 0)
-        mean = np.array([0.485, 0.456, 0.406])
-        std = np.array([0.229, 0.224, 0.225])
-        img = std * img + mean
-        img = np.clip(img, 0, 1)
-        
-        axs[i].imshow(img)
-        
-        # 予測とターゲットの表示
-        target_class = targets[i]
-        pred_class = predicted[i]
-        prob = probabilities[i, pred_class]
-        
-        # 予測とターゲットが一致するかどうかで色を変更
-        match_color = 'green' if pred_class == target_class else 'red'
-        
-        # タイトルの設定
-        axs[i].set_title(f'Sample {i+1} - Target: {target_class} (位置 {target_class}), '
-                        f'Prediction: {pred_class} (位置 {pred_class}, 確信度: {prob:.2f})',
-                        color=match_color)
-        
-        # 各クラスの確率をバーグラフで表示
-        for j in range(num_classes):
-            # バーの色を設定（位置番号による色）
-            if j < len(color_map):
-                bar_color = color_map[j]
-            else:
-                bar_color = (0.5, 0.5, 0.5)  # デフォルト：グレー
-                
-            # 左側にバーを表示（画像上に重ねる）
-            bar_width = 0.05
-            bar_height = probabilities[i, j] * 0.5  # 画像高さの50%まで
-            
-            # バーの位置調整
-            bar_x = 0.05 + j * bar_width * 1.5
-            bar_y = 0.95 - bar_height
-            
-            # 透明度付きでバーを描画
-            rect = plt.Rectangle((bar_x, bar_y), bar_width, bar_height,
-                              transform=axs[i].transAxes, alpha=0.7,
-                              color=bar_color)
-            axs[i].add_patch(rect)
-            
-            # 確率値のテキスト表示
-            prob_text = f'{probabilities[i, j]:.2f}'
-            axs[i].text(bar_x + bar_width/2, bar_y - 0.02, f'{j}',
-                     ha='center', va='top', transform=axs[i].transAxes,
-                     color='black', fontsize=8)
-            
-            # 位置番号=jのバーが一番高い場合（予測クラス）、または正解クラスの場合は強調表示
-            if j == pred_class or j == target_class:
-                edge_color = 'white' if j == pred_class else 'yellow'
-                highlight = plt.Rectangle((bar_x, bar_y), bar_width, bar_height,
-                                      transform=axs[i].transAxes, fill=False,
-                                      edgecolor=edge_color, linewidth=2)
-                axs[i].add_patch(highlight)
-    
-    plt.tight_layout()
-    plt.savefig(f'{model_name}_location_predictions.png')
-    plt.close()
-    print(f'Location predictions visualization saved: {model_name}_location_predictions.png')
-
-def prepare_location_data_from_annotations(annotations, location_annotations, images_list=None):
-    """アノテーションから位置分類用のデータを準備する
-
-    Args:
-        annotations: 自動運転アノテーション辞書
-        location_annotations: 位置アノテーション辞書
-        images_list: 画像パスのリスト（オプション、インデックスから変換するために使用）
-
-    Returns:
-        画像パスのリスト、位置ラベルのリスト
-    """
-    image_paths = []
-    location_labels = []
-    
-    # 位置情報があるアノテーションを収集
-    for key, location in location_annotations.items():
-        # キーがインデックス（整数）かどうかをチェック
-        if isinstance(key, int) and images_list:
-            # インデックスが有効範囲内かチェック
-            if 0 <= key < len(images_list):
-                # インデックスから画像パスに変換
-                img_path = images_list[key]
-                
-                # annotations辞書にも同じキーがあるかチェック
-                if key in annotations:
-                    image_paths.append(img_path)
-                    location_labels.append(location)
-        else:
-            # キーが画像パス（文字列）の場合
-            img_path = key
-            
-            # パスが存在するかチェック
-            if os.path.exists(img_path) and img_path in annotations:
-                image_paths.append(img_path)
-                location_labels.append(location)
-    
-    # 画像パスが実際に存在するかを最終確認
-    valid_paths = []
-    valid_labels = []
-    for path, label in zip(image_paths, location_labels):
-        if os.path.exists(path):
-            valid_paths.append(path)
-            valid_labels.append(label)
-        else:
-            print(f"警告: 画像パスが存在しません: {path}")
-    
-    print(f"位置データ準備完了: {len(valid_paths)} 個の有効な画像パス")
-    if len(valid_paths) == 0:
-        raise ValueError("有効な画像パスがありません。位置アノテーションを確認してください。")
-    
-    return valid_paths, valid_labels
 
 # モジュールが直接実行された場合のサンプル処理（オプション）
 if __name__ == "__main__":

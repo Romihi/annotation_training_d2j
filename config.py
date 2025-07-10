@@ -17,6 +17,7 @@ DATA_DONKEY_DIR_NAME = "data_donkey"
 DATA_JETRACER_DIR_NAME = "data_jetracer"
 DATA_YOLO_DIR_NAME = "data_yolo"
 VIDEO_DIR_NAME = "video"
+MLFLOW_DIR_NAME = "mlruns"
 
 # ===========================================
 # パス設定（動的生成）
@@ -34,7 +35,7 @@ os.makedirs(video_folder, exist_ok=True)
 
 models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
 os.makedirs(models_dir, exist_ok=True)
-mlflow_dir = os.path.join(APP_DIR_PATH, "mlruns")
+mlflow_dir = os.path.join(APP_DIR_PATH, MLFLOW_DIR_NAME)
 os.makedirs(mlflow_dir, exist_ok=True)
 # パスの正規化 - すべてのバックスラッシュをフォワードスラッシュに変換
 normalized_path = mlflow_dir.replace("\\", "/")
@@ -105,6 +106,8 @@ BBOX_HOVER_HANDLE_SIZE = 10
 BBOX_PEN_WIDTH_NORMAL = 2
 BBOX_PEN_WIDTH_HOVERED = 2.5
 BBOX_PEN_WIDTH_SELECTED = 3
+
+
 
 # セグメンテーション
 SEGMENTATION_CLOSE_THRESHOLD = 15
