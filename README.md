@@ -50,7 +50,7 @@
 
 1. リポジトリをクローンします:
 ```bash
-git clone <repository-url>
+git clone https://github.com/Romihi/annotation_training_d2j.git
 cd minicar-annotation-tool
 ```
 
@@ -61,7 +61,7 @@ pip install -r requirements.txt
 
 3. ツールを実行します:
 ```bash
-python annotation_bbox.py
+python main.py
 ```
 
 ## 使用ガイド
