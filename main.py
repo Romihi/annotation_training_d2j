@@ -4203,81 +4203,78 @@ class ImageAnnotationTool(QMainWindow):
         if train_success == 0 or val_success == 0:
             raise Exception("セグメンテーションデータのエクスポートに失敗しました。")
 
-    def _export_segmentation_subset(self, indices, output_dir, class_to_index):
-        """セグメンテーションサブセットのエクスポート"""
+    # def _export_segmentation_subset(self, indices, output_dir, class_to_index):
+    #     """セグメンテーションサブセットのエクスポート"""
         
-        success_count = 0
+    #     success_count = 0
         
-        for idx in indices:
-            if idx in self.segmentation_annotations:
-                try:
-                    # 画像をコピー
-                    source_image_path = self.images[idx]
-                    image_filename = os.path.basename(source_image_path)
-                    dest_image_path = os.path.join(output_dir, "images", image_filename)
-                    ####
-                    print(source_image_path, image_filename, dest_image_path)
+    #     for idx in indices:
+    #         if idx in self.segmentation_annotations:
+    #             try:
+    #                 # 画像をコピー
+    #                 source_image_path = self.images[idx]
+    #                 image_filename = os.path.basename(source_image_path)
+    #                 dest_image_path = os.path.join(output_dir, "images", image_filename)
+    #                 ####
+    #                 print(source_image_path, image_filename, dest_image_path)
                     
-                    import shutil
-                    shutil.copy2(source_image_path, dest_image_path)
+    #                 import shutil
+    #                 shutil.copy2(source_image_path, dest_image_path)
                     
-                    # セグメンテーションアノテーションを処理
-                    label_filename = os.path.splitext(image_filename)[0] + ".txt"
-                    label_path = os.path.join(output_dir, "labels", label_filename)
+    #                 # セグメンテーションアノテーションを処理
+    #                 label_filename = os.path.splitext(image_filename)[0] + ".txt"
+    #                 label_path = os.path.join(output_dir, "labels", label_filename)
                     
-                    # 画像サイズを取得
-                    from PIL import Image
-                    with Image.open(source_image_path) as img:
-                        img_width, img_height = img.size
+    #                 # 画像サイズを取得
+    #                 from PIL import Image
+    #                 with Image.open(source_image_path) as img:
+    #                     img_width, img_height = img.size
                     
-                    # ラベルファイルを作成（セグメンテーション形式）
-                    with open(label_path, 'w') as f:
-                        for seg in self.segmentation_annotations[idx]:
-                            # クラス名を取得
-                            class_name = None
-                            if isinstance(seg, dict):
-                                class_name = seg.get('class_name')
-                                points = seg.get('points', [])
-                            else:
-                                class_name = getattr(seg, 'class_name', None)
-                                points = getattr(seg, 'points', [])
+    #                 # ラベルファイルを作成（セグメンテーション形式）
+    #                 with open(label_path, 'w') as f:
+    #                     for seg in self.segmentation_annotations[idx]:
+    #                         # クラス名を取得
+    #                         class_name = None
+    #                         if isinstance(seg, dict):
+    #                             class_name = seg.get('class_name')
+    #                             points = seg.get('points', [])
+    #                         else:
+    #                             class_name = getattr(seg, 'class_name', None)
+    #                             points = getattr(seg, 'points', [])
                             
-                            if class_name in class_to_index and points and len(points) >= 3:
-                                class_id = class_to_index[class_name]
+    #                         if class_name in class_to_index and points and len(points) >= 3:
+    #                             class_id = class_to_index[class_name]
                                 
-                                # ポイントを正規化座標に変換
-                                normalized_points = []
-                                for point in points:
-                                    if isinstance(point, dict):
-                                        x = point.get('x', 0) / img_width
-                                        y = point.get('y', 0) / img_height
-                                    else:
-                                        x = getattr(point, 'x', 0) / img_width
-                                        y = getattr(point, 'y', 0) / img_height
+    #                             # ポイントを正規化座標に変換
+    #                             normalized_points = []
+    #                             for point in points:
+    #                                 if isinstance(point, dict):
+    #                                     x = point.get('x', 0) / img_width
+    #                                     y = point.get('y', 0) / img_height
+    #                                 else:
+    #                                     x = getattr(point, 'x', 0) / img_width
+    #                                     y = getattr(point, 'y', 0) / img_height
                                     
-                                    # 座標を0-1の範囲にクランプ
-                                    x = max(0.0, min(1.0, x))
-                                    y = max(0.0, min(1.0, y))
+    #                                 # 座標を0-1の範囲にクランプ
+    #                                 x = max(0.0, min(1.0, x))
+    #                                 y = max(0.0, min(1.0, y))
                                     
-                                    normalized_points.extend([x, y])
+    #                                 normalized_points.extend([x, y])
                                 
-                                # YOLO セグメンテーション形式で書き込み
-                                # フォーマット: class_id x1 y1 x2 y2 x3 y3 ...
-                                if len(normalized_points) >= 6:  # 最低3点 (6座標)
-                                    points_str = ' '.join([f"{coord:.6f}" for coord in normalized_points])
-                                    f.write(f"{class_id} {points_str}\n")
+    #                             # YOLO セグメンテーション形式で書き込み
+    #                             # フォーマット: class_id x1 y1 x2 y2 x3 y3 ...
+    #                             if len(normalized_points) >= 6:  # 最低3点 (6座標)
+    #                                 points_str = ' '.join([f"{coord:.6f}" for coord in normalized_points])
+    #                                 f.write(f"{class_id} {points_str}\n")
                     
-                    success_count += 1
+    #                 success_count += 1
                     
-                except Exception as e:
-                    print(f"セグメンテーション インデックス {idx} の処理中にエラー: {e}")
-                    import traceback
-                    traceback.print_exc()
+    #             except Exception as e:
+    #                 print(f"セグメンテーション インデックス {idx} の処理中にエラー: {e}")
+    #                 import traceback
+    #                 traceback.print_exc()
         
-        return success_count
-
-
-    ###修正中↑
+    #     return success_count
 
     def export_bbox_only_to_yolo(self, train_dir, val_dir, classes):
         """バウンディングボックスのみをYOLO形式でエクスポート（既存メソッドの改良版）"""
@@ -4309,8 +4306,56 @@ class ImageAnnotationTool(QMainWindow):
         print(f"バウンディングボックス専用アノテーションエクスポート完了")
         print(f"学習用成功: {train_success}/{len(train_indices)}, 検証用成功: {val_success}/{len(val_indices)}")
 
+    # def _export_bbox_subset(self, indices, output_dir, class_to_index):
+    #     """バウンディングボックスサブセットのエクスポート"""
+        
+    #     success_count = 0
+        
+    #     for idx in indices:
+    #         if idx in self.bbox_annotations:
+    #             try:
+    #                 # 画像をコピー
+    #                 source_image_path = self.images[idx]
+    #                 image_filename = os.path.basename(source_image_path)
+    #                 dest_image_path = os.path.join(output_dir, "images", image_filename)
+                    
+    #                 import shutil
+    #                 shutil.copy2(source_image_path, dest_image_path)
+                    
+    #                 # バウンディングボックスアノテーションを処理
+    #                 label_filename = os.path.splitext(image_filename)[0] + ".txt"
+    #                 label_path = os.path.join(output_dir, "labels", label_filename)
+                    
+    #                 # 画像サイズを取得
+    #                 from PIL import Image
+    #                 with Image.open(source_image_path) as img:
+    #                     img_width, img_height = img.size
+                    
+    #                 # ラベルファイルを作成（バウンディングボックス形式のみ）
+    #                 with open(label_path, 'w') as f:
+    #                     for bbox in self.bbox_annotations[idx]:
+    #                         if bbox.class_name in class_to_index:
+    #                             class_id = class_to_index[bbox.class_name]
+                                
+    #                             # 正規化座標に変換
+    #                             x_center = (bbox.x + bbox.width / 2) / img_width
+    #                             y_center = (bbox.y + bbox.height / 2) / img_height
+    #                             width = bbox.width / img_width
+    #                             height = bbox.height / img_height
+                                
+    #                             # YOLO 検出形式で書き込み
+    #                             # フォーマット: class_id x_center y_center width height
+    #                             f.write(f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}\n")
+                    
+    #                 success_count += 1
+                    
+    #             except Exception as e:
+    #                 print(f"バウンディングボックス インデックス {idx} の処理中にエラー: {e}")
+        
+    #     return success_count
+###
     def _export_bbox_subset(self, indices, output_dir, class_to_index):
-        """バウンディングボックスサブセットのエクスポート"""
+        """バウンディングボックスサブセットのエクスポート（修正版）"""
         
         success_count = 0
         
@@ -4327,6 +4372,73 @@ class ImageAnnotationTool(QMainWindow):
                     
                     # バウンディングボックスアノテーションを処理
                     label_filename = os.path.splitext(image_filename)[0] + ".txt"
+                    label_path = os.path.join(output_dir, "labels", label_path)
+                    
+                    # ラベルファイルを作成（バウンディングボックス形式のみ）
+                    with open(label_path, 'w') as f:
+                        for bbox in self.bbox_annotations[idx]:
+                            # クラス名の取得（辞書形式とオブジェクト形式の両方に対応）
+                            class_name = None
+                            if isinstance(bbox, dict):
+                                class_name = bbox.get('class') or bbox.get('class_name')
+                            else:
+                                class_name = getattr(bbox, 'class', None) or getattr(bbox, 'class_name', None)
+                            
+                            if class_name and class_name in class_to_index:
+                                class_id = class_to_index[class_name]
+                                
+                                # バウンディングボックス座標を取得（既に正規化済み）
+                                if isinstance(bbox, dict):
+                                    # 辞書形式（現在のアプリケーション形式）
+                                    x1, y1, x2, y2 = bbox['x1'], bbox['y1'], bbox['x2'], bbox['y2']
+                                else:
+                                    # オブジェクト形式（古い形式への対応）
+                                    # 画像サイズを取得して正規化
+                                    from PIL import Image
+                                    with Image.open(source_image_path) as img:
+                                        img_width, img_height = img.size
+                                    
+                                    x1 = bbox.x / img_width
+                                    y1 = bbox.y / img_height
+                                    x2 = (bbox.x + bbox.width) / img_width
+                                    y2 = (bbox.y + bbox.height) / img_height
+                                
+                                # YOLO形式に変換（左上・右下座標 → 中心・幅・高さ）
+                                x_center = (x1 + x2) / 2
+                                y_center = (y1 + y2) / 2
+                                width = x2 - x1
+                                height = y2 - y1
+                                
+                                # YOLO検出形式で書き込み
+                                f.write(f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}\n")
+                    
+                    success_count += 1
+                    
+                except Exception as e:
+                    print(f"バウンディングボックス インデックス {idx} の処理中にエラー: {e}")
+                    import traceback
+                    traceback.print_exc()
+        
+        return success_count
+
+    def _export_segmentation_subset(self, indices, output_dir, class_to_index):
+        """セグメンテーションサブセットのエクスポート（修正版）"""
+        
+        success_count = 0
+        
+        for idx in indices:
+            if idx in self.segmentation_annotations:
+                try:
+                    # 画像をコピー
+                    source_image_path = self.images[idx]
+                    image_filename = os.path.basename(source_image_path)
+                    dest_image_path = os.path.join(output_dir, "images", image_filename)
+                    
+                    import shutil
+                    shutil.copy2(source_image_path, dest_image_path)
+                    
+                    # セグメンテーションアノテーションを処理
+                    label_filename = os.path.splitext(image_filename)[0] + ".txt"
                     label_path = os.path.join(output_dir, "labels", label_filename)
                     
                     # 画像サイズを取得
@@ -4334,28 +4446,58 @@ class ImageAnnotationTool(QMainWindow):
                     with Image.open(source_image_path) as img:
                         img_width, img_height = img.size
                     
-                    # ラベルファイルを作成（バウンディングボックス形式のみ）
+                    # ラベルファイルを作成（セグメンテーション形式）
                     with open(label_path, 'w') as f:
-                        for bbox in self.bbox_annotations[idx]:
-                            if bbox.class_name in class_to_index:
-                                class_id = class_to_index[bbox.class_name]
+                        for seg in self.segmentation_annotations[idx]:
+                            # クラス名を取得
+                            class_name = None
+                            if isinstance(seg, dict):
+                                class_name = seg.get('class') or seg.get('class_name')
+                                points = seg.get('points', [])
+                            else:
+                                class_name = getattr(seg, 'class', None) or getattr(seg, 'class_name', None)
+                                points = getattr(seg, 'points', [])
+                            
+                            if class_name and class_name in class_to_index and points and len(points) >= 3:
+                                class_id = class_to_index[class_name]
                                 
-                                # 正規化座標に変換
-                                x_center = (bbox.x + bbox.width / 2) / img_width
-                                y_center = (bbox.y + bbox.height / 2) / img_height
-                                width = bbox.width / img_width
-                                height = bbox.height / img_height
+                                # ポイントを正規化座標に変換
+                                normalized_points = []
+                                for point in points:
+                                    # アプリではピクセル座標で保存されているため正規化が必要
+                                    if isinstance(point, (list, tuple)) and len(point) >= 2:
+                                        # タプル/リスト形式: (x, y)
+                                        x = point[0] / img_width
+                                        y = point[1] / img_height
+                                    elif isinstance(point, dict):
+                                        # 辞書形式: {'x': x, 'y': y}
+                                        x = point.get('x', 0) / img_width
+                                        y = point.get('y', 0) / img_height
+                                    else:
+                                        # オブジェクト形式: point.x, point.y
+                                        x = getattr(point, 'x', 0) / img_width
+                                        y = getattr(point, 'y', 0) / img_height
+                                    
+                                    # 座標を0-1の範囲にクランプ
+                                    x = max(0.0, min(1.0, x))
+                                    y = max(0.0, min(1.0, y))
+                                    
+                                    normalized_points.extend([x, y])
                                 
-                                # YOLO 検出形式で書き込み
-                                # フォーマット: class_id x_center y_center width height
-                                f.write(f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}\n")
+                                # YOLO セグメンテーション形式で書き込み
+                                if len(normalized_points) >= 6:  # 最低3点 (6座標)
+                                    points_str = ' '.join([f"{coord:.6f}" for coord in normalized_points])
+                                    f.write(f"{class_id} {points_str}\n")
                     
                     success_count += 1
                     
                 except Exception as e:
-                    print(f"バウンディングボックス インデックス {idx} の処理中にエラー: {e}")
+                    print(f"セグメンテーション インデックス {idx} の処理中にエラー: {e}")
+                    import traceback
+                    traceback.print_exc()
         
         return success_count
+
 
     # セグメンテーション学習前のバリデーション強化
     def _validate_yolo_annotations(self, task_type):
@@ -5855,11 +5997,11 @@ class ImageAnnotationTool(QMainWindow):
                         if class_name in classes:
                             class_id = classes.index(class_name)
                             
-                            # YOLO形式に変換（正規化された座標）
-                            center_x = ((bbox['x1'] + bbox['x2']) / 2) / img_width
-                            center_y = ((bbox['y1'] + bbox['y2']) / 2) / img_height
-                            width = (bbox['x2'] - bbox['x1']) / img_width
-                            height = (bbox['y2'] - bbox['y1']) / img_height
+                            # YOLO形式に変換
+                            center_x = ((bbox['x1'] + bbox['x2']) / 2) 
+                            center_y = ((bbox['y1'] + bbox['y2']) / 2) 
+                            width = (bbox['x2'] - bbox['x1']) 
+                            height = (bbox['y2'] - bbox['y1']) 
                             
                             f.write(f"{class_id} {center_x:.6f} {center_y:.6f} {width:.6f} {height:.6f}\n")
         
@@ -10360,8 +10502,69 @@ class ImageAnnotationTool(QMainWindow):
         print(f"処理成功: {val_success}/{len(val_indices)}")
         print(f"バウンディングボックスアノテーションエクスポート完了")
 
+    # def _export_single_bbox_annotation(self, index, img_path, output_dir, class_to_index):
+    #     """単一のバウンディングボックスアノテーションをエクスポート"""
+        
+    #     # 画像ファイルの存在確認
+    #     if not os.path.exists(img_path):
+    #         print(f"画像ファイルが見つかりません: {img_path}")
+    #         return False
+        
+    #     # バウンディングボックスデータを取得
+    #     bboxes = self.bbox_annotations.get(index, [])
+    #     if not bboxes:
+    #         print(f"インデックス {index} にバウンディングボックスデータがありません")
+    #         return False
+        
+    #     # 画像ファイルをコピー
+    #     img_filename = os.path.basename(img_path)
+    #     dest_img_path = os.path.join(output_dir, "images", img_filename)
+        
+    #     try:
+    #         import shutil
+    #         shutil.copy2(img_path, dest_img_path)
+    #     except Exception as e:
+    #         print(f"画像コピーエラー {img_path}: {str(e)}")
+    #         return False
+        
+    #     # ラベルファイルの作成
+    #     label_filename = os.path.splitext(img_filename)[0] + ".txt"
+    #     label_path = os.path.join(output_dir, "labels", label_filename)
+        
+    #     try:
+    #         with open(label_path, 'w') as f:
+    #             for bbox in bboxes:
+    #                 class_name = bbox.get('class', 'unknown')
+                    
+    #                 # クラスインデックスを取得
+    #                 if class_name not in class_to_index:
+    #                     print(f"警告: 未知のクラス '{class_name}' をスキップします")
+    #                     continue
+                    
+    #                 class_idx = class_to_index[class_name]
+                    
+    #                 # バウンディングボックス座標（既に正規化済み）
+    #                 x1, y1, x2, y2 = bbox['x1'], bbox['y1'], bbox['x2'], bbox['y2']
+                    
+    #                 print("exp: ",bbox)
+
+    #                 # YOLO形式に変換: center_x, center_y, width, height
+    #                 center_x = (x1 + x2) / 2
+    #                 center_y = (y1 + y2) / 2
+    #                 width = x2 - x1
+    #                 height = y2 - y1
+                    
+    #                 # YOLO形式で書き込み
+    #                 f.write(f"{class_idx} {center_x:.6f} {center_y:.6f} {width:.6f} {height:.6f}\n")
+            
+    #         return True
+            
+    #     except Exception as e:
+    #         print(f"ラベルファイル作成エラー {label_path}: {str(e)}")
+    #         return False
+
     def _export_single_bbox_annotation(self, index, img_path, output_dir, class_to_index):
-        """単一のバウンディングボックスアノテーションをエクスポート"""
+        """単一のバウンディングボックスアノテーションをエクスポート（修正版）"""
         
         # 画像ファイルの存在確認
         if not os.path.exists(img_path):
@@ -10392,20 +10595,35 @@ class ImageAnnotationTool(QMainWindow):
         try:
             with open(label_path, 'w') as f:
                 for bbox in bboxes:
-                    class_name = bbox.get('class', 'unknown')
+                    # クラス名の取得（複数の形式に対応）
+                    class_name = None
+                    if isinstance(bbox, dict):
+                        class_name = bbox.get('class') or bbox.get('class_name')
+                    else:
+                        class_name = getattr(bbox, 'class', None) or getattr(bbox, 'class_name', None)
                     
                     # クラスインデックスを取得
-                    if class_name not in class_to_index:
+                    if not class_name or class_name not in class_to_index:
                         print(f"警告: 未知のクラス '{class_name}' をスキップします")
                         continue
                     
                     class_idx = class_to_index[class_name]
                     
-                    # バウンディングボックス座標（既に正規化済み）
-                    x1, y1, x2, y2 = bbox['x1'], bbox['y1'], bbox['x2'], bbox['y2']
-                    
-                    print("exp: ",bbox)
-
+                    # バウンディングボックス座標を取得（既に正規化済み）
+                    if isinstance(bbox, dict):
+                        # 現在の辞書形式（正規化済み）
+                        x1, y1, x2, y2 = bbox['x1'], bbox['y1'], bbox['x2'], bbox['y2']
+                    else:
+                        # 古いオブジェクト形式（ピクセル座標の場合）
+                        from PIL import Image
+                        with Image.open(img_path) as img:
+                            img_width, img_height = img.size
+                        
+                        x1 = bbox.x / img_width
+                        y1 = bbox.y / img_height
+                        x2 = (bbox.x + bbox.width) / img_width
+                        y2 = (bbox.y + bbox.height) / img_height
+                        print(x1,x2,"old")
                     # YOLO形式に変換: center_x, center_y, width, height
                     center_x = (x1 + x2) / 2
                     center_y = (y1 + y2) / 2
