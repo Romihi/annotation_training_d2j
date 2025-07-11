@@ -24,16 +24,85 @@ from model_info import (
 
 
 # モデルのロード関数を定義して、チェックポイント形式かどうかを自動判定
-def load_model_weights(model, weights_path, device):
-    checkpoint = torch.load(weights_path, map_location=device)
-    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-        print("Loaded checkpoint format model")
-    else:
-        model.load_state_dict(checkpoint)
-        print("Loaded state_dict format model")
-    return model
+# def load_model_weights(model, weights_path, device):
+#     checkpoint = torch.load(weights_path, map_location=device)
+#     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+#         model.load_state_dict(checkpoint['model_state_dict'])
+#         print("Loaded checkpoint format model")
+#     else:
+#         model.load_state_dict(checkpoint)
+#         print("Loaded state_dict format model")
+#     return model
 
+def load_model_weights(model, weights_path, device):
+    """
+    モデルの重みを読み込み、指定されたデバイスに移動する
+    
+    Args:
+        model: PyTorchモデル
+        weights_path: 重みファイルのパス
+        device: 使用するデバイス (torch.device)
+        
+    Returns:
+        重みが読み込まれ、デバイスに移動されたモデル
+    """
+    try:
+        print(f"Loading model weights from: {weights_path}")
+        print(f"Target device: {device}")
+        
+        # 重みを読み込み
+        checkpoint = torch.load(weights_path, map_location=device)
+        
+        if isinstance(checkpoint, dict):
+            if 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+                print("Loaded checkpoint format model")
+            elif 'state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['state_dict'])
+                print("Loaded state_dict format model")
+            else:
+                # 辞書だが特別なキーがない場合、直接state_dictとして使用
+                model.load_state_dict(checkpoint)
+                print("Loaded direct state_dict model")
+        else:
+            # 直接state_dictの場合
+            model.load_state_dict(checkpoint)
+            print("Loaded direct weights model")
+        
+        # モデルをデバイスに移動（device属性も更新される）
+        model = model.to(device)
+        print(f"Model moved to device: {model.device}")
+        
+        # 推論モードに設定
+        model.eval()
+        print("Model set to evaluation mode")
+        
+        return model
+        
+    except Exception as e:
+        print(f"Error loading model weights: {e}")
+        print(f"Attempting to load with alternative method...")
+        
+        try:
+            # 代替方法での読み込み
+            checkpoint = torch.load(weights_path, map_location='cpu')
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                model.load_state_dict(checkpoint)
+            
+            # デバイスに移動
+            model = model.to(device)
+            model.eval()
+            
+            print("Model loaded with alternative method")
+            print(f"Model device: {model.device}")
+            
+            return model
+            
+        except Exception as e2:
+            print(f"All loading attempts failed: {e2}")
+            raise
 
 class BaseModel(nn.Module):
     """すべてのモデルの基底クラス"""
@@ -41,15 +110,20 @@ class BaseModel(nn.Module):
         super(BaseModel, self).__init__()
         self.name = name
         self._preprocess = None
+        self.device = torch.device('cpu')  # デフォルトはCPU
 
-        #以下はモデル読み込み側のロジックで実行
-        # モデルを生成した時点でデバイスを決定して保存
-        #self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        #self.to(self.device)  # モデル自体を適切なデバイスに移動
+    def to(self, device):
+        """デバイスに移動し、device属性を更新"""
+        result = super().to(device)
+        if isinstance(device, torch.device):
+            result.device = device
+        elif isinstance(device, str):
+            result.device = torch.device(device)
+        else:
+            # テンソルが渡された場合はそのデバイスを使用
+            result.device = device.device if hasattr(device, 'device') else torch.device('cpu')
+        return result
 
-        # 初期化時に推論モードに設定
-        #self.eval()
-        
     def get_preprocess(self):
         """デフォルトの前処理を返す"""
         return transforms.Compose([
@@ -174,7 +248,6 @@ class TIMMBasedModel(BaseModel):
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
-
 
 # 各モデルの実装クラス
 # 基本的にはTIMMBasedModelを継承し、必要に応じてカスタマイズ
@@ -507,6 +580,336 @@ class DonkeyModel_FCN(BaseModel):
             #transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
+# Add these classification models to model_catalog.py
+# class DonkeyLocationModel(BaseModel):
+#     """Donkeycarモデルをベースとした位置分類用モデル"""
+#     def __init__(self, num_classes=8, pretrained=False, input_size=(224, 224)):
+#         super(DonkeyLocationModel, self).__init__(name="donkey_location")
+        
+#         # 入力サイズを保存（前処理と特徴計算で使用）
+#         self.input_size = input_size
+#         self.num_classes = num_classes
+        
+#         # 特徴抽出部分（DonkeyModelと同じ）
+#         drop = 0.2
+#         self.features = nn.Sequential(
+#             nn.Conv2d(3, 24, kernel_size=5, stride=2),
+#             nn.ReLU(inplace=True),
+#             nn.Dropout(drop),
+#             nn.Conv2d(24, 32, kernel_size=5, stride=2),
+#             nn.ReLU(inplace=True),
+#             nn.Dropout(drop),
+#             nn.Conv2d(32, 64, kernel_size=5, stride=2),
+#             nn.ReLU(inplace=True),
+#             nn.Dropout(drop),
+#             nn.Conv2d(64, 64, kernel_size=3, stride=1),
+#             nn.ReLU(inplace=True),
+#             nn.Dropout(drop),
+#             nn.Conv2d(64, 64, kernel_size=3, stride=1),
+#             nn.ReLU(inplace=True),
+#             nn.Dropout(drop),
+#             nn.Flatten()
+#         )
+        
+#         # 計算される特徴マップサイズに依存するため、ダミー入力を使って計算
+#         dummy_input = torch.zeros(1, 3, input_size[0], input_size[1])
+#         dummy_output = self.features(dummy_input)
+#         feature_size = dummy_output.shape[1]
+        
+#         print(f"DonkeyLocationModel feature size: {feature_size} for input {input_size}")
+
+#         # 全結合層
+#         self.dense_layers = nn.Sequential(
+#             nn.Linear(feature_size, 100),
+#             nn.ReLU(inplace=True),
+#             nn.Dropout(drop),
+#             nn.Linear(100, 50),
+#             nn.ReLU(inplace=True),
+#             nn.Dropout(drop),
+#         )        
+
+#         # 分類器（位置情報の予測）
+#         self.classifier = nn.Linear(50, num_classes)
+    
+#     def forward(self, x):
+#         x = self.features(x)
+#         x = self.dense_layers(x)
+#         x = self.classifier(x)
+#         return x
+    
+#     def get_preprocess(self):
+#         """Donkeycar用の前処理 - 保存されている入力サイズを使用"""
+#         return transforms.Compose([
+#             transforms.Resize(self.input_size),
+#             transforms.ToTensor(),
+#             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+#         ])
+
+#     def run(self, img_arr):
+#         """推論メソッド（分類用）"""
+#         # 前処理パイプラインが初期化されていなければ作成
+#         if self._preprocess is None:
+#             self._preprocess = self.get_preprocess()
+        
+#         # PILイメージに変換して前処理を適用
+#         pil_image = Image.fromarray(img_arr)
+#         tensor_image = self._preprocess(pil_image)
+#         tensor_image = tensor_image.unsqueeze(0)
+        
+#         # デバイスに転送
+#         tensor_image = tensor_image.to(self.device)
+                
+#         # 勾配計算なしで推論を実行
+#         with torch.no_grad():
+#             logits = self(tensor_image)
+#             probs = torch.softmax(logits, dim=1)
+            
+#             # クラスインデックスと確率を取得
+#             max_prob, pred_class = torch.max(probs, dim=1)
+        
+#         # CPU上のNumPy配列に変換
+#         pred_class = pred_class.cpu().numpy()[0]
+#         max_prob = max_prob.cpu().numpy()[0]
+        
+#         return pred_class, max_prob
+
+# class ResNet18LocationModel(TIMMBasedModel):
+#     """ResNet18をベースとした位置分類用モデル"""
+#     def __init__(self, num_classes=8, pretrained=True):
+#         self.num_classes = num_classes
+#         super(ResNet18LocationModel, self).__init__(
+#             name="resnet18_location",
+#             timm_model_name="resnet18",
+#             pretrained=pretrained,
+#             num_outputs=num_classes
+#         )
+
+#     def forward(self, x):
+#         """順伝播処理"""
+#         features = self.base_model(x)
+        
+#         # 特徴量がテンソルでない場合（辞書など）の対応
+#         if not isinstance(features, torch.Tensor):
+#             features = next(iter(features.values()))
+            
+#         # 分類出力
+#         logits = self.regressor(features)
+#         return logits
+
+#     def run(self, img_arr):
+#         """推論メソッド（分類用）"""
+#         # 前処理パイプラインが初期化されていなければ作成
+#         if self._preprocess is None:
+#             self._preprocess = self.get_preprocess()
+        
+#         # PILイメージに変換して前処理を適用
+#         pil_image = Image.fromarray(img_arr)
+#         tensor_image = self._preprocess(pil_image)
+#         tensor_image = tensor_image.unsqueeze(0)
+        
+#         # デバイスに転送
+#         tensor_image = tensor_image.to(self.device)
+                
+#         # 勾配計算なしで推論を実行
+#         with torch.no_grad():
+#             logits = self(tensor_image)
+#             probs = torch.softmax(logits, dim=1)
+            
+#             # クラスインデックスと確率を取得
+#             max_prob, pred_class = torch.max(probs, dim=1)
+        
+#         # CPU上のNumPy配列に変換
+#         pred_class = pred_class.cpu().numpy()[0]
+#         max_prob = max_prob.cpu().numpy()[0]
+        
+#         return pred_class, max_prob
+
+# 位置推論モデルのベース
+class BaseLocationModel(BaseModel):
+    """位置推論モデル用のベースクラス"""
+    def __init__(self, name, num_classes=8):
+        super(BaseLocationModel, self).__init__(name=name)
+        self.num_classes = num_classes
+        
+        # 推論履歴管理
+        self.prediction_history = []
+        self.max_history = 3
+        self.confirmed_class = None
+    
+    def get_max_probability_class(self, prob_vector):
+        """最大確率のクラスを返すヘルパー関数"""
+        return np.argmax(prob_vector)
+    
+    def get_class_with_confidence(self, prob_vector):
+        """最大確率のクラスとその確率を返すヘルパー関数"""
+        max_class = np.argmax(prob_vector)
+        max_prob = prob_vector[max_class]
+        return max_class, max_prob
+    
+    def _update_prediction_history(self, pred_class):
+        """推論履歴を更新する内部メソッド"""
+        self.prediction_history.append(pred_class)
+        
+        # 履歴が最大サイズを超えた場合、古いものを削除
+        if len(self.prediction_history) > self.max_history:
+            self.prediction_history.pop(0)
+    
+    def get_confirmed_class(self):
+        """3回同じクラスが推論されたら、そのクラスに確定するヘルパー関数"""
+        if len(self.prediction_history) < self.max_history:
+            return None
+        
+        # 最新の3回の予測が全て同じかチェック
+        if all(cls == self.prediction_history[0] for cls in self.prediction_history):
+            self.confirmed_class = self.prediction_history[0]
+            return self.confirmed_class
+        
+        return None
+    
+    def reset_confirmation(self):
+        """確定状態をリセットするヘルパー関数"""
+        self.prediction_history = []
+        self.confirmed_class = None
+    
+    def run_classification(self, img_arr):
+        """位置推論用の共通runメソッド - 確率ベクトルを返す"""
+        # 前処理パイプラインが初期化されていなければ作成
+        if self._preprocess is None:
+            self._preprocess = self.get_preprocess()
+        
+        # PILイメージに変換して前処理を適用
+        pil_image = Image.fromarray(img_arr)
+        tensor_image = self._preprocess(pil_image)
+        tensor_image = tensor_image.unsqueeze(0)
+        
+        # デバイスに転送
+        tensor_image = tensor_image.to(self.device)
+                
+        # 勾配計算なしで推論を実行
+        with torch.no_grad():
+            logits = self(tensor_image)
+            probs = torch.softmax(logits, dim=1)
+        
+        # CPU上のNumPy配列に変換して確率ベクトルを返す
+        probs_array = probs.cpu().numpy()[0]
+        
+        # 推論履歴を更新
+        pred_class = np.argmax(probs_array)
+        self._update_prediction_history(pred_class)
+        
+        return probs_array
+
+class DonkeyLocationModel(BaseLocationModel):
+    """Donkeycarモデルをベースとした位置分類用モデル"""
+    def __init__(self, num_classes=8, pretrained=False, input_size=(224, 224)):
+        super(DonkeyLocationModel, self).__init__(name="donkey_location", num_classes=num_classes)
+        
+        # 入力サイズを保存（前処理と特徴計算で使用）
+        self.input_size = input_size
+        
+        # 特徴抽出部分（DonkeyModelと同じ）
+        drop = 0.2
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 24, kernel_size=5, stride=2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop),
+            nn.Conv2d(24, 32, kernel_size=5, stride=2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop),
+            nn.Conv2d(32, 64, kernel_size=5, stride=2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop),
+            nn.Flatten()
+        )
+        
+        # 計算される特徴マップサイズに依存するため、ダミー入力を使って計算
+        dummy_input = torch.zeros(1, 3, input_size[0], input_size[1])
+        dummy_output = self.features(dummy_input)
+        feature_size = dummy_output.shape[1]
+        
+        print(f"DonkeyLocationModel feature size: {feature_size} for input {input_size}")
+
+        # 全結合層
+        self.dense_layers = nn.Sequential(
+            nn.Linear(feature_size, 100),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop),
+            nn.Linear(100, 50),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop),
+        )        
+
+        # 分類器（位置情報の予測）
+        self.classifier = nn.Linear(50, num_classes)
+    
+    def forward(self, x):
+        x = self.features(x)
+        x = self.dense_layers(x)
+        x = self.classifier(x)
+        return x
+    
+    def get_preprocess(self):
+        """Donkeycar用の前処理 - 保存されている入力サイズを使用"""
+        return transforms.Compose([
+            transforms.Resize(self.input_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+    def run(self, img_arr):
+        """推論メソッド - BaseLocationModelの共通メソッドを使用"""
+        return self.run_classification(img_arr)
+
+
+class ResNet18LocationModel(BaseLocationModel):
+    """ResNet18をベースとした位置分類用モデル"""
+    def __init__(self, num_classes=8, pretrained=True):
+        super(ResNet18LocationModel, self).__init__(name="resnet18_location", num_classes=num_classes)
+        
+        # TIMMモデルのロード
+        self.base_model = timm.create_model("resnet18", pretrained=pretrained, num_classes=0)
+        
+        # 特徴量の次元を取得
+        input_size = self._get_model_input_size()
+        dummy_input = torch.zeros(1, 3, input_size[0], input_size[1])
+        with torch.no_grad():
+            dummy_output = self.base_model(dummy_input)
+        
+        feature_dim = dummy_output.shape[1]
+        
+        # 分類器
+        self.regressor = nn.Linear(feature_dim, num_classes)
+    
+    def _get_model_input_size(self):
+        """モデルの入力サイズを取得"""
+        return get_model_input_size(self.name.replace("_location", ""))
+    
+    def forward(self, x):
+        """順伝播処理"""
+        features = self.base_model(x)
+        logits = self.regressor(features)
+        return logits
+    
+    def get_preprocess(self):
+        """ResNet18用の前処理"""
+        input_size = self._get_model_input_size()
+        return transforms.Compose([
+            transforms.Resize((input_size[0], input_size[1])),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+    def run(self, img_arr):
+        """推論メソッド - BaseLocationModelの共通メソッドを使用"""
+        return self.run_classification(img_arr)
+
+
 # 利用可能なすべてのモデルを登録する辞書
 MODEL_REGISTRY = {
     # Donkeycar model
@@ -559,7 +962,11 @@ MODEL_REGISTRY = {
     
     # EfficientFormer variants
     "efficientformer_l1": EfficientFormerL1Model,
-    
+
+    # 位置推論モデル
+    "donkey_location": DonkeyLocationModel,
+    "resnet18_location": ResNet18LocationModel,
+
 }
 
 

@@ -1,0 +1,13627 @@
+# annotation.py
+""" AIミニカーで取得した画像に対して教師データを作成、モデルを学習するツール"""
+import sys
+import os
+import re
+import json
+import shutil
+import time
+import random
+import subprocess
+from datetime import datetime
+import math
+
+import matplotlib
+matplotlib.use('Agg')  # GUIバックエンドを使用しない設定
+import matplotlib.pyplot as plt
+import numpy as np
+import io
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+torch.set_num_threads(2)  # スレッド数を制限
+# マルチプロセッシングのコンテキストが設定されていない場合のみ設定する
+try:
+    torch.multiprocessing.set_start_method('spawn')
+except RuntimeError:
+    pass  # すでに設定されている場合は無視
+# メモリ管理の最適化
+torch.cuda.empty_cache()
+
+from ultralytics import YOLO
+from ultralytics import settings
+
+import mlflow
+import mlflow.pytorch
+
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+                            QLabel, QPushButton, QFileDialog, QMessageBox,
+                            QScrollArea, QGridLayout, QFrame, QLineEdit, QProgressDialog,
+                            QCheckBox, QSpinBox, QComboBox, QSlider, QInputDialog, 
+                            QDoubleSpinBox, QDialog, QDialogButtonBox,
+                            QGroupBox, QRadioButton, QTabWidget, QSizePolicy,QButtonGroup,
+                            QListView, QTreeView, QAbstractItemView,QStyleOptionSlider,QStyle, QTextEdit, QPlainTextEdit)
+from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont, QPolygon
+from PyQt5.QtCore import Qt, QRect, QPoint, QTimer, QEvent
+
+from PIL import Image
+
+# ユーティリティのインポート
+#from utils.color_utils import get_location_color, get_class_color, get_segmentation_color
+from utils.file_utils import (
+    get_image_files, extract_index_from_filename, 
+    extract_variant_info, ensure_directory_exists
+)
+from utils.geometry_utils import (
+    estimate_location_from_angle,
+    normalize_coordinates, denormalize_coordinates,
+    is_point_in_polygon, calculate_bbox_center, calculate_bbox_dimensions
+)
+from utils.image_utils import (
+    pil_to_qimage, pil_to_qpixmap, 
+    load_image_safely, get_image_size
+)
+
+# カスタムモジュールのインポート
+from model_catalog import get_model, list_available_models
+from inference_utils import batch_inference
+from exports_file import export_to_donkey, export_to_jetracer, export_to_video, export_to_video_multi_source
+from model_training import train_model, create_datasets
+from model_training import train_location_model, create_location_datasets, LocationModelManager
+from model_training import generate_augmentation_samples
+# TODO:ボタンのスタイルを実装、他のUIの移植については後ほど検討
+from styles import get_location_color, apply_style, set_theme, get_current_theme, PRIMARY_STYLE, MODEL_STYLE, TRAINING_STYLE, EXPORT_STYLE, SPECIAL_STYLE, DESTRUCTIVE_STYLE, NAV_STYLE
+
+from enhanced_annotations import apply_enhanced_annotations_display
+
+from managers import AnnotationDataManager, MLflowManager, ModelType
+
+import traceback
+def exception_hook(exc_type, exc_value, exc_traceback):
+    print("An unhandled exception occurred:")
+    traceback.print_exception(exc_type, exc_value, exc_traceback)
+
+sys.excepthook = exception_hook
+
+# グローバル設定変数（移植中）
+from config import *
+
+# マウス操作画面表示系
+class ImageLabel(QLabel):
+    def __init__(self, parent=None, main_window=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(MAIN_IMAGE_MIN_WIDTH, MAIN_IMAGE_MIN_HEIGHT)
+        self.annotation_point = None
+        self.show_grid = True  
+        self.grid_size = DEFAULT_GRID_SIZE    
+        self.inference_point = None 
+        self.show_inference = False 
+        self.zoom_factor = DEFAULT_ZOOM_FACTOR  
+        self.is_deleted = False  
+
+        # バウンディングボックス関連
+        self.bbox_start = None  
+        self.bbox_end = None    
+        self.bboxes = []        
+        self.current_class = 0  
+        self.is_drawing_bbox = False 
+        self.selected_bbox_index = None 
+        self.is_moving_bbox = False     
+        self.move_start_pos = None      
+        self.setMouseTracking(True)  
+        self.hovering_bbox_index = None  
+        self.is_resizing_bbox = False    
+        self.resize_handle = None 
+        self.resize_start_pos = None     
+
+        # セグメンテーション関連の新規追加
+        self.segmentation_polygons = []  
+        self.current_segmentation_polygon = []  
+        self.is_drawing_segmentation = False
+        self.segmentation_inference_masks = []          
+        self.selected_segmentation_index = None  
+        self.is_moving_segmentation = False      
+        self.seg_move_start_pos = None           
+        self.hovering_segmentation_index = None 
+        self.close_threshold = SEGMENTATION_CLOSE_THRESHOLD
+        self.selected_polygon_index = None    
+        self.selected_vertex_index = None     
+        self.is_moving_vertex = False         
+        self.hovering_polygon_index = None    
+        self.hovering_vertex_index = None     
+        self.vertex_radius = SEGMENTATION_VERTEX_RADIUS
+
+    #　paintEventはリファクタリング済 ~
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        
+        if not self.pixmap():
+            painter = QPainter(self)
+            painter.setPen(QPen(QColor(100, 100, 100), 1))
+            painter.setFont(QFont("Arial", 14))
+            painter.drawText(self.rect(), Qt.AlignCenter, "フォルダを選択し、読込ボタンを押してください")
+            painter.end()
+            return
+
+        painter = QPainter(self)
+        
+        self.draw_initial_frame(painter)
+
+        # 各機能毎に描画
+        self.draw_grid(painter, self.target_rect)
+        self.draw_background_frame(painter, self.target_rect)
+        self.draw_control_points(painter, self.target_rect)
+        self.draw_bbox(self.pix_width, self.pix_height, painter, self.target_rect)
+        self.draw_segmentation(self.pix_width, self.pix_height, painter, self.target_rect)
+
+        painter.end()
+
+    def draw_initial_frame(self, painter):
+        # 元の画像のサイズ
+        self.pix_width = self.pixmap().width()
+        self.pix_height = self.pixmap().height()
+        
+        # ズーム係数を使用して拡大後のサイズを計算
+        self.scaled_width = int(self.pix_width * self.zoom_factor)
+        self.scaled_height = int(self.pix_height * self.zoom_factor)
+        
+        # 中央に配置するための座標計算
+        self.x = (self.width() - self.scaled_width) // 2
+        self.y = (self.height() - self.scaled_height) // 2
+
+        # 画像を拡大して描画
+        self.target_rect = QRect(self.x, self.y, self.scaled_width, self.scaled_height)
+        painter.drawPixmap(self.target_rect, self.pixmap())
+
+    def draw_background_frame(self, painter, target_rect):
+        """削除状態や位置番号などの背景フレームを描画する"""
+        scaled_width = target_rect.width()
+        scaled_height = target_rect.height()
+        x = target_rect.x()
+        y = target_rect.y()
+
+        if self.is_deleted:
+            painter.setPen(QPen(QColor(255, 85, 85), 6))  # 赤い枠線
+            border_rect = QRect(x-6, y-6, scaled_width+12, scaled_height+12)
+            painter.drawRect(border_rect)
+
+            badge_rect = QRect(x - 100, y, 80, 40)
+            painter.fillRect(badge_rect, QColor(255, 85, 85))
+            painter.setPen(QPen(Qt.white, 2))
+            painter.setFont(QFont("Arial", 12, QFont.Bold))
+            painter.drawText(badge_rect, Qt.AlignCenter, "削除済み")
+
+            # 削除済みの場合は半透明の赤オーバーレイを表示
+            painter.setOpacity(0.25)  # 75%透明
+            painter.fillRect(target_rect, QColor(255, 0, 0))
+            
+            # 中央に削除済みテキストを表示
+            painter.setOpacity(1.0)  # 不透明に戻す
+            painter.setPen(QPen(Qt.white, 2))
+            painter.setFont(QFont("Arial", 24, QFont.Bold))
+            
+            painter.drawText(
+                target_rect, 
+                Qt.AlignCenter, 
+                "削除済み\nクリックで再アノテーション"
+            )
+
+        elif self.main_window and hasattr(self.main_window, 'current_location') and self.main_window.current_location is not None:
+            loc_value = self.main_window.current_location
+            loc_color = get_location_color(loc_value)
+
+            painter.setPen(QPen(loc_color, 6))
+            border_rect = QRect(x-3, y-3, scaled_width+6, scaled_height+6)
+            painter.drawRect(border_rect)
+
+            badge_size = 40
+            badge_rect = QRect(x - badge_size - 10, y, badge_size, badge_size)
+            painter.fillRect(badge_rect, loc_color)
+            painter.setPen(QPen(Qt.white, 2))
+            painter.setFont(QFont("Arial", 16, QFont.Bold))
+            painter.drawText(badge_rect, Qt.AlignCenter, str(loc_value))
+
+    def draw_bbox(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
+        """バウンディングボックスの描画と編集"""
+        if self.main_window and hasattr(self.main_window, 'bbox_annotations'):
+            current_index = self.main_window.current_index  # インデックスベースに変更
+            
+            # 現在のインデックスが有効かチェック
+            if (current_index is not None and 
+                isinstance(current_index, int) and 
+                current_index in self.main_window.bbox_annotations):
+                
+                bboxes = self.main_window.bbox_annotations[current_index]
+                
+                for i, bbox in enumerate(bboxes):
+                    # クラスに応じた色を設定
+                    class_name = bbox.get('class', 'unknown')
+                    class_colors = CLASS_COLORS
+                    color = QColor(*class_colors.get(class_name, (255, 0, 0, 180)))
+                    
+                    # 選択またはホバーされているバウンディングボックスかどうかで線の太さを変更
+                    is_selected = (hasattr(self, 'selected_bbox_index') and 
+                                self.selected_bbox_index is not None and 
+                                i == self.selected_bbox_index)
+                    is_hovered = (hasattr(self, 'hovering_bbox_index') and 
+                                self.hovering_bbox_index is not None and 
+                                i == self.hovering_bbox_index)
+                    
+                    pen_width = 3 if is_selected else (2.5 if is_hovered else 2)
+                    pen_style = Qt.DashLine if is_selected else (Qt.DashDotLine if is_hovered else Qt.SolidLine)
+                    
+                    # 正規化された座標を画面座標に変換
+                    x1 = int(target_rect.x() + bbox['x1'] * target_rect.width())
+                    y1 = int(target_rect.y() + bbox['y1'] * target_rect.height())
+                    x2 = int(target_rect.x() + bbox['x2'] * target_rect.width())
+                    y2 = int(target_rect.y() + bbox['y2'] * target_rect.height())
+                    
+                    # バウンディングボックスを描画
+                    painter.setPen(QPen(color, pen_width, pen_style))
+                    
+                    # ホバー中のバウンディングボックスは半透明の塗りつぶしを追加
+                    if is_hovered or is_selected:
+                        highlight_color = QColor(color)
+                        highlight_color.setAlpha(40)  # 非常に透明に
+                        painter.setBrush(QBrush(highlight_color))
+                    else:
+                        painter.setBrush(QBrush())  # 透明ブラシ
+                    
+                    painter.drawRect(QRect(x1, y1, x2-x1, y2-y1))
+                    
+                    # 選択されているバウンディングボックスにはリサイズ用のハンドルを表示
+                    if is_selected:
+                        # ハンドルのサイズを設定（より大きく、視認性向上）
+                        handle_size = 8
+                        painter.setBrush(QBrush(color))
+                        
+                        # 四隅にハンドルを描画
+                        # 左上
+                        painter.drawRect(QRect(x1-handle_size//2, y1-handle_size//2, handle_size, handle_size))
+                        # 右上
+                        painter.drawRect(QRect(x2-handle_size//2, y1-handle_size//2, handle_size, handle_size))
+                        # 左下
+                        painter.drawRect(QRect(x1-handle_size//2, y2-handle_size//2, handle_size, handle_size))
+                        # 右下
+                        painter.drawRect(QRect(x2-handle_size//2, y2-handle_size//2, handle_size, handle_size))
+
+                    # ラベルテキストを作成（信頼度情報がある場合は追加）
+                    label_text = class_name
+                    if 'confidence' in bbox:
+                        label_text += f" {bbox['confidence']:.2f}"
+                    
+                    # クラスラベルの背景を描画
+                    label_rect = QRect(x1, y1-20, len(label_text)*8+10, 20)
+                    painter.fillRect(label_rect, color)
+                    
+                    # クラス名を描画
+                    painter.setPen(QPen(Qt.white, 1))
+                    painter.setFont(QFont("Arial", 10, QFont.Bold))
+                    painter.drawText(label_rect, Qt.AlignCenter, label_text)
+            
+            # 描画中のバウンディングボックスがあれば表示
+            if (hasattr(self, 'is_drawing_bbox') and self.is_drawing_bbox and 
+                hasattr(self, 'bbox_start') and self.bbox_start and 
+                hasattr(self, 'bbox_end') and self.bbox_end):
+                
+                # バウンディングボックスの座標を計算
+                start_rel_x = self.bbox_start.x() / pix_width
+                start_rel_y = self.bbox_start.y() / pix_height
+                end_rel_x = self.bbox_end.x() / pix_width
+                end_rel_y = self.bbox_end.y() / pix_height
+                
+                start_x = int(target_rect.x() + start_rel_x * target_rect.width())
+                start_y = int(target_rect.y() + start_rel_y * target_rect.height())
+                end_x = int(target_rect.x() + end_rel_x * target_rect.width())
+                end_y = int(target_rect.y() + end_rel_y * target_rect.height())
+                
+                # 半透明の黄色でドラッグ中のボックスを描画
+                painter.setPen(QPen(QColor(255, 255, 0, 180), 2, Qt.DashLine))
+                painter.setBrush(QBrush(QColor(255, 255, 0, 40)))
+                painter.drawRect(QRect(
+                    min(start_x, end_x),
+                    min(start_y, end_y),
+                    abs(end_x - start_x),
+                    abs(end_y - start_y)
+                ))
+
+        # 推論結果のバウンディングボックスを表示
+        if (self.main_window and 
+            hasattr(self.main_window, 'show_detection_inference') and 
+            self.main_window.show_detection_inference and
+            hasattr(self.main_window, 'detection_inference_results')):
+            
+            # 推論結果はパスベースで管理されている可能性があるため、パスを取得
+            if (hasattr(self.main_window, 'images') and 
+                hasattr(self.main_window, 'current_index') and
+                self.main_window.current_index is not None and
+                self.main_window.current_index < len(self.main_window.images)):
+                
+                current_img_path = self.main_window.images[self.main_window.current_index]
+                if current_img_path in self.main_window.detection_inference_results:
+                    inference_bboxes = self.main_window.detection_inference_results[current_img_path]
+                    
+                    for i, bbox in enumerate(inference_bboxes):
+                        # クラスに応じた色を設定 (推論結果は別の透明度で表示)
+                        class_name = bbox.get('class', 'unknown')
+                        class_colors = SEGMENTATION_CLASS_COLORS
+                        color = QColor(*class_colors.get(class_name, (255, 0, 0, 120)))
+                        
+                        # 推論結果は点線で表示
+                        pen_width = 2
+                        pen_style = Qt.DashLine
+                        
+                        # 正規化された座標を画面座標に変換
+                        x1 = int(target_rect.x() + bbox['x1'] * target_rect.width())
+                        y1 = int(target_rect.y() + bbox['y1'] * target_rect.height())
+                        x2 = int(target_rect.x() + bbox['x2'] * target_rect.width())
+                        y2 = int(target_rect.y() + bbox['y2'] * target_rect.height())
+                        
+                        # バウンディングボックスを描画
+                        painter.setPen(QPen(color, pen_width, pen_style))
+                        painter.drawRect(QRect(x1, y1, x2-x1, y2-y1))
+                        
+                        # ラベルテキストを作成（信頼度情報がある場合は追加）
+                        label_text = f"推論:{class_name}"
+                        if 'confidence' in bbox:
+                            label_text += f" {bbox['confidence']:.2f}"
+                        
+                        # クラスラベルの背景を描画
+                        label_rect = QRect(x1, y1-20, len(label_text)*8+10, 20)
+                        painter.fillRect(label_rect, color)
+                        
+                        # クラス名を描画
+                        painter.setPen(QPen(Qt.white, 1))
+                        painter.setFont(QFont("Arial", 10, QFont.Bold))
+                        painter.drawText(label_rect, Qt.AlignCenter, label_text)
+
+    def get_bbox_at_position(self, pos, target_rect, pix_width, pix_height):
+        """指定した位置にあるバウンディングボックスのインデックスを取得"""
+        if not (self.main_window and hasattr(self.main_window, 'bbox_annotations')):
+            return None
+        
+        current_index = self.main_window.current_index
+        if (current_index is None or 
+            not isinstance(current_index, int) or 
+            current_index not in self.main_window.bbox_annotations):
+            return None
+        
+        bboxes = self.main_window.bbox_annotations[current_index]
+        
+        # クリック位置を正規化座標に変換
+        rel_x = (pos.x() - target_rect.x()) / target_rect.width()
+        rel_y = (pos.y() - target_rect.y()) / target_rect.height()
+        
+        # 後ろから検索（上に描画されたものを優先）
+        for i in reversed(range(len(bboxes))):
+            bbox = bboxes[i]
+            if (bbox['x1'] <= rel_x <= bbox['x2'] and 
+                bbox['y1'] <= rel_y <= bbox['y2']):
+                return i
+        
+        return None
+
+    def get_resize_handle_at_position(self, pos, target_rect, bbox_index):
+        """指定した位置にあるリサイズハンドルの種類を取得"""
+        if not (self.main_window and hasattr(self.main_window, 'bbox_annotations')):
+            return None
+        
+        current_index = self.main_window.current_index
+        if (current_index is None or 
+            not isinstance(current_index, int) or 
+            current_index not in self.main_window.bbox_annotations or
+            bbox_index >= len(self.main_window.bbox_annotations[current_index])):
+            return None
+        
+        bbox = self.main_window.bbox_annotations[current_index][bbox_index]
+        
+        # バウンディングボックスの座標を画面座標に変換
+        x1 = int(target_rect.x() + bbox['x1'] * target_rect.width())
+        y1 = int(target_rect.y() + bbox['y1'] * target_rect.height())
+        x2 = int(target_rect.x() + bbox['x2'] * target_rect.width())
+        y2 = int(target_rect.y() + bbox['y2'] * target_rect.height())
+        
+        handle_size = 8
+        tolerance = handle_size // 2
+        
+        # 各ハンドルの位置をチェック
+        handles = {
+            'top_left': (x1, y1),
+            'top_right': (x2, y1),
+            'bottom_left': (x1, y2),
+            'bottom_right': (x2, y2)
+        }
+        
+        for handle_type, (hx, hy) in handles.items():
+            if (abs(pos.x() - hx) <= tolerance and 
+                abs(pos.y() - hy) <= tolerance):
+                return handle_type
+        
+        return None
+
+    def update_bbox_coordinates(self, bbox_index, new_coords):
+        """バウンディングボックスの座標を更新"""
+        if not (self.main_window and hasattr(self.main_window, 'bbox_annotations')):
+            return False
+        
+        current_index = self.main_window.current_index
+        if (current_index is None or 
+            not isinstance(current_index, int) or 
+            current_index not in self.main_window.bbox_annotations or
+            bbox_index >= len(self.main_window.bbox_annotations[current_index])):
+            return False
+        
+        # 座標を正規化してソート
+        x1, y1, x2, y2 = new_coords
+        min_x, max_x = min(x1, x2), max(x1, x2)
+        min_y, max_y = min(y1, y2), max(y1, y2)
+        
+        # 座標を0-1の範囲にクランプ
+        min_x = max(0, min(1, min_x))
+        max_x = max(0, min(1, max_x))
+        min_y = max(0, min(1, min_y))
+        max_y = max(0, min(1, max_y))
+        
+        # 最小サイズをチェック
+        min_size = 0.01  # 1%の最小サイズ
+        if (max_x - min_x) < min_size or (max_y - min_y) < min_size:
+            return False
+        
+        # 座標を更新
+        self.main_window.bbox_annotations[current_index][bbox_index].update({
+            'x1': min_x,
+            'y1': min_y,
+            'x2': max_x,
+            'y2': max_y
+        })
+        
+        return True
+
+    def delete_bbox(self, bbox_index):
+        """バウンディングボックスを削除"""
+        if not (self.main_window and hasattr(self.main_window, 'bbox_annotations')):
+            return False
+        
+        current_index = self.main_window.current_index
+        if (current_index is None or 
+            not isinstance(current_index, int) or 
+            current_index not in self.main_window.bbox_annotations or
+            bbox_index >= len(self.main_window.bbox_annotations[current_index])):
+            return False
+        
+        # バウンディングボックスを削除
+        del self.main_window.bbox_annotations[current_index][bbox_index]
+        
+        # 選択状態をリセット
+        if hasattr(self, 'selected_bbox_index'):
+            if self.selected_bbox_index == bbox_index:
+                self.selected_bbox_index = None
+            elif self.selected_bbox_index > bbox_index:
+                self.selected_bbox_index -= 1
+        
+        # ホバー状態をリセット
+        if hasattr(self, 'hovering_bbox_index'):
+            if self.hovering_bbox_index == bbox_index:
+                self.hovering_bbox_index = None
+            elif self.hovering_bbox_index > bbox_index:
+                self.hovering_bbox_index -= 1
+        
+        return True
+
+
+    def draw_grid(self, painter: QPainter, target_rect: QRect):
+        """ズーム済み領域にグリッドと目盛りを描画"""
+        if not self.show_grid:
+            return
+
+        grid_size = self.grid_size
+        step_x = target_rect.width() / grid_size
+        step_y = target_rect.height() / grid_size
+
+        # グレーの薄い線で描画
+        painter.setPen(QPen(QColor(100, 100, 100, 100), 1))
+        for i in range(1, grid_size):
+            x_pos = target_rect.x() + i * step_x
+            y_pos = target_rect.y() + i * step_y
+            painter.drawLine(int(x_pos), target_rect.y(), int(x_pos), target_rect.y() + target_rect.height())
+            painter.drawLine(target_rect.x(), int(y_pos), target_rect.x() + target_rect.width(), int(y_pos))
+
+        # 中央線
+        painter.setPen(QPen(QColor(200, 200, 200, 150), 2))
+        mid_x = target_rect.x() + target_rect.width() // 2
+        mid_y = target_rect.y() + target_rect.height() // 2
+        painter.drawLine(mid_x, target_rect.y(), mid_x, target_rect.y() + target_rect.height())
+        painter.drawLine(target_rect.x(), mid_y, target_rect.x() + target_rect.width(), mid_y)
+
+        # 目盛り表示
+        painter.setFont(QFont("Arial", 10))
+        painter.setPen(QPen(QColor(80, 80, 80, 200), 1))
+        painter.drawText(target_rect.x() - 25, target_rect.y() - 5, "-1")
+        painter.drawText(target_rect.x() + target_rect.width() + 5, target_rect.y() - 5, "1")
+
+        for i in range(1, grid_size):
+            value = -1 + (2.0 * i / grid_size)
+            x_pos = target_rect.x() + i * step_x
+            if abs(value) < 0.1:
+                painter.drawText(int(x_pos) - 5, target_rect.y() - 5, "0")
+            elif i % 2 == 0:
+                painter.drawText(int(x_pos) - 15, target_rect.y() - 5, f"{value:.1f}")
+
+        painter.drawText(target_rect.x() - 35, target_rect.y() + 15, "-1")
+        painter.drawText(target_rect.x() - 35, target_rect.y() + target_rect.height(), "1")
+
+        for i in range(1, grid_size):
+            value = -1 + (2.0 * i / grid_size)
+            y_pos = target_rect.y() + i * step_y
+            if abs(value) < 0.1:
+                painter.drawText(target_rect.x() - 35, int(y_pos) + 5, "0")
+            elif i % 2 == 0:
+                painter.drawText(target_rect.x() - 35, int(y_pos) + 5, f"{value:.1f}")
+
+    def draw_control_points(self, painter: QPainter, target_rect: QRect):
+        """アノテーション点、推論点、ベクトル矢印を描画"""
+        if not self.pixmap():
+            return
+
+        pix_width = self.pixmap().width()
+        pix_height = self.pixmap().height()
+
+        # 赤：アノテーション点（教師データ）
+        if self.annotation_point:
+            rel_x = self.annotation_point.x() / pix_width
+            rel_y = self.annotation_point.y() / pix_height
+            scaled_x = int(target_rect.x() + rel_x * target_rect.width())
+            scaled_y = int(target_rect.y() + rel_y * target_rect.height())
+
+            painter.setPen(QPen(QColor(255, 0, 0), 4))
+            painter.drawEllipse(scaled_x - 15, scaled_y - 15, 30, 30)
+
+        # 青：推論点（推論結果）
+        if self.show_inference and self.inference_point:
+            rel_x = self.inference_point.x() / pix_width
+            rel_y = self.inference_point.y() / pix_height
+            scaled_x = int(target_rect.x() + rel_x * target_rect.width())
+            scaled_y = int(target_rect.y() + rel_y * target_rect.height())
+
+            painter.setPen(QPen(QColor(0, 0, 255), 4))
+            painter.drawEllipse(scaled_x - 15, scaled_y - 15, 30, 30)
+
+            # 緑のベクトル：教師 → 推論
+            if (
+                self.annotation_point and
+                hasattr(self.main_window, 'inference_diff_vectors') and
+                hasattr(self.main_window, 'show_diff_vectors') and
+                self.main_window.show_diff_vectors
+            ):
+                current_index = self.main_window.current_index
+                if current_index in self.main_window.inference_diff_vectors:
+                    anno_rel_x = self.annotation_point.x() / pix_width
+                    anno_rel_y = self.annotation_point.y() / pix_height
+                    anno_scaled_x = int(target_rect.x() + anno_rel_x * target_rect.width())
+                    anno_scaled_y = int(target_rect.y() + anno_rel_y * target_rect.height())
+
+                    self.draw_vector_arrow(painter, anno_scaled_x, anno_scaled_y, scaled_x, scaled_y)
+
+    def draw_vector_arrow(self, painter, start_x, start_y, end_x, end_y):
+        """教師データから推論結果への矢印を描画する"""
+        # 矢印の色とスタイル設定
+        painter.setPen(QPen(QColor(0, 255, 0), 2))  # 緑色
+        painter.setBrush(QBrush(QColor(0, 255, 0)))
+
+        # 矢印の線を描画
+        painter.drawLine(start_x, start_y, end_x, end_y)
+
+        # 矢印の線を描画
+        painter.drawLine(start_x, start_y, end_x, end_y)
+                
+        # ベクトルの角度を計算
+        dx = end_x - start_x
+        dy = end_y - start_y
+        
+        # 矢印が短すぎる場合は描画しない
+        vector_length = math.sqrt(dx*dx + dy*dy)
+        if vector_length < 5:
+            return
+            
+        angle = math.atan2(dy, dx)
+        
+        # 矢印の先端のサイズ
+        arrow_length = 10
+        arrow_angle = math.pi / 6  # 30度
+        
+        # 矢印の先端の座標を計算
+        arrow_x1 = end_x - arrow_length * math.cos(angle - arrow_angle)
+        arrow_y1 = end_y - arrow_length * math.sin(angle - arrow_angle)
+        arrow_x2 = end_x - arrow_length * math.cos(angle + arrow_angle)
+        arrow_y2 = end_y - arrow_length * math.sin(angle + arrow_angle)
+        
+        # 矢印の先端を描画
+        arrow_points = [
+            QPoint(int(end_x), int(end_y)),
+            QPoint(int(arrow_x1), int(arrow_y1)),
+            QPoint(int(arrow_x2), int(arrow_y2))
+        ]
+        
+        arrow_polygon = QPolygon(arrow_points)
+        painter.drawPolygon(arrow_polygon)
+
+    ###
+    def draw_segmentation(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
+        """セグメンテーションポリゴンの描画と編集"""
+        if hasattr(self.main_window, 'segmentation_annotations'):
+            current_index = self.main_window.current_index  # インデックスベースに変更
+            if current_index in self.main_window.segmentation_annotations:
+                polygons = self.main_window.segmentation_annotations[current_index]
+            # current_img_path = self.main_window.images[self.main_window.current_index]
+            # if current_img_path in self.main_window.segmentation_annotations:
+            #     polygons = self.main_window.segmentation_annotations[current_img_path]
+                
+                for i, polygon_data in enumerate(polygons):
+                    class_name = polygon_data.get('class', 'unknown')
+                    points = polygon_data.get('points', [])
+                    
+                    if len(points) >= 3:
+                        # クラスに応じた色を設定
+                        class_colors = SEGMENTATION_CLASS_COLORS
+                        base_color = QColor(*class_colors.get(class_name, (255, 0, 0, 120)))
+
+
+                        # 選択またはホバーされているセグメンテーションの強調表示
+                        is_selected = i == self.selected_segmentation_index
+                        is_hovered = i == self.hovering_segmentation_index
+                        
+                        if is_selected:
+                            # 選択時は濃い色で縁取り
+                            painter.setPen(QPen(base_color.darker(), 4))
+                            painter.setBrush(QBrush(QColor(base_color.red(), base_color.green(), base_color.blue(), 150)))
+                        elif is_hovered:
+                            # ホバー時は少し濃い色
+                            painter.setPen(QPen(base_color.darker(), 3))
+                            painter.setBrush(QBrush(QColor(base_color.red(), base_color.green(), base_color.blue(), 100)))
+                        else:
+                            # 通常時
+                            painter.setPen(QPen(base_color.darker(), 2))
+                            painter.setBrush(QBrush(base_color))
+                        
+                        # ポリゴンの描画
+                        polygon_points = []
+                        for px, py in points:
+                            screen_x = int(target_rect.x() + (px / pix_width) * target_rect.width())
+                            screen_y = int(target_rect.y() + (py / pix_height) * target_rect.height())
+                            polygon_points.append(QPoint(screen_x, screen_y))
+                        
+                        # 塗りつぶし
+                        painter.drawPolygon(polygon_points)
+                        
+                        # 選択されているセグメンテーションには頂点を表示 - ここに移動
+                        if is_selected:
+                            for vertex_index, point in enumerate(polygon_points):
+                                # 頂点の状態に応じて色とサイズを変更
+                                if (self.selected_polygon_index == i and 
+                                    self.selected_vertex_index == vertex_index):
+                                    # 選択された頂点（編集中）
+                                    painter.setBrush(QBrush(QColor(255, 255, 0)))  # 黄色
+                                    painter.setPen(QPen(Qt.black, 3))
+                                    painter.drawEllipse(point.x() - 6, point.y() - 6, 12, 12)
+                                elif (self.hovering_polygon_index == i and 
+                                    self.hovering_vertex_index == vertex_index):
+                                    # ホバー中の頂点
+                                    painter.setBrush(QBrush(QColor(255, 165, 0)))  # オレンジ色
+                                    painter.setPen(QPen(base_color.darker(), 2))
+                                    painter.drawEllipse(point.x() - 5, point.y() - 5, 10, 10)  # 少し大きく
+                                else:
+                                    # 通常の頂点
+                                    painter.setBrush(QBrush(Qt.white))
+                                    painter.setPen(QPen(base_color.darker(), 2))
+                                    painter.drawEllipse(point.x() - 4, point.y() - 4, 8, 8)
+                        
+                        # ラベル表示
+                        if polygon_points:
+                            center_x = sum(p.x() for p in polygon_points) // len(polygon_points)
+                            center_y = sum(p.y() for p in polygon_points) // len(polygon_points)
+                            painter.setPen(QPen(Qt.white, 1))
+                            painter.setFont(QFont("Arial", 10, QFont.Bold))
+                            
+                            # ラベル背景
+                            text_width = painter.fontMetrics().horizontalAdvance(class_name)
+                            painter.fillRect(center_x - text_width//2 - 2, center_y - 10, text_width + 4, 16, base_color.darker())
+                            
+                            painter.drawText(center_x - text_width//2, center_y + 2, class_name)
+
+        # 現在描画中のポリゴンの表示（修正）
+        if self.is_drawing_segmentation and len(self.current_segmentation_polygon) > 0:
+            painter.setPen(QPen(QColor(255, 255, 0), 3))
+            
+            # 点を線で結ぶ
+            screen_points = []
+            for point in self.current_segmentation_polygon:
+                screen_x = int(target_rect.x() + (point.x() / pix_width) * target_rect.width())
+                screen_y = int(target_rect.y() + (point.y() / pix_height) * target_rect.height())
+                screen_points.append(QPoint(screen_x, screen_y))
+            
+            # 線を描画
+            for i in range(len(screen_points)):
+                # 点を描画
+                painter.setBrush(QBrush(QColor(255, 255, 0)))
+                painter.drawEllipse(screen_points[i].x() - 4, screen_points[i].y() - 4, 8, 8)
+                
+                if i < len(screen_points) - 1:
+                    # 線を描画
+                    painter.drawLine(screen_points[i], screen_points[i + 1])
+            
+            # 最初の点と最後の点を点線で結ぶ（閉じる候補を表示）
+            if len(screen_points) >= 3:
+                painter.setPen(QPen(QColor(255, 255, 0), 2, Qt.DashLine))
+                painter.drawLine(screen_points[-1], screen_points[0])
+                
+                # 最初の点を強調表示
+                painter.setBrush(QBrush(QColor(255, 255, 255)))
+                painter.setPen(QPen(QColor(255, 255, 0), 3))
+                painter.drawEllipse(screen_points[0].x() - 6, screen_points[0].y() - 6, 12, 12)
+
+    def mousePressEvent(self, event):
+        if self.pixmap() and self.main_window:
+            # クリック位置を取得
+            pos = event.pos()
+                        
+            # クリック位置が画像内かチェック
+            if not self.target_rect.contains(pos):
+                return
+            
+            # 画像内の相対位置を計算
+            rel_x = (pos.x() - self.target_rect.x()) / self.target_rect.width()
+            rel_y = (pos.y() - self.target_rect.y()) / self.target_rect.height()
+            
+            # 元の画像の座標に変換
+            orig_x = int(rel_x * self.pix_width)
+            orig_y = int(rel_y * self.pix_height)
+            
+            # 現在のモードに基づいて処理
+            ## 物体検知モード
+            if hasattr(self.main_window, 'current_mode') and self.main_window.current_mode == 1:
+                # 物体検知アノテーションモード
+                current_index = self.main_window.current_index  # インデックスベースに変更
+                
+                # 選択されたバウンディングボックスがある場合、ハンドルのチェック
+                if (self.selected_bbox_index is not None and 
+                    current_index in self.main_window.bbox_annotations):
+                    bboxes = self.main_window.bbox_annotations[current_index]
+                    if 0 <= self.selected_bbox_index < len(bboxes):
+                        bbox = bboxes[self.selected_bbox_index]
+                        
+                        # バウンディングボックスの座標を取得
+                        x1 = int(bbox['x1'] * self.pix_width)
+                        y1 = int(bbox['y1'] * self.pix_height)
+                        x2 = int(bbox['x2'] * self.pix_width)
+                        y2 = int(bbox['y2'] * self.pix_height)
+                        
+                        # ハンドルのサイズ
+                        handle_size = 10  # ハンドルの検出範囲を大きくする
+                        
+                        # 左上ハンドル
+                        if abs(orig_x - x1) <= handle_size and abs(orig_y - y1) <= handle_size:
+                            self.is_resizing_bbox = True
+                            self.resize_handle = "tl"  # top-left
+                            self.resize_start_pos = QPoint(orig_x, orig_y)
+                            self.setCursor(Qt.SizeFDiagCursor)  # 斜め矢印カーソル
+                            return
+                        
+                        # 右上ハンドル
+                        if abs(orig_x - x2) <= handle_size and abs(orig_y - y1) <= handle_size:
+                            self.is_resizing_bbox = True
+                            self.resize_handle = "tr"  # top-right
+                            self.resize_start_pos = QPoint(orig_x, orig_y)
+                            self.setCursor(Qt.SizeBDiagCursor)  # 斜め矢印カーソル
+                            return
+                        
+                        # 左下ハンドル
+                        if abs(orig_x - x1) <= handle_size and abs(orig_y - y2) <= handle_size:
+                            self.is_resizing_bbox = True
+                            self.resize_handle = "bl"  # bottom-left
+                            self.resize_start_pos = QPoint(orig_x, orig_y)
+                            self.setCursor(Qt.SizeBDiagCursor)  # 斜め矢印カーソル
+                            return
+                        
+                        # 右下ハンドル
+                        if abs(orig_x - x2) <= handle_size and abs(orig_y - y2) <= handle_size:
+                            self.is_resizing_bbox = True
+                            self.resize_handle = "br"  # bottom-right
+                            self.resize_start_pos = QPoint(orig_x, orig_y)
+                            self.setCursor(Qt.SizeFDiagCursor)  # 斜め矢印カーソル
+                            return
+
+                # 既存のバウンディングボックスを選択するかチェック
+                if (hasattr(self.main_window, 'bbox_annotations') and 
+                    current_index in self.main_window.bbox_annotations):
+                    bboxes = self.main_window.bbox_annotations[current_index]
+                    
+                    # 各バウンディングボックスについて、クリック位置が内部にあるかチェック
+                    for i, bbox in enumerate(bboxes):
+                        # バウンディングボックスの座標を計算
+                        x1 = int(bbox['x1'] * self.pix_width)
+                        y1 = int(bbox['y1'] * self.pix_height)
+                        x2 = int(bbox['x2'] * self.pix_width)
+                        y2 = int(bbox['y2'] * self.pix_height)
+                        
+                        # クリック位置がバウンディングボックス内にあるか
+                        if x1 <= orig_x <= x2 and y1 <= orig_y <= y2:
+                            # 選択済みのボックスをクリックした場合
+                            if self.selected_bbox_index == i:
+                                # 選択解除が必要かどうかを判断（例：シフトキーが押されているなど）
+                                if event.modifiers() & Qt.ShiftModifier:
+                                    self.selected_bbox_index = None
+                                    self.update()
+                                    if hasattr(self.main_window, 'statusBar'):
+                                        self.main_window.statusBar().showMessage("バウンディングボックスの選択を解除しました", 3000)
+                                    return
+                            
+                            # 新規選択の場合
+                            self.selected_bbox_index = i
+                            self.is_moving_bbox = True
+                            self.move_start_pos = QPoint(orig_x, orig_y)
+                                                        
+                            self.update() 
+                            return
+                    
+                    # どのバウンディングボックスにも含まれない場合、新規描画開始
+                    self.selected_bbox_index = None
+                    self.bbox_start = QPoint(orig_x, orig_y)
+                    self.is_drawing_bbox = True
+                    self.bbox_end = self.bbox_start  
+                    self.update()  
+                else:
+                    # バウンディングボックスがない場合、新規描画開始
+                    self.selected_bbox_index = None
+                    self.bbox_start = QPoint(orig_x, orig_y)
+                    self.is_drawing_bbox = True
+                    self.bbox_end = self.bbox_start  
+                    self.update()
+
+            ## セグモード
+            elif hasattr(self.main_window, 'current_mode') and self.main_window.current_mode == 2:
+                # セグメンテーションモード
+                current_index = self.main_window.current_index  # インデックスベースに変更
+                
+                # ホバー中の頂点がある場合はそれを優先
+                if (self.hovering_polygon_index is not None and 
+                    self.hovering_vertex_index is not None):
+                    # 頂点がクリックされた場合
+                    self.selected_polygon_index = self.hovering_polygon_index
+                    self.selected_vertex_index = self.hovering_vertex_index
+                    self.is_moving_vertex = True
+                    
+                    # 選択されたセグメンテーションも更新
+                    self.selected_segmentation_index = self.hovering_polygon_index
+                    
+                    # ステータスバーに表示
+                    if hasattr(self.main_window, 'statusBar'):
+                        self.main_window.statusBar().showMessage(f"頂点を編集中... (頂点 {self.hovering_vertex_index+1})", 3000)
+                    
+                    self.update()
+                    return
+
+                # 既存のセグメンテーションを選択するかチェック
+                if (hasattr(self.main_window, 'segmentation_annotations') and 
+                    current_index in self.main_window.segmentation_annotations):
+                    segmentations = self.main_window.segmentation_annotations[current_index]
+                    
+                    # 各セグメンテーションについて、クリック位置が内部にあるかチェック
+                    for i, seg_data in enumerate(segmentations):
+                        if is_point_in_polygon(orig_x, orig_y, seg_data['points']):
+                            if event.button() == Qt.LeftButton:
+                                # 選択済みのセグメンテーションをクリックした場合
+                                if self.selected_segmentation_index == i:
+                                    # 選択解除が必要かどうかを判断
+                                    if event.modifiers() & Qt.ShiftModifier:
+                                        self.selected_segmentation_index = None
+                                        self.update()
+                                        if hasattr(self.main_window, 'statusBar'):
+                                            self.main_window.statusBar().showMessage("セグメンテーションの選択を解除しました", 3000)
+                                        return
+                                
+                                # 新規選択の場合
+                                self.selected_segmentation_index = i
+                                self.is_moving_segmentation = True
+                                self.seg_move_start_pos = QPoint(orig_x, orig_y)
+                                                                
+                                self.update()
+                                return
+                            elif event.button() == Qt.RightButton and self.selected_segmentation_index == i:
+                                # 右クリックで選択中のセグメンテーションを削除
+                                self.main_window.delete_selected_segmentation(i)
+                                return
+                
+                # 新しいポリゴンの描画処理
+                if event.button() == Qt.LeftButton:
+                    if not self.is_drawing_segmentation:
+                        # 新しいポリゴンを開始
+                        self.current_segmentation_polygon = [QPoint(orig_x, orig_y)]
+                        self.is_drawing_segmentation = True
+                        self.selected_segmentation_index = None
+                    else:
+                        # ポリゴンに点を追加
+                        new_point = QPoint(orig_x, orig_y)
+                        
+                        # 最初の点に近い場合はポリゴンを閉じる
+                        if len(self.current_segmentation_polygon) >= 3:
+                            first_point = self.current_segmentation_polygon[0]
+                            distance = ((new_point.x() - first_point.x())**2 + (new_point.y() - first_point.y())**2)**0.5
+                            
+                            if distance <= self.close_threshold:
+                                # ポリゴンを閉じる
+                                polygon_data = self.complete_segmentation_polygon()
+                                self.main_window.add_segmentation_annotation(polygon_data)
+
+                                # 描画状態をリセット
+                                self.current_segmentation_polygon = []
+                                self.is_drawing_segmentation = False
+                                self.update()
+                                return
+                        
+                        self.current_segmentation_polygon.append(new_point)
+                    self.update()
+                elif event.button() == Qt.RightButton and self.is_drawing_segmentation:
+                    # 右クリックでポリゴンを完了（3点以上必要）
+                    if len(self.current_segmentation_polygon) >= 3:
+                        polygon_data = self.complete_segmentation_polygon()
+                        self.main_window.add_segmentation_annotation(polygon_data)
+
+                        # 描画状態をリセット
+                        self.current_segmentation_polygon = []
+                        self.is_drawing_segmentation = False
+                        self.update()
+
+            else:
+                # 自動運転アノテーションモード
+                self.annotation_point = QPoint(orig_x, orig_y)
+                
+                # メインウィンドウに通知
+                self.main_window.handle_annotation(orig_x, orig_y)
+                
+                # アノテーション後に自動的に次の画像に進む（スキップ枚数考慮）
+                if hasattr(self.main_window, 'skip_images_on_click') and self.main_window.skip_images_on_click.isChecked():
+                    skip_count = self.main_window.skip_count_spin.value()
+                    self.main_window.skip_images(skip_count)
+                else:
+                    self.main_window.skip_images(1)  # デフォルトは1枚
+
+    def mouseReleaseEvent(self, event):
+        # 頂点移動完了処理を追加（既存のコードの前に追加）
+        if self.is_moving_vertex:
+            # 頂点移動が完了
+            self.is_moving_vertex = False
+            
+            # 選択状態は維持（頂点の選択は解除しない）
+            
+            # ステータスバーに完了メッセージ
+            if hasattr(self.main_window, 'statusBar') and self.selected_polygon_index is not None:
+                # インデックスベースに変更
+                current_index = self.main_window.current_index
+                if (current_index is not None and 
+                    isinstance(current_index, int) and 
+                    current_index in self.main_window.segmentation_annotations):
+                    segmentations = self.main_window.segmentation_annotations[current_index]
+                    if 0 <= self.selected_polygon_index < len(segmentations):
+                        class_name = segmentations[self.selected_polygon_index].get('class', 'unknown')
+                        self.main_window.statusBar().showMessage(
+                            f"'{class_name}' の頂点編集が完了しました", 3000
+                        )
+            
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+            return
+
+        # 既存のコードに追加
+        if self.is_moving_segmentation:
+            # セグメンテーション移動が完了
+            self.is_moving_segmentation = False
+            self.seg_move_start_pos = None
+                        
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+            return
+
+        if self.is_moving_bbox:
+            # 移動が完了したのでフラグをリセット
+            self.is_moving_bbox = False
+            self.move_start_pos = None
+                        
+            # 通常のカーソルに戻す
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+
+        elif self.is_drawing_bbox and self.pixmap() and self.bbox_start and self.bbox_end:
+            # バウンディングボックスの確定処理
+            if abs(self.bbox_end.x() - self.bbox_start.x()) > 10 and abs(self.bbox_end.y() - self.bbox_start.y()) > 10:
+                class_name = self.main_window.select_object_class()
+                if class_name:
+                    bbox = {
+                        'x1': min(self.bbox_start.x(), self.bbox_end.x()) / self.pixmap().width(),
+                        'y1': min(self.bbox_start.y(), self.bbox_end.y()) / self.pixmap().height(),
+                        'x2': max(self.bbox_start.x(), self.bbox_end.x()) / self.pixmap().width(),
+                        'y2': max(self.bbox_start.y(), self.bbox_end.y()) / self.pixmap().height(),
+                        'class': class_name
+                    }
+                    self.main_window.add_bbox_annotation(bbox)
+            
+            self.is_drawing_bbox = False
+            self.bbox_start = None
+            self.bbox_end = None
+            # 通常のカーソルに戻す
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+        
+        elif self.is_resizing_bbox:
+            # サイズ変更が完了したのでフラグをリセット
+            self.is_resizing_bbox = False
+            self.resize_handle = None
+            self.resize_start_pos = None
+                        
+            # 通常のカーソルに戻す
+            self.setCursor(Qt.ArrowCursor)
+            self.update()    
+
+    def mouseMoveEvent(self, event):
+        """マウス移動時の処理 - ハンドルによるサイズ変更機能を追加"""
+        # 物体検知モードでドラッグ中はカーソルを変更
+        if self.is_moving_bbox:
+            self.setCursor(Qt.ClosedHandCursor)  # つかんでいる状態
+        elif self.is_drawing_bbox:
+            self.setCursor(Qt.CrossCursor)  # 描画中は十字
+        elif self.is_resizing_bbox:
+            # リサイズ中のカーソル設定（ハンドルに応じて）
+            if self.resize_handle in ["tl", "br"]:
+                self.setCursor(Qt.SizeFDiagCursor)  # 左上-右下
+            else:  # "tr", "bl"
+                self.setCursor(Qt.SizeBDiagCursor)  # 右上-左下
+        
+        # 既存の移動/描画/リサイズ処理
+        if self.pixmap() and (self.is_drawing_bbox or self.is_moving_bbox or self.is_resizing_bbox):
+            # クリック位置を取得
+            pos = event.pos()
+            
+            # 元の画像のサイズ
+            pix_width = self.pixmap().width()
+            pix_height = self.pixmap().height()
+            
+            # ズーム係数を使用して拡大後のサイズを計算
+            scaled_width = int(pix_width * self.zoom_factor)
+            scaled_height = int(pix_height * self.zoom_factor)
+            
+            # 表示領域の計算
+            x = (self.width() - scaled_width) // 2
+            y = (self.height() - scaled_height) // 2
+            target_rect = QRect(x, y, scaled_width, scaled_height)
+            
+            # クリック位置が画像内かチェック
+            if not target_rect.contains(pos):
+                # 画像外に出た場合は画像の端に制限
+                constrained_x = max(target_rect.left(), min(pos.x(), target_rect.right()))
+                constrained_y = max(target_rect.top(), min(pos.y(), target_rect.bottom()))
+                pos = QPoint(constrained_x, constrained_y)
+            
+            # 画像内の相対位置を計算
+            rel_x = (pos.x() - target_rect.x()) / target_rect.width()
+            rel_y = (pos.y() - target_rect.y()) / target_rect.height()
+            
+            # 元の画像の座標に変換
+            orig_x = int(rel_x * pix_width)
+            orig_y = int(rel_y * pix_height)
+            
+            if self.is_moving_bbox and self.selected_bbox_index is not None:
+                # バウンディングボックスの移動処理
+                current_index = self.main_window.current_index  # インデックスベースに変更
+                if current_index in self.main_window.bbox_annotations:
+                    bboxes = self.main_window.bbox_annotations[current_index]
+                    if 0 <= self.selected_bbox_index < len(bboxes):
+                        # 移動距離を計算
+                        dx = orig_x - self.move_start_pos.x()
+                        dy = orig_y - self.move_start_pos.y()
+                        
+                        # 更新されたバウンディングボックス座標を計算
+                        bbox = bboxes[self.selected_bbox_index]
+                        
+                        # 画像の端を超えないように制限
+                        new_x1 = max(0, min(bbox['x1'] * pix_width + dx, pix_width - 10)) / pix_width
+                        new_y1 = max(0, min(bbox['y1'] * pix_height + dy, pix_height - 10)) / pix_height
+                        new_x2 = max(10/pix_width, min(bbox['x2'] * pix_width + dx, pix_width)) / pix_width
+                        new_y2 = max(10/pix_height, min(bbox['y2'] * pix_height + dy, pix_height)) / pix_height
+                        
+                        # バウンディングボックスを更新
+                        bboxes[self.selected_bbox_index]['x1'] = new_x1
+                        bboxes[self.selected_bbox_index]['y1'] = new_y1
+                        bboxes[self.selected_bbox_index]['x2'] = new_x2
+                        bboxes[self.selected_bbox_index]['y2'] = new_y2
+                        
+                        # 移動開始位置を更新
+                        self.move_start_pos = QPoint(orig_x, orig_y)
+                        
+                        # ステータスバーに情報表示
+                        if hasattr(self.main_window, 'statusBar'):
+                            class_name = bbox.get('class', 'unknown')
+                            self.main_window.statusBar().showMessage(f"'{class_name}' バウンディングボックスを移動中... [x1={new_x1:.2f}, y1={new_y1:.2f}, x2={new_x2:.2f}, y2={new_y2:.2f}]", 500)
+            
+            elif self.is_resizing_bbox and self.selected_bbox_index is not None and self.resize_handle:
+                # サイズ変更処理
+                current_index = self.main_window.current_index  # インデックスベースに変更
+                if current_index in self.main_window.bbox_annotations:
+                    bboxes = self.main_window.bbox_annotations[current_index]
+                    if 0 <= self.selected_bbox_index < len(bboxes):
+                        bbox = bboxes[self.selected_bbox_index]
+                        
+                        # 現在のバウンディングボックスの座標を取得（ピクセル単位）
+                        x1 = bbox['x1'] * pix_width
+                        y1 = bbox['y1'] * pix_height
+                        x2 = bbox['x2'] * pix_width
+                        y2 = bbox['y2'] * pix_height
+                        
+                        # リサイズハンドルに応じて座標を更新
+                        if self.resize_handle == "tl":  # 左上
+                            x1 = orig_x
+                            y1 = orig_y
+                        elif self.resize_handle == "tr":  # 右上
+                            x2 = orig_x
+                            y1 = orig_y
+                        elif self.resize_handle == "bl":  # 左下
+                            x1 = orig_x
+                            y2 = orig_y
+                        elif self.resize_handle == "br":  # 右下
+                            x2 = orig_x
+                            y2 = orig_y
+                        
+                        # 最小サイズの確保（10x10ピクセル）
+                        if x2 - x1 < 10:
+                            if self.resize_handle in ["tl", "bl"]:
+                                x1 = x2 - 10
+                            else:
+                                x2 = x1 + 10
+                        
+                        if y2 - y1 < 10:
+                            if self.resize_handle in ["tl", "tr"]:
+                                y1 = y2 - 10
+                            else:
+                                y2 = y1 + 10
+                        
+                        # 画像の端を超えないように制限
+                        x1 = max(0, min(x1, pix_width - 10))
+                        y1 = max(0, min(y1, pix_height - 10))
+                        x2 = max(10, min(x2, pix_width))
+                        y2 = max(10, min(y2, pix_height))
+                        
+                        # バウンディングボックスを更新（正規化座標に戻す）
+                        bboxes[self.selected_bbox_index]['x1'] = x1 / pix_width
+                        bboxes[self.selected_bbox_index]['y1'] = y1 / pix_height
+                        bboxes[self.selected_bbox_index]['x2'] = x2 / pix_width
+                        bboxes[self.selected_bbox_index]['y2'] = y2 / pix_height
+                        
+                        # ステータスバーに情報表示
+                        if hasattr(self.main_window, 'statusBar'):
+                            class_name = bbox.get('class', 'unknown')
+                            width = x2 - x1
+                            height = y2 - y1
+                            self.main_window.statusBar().showMessage(
+                                f"'{class_name}' バウンディングボックスのサイズ変更中... "
+                                f"[位置: ({x1:.0f}, {y1:.0f}), サイズ: {width:.0f}x{height:.0f}]", 
+                                500
+                            )
+            
+            elif self.is_drawing_bbox:
+                # 新規バウンディングボックスの描画処理
+                self.bbox_end = QPoint(orig_x, orig_y)
+                
+                # サイズ情報をステータスバーに表示
+                if hasattr(self.main_window, 'statusBar'):
+                    width = abs(self.bbox_end.x() - self.bbox_start.x())
+                    height = abs(self.bbox_end.y() - self.bbox_start.y())
+                    self.main_window.statusBar().showMessage(f"新規バウンディングボックス作成中... 幅: {width}px, 高さ: {height}px", 500)
+            
+            self.update()  # 画面を更新
+        
+        # 既存のホバー効果（別の条件）
+        elif not self.is_moving_bbox and not self.is_drawing_bbox and not self.is_resizing_bbox:
+            self.check_bbox_hover_and_resize_handles(event.pos())
+
+        # 頂点移動処理を追加（セグメンテーション移動処理の前に追加）
+        if self.is_moving_vertex and self.selected_polygon_index is not None and self.selected_vertex_index is not None:
+            if not self.pixmap():
+                return
+                
+            # 座標変換
+            pos = event.pos()
+            pix_width = self.pixmap().width()
+            pix_height = self.pixmap().height()
+            scaled_width = int(pix_width * self.zoom_factor)
+            scaled_height = int(pix_height * self.zoom_factor)
+            
+            x = (self.width() - scaled_width) // 2
+            y = (self.height() - scaled_height) // 2
+            target_rect = QRect(x, y, scaled_width, scaled_height)
+            
+            if not target_rect.contains(pos):
+                constrained_x = max(target_rect.left(), min(pos.x(), target_rect.right()))
+                constrained_y = max(target_rect.top(), min(pos.y(), target_rect.bottom()))
+                pos = QPoint(constrained_x, constrained_y)
+            
+            rel_x = (pos.x() - target_rect.x()) / target_rect.width()
+            rel_y = (pos.y() - target_rect.y()) / target_rect.height()
+            orig_x = int(rel_x * pix_width)
+            orig_y = int(rel_y * pix_height)
+            
+            # 頂点の位置を更新
+            current_index = self.main_window.current_index  # インデックスベースに変更
+            if current_index in self.main_window.segmentation_annotations:
+                segmentations = self.main_window.segmentation_annotations[current_index]
+                if 0 <= self.selected_polygon_index < len(segmentations):
+                    points = segmentations[self.selected_polygon_index]['points']
+                    if 0 <= self.selected_vertex_index < len(points):
+                        # 画像境界内に制限
+                        new_x = max(0, min(orig_x, pix_width))
+                        new_y = max(0, min(orig_y, pix_height))
+                        points[self.selected_vertex_index] = (new_x, new_y)
+                        
+                        # ステータスバーに情報表示
+                        if hasattr(self.main_window, 'statusBar'):
+                            class_name = segmentations[self.selected_polygon_index].get('class', 'unknown')
+                            self.main_window.statusBar().showMessage(
+                                f"'{class_name}' 頂点 {self.selected_vertex_index+1} を移動中... ({new_x}, {new_y})", 500
+                            )
+            
+            self.update()
+            return
+
+        ###
+        # セグメンテーションホバー検出（移動中でない場合のみ）- 既存のコードを修正
+        elif (not self.is_moving_segmentation and not self.is_moving_vertex and 
+            hasattr(self.main_window, 'current_mode') and self.main_window.current_mode == 2):
+            
+            # 座標変換
+            if not self.pixmap():
+                return
+                
+            pos = event.pos()
+            pix_width = self.pixmap().width()
+            pix_height = self.pixmap().height()
+            scaled_width = int(pix_width * self.zoom_factor)
+            scaled_height = int(pix_height * self.zoom_factor)
+            
+            x = (self.width() - scaled_width) // 2
+            y = (self.height() - scaled_height) // 2
+            target_rect = QRect(x, y, scaled_width, scaled_height)
+            
+            if not target_rect.contains(pos):
+                # マウスが画像外の場合はホバー状態をクリア
+                if self.hovering_vertex_index is not None or self.hovering_polygon_index is not None:
+                    self.hovering_vertex_index = None
+                    self.hovering_polygon_index = None
+                    self.setCursor(Qt.ArrowCursor)
+                    self.update()
+                return
+            
+            rel_x = (pos.x() - target_rect.x()) / target_rect.width()
+            rel_y = (pos.y() - target_rect.y()) / target_rect.height()
+            orig_x = int(rel_x * pix_width)
+            orig_y = int(rel_y * pix_height)
+            
+            # 頂点のホバー検出
+            hovered_vertex = self.check_vertex_hover(orig_x, orig_y)
+            
+            # ホバー状態が変化した場合の処理
+            if hovered_vertex != (self.hovering_polygon_index, self.hovering_vertex_index):
+                if hovered_vertex is not None:
+                    self.hovering_polygon_index, self.hovering_vertex_index = hovered_vertex
+                    self.setCursor(Qt.PointingHandCursor)  # 手のカーソルに変更
+                else:
+                    # 頂点ホバーがない場合、セグメンテーション全体のホバーをチェック
+                    hover_index = self.check_segmentation_hover(event.pos())
+                    self.hovering_polygon_index = hover_index
+                    self.hovering_vertex_index = None
+                    
+                    if hover_index is not None:
+                        self.setCursor(Qt.OpenHandCursor)
+                    else:
+                        self.setCursor(Qt.ArrowCursor)
+                
+                self.update()
+
+        ###
+
+        # セグメンテーション移動処理
+        if self.is_moving_segmentation and self.selected_segmentation_index is not None:
+            if not self.pixmap():
+                return
+                
+            # 座標変換（既存のコードと同様）
+            pos = event.pos()
+            pix_width = self.pixmap().width()
+            pix_height = self.pixmap().height()
+            scaled_width = int(pix_width * self.zoom_factor)
+            scaled_height = int(pix_height * self.zoom_factor)
+            
+            x = (self.width() - scaled_width) // 2
+            y = (self.height() - scaled_height) // 2
+            target_rect = QRect(x, y, scaled_width, scaled_height)
+            
+            if not target_rect.contains(pos):
+                constrained_x = max(target_rect.left(), min(pos.x(), target_rect.right()))
+                constrained_y = max(target_rect.top(), min(pos.y(), target_rect.bottom()))
+                pos = QPoint(constrained_x, constrained_y)
+            
+            rel_x = (pos.x() - target_rect.x()) / target_rect.width()
+            rel_y = (pos.y() - target_rect.y()) / target_rect.height()
+            orig_x = int(rel_x * pix_width)
+            orig_y = int(rel_y * pix_height)
+            
+            # セグメンテーションの移動処理
+            current_index = self.main_window.current_index  # インデックスベースに変更
+            if current_index in self.main_window.segmentation_annotations:
+                segmentations = self.main_window.segmentation_annotations[current_index]
+                if 0 <= self.selected_segmentation_index < len(segmentations):
+                    # 移動距離を計算
+                    delta_x = orig_x - self.seg_move_start_pos.x()
+                    delta_y = orig_y - self.seg_move_start_pos.y()
+                    
+                    # ポリゴンの全ての点を移動
+                    seg_data = segmentations[self.selected_segmentation_index]
+                    new_points = []
+                    for px, py in seg_data['points']:
+                        new_x = max(0, min(px + delta_x, pix_width))
+                        new_y = max(0, min(py + delta_y, pix_height))
+                        new_points.append((new_x, new_y))
+                    
+                    segmentations[self.selected_segmentation_index]['points'] = new_points
+                    self.seg_move_start_pos = QPoint(orig_x, orig_y)
+                    
+                    # ステータスバーに情報表示
+                    if hasattr(self.main_window, 'statusBar'):
+                        class_name = seg_data.get('class', 'unknown')
+                        self.main_window.statusBar().showMessage(f"'{class_name}' セグメンテーションを移動中...", 500)
+            
+            self.update()
+
+        ###
+        # セグメンテーションホバー検出（移動中でない場合のみ）
+        elif not self.is_moving_segmentation and hasattr(self.main_window, 'current_mode') and self.main_window.current_mode == 2:
+            hover_index = self.check_segmentation_hover(event.pos())
+            
+            if hover_index != self.hovering_segmentation_index:
+                self.hovering_segmentation_index = hover_index
+                
+                if hover_index is not None:
+                    self.setCursor(Qt.OpenHandCursor)
+                else:
+                    self.setCursor(Qt.ArrowCursor)
+                
+                self.update()
+
+    def leaveEvent(self, event):
+        """マウスがウィジェットから離れた時の処理"""
+        self.setCursor(Qt.ArrowCursor)  
+        self.hovering_bbox_index = None
+        
+        # セグメンテーション関連のホバー状態もクリア
+        self.hovering_segmentation_index = None
+        self.hovering_polygon_index = None
+        self.hovering_vertex_index = None
+        
+        self.update()  # 画面を更新してホバー効果を消す
+        super().leaveEvent(event)
+    
+    def check_bbox_hover(self, pos):
+        """マウス位置がバウンディングボックス上にあるかチェック"""
+        if not self.pixmap() or not hasattr(self.main_window, 'current_mode'):
+            return None
+        
+        # 物体検知モードでない場合は処理しない
+        if self.main_window.current_mode != 1:
+            return None
+        
+        # マウス位置が画像内かチェック
+        if not self.target_rect.contains(pos):
+            return None
+        
+        # 画像内の相対位置を計算
+        rel_x = (pos.x() - self.target_rect.x()) / self.target_rect.width()
+        rel_y = (pos.y() - self.target_rect.y()) / self.target_rect.height()
+        
+        # 元の画像の座標に変換
+        orig_x = int(rel_x * self.pix_width)
+        orig_y = int(rel_y * self.pix_height)
+        
+        # 現在の画像のバウンディングボックスをチェック
+        current_index = self.main_window.current_index  # インデックスベースに変更
+        if current_index in self.main_window.bbox_annotations:
+            bboxes = self.main_window.bbox_annotations[current_index]
+            
+            # 各バウンディングボックスについて、マウス位置が内部にあるかチェック
+            for i, bbox in enumerate(bboxes):
+                # バウンディングボックスの座標を計算
+                x1 = int(bbox['x1'] * self.pix_width)
+                y1 = int(bbox['y1'] * self.pix_height)
+                x2 = int(bbox['x2'] * self.pix_width)
+                y2 = int(bbox['y2'] * self.pix_height)
+                
+                # マウス位置がバウンディングボックス内にあるか
+                if x1 <= orig_x <= x2 and y1 <= orig_y <= y2:
+                    return i
+        
+        return None
+
+    def check_vertex_hover(self, x, y):
+        """指定された座標が既存のセグメンテーションの頂点上にホバーしているかチェック"""
+        if not hasattr(self.main_window, 'segmentation_annotations'):
+            return None
+        
+        current_index = self.main_window.current_index  # インデックスベースに変更
+        if current_index not in self.main_window.segmentation_annotations:
+            return None
+        
+        segmentations = self.main_window.segmentation_annotations[current_index]
+        
+        # ホバー検出の範囲を少し大きくする
+        hover_radius = self.vertex_radius + 2
+        
+        # 各セグメンテーションの各頂点をチェック
+        for polygon_index, seg_data in enumerate(segmentations):
+            points = seg_data.get('points', [])
+            
+            for vertex_index, (px, py) in enumerate(points):
+                # 頂点との距離を計算
+                distance = ((x - px) ** 2 + (y - py) ** 2) ** 0.5
+                
+                # ホバー半径内にマウスがある場合
+                if distance <= hover_radius:
+                    return (polygon_index, vertex_index)
+        
+        return None
+
+    def check_bbox_hover_and_resize_handles(self, pos):
+        """バウンディングボックスのホバー状態とリサイズハンドルのチェック"""
+        if not self.pixmap() or not hasattr(self.main_window, 'current_mode'):
+            return
+        
+        # 物体検知モードでない場合は処理しない
+        if self.main_window.current_mode != 1:
+            return
+                
+        # マウス位置が画像内かチェック
+        if not self.target_rect.contains(pos):
+            self.setCursor(Qt.ArrowCursor)
+            self.hovering_bbox_index = None
+            return
+        
+        # 画像内の相対位置を計算
+        rel_x = (pos.x() - self.target_rect.x()) / self.target_rect.width()
+        rel_y = (pos.y() - self.target_rect.y()) / self.target_rect.height()
+        
+        # 元の画像の座標に変換
+        orig_x = int(rel_x * self.pix_width)
+        orig_y = int(rel_y * self.pix_height)
+        
+        # 選択されたバウンディングボックスがある場合、ハンドルのチェック
+        if self.selected_bbox_index is not None:
+            current_index = self.main_window.current_index  # インデックスベースに変更
+            if current_index in self.main_window.bbox_annotations:
+                bboxes = self.main_window.bbox_annotations[current_index]
+                if 0 <= self.selected_bbox_index < len(bboxes):
+                    bbox = bboxes[self.selected_bbox_index]
+                    
+                    # バウンディングボックスの座標を取得
+                    x1 = int(bbox['x1'] * self.pix_width)
+                    y1 = int(bbox['y1'] * self.pix_height)
+                    x2 = int(bbox['x2'] * self.pix_width)
+                    y2 = int(bbox['y2'] * self.pix_height)
+                    
+                    # ハンドルのサイズ
+                    handle_size = 10  # ハンドルの検出範囲
+                    
+                    # 左上ハンドル
+                    if abs(orig_x - x1) <= handle_size and abs(orig_y - y1) <= handle_size:
+                        self.setCursor(Qt.SizeFDiagCursor)  # 斜め矢印カーソル
+                        return
+                    
+                    # 右上ハンドル
+                    if abs(orig_x - x2) <= handle_size and abs(orig_y - y1) <= handle_size:
+                        self.setCursor(Qt.SizeBDiagCursor)  # 斜め矢印カーソル
+                        return
+                    
+                    # 左下ハンドル
+                    if abs(orig_x - x1) <= handle_size and abs(orig_y - y2) <= handle_size:
+                        self.setCursor(Qt.SizeBDiagCursor)  # 斜め矢印カーソル
+                        return
+                    
+                    # 右下ハンドル
+                    if abs(orig_x - x2) <= handle_size and abs(orig_y - y2) <= handle_size:
+                        self.setCursor(Qt.SizeFDiagCursor)  # 斜め矢印カーソル
+                        return
+        
+        # 現在の画像のバウンディングボックスをチェック
+        hover_index = None
+        current_index = self.main_window.current_index  # インデックスベースに変更
+        if current_index in self.main_window.bbox_annotations:
+            bboxes = self.main_window.bbox_annotations[current_index]
+            
+            # 各バウンディングボックスについて、マウス位置が内部にあるかチェック
+            for i, bbox in enumerate(bboxes):
+                # バウンディングボックスの座標を計算
+                x1 = int(bbox['x1'] * self.pix_width)
+                y1 = int(bbox['y1'] * self.pix_height)
+                x2 = int(bbox['x2'] * self.pix_width)
+                y2 = int(bbox['y2'] * self.pix_height)
+                
+                # マウス位置がバウンディングボックス内にあるか
+                if x1 <= orig_x <= x2 and y1 <= orig_y <= y2:
+                    hover_index = i
+                    break
+        
+        # ホバー状態が変わった場合は再描画
+        if hover_index != self.hovering_bbox_index:
+            self.hovering_bbox_index = hover_index
+            
+            # カーソルを更新
+            if hover_index is not None:
+                self.setCursor(Qt.OpenHandCursor)  # バウンディングボックス上では手の形
+            else:
+                self.setCursor(Qt.ArrowCursor)  # 通常は矢印
+            
+            self.update()  # 再描画
+
+    def complete_segmentation_polygon(self):
+        """ポリゴンを完了してクラス選択を行う"""
+        if len(self.current_segmentation_polygon) >= 3:
+            # クラス選択ダイアログ
+            class_name = self.main_window.select_object_class()
+            if class_name:
+                # ポリゴンを保存
+                polygon_data = {
+                    'class': class_name,
+                    'points': [(p.x(), p.y()) for p in self.current_segmentation_polygon]
+                }
+        return polygon_data
+
+    def check_segmentation_hover(self, pos):
+        """マウス位置がセグメンテーション上にあるかチェック"""
+        if not self.pixmap() or not hasattr(self.main_window, 'current_mode'):
+            return None
+        
+        if self.main_window.current_mode != 2:
+            return None
+                
+        if not self.target_rect.contains(pos):
+            return None
+        
+        rel_x = (pos.x() - self.target_rect.x()) / self.target_rect.width()
+        rel_y = (pos.y() - self.target_rect.y()) / self.target_rect.height()
+        orig_x = int(rel_x * self.pix_width)
+        orig_y = int(rel_y * self.pix_height)
+        
+        # 現在の画像のセグメンテーションをチェック
+        current_index = self.main_window.current_index  # インデックスベースに変更
+        if current_index in self.main_window.segmentation_annotations:
+            segmentations = self.main_window.segmentation_annotations[current_index]
+            
+            for i, seg_data in enumerate(segmentations):
+                if is_point_in_polygon(orig_x, orig_y, seg_data['points']):
+                    return i
+        
+        return None
+
+# 下部ギャラリー系
+class ThumbnailWidget(QWidget):
+    def __init__(self, parent=None, img_path="", index=0, is_selected=False, 
+                 annotation=None, on_click=None, location_value=None, is_deleted=False):
+        super().__init__(parent)
+        self.img_path = img_path
+        self.index = index
+        self.on_click = on_click
+        self.is_selected = is_selected
+        self.annotation = annotation  # アノテーション情報
+        self.location_value = location_value  # 変更: 辞書ではなく直接位置情報の値を受け取る
+        self.is_deleted = is_deleted  # 削除済みフラグ
+        
+        # サムネイル全体のサイズも調整
+        self.setMinimumWidth(210)
+        self.setMinimumHeight(170)  # 高さを少し小さく
+        
+        # メインレイアウト（水平レイアウト）
+        self.layout = QHBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)  # マージンをなくす
+        self.layout.setSpacing(1)  # 最小限のスペーシング
+        
+        # 左側の情報パネル
+        info_panel = QWidget()
+        info_panel.setFixedWidth(70)  # 情報パネル幅
+        info_layout = QVBoxLayout(info_panel)
+        info_layout.setContentsMargins(0, 0, 0, 0)
+        info_layout.setSpacing(1)
+
+        # ラベル
+        info_panel_label = QLabel("情報パネル:")
+        info_panel_label.setStyleSheet("font-weight: bold;")
+        info_layout.addWidget(info_panel_label)
+
+        # インデックス番号
+        self.idx_label = QLabel(f"{index + 1}")
+        self.idx_label.setAlignment(Qt.AlignCenter)
+        info_layout.addWidget(self.idx_label)
+        
+        # 削除済みバッジ（削除されている場合）
+        if is_deleted:
+            deleted_badge = QLabel("削除済")
+            deleted_badge.setAlignment(Qt.AlignCenter)
+            deleted_badge.setStyleSheet("""
+                background-color: #FF5555;
+                color: white;
+                font-weight: bold;
+                border-radius: 10px;
+                min-width: 20px;
+                min-height: 20px;
+                padding: 1px;
+            """)
+            info_layout.addWidget(deleted_badge)
+        # アノテーション情報
+        if annotation:
+            angle_label = QLabel(f"A: {annotation.get('angle', 0):.2f}")
+            angle_label.setStyleSheet("color: #FF6666; font-size: 12px;font-weight: bold;")
+            info_layout.addWidget(angle_label)
+            
+            throttle_label = QLabel(f"T: {annotation.get('throttle', 0):.2f}")
+            throttle_label.setStyleSheet("color: #FF6666; font-size: 12px;font-weight: bold;")
+            info_layout.addWidget(throttle_label)
+
+            # 位置情報バッジ（位置情報がある場合）
+            if location_value is not None:
+                loc_color = get_location_color(location_value)
+                
+                loc_badge = QLabel(str(location_value))
+                loc_badge.setAlignment(Qt.AlignCenter)
+                loc_badge.setStyleSheet(f"""
+                    background-color: {loc_color.name()};
+                    color: white;
+                    font-weight: bold;
+                    border-radius: 10px;
+                    min-width: 20px;
+                    min-height: 20px;
+                    padding: 1px;
+                """)
+                info_layout.addWidget(loc_badge)
+                    
+
+        # 分布グラフ用ラベルを追加 (info_layoutに追加)
+        self.distribution_label = QLabel("アノテーションがありません")
+        self.distribution_label.setAlignment(Qt.AlignCenter)
+        self.distribution_label.setMinimumHeight(300)  # 高さを確保
+        self.distribution_label.setStyleSheet("background-color: #f5f5f5; border: 1px solid #dddddd;")
+        info_layout.addWidget(self.distribution_label)
+
+        # 残りのスペースを埋めるスペーサー
+        info_layout.addStretch()
+        
+        # 左側の情報パネルをメインレイアウトに追加
+        self.layout.addWidget(info_panel)
+        
+        # 右側の画像パネル
+        image_panel = QWidget()
+        image_layout = QVBoxLayout(image_panel)
+        image_layout.setContentsMargins(0, 0, 0, 0)
+        image_layout.setSpacing(0)  # スペーシングをなくす
+        
+        # ファイル名ラベルを画像の上部に配置
+        filename = os.path.basename(img_path)
+        if len(filename) > 20:  # ファイル名が長い場合は切り詰める
+            filename = filename[:18] + "..."
+        
+        name_label = QLabel(filename)
+        name_label.setAlignment(Qt.AlignCenter)
+        name_label.setStyleSheet("font-size: 12px; color: #444444; background-color: #f8f8f8;font-weight: bold;")
+        name_label.setFixedHeight(10)  # 高さを最小限に
+        image_layout.addWidget(name_label)
+        
+        # 画像コンテナ（枠を付けるための外側のコンテナ）
+        image_container = QFrame()
+        
+        # ボーダーのスタイル設定
+        border_style = ""
+        if is_selected:
+            border_style = "border: 2px solid red;"
+        elif is_deleted:
+            border_style = "border: 2px solid #FF5555;"  # 削除済みは赤い枠線
+        elif location_value is not None:
+            loc_color = get_location_color(location_value)
+            border_style = f"border: 2px solid {loc_color.name()};"
+        elif annotation:
+            border_style = "border: 2px solid #FF9966;"  # アノテーションのみはオレンジ系
+        else:
+            border_style = "border: 1px solid #dddddd;"
+        
+        # 画像コンテナのレイアウト - マージンを完全に削除
+        image_container_layout = QVBoxLayout(image_container)
+        image_container_layout.setContentsMargins(0, 0, 0, 0)  # 余白なし
+        image_container_layout.setSpacing(0)  # スペーシングなし
+        
+        # 画像ラベル
+        self.img_label = QLabel()
+        self.img_label.setAlignment(Qt.AlignCenter)
+        #self.img_label.setFixedSize(150, 140)  # 幅を少し広げる
+        self.img_label.setMinimumSize(150, 120)  # 最小サイズを設定
+        self.img_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)  # サイズポリシーを設定
+        
+        # 削除済みの場合は半透明になるスタイルを追加
+        if is_deleted:
+            self.img_label.setStyleSheet(f"{border_style} padding: 0px; opacity: 0.5;")
+        else:
+            self.img_label.setStyleSheet(f"{border_style} padding: 0px;")
+            
+        image_container_layout.addWidget(self.img_label)
+        
+        # 画像コンテナをイメージパネルに追加
+        image_layout.addWidget(image_container)
+        
+        # 画像パネルをメインレイアウトに追加
+        self.layout.addWidget(image_panel)
+                
+        # ウィジェット全体の枠線はなし
+        self.setStyleSheet("border: none;")
+
+    def mousePressEvent(self, event):
+        # クリック時にon_click関数を呼び出す
+        if self.on_click and event.button() == Qt.LeftButton:
+            self.on_click(self.index)
+    
+# データ操作全体系
+class ImageAnnotationTool(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        
+        self.data_manager = AnnotationDataManager()
+        self.mlflow_manager = MLflowManager(mlflow_dir)
+
+        # Initialize state
+        self.folder_path = ""
+        self.folder_paths = []       
+        self.image_folders = []      
+        self.images = []
+        self.current_index = 0
+        self.available_variants = {}
+        self.annotations = {}
+        self.annotation_history = []
+        self.annotated_count = 0
+
+        # 現在のアノテーションモード（0=自動運転、1=物体検知）
+        self.current_mode = 0
+        self.last_selected_bbox_class = None  # 前回選択した物体検知クラス
+        self.last_bbox = None  # 前回作成したバウンディングボックスの情報
+        self.last_bboxes = []  # 前回の画像の全てのバウンディングボックスを保存するリスト（新規追加）
+        self.auto_apply_last_bbox = False  # 前回のバウンディングボックスを自動適用するかどうか
+
+        # セグメンテーション関連の初期化
+        self.segmentation_annotations = {}  # セグメンテーションアノテーション用
+        self.current_polygon = []  # 現在描画中のポリゴン
+        self.is_drawing_polygon = False  # ポリゴン描画中フラグ
+        self.segmentation_inference_results = {}  # セグメンテーション推論結果
+        self.yolo_seg_model = None  # YOLOセグメンテーションモデル
+        self.last_segmentations = []
+
+        # 削除インデックス
+        self.deleted_indexes = []
+
+        # manifest.jsonのパスを保存する変数
+        self.last_manifest_path = None
+
+        self.info_panel_width = 280  # 基本の幅
+        self.info_panel_margin = 20  # パネル周りの余白（左右合計）
+
+        # 位置情報関連の初期化
+        self.location_buttons = []  # 位置情報ボタンのリスト
+        self.current_location = None  # 現在選択されている位置情報
+        self.location_annotations = {}  # 画像ごとの位置情報アノテーション
+        
+        # アノテーションのタイムスタンプを保存する辞書
+        self.annotation_timestamps = {}
+        
+        # 推論結果のキャッシュ
+        self.inference_results = {}
+        self.inference_diff_vectors = {}
+        self.show_diff_vectors = False  
+
+        # YOLO関連の初期化を追加
+        self.yolo_model = None  # YOLOモデルのインスタンス
+        self.yolo_confidence_threshold = 0.6  
+        self.bbox_annotations = {} 
+
+        # Setup UI
+        self.init_ui()
+
+        # Update UI
+        self.display_current_image()
+        self.update_gallery()
+        self.update_slider_deleted_indexes()
+
+        if hasattr(self, 'prev_multi_button') and hasattr(self, 'next_multi_button'):
+            self.update_skip_button_labels(10)  # デフォルト値は10
+
+        self.add_session_check_to_init_ui()
+
+        QApplication.instance().installEventFilter(self)
+
+    def init_ui(self):
+        self.setWindowTitle("画像アノテーションツール")
+        self.setGeometry(MAIN_WINDOW_X, MAIN_WINDOW_Y, MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT)
+
+        # Main widget and layout
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QHBoxLayout(central_widget)
+        
+        # Left panel for controls
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_panel.setMaximumWidth(LEFT_PANEL_MAX_WIDTH)
+        main_layout.addWidget(left_panel)
+
+        # Folder selection
+        folder_label = QLabel("データ読込（imagesフォルダの親フォルダ:")
+        folder_label.setStyleSheet("font-weight: bold;")  
+        left_layout.addWidget(folder_label)
+        
+        folder_layout = QHBoxLayout()
+        self.folder_input = QLineEdit()
+        self.folder_input.setPlaceholderText("フォルダパスを入力または参照ボタンで複数選択可能")
+        self.folder_input.textChanged.connect(self.on_folder_path_changed)
+        folder_layout.addWidget(self.folder_input)
+        
+        browse_button = QPushButton("参照...")
+        browse_button.clicked.connect(self.browse_folder)
+        folder_layout.addWidget(browse_button)
+        apply_style(browse_button, 'primary')
+        left_layout.addLayout(folder_layout)
+        
+        load_button_layout = QHBoxLayout()
+
+        self.load_button = QPushButton("画像読込")
+        self.load_button.clicked.connect(self.load_images)
+        self.load_button.setEnabled(False)  # 初期状態は無効
+        apply_style(self.load_button, 'primary')
+        load_button_layout.addWidget(self.load_button)
+
+        # アノテーションデータ読み込みボタンを追加
+        self.load_annotation_button = QPushButton("アノテーション読込")
+        self.load_annotation_button.clicked.connect(self.load_annotations)
+        self.load_annotation_button.setEnabled(False)  # 初期状態は無効
+        apply_style(self.load_annotation_button, 'primary')
+        load_button_layout.addWidget(self.load_annotation_button)
+
+        left_layout.addLayout(load_button_layout)
+
+        # Stats
+        self.stats_label = QLabel("アノテーション済み: 0 / 0")
+        left_layout.addWidget(self.stats_label)
+                
+        # --- 統計ラベル直後にキー選択用ラジオボタン群を追加 ---
+        variants = self.available_variants
+        variant_box = QGroupBox("画像ソース")
+        # variant_box = QGroupBox("画像ソース:idx_sensor_image_array_.jpg（学習に用いられます）")
+        variant_layout = QHBoxLayout(variant_box)
+        # 排他制御用のボタングループ
+        self.variant_button_group = QButtonGroup(self)
+        self.variant_button_group.setExclusive(True)
+        for var in variants:
+            rb = QRadioButton(var)
+            variant_layout.addWidget(rb)
+            self.variant_button_group.addButton(rb)
+            if var == self.current_variant:
+                rb.setChecked(True)
+            # 切替時、チェックされた変化のみ受け取る
+            rb.toggled.connect(lambda checked, v=var: self.on_variant_changed(v) if checked else None)
+        left_layout.addWidget(variant_box)
+
+        # エクスポートセクション
+        save_label = QLabel("アノテーションデータ保存:")
+        save_label.setStyleSheet("font-weight: bold;")  # 太文字にするスタイルを追加
+        left_layout.addWidget(save_label)
+
+        export_layout = QHBoxLayout()
+        
+        # donkey保存
+        donkey_btn = QPushButton("Donkey")
+        donkey_btn.clicked.connect(self.export_to_donkey)
+        apply_style(donkey_btn, 'export')
+        export_layout.addWidget(donkey_btn)
+
+        # jetracer保存保存
+        jetracer_btn = QPushButton("Jetracr")
+        jetracer_btn.clicked.connect(self.export_to_jetracer)
+        apply_style(jetracer_btn, 'export')
+        export_layout.addWidget(jetracer_btn)
+
+        # 統合YOLOエクスポートボタン（修正）
+        yolo_btn = QPushButton("YOLO")
+        yolo_btn.clicked.connect(self.export_to_yolo_unified)
+        apply_style(yolo_btn, 'export')
+        export_layout.addWidget(yolo_btn)
+
+        left_layout.addLayout(export_layout)
+
+        ## 動画作成ボタン
+        create_video_button = QPushButton("アノテーション動画作成")
+        create_video_button.clicked.connect(self.create_annotation_video)
+        left_layout.addWidget(create_video_button)
+
+        # 自動運転コンテナ
+        self.pilot_container = QWidget()
+        pilot_layout = QVBoxLayout(self.pilot_container)
+
+        # 学習モード
+        pilot_label = QLabel("自動運転モデル:")
+        pilot_label.setStyleSheet("font-weight: bold;")  # 太文字にするスタイルを追加
+        pilot_layout.addWidget(pilot_label)
+
+        # 学習方法選択
+        method_layout = QHBoxLayout()
+        method_layout.addWidget(QLabel("走行モデル選択:"))
+        self.auto_method_combo = QComboBox()
+
+        # 利用可能なモデルのリストを取得
+        available_models = list_available_models()
+
+        # コンボボックスのアイテムをモデルリストで初期化
+        self.auto_method_combo.addItems(available_models)
+
+        self.auto_method_combo.currentIndexChanged.connect(self.on_method_changed)
+        method_layout.addWidget(self.auto_method_combo)
+        pilot_layout.addLayout(method_layout)
+
+        # モデル選択コンボボックス（1行使用）
+        self.model_combo = QComboBox()
+        self.model_combo.setMinimumWidth(180)  # 幅を広げて見やすく
+        self.model_combo.setStyleSheet("combobox-popup: 0;")  # ドロップダウンリストの高さを自動調整
+        pilot_layout.addWidget(self.model_combo)
+
+        # モデル操作ボタン（更新と読み込み - 横並び）
+        model_buttons_layout = QHBoxLayout()
+
+        # モデル学習ボタン（自動運転用）
+        train_model_button = QPushButton("モデル学習・保存")
+        train_model_button.clicked.connect(self.train_and_save_model)
+        apply_style(train_model_button, 'training')
+        model_buttons_layout.addWidget(train_model_button)  
+
+        # モデル明示的読み込みボタン
+        self.model_load_button = QPushButton("モデル読込")
+        self.model_load_button.setToolTip("modelsフォルダのモデルを読込む")
+        self.model_load_button.clicked.connect(self.load_selected_model)
+        apply_style(self.model_load_button, 'model')
+        model_buttons_layout.addWidget(self.model_load_button)
+
+        pilot_layout.addLayout(model_buttons_layout)
+
+        # 推論結果表示オプション
+        inference_layout = QHBoxLayout()
+        self.inference_checkbox = QCheckBox("推論結果表示（青丸）")
+        self.inference_checkbox.setChecked(False)
+        self.inference_checkbox.stateChanged.connect(self.toggle_inference_display)
+        inference_layout.addWidget(self.inference_checkbox)
+
+
+        # 一括推論実行ボタンを追加
+        batch_inference_button = QPushButton("全画像を推論")
+        batch_inference_button.setToolTip("全ての画像に対して推論を実行します")
+        batch_inference_button.clicked.connect(self.run_batch_inference)
+        inference_layout.addWidget(batch_inference_button)
+
+        pilot_layout.addLayout(inference_layout)
+
+        # 差分ベクトル矢印表示オプション
+        diff_vector_layout = QHBoxLayout()
+        self.diff_vector_checkbox = QCheckBox("差分ベクトル矢印表示（緑矢印）")
+        self.diff_vector_checkbox.setChecked(False)
+        self.diff_vector_checkbox.stateChanged.connect(self.toggle_diff_vector_display)
+        diff_vector_layout.addWidget(self.diff_vector_checkbox)
+        
+        pilot_layout.addLayout(diff_vector_layout)
+
+        left_layout.addWidget(self.pilot_container)
+                    
+        # 物体検知推論結果表示フラグの初期化
+        self.show_detection_inference = False
+
+        # 物体検知推論結果格納用の辞書を初期化
+        self.detection_inference_results = {}
+
+        # 物体検知推論結果表示用ラベルを作成
+        self.detection_inference_info_label = QLabel("")
+        self.detection_inference_info_label.setStyleSheet("color: blue;")
+        self.detection_inference_info_label.setWordWrap(True)
+
+        # 推論実行ボタン
+        inference_button_layout = QHBoxLayout()
+
+        # オートアノテーションボタン
+        auto_annotate_button = QPushButton("オートアノテーション実行")
+        auto_annotate_button.clicked.connect(self.auto_annotate)
+        apply_style(auto_annotate_button, 'special')
+        inference_button_layout.addWidget(auto_annotate_button)
+
+        left_layout.addLayout(inference_button_layout)
+
+
+        # 物体検知設定コンテナ
+        self.object_detection_container = QWidget()
+        obj_detection_layout = QVBoxLayout(self.object_detection_container)
+
+        # 位置推論モデル追加
+        self.add_location_model_section()
+
+        # ラベル
+        obj_detection_label = QLabel("物体検知・セグメンテーションモデル:")
+        obj_detection_label.setStyleSheet("font-weight: bold")
+        obj_detection_layout.addWidget(obj_detection_label)
+
+        # YOLOアノテーション読み込みボタン
+        load_yolo_btn = QPushButton("YOLOアノテーション読込")
+        load_yolo_btn.clicked.connect(self.load_yolo_annotations)
+        apply_style(load_yolo_btn, 'primary')
+        obj_detection_layout.addWidget(load_yolo_btn)
+
+        # クラス設定グループ（既存のコード）
+        classes_group = QGroupBox("検知クラス設定")
+        classes_group_layout = QVBoxLayout(classes_group)
+        
+        # クラス入力フィールド
+        classes_layout = QHBoxLayout()
+        classes_layout.addWidget(QLabel("検知クラス:"))
+        self.classes_input = QLineEdit("car,person,sign,cone")
+        self.classes_input.setPlaceholderText("カンマ区切りでクラス名を入力")
+        self.classes_input.setToolTip("例: car,person,wall,crossroad,sign")
+        classes_layout.addWidget(self.classes_input)
+        classes_group_layout.addLayout(classes_layout)
+        
+        # クラス操作ボタン
+        class_buttons_layout = QHBoxLayout()
+        preset_button = QPushButton("プリセット")
+        preset_button.clicked.connect(self.show_class_preset_dialog)
+        class_buttons_layout.addWidget(preset_button)
+        validate_button = QPushButton("クラス確認")
+        validate_button.clicked.connect(self.validate_classes)
+        class_buttons_layout.addWidget(validate_button)
+        classes_group_layout.addLayout(class_buttons_layout)
+        
+        obj_detection_layout.addWidget(classes_group)
+        
+        # クラス入力フィールドの変更を監視
+        self.classes_input.textChanged.connect(self.on_classes_changed)
+
+        # YOLOモデルタイプ選択
+        model_type_layout = QHBoxLayout()
+        model_type_layout.addWidget(QLabel("YOLOモデル:"))
+        self.yolo_model_combo = QComboBox()
+        self.yolo_model_combo.addItems(["yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x"])
+        self.yolo_model_combo.currentIndexChanged.connect(self.on_yolo_model_type_changed)
+        model_type_layout.addWidget(self.yolo_model_combo)
+        obj_detection_layout.addLayout(model_type_layout)
+
+        # 統合されたモデル選択コンボボックス
+        model_selection_label = QLabel("学習済みモデル (物体検知・セグメンテーション):")
+        model_selection_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        obj_detection_layout.addWidget(model_selection_label)
+
+        self.yolo_unified_model_combo = QComboBox()
+        self.yolo_unified_model_combo.setMinimumWidth(180)
+        self.yolo_unified_model_combo.setStyleSheet("combobox-popup: 0;")
+        obj_detection_layout.addWidget(self.yolo_unified_model_combo)
+
+        # YOLOモデル操作ボタン
+        yolo_model_buttons_layout = QHBoxLayout()
+
+        # 統合された学習ボタン（物体検知・セグメンテーション両対応）
+        train_yolo_button = QPushButton("YOLO学習・保存")
+        train_yolo_button.clicked.connect(self.train_yolo_unified)  # 新しいメソッドに変更
+        train_yolo_button.setToolTip("物体検知またはセグメンテーションを学習")
+        apply_style(train_yolo_button, 'training')
+        yolo_model_buttons_layout.addWidget(train_yolo_button)
+
+        # モデル読み込みボタン
+        self.yolo_load_button = QPushButton("モデル読込")
+        self.yolo_load_button.setToolTip("modelsフォルダのモデルを読込む")
+        self.yolo_load_button.clicked.connect(self.load_yolo_model_unified)  # 新しいメソッドに変更
+        #self.yolo_load_button.clicked.connect(self.load_yolo_model_unified)  # 新しいメソッドに変更
+        apply_style(self.yolo_load_button, 'model')
+        yolo_model_buttons_layout.addWidget(self.yolo_load_button)
+
+        obj_detection_layout.addLayout(yolo_model_buttons_layout)
+
+        # 推論結果表示オプション
+        inference_layout = QHBoxLayout()
+        
+        # 物体検知推論結果表示チェックボックス
+        self.detection_inference_checkbox = QCheckBox("物体検知推論結果表示")
+        self.detection_inference_checkbox.setChecked(False)
+        self.detection_inference_checkbox.stateChanged.connect(self.toggle_detection_inference_display)
+        inference_layout.addWidget(self.detection_inference_checkbox)
+        
+        # セグメンテーション推論結果表示チェックボックス
+        self.segmentation_inference_checkbox = QCheckBox("セグメンテーション推論結果表示")
+        self.segmentation_inference_checkbox.setChecked(False)
+        self.segmentation_inference_checkbox.stateChanged.connect(self.toggle_segmentation_inference_display)
+        inference_layout.addWidget(self.segmentation_inference_checkbox)
+        
+        obj_detection_layout.addLayout(inference_layout)
+        
+        # 物体検知コンテナを追加
+        left_layout.addWidget(self.object_detection_container)
+        
+
+        # --- MLflow関連ボタンを追加 ---
+        mlflow_layout = QVBoxLayout()
+
+        mlflow_label = QLabel("モデル管理（mlflow/databricks）:")
+        mlflow_label.setStyleSheet("font-weight: bold;") 
+        mlflow_layout.addWidget(mlflow_label)
+
+        # MLflow比較ボタン
+        mlflow_compare_button = QPushButton("Mlflowを開く")
+        apply_style(mlflow_compare_button, 'special')
+
+        mlflow_compare_button.clicked.connect(self.mlflow_manager.open_ui)
+        #mlflow_compare_button.clicked.connect(self.compare_models_mlflow)
+        mlflow_layout.addWidget(mlflow_compare_button)
+
+        left_layout.addLayout(mlflow_layout)
+
+        self.on_method_changed(self.auto_method_combo.currentIndex())
+
+        # Current image info
+        left_layout.addWidget(QLabel(""))  # Spacer
+        self.current_image_label = QLabel("画像が選択されていません")
+                        
+        # ステータスバー
+        self.statusBar().showMessage("Bキーを押しながらクリックすると、いつでもバウンディングボックスを作成できます。Deleteキーで選択したボックスを削除できます。", 10000)
+
+        # 最後にスペーサーを追加
+        left_layout.addStretch()
+        
+        # Right panel for images
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        main_layout.addWidget(right_panel)
+        
+        # メイン画像と位置情報パネルを横に並べるレイアウト - 1:4:1の比率に変更
+        main_panel_layout = QHBoxLayout()
+        
+        # 1. 左側の情報パネル（アノテーション情報表示用）- 追加
+        info_panel = QWidget()
+        info_panel.setObjectName("info_panel")  # スタイルシート適用用
+        info_panel.setStyleSheet("#info_panel { background-color: rgba(0, 0, 0, 0.1); border-radius: 5px; }")
+        info_layout = QVBoxLayout(info_panel)
+        info_layout.setSpacing(8)  # スペーシングを調整
+        
+        # 情報パネルの内容
+        self.current_image_info = QLabel("画像情報")
+        self.current_image_info.setStyleSheet("color: #333333; font-weight: bold;")
+        info_layout.addWidget(self.current_image_info)
+        
+        self.annotation_info_label = QLabel("")
+        self.annotation_info_label.setWordWrap(True)  # テキスト折り返し
+        info_layout.addWidget(self.annotation_info_label)
+        
+        self.inference_info_label = QLabel("")
+        self.inference_info_label.setWordWrap(True)
+        self.inference_info_label.setStyleSheet("color: blue;")
+        info_layout.addWidget(self.inference_info_label)
+
+        # 物体検知推論結果表示ラベル
+        self.detection_inference_info_label = QLabel("")
+        self.detection_inference_info_label.setWordWrap(True)
+        self.detection_inference_info_label.setStyleSheet("color: green;")  # 緑色で表示して区別
+        info_layout.addWidget(self.detection_inference_info_label)
+        
+        # 上部のウィジェットと分布グラフの間にスペーサーを入れる
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        info_layout.addWidget(spacer)
+
+        # 分布タイトルラベル
+        graph_title = QLabel("運転アノテーション分布")
+        graph_title.setStyleSheet("font-weight: bold; color: #333333;")
+        graph_title.setAlignment(Qt.AlignCenter)
+        info_layout.addWidget(graph_title)
+
+        # 分布グラフ用ラベル - 固定サイズで配置
+        self.distribution_label = QLabel()
+        self.distribution_label.setAlignment(Qt.AlignCenter)
+        self.distribution_label.setFixedHeight(400)  # 高さを固定
+        self.distribution_label.setStyleSheet("background-color: #f8f8f8; border: 1px solid #dddddd; border-radius: 4px;")
+
+        # 初期表示テキストの設定
+        no_data_font = QFont()
+        no_data_font.setPointSize(10)
+        self.distribution_label.setFont(no_data_font)
+        self.distribution_label.setText("アノテーションがありません")
+
+        info_layout.addWidget(self.distribution_label)
+
+        # パネルのサイズ設定を記録（グラフ作成時に使用）
+        self.info_panel_width = 200  # 基本の幅
+        self.info_panel_margin = 0  # パネル周りの余白（左右合計）
+
+        # パネルの最小幅を設定
+        info_panel.setMinimumWidth(self.info_panel_width)
+        
+        # パネルのサイズ設定
+        # info_panel.setMinimumWidth(200)  # 最小幅
+        main_panel_layout.addWidget(info_panel, 1)  # 比率1
+        
+        # 2. 中央の画像パネル - 既存のmain_image_containerをそのまま利用
+        # メインイメージの周りにマージンを調整 - 左側マージンを0に変更（情報パネルを別ウィジェットにしたため）
+        main_image_container = QVBoxLayout()
+        main_image_container.setContentsMargins(0, 0, 0, 0)  # マージンを0に変更
+        
+        self.main_image_view = ImageLabel(main_window=self)
+        self.main_image_view.setMinimumSize(800, 600)
+        main_image_container.addWidget(self.main_image_view)
+        
+        # ナビゲーションコントロールをメイン画像の下に配置
+        nav_container = QWidget()
+        nav_container_layout = QVBoxLayout(nav_container)
+        
+        # スライダーの配置
+        slider_layout = QHBoxLayout()
+        slider_label = QLabel("画像シーク:")
+        slider_layout.addWidget(slider_label)
+        
+        #self.image_slider = QSlider(Qt.Horizontal)
+        self.image_slider = DeletedIndexesSlider()
+        self.image_slider.setMinimum(0)
+        self.image_slider.setMaximum(0) 
+        self.image_slider.setValue(0)
+        self.image_slider.setTickPosition(QSlider.TicksBelow)
+        self.image_slider.setTickInterval(10)
+        self.image_slider.valueChanged.connect(self.slider_changed)
+        slider_layout.addWidget(self.image_slider)
+        
+        self.slider_value_label = QLabel("0/0")
+        slider_layout.addWidget(self.slider_value_label)
+        
+        nav_container_layout.addLayout(slider_layout)
+        
+        # ナビゲーションボタンの配置
+        nav_layout = QHBoxLayout()
+        
+        self.prev_multi_button = QPushButton("◀◀")  # 早戻しマーク
+        self.prev_multi_button.clicked.connect(lambda: self.skip_images(-self.skip_count_spin.value()))
+        nav_layout.addWidget(self.prev_multi_button)
+        
+        prev_button = QPushButton("◀ 前へ")
+        prev_button.clicked.connect(lambda: self.skip_images(-1))
+        nav_layout.addWidget(prev_button)
+        
+        next_button = QPushButton("次へ ▶")
+        next_button.clicked.connect(lambda: self.skip_images(1))
+        nav_layout.addWidget(next_button)
+        
+        self.next_multi_button = QPushButton("▶▶")  # 早送りマーク
+        self.next_multi_button.clicked.connect(lambda: self.skip_images(self.skip_count_spin.value()))
+        nav_layout.addWidget(self.next_multi_button)
+        
+        nav_container_layout.addLayout(nav_layout)
+        
+        # 再生ボタンの配置
+        play_layout = QHBoxLayout()
+        
+        play_layout.addWidget(QLabel("再生:"))
+        reverse_play_button = QPushButton("◀️")
+        reverse_play_button.clicked.connect(self.play_reverse)
+        play_layout.addWidget(reverse_play_button)
+        
+        play_button = QPushButton("▶️")
+        play_button.clicked.connect(self.play_forward)
+        play_layout.addWidget(play_button)
+        
+        nav_container_layout.addLayout(play_layout)
+
+        # 削除機能を追加 - 1. 現在のアノテーションを削除するボタン
+        delete_layout = QHBoxLayout()
+        delete_layout.addWidget(QLabel("削除/復元:"))
+
+        delete_current_button = QPushButton("現在のアノテーション削除")
+        delete_current_button.clicked.connect(self.delete_current_annotation)
+        apply_style(delete_current_button, "destructive")
+        delete_layout.addWidget(delete_current_button)
+
+        # 復元ボタンを追加
+        restore_button = QPushButton("削除状態を復元")
+        restore_button.clicked.connect(self.restore_deleted_annotation)
+        delete_layout.addWidget(restore_button)
+
+        # 全ての削除状態を復元するボタンを追加
+        restore_all_button = QPushButton("全ての削除状態を復元")
+        restore_all_button.clicked.connect(self.restore_all_deleted_annotations)
+        delete_layout.addWidget(restore_all_button)
+
+        nav_container_layout.addLayout(delete_layout)
+
+        # 削除機能を追加 - 2. クリップ機能（範囲指定削除）- ここを修正
+        clip_layout = QHBoxLayout()
+        clip_layout.addWidget(QLabel("クリップ範囲:"))
+
+        # クリップ開始位置入力と「現在位置を設定」ボタン
+        start_layout = QHBoxLayout()
+        self.clip_start_spin = QSpinBox()
+        self.clip_start_spin.setRange(0, 99999)
+        self.clip_start_spin.setValue(0)
+        start_layout.addWidget(self.clip_start_spin)
+
+        self.set_start_button = QPushButton("現在位置")
+        self.set_start_button.clicked.connect(self.set_clip_start_to_current)
+        self.set_start_button.setToolTip("現在のインデックスを開始位置に設定")
+        start_layout.addWidget(self.set_start_button)
+        clip_layout.addLayout(start_layout)
+
+        clip_layout.addWidget(QLabel("から"))
+
+        # クリップ終了位置入力と「現在位置を設定」ボタン
+        end_layout = QHBoxLayout()
+        self.clip_end_spin = QSpinBox()
+        self.clip_end_spin.setRange(0, 99999)
+        self.clip_end_spin.setValue(0)
+        end_layout.addWidget(self.clip_end_spin)
+
+        self.set_end_button = QPushButton("現在位置")
+        self.set_end_button.clicked.connect(self.set_clip_end_to_current)
+        self.set_end_button.setToolTip("現在のインデックスを終了位置に設定")
+        end_layout.addWidget(self.set_end_button)
+        clip_layout.addLayout(end_layout)
+
+        clip_button = QPushButton("範囲削除")
+        clip_button.clicked.connect(self.delete_clip_range)
+        apply_style(clip_button, "destructive")
+        clip_layout.addWidget(clip_button)
+
+        nav_container_layout.addLayout(clip_layout)
+
+
+        # ナビゲーションコンテナをメイン画像コンテナに追加
+        main_image_container.addWidget(nav_container)
+        
+        # 中央パネルをメインパネルに追加 - 比率4に設定
+        main_panel_layout.addLayout(main_image_container, 4)
+        
+        # 3. 右側の位置情報パネル - 既存のright_layoutをそのまま利用、比率1に設定
+        location_panel = QWidget()
+        location_layout = QVBoxLayout(location_panel)
+        location_layout.setSpacing(5)
+        
+        mode_layout_label = QLabel("アノテーションモード:")
+        mode_layout_label.setStyleSheet("font-weight: bold;")
+        location_layout.addWidget(mode_layout_label)
+
+        # アノテーションモード切替ボタン
+        mode_layout = QHBoxLayout()
+        
+        self.auto_mode_button = QPushButton("自動運転")
+        self.auto_mode_button.setCheckable(True)
+        self.auto_mode_button.setChecked(True)
+        self.auto_mode_button.clicked.connect(self.toggle_annotation_mode)
+
+        self.detection_mode_button = QPushButton("物体検知")
+        self.detection_mode_button.setCheckable(True)
+        self.detection_mode_button.clicked.connect(self.toggle_annotation_mode)
+
+        # 新規追加: セグメンテーションモードボタン
+        self.segmentation_mode_button = QPushButton("セグメンテーション")
+        self.segmentation_mode_button.setCheckable(True)
+        self.segmentation_mode_button.clicked.connect(self.toggle_annotation_mode)
+
+        mode_layout.addWidget(self.auto_mode_button)
+        mode_layout.addWidget(self.detection_mode_button)
+        mode_layout.addWidget(self.segmentation_mode_button)  # 追加
+
+        location_layout.addLayout(mode_layout)
+
+        # 現在のモードを表すヒントラベル
+        self.mode_hint_label = QLabel("※Bキーを押すとモードが切り替わります")
+        self.mode_hint_label.setStyleSheet("color: #666; font-style: italic;")
+        location_layout.addWidget(self.mode_hint_label)
+
+        # 前回のバウンディングボックスを自動適用するチェックボックス
+        self.apply_last_bbox_checkbox = QCheckBox("前回のバウンディングボックスを適用")
+        self.apply_last_bbox_checkbox.setChecked(False)
+        self.apply_last_bbox_checkbox.setToolTip("前回作成したバウンディングボックスを現在の画像にも適用します")
+        self.apply_last_bbox_checkbox.stateChanged.connect(self.toggle_auto_apply_bbox)
+        location_layout.addWidget(self.apply_last_bbox_checkbox)
+
+        # セグメンテーション用の前回適用チェックボックス
+        self.apply_last_segmentation_checkbox = QCheckBox("前回のセグメンテーションを適用")
+        self.apply_last_segmentation_checkbox.setChecked(False)
+        self.apply_last_segmentation_checkbox.setToolTip("前回作成したセグメンテーションを現在の画像にも適用します")
+        self.apply_last_segmentation_checkbox.stateChanged.connect(self.toggle_auto_apply_segmentation)
+        location_layout.addWidget(self.apply_last_segmentation_checkbox)
+
+        # スキップ枚数設定
+        skip_layout = QHBoxLayout()
+        self.skip_images_on_click = QCheckBox("クリック時自動スキップ枚数")
+        self.skip_images_on_click.setChecked(True)  # デフォルトでオン
+        skip_layout.addWidget(self.skip_images_on_click)
+        self.skip_count_spin = QSpinBox()
+        self.skip_count_spin.setRange(1, 1000)
+        self.skip_count_spin.setValue(10)  # デフォルト値は10
+        self.skip_count_spin.valueChanged.connect(self.update_skip_button_labels)
+        skip_layout.addWidget(self.skip_count_spin)
+
+        location_layout.addLayout(skip_layout)
+
+        location_label = QLabel("コースの位置情報:")
+        location_label.setStyleSheet("font-weight: bold;")
+        location_layout.addWidget(location_label)
+
+        # 位置情報の自動適用チェックボックス
+        self.apply_location_checkbox = QCheckBox("前回の位置情報を適用")
+        self.apply_location_checkbox.setChecked(False)
+        self.apply_location_checkbox.setToolTip("前回選択した位置情報を現在の画像にも適用します")
+        self.apply_location_checkbox.stateChanged.connect(self.toggle_auto_apply_location)
+        location_layout.addWidget(self.apply_location_checkbox)
+        
+        # 位置情報の選択肢を管理するレイアウト
+        self.location_buttons_layout = QVBoxLayout()
+        location_layout.addLayout(self.location_buttons_layout)
+        
+        # 位置情報の追加ボタン
+        add_location_layout = QHBoxLayout()
+        self.new_location_input = QSpinBox()
+        self.new_location_input.setRange(0, 100)
+        self.new_location_input.setValue(8)  # 初期値を8に設定（8個作成後）
+        add_location_layout.addWidget(self.new_location_input)
+        
+        add_location_button = QPushButton("位置情報を追加")
+        add_location_button.clicked.connect(self.add_location_button)
+        add_location_layout.addWidget(add_location_button)
+        location_layout.addLayout(add_location_layout)
+        
+        # 現在の位置情報表示ラベル
+        self.current_location_label = QLabel("現在の位置情報: なし")
+        location_layout.addWidget(self.current_location_label)
+        
+        # スペーサーを追加して上部に配置
+        location_layout.addStretch()
+        
+        # 位置情報パネルをメインパネルに追加
+        main_panel_layout.addWidget(location_panel, 1)  # 比率1に設定
+        
+        # メインパネルをレイアウトに追加
+        right_layout.addLayout(main_panel_layout)
+
+        # Gallery
+        gallery_label = QLabel("ギャラリー:")
+        right_layout.addWidget(gallery_label)
+        
+        self.gallery_widget = QWidget()
+        self.gallery_layout = QGridLayout(self.gallery_widget)
+        self.gallery_layout.setContentsMargins(0, 0, 0, 0)  # マージンをゼロに
+        self.gallery_layout.setSpacing(2)
+        
+        gallery_scroll = QScrollArea()
+        gallery_scroll.setWidgetResizable(True)
+        gallery_scroll.setWidget(self.gallery_widget)
+        gallery_scroll.setMinimumHeight(GALLERY_MIN_HEIGHT)
+        right_layout.addWidget(gallery_scroll)
+        
+        # 位置情報ボタンを初期化（8個作成）
+        self.init_location_buttons()
+        
+        # キーボードイベント用のフォーカス設定
+        self.setFocusPolicy(Qt.StrongFocus)
+
+        # 削除インデックス
+        self.deleted_indexes = []
+
+        # 現在の位置情報を初期化（明示的に None に設定）
+        self.current_location = None
+        self.auto_apply_location = False  # 位置情報の自動適用フラグ
+
+        # 初期状態の設定
+        self.current_mode = 0  # 自動運転モード
+        self.auto_mode_button.setChecked(True)
+        self.detection_mode_button.setChecked(False)
+
+        # TODO:enhanced_annotationsの組み込み
+        apply_enhanced_annotations_display(self)
+
+    def update_ui(self):
+            """アノテーション変更後のUI更新を一括処理"""
+            # メイン画像表示を更新
+            if hasattr(self, 'main_image_view'):
+                self.main_image_view.update()
+            
+            if hasattr(self, 'update_slider_deleted_indexes'):
+                self.update_slider_deleted_indexes()
+
+            # ギャラリー表示を更新
+            if hasattr(self, 'update_gallery'):
+                self.update_gallery()
+            
+            # 情報パネルを更新
+            if hasattr(self, 'display_current_image'):
+                self.display_current_image()
+            
+            # 推論情報パネルを更新（推論表示がONの場合のみ）
+            if (hasattr(self, 'inference_checkbox') and 
+                hasattr(self, 'update_inference_display') and 
+                self.inference_checkbox.isChecked()):
+                self.update_inference_display()
+            
+            # 物体検知推論情報パネルを更新（表示がONの場合のみ）
+            if (hasattr(self, 'detection_inference_checkbox') and 
+                hasattr(self, 'update_detection_info_panel') and 
+                self.detection_inference_checkbox.isChecked()):
+                self.update_detection_info_panel()
+            
+            # 自動運転推論情報パネルを更新（推論表示がONの場合のみ）
+            if (hasattr(self, 'inference_checkbox') and 
+                hasattr(self, 'update_driving_info_panel') and 
+                self.inference_checkbox.isChecked()):
+                self.update_driving_info_panel()
+
+            # 位置情報パネルを更新（表示がONの場合のみ）
+            if (hasattr(self, 'location_inference_checkbox') and 
+                hasattr(self, 'update_location_info_panel') and 
+                self.location_inference_checkbox.isChecked()):
+                self.update_location_info_panel()
+
+            # 統計情報を更新
+            if hasattr(self, 'update_bbox_stats'):
+                self.update_bbox_stats()
+            
+            if hasattr(self, 'update_segmentation_stats'):
+                self.update_segmentation_stats()
+            
+            # 分布グラフを更新（自動運転アノテーションがある場合）
+            if hasattr(self, 'update_distribution_graph') and hasattr(self, 'annotations') and self.annotations:
+                self.update_distribution_graph()
+            
+            # 位置情報ボタンのカウント表示を更新
+            if hasattr(self, 'update_location_button_counts'):
+                self.update_location_button_counts()
+                
+    # 初期化/ファイル読込
+    def save_session_info(self):
+        """現在の作業セッション情報を保存する"""
+        try:            
+            # 保存する情報
+            session_info = {
+                "last_folder_path": self.folder_path if hasattr(self, 'folder_path') else "",
+                "last_folder_paths": self.folder_paths if hasattr(self, 'folder_paths') else [],
+                "last_model_arch": self.auto_method_combo.currentText() if hasattr(self, 'auto_method_combo') else "",
+                "last_model_name": self.model_combo.currentText() if hasattr(self, 'model_combo') else "",
+                "timestamp": int(time.time())
+            }
+            
+            # ファイルに保存
+            session_file = os.path.join(session_dir, "session.json")
+            with open(session_file, 'w') as f:
+                json.dump(session_info, f)
+                
+            print(f"セッション情報を保存しました: {session_file}")
+        except Exception as e:
+            print(f"セッション情報の保存に失敗: {e}")
+
+    def load_session_info(self):
+        """保存されたセッション情報を読み込む"""
+        try:
+            # セッション情報ファイルのパス
+            session_dir = os.path.join(APP_DIR_PATH, SESSION_DIR_NAME)
+            session_file = os.path.join(session_dir, "session.json")
+            
+            # ファイルが存在しない場合は空の情報を返す
+            if not os.path.exists(session_file):
+                return {}
+            
+            # ファイルから読み込み
+            with open(session_file, 'r') as f:
+                session_info = json.load(f)
+                
+            print(f"セッション情報を読み込みました: {session_file}")
+            return session_info
+        except Exception as e:
+            print(f"セッション情報の読み込みに失敗: {e}")
+            return {}
+
+    def update_distribution_graph(self):
+        """アノテーションの角度とスロットル値の分布を縦並びのヒストグラムで表示 - 削除済みを除外"""
+        
+        if not self.annotations:
+            # アノテーションがない場合は空のグラフを表示
+            self.distribution_label.clear()
+            self.distribution_label.setText("アノテーションがありません")
+            return
+        
+        # 既存のアノテーションからangleとthrottleの値を抽出
+        # 削除済みのインデックスは除外
+        angles = []
+        throttles = []
+        
+        for idx, anno in self.annotations.items():
+            # 削除済みインデックスをスキップ
+            if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
+                continue
+                
+            if 'angle' in anno and 'throttle' in anno:
+                angles.append(anno['angle'])
+                throttles.append(anno['throttle'])
+        
+        # データがない場合は終了
+        if not angles or not throttles:
+            self.distribution_label.clear()
+            self.distribution_label.setText("有効なアノテーションがありません")
+            return
+        
+        # グラフ作成
+        try:
+            # 情報パネルの幅に合わせてグラフサイズを調整
+            panel_width = self.info_panel_width - self.info_panel_margin
+            # 縦に2つのグラフを配置（縦長）
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(panel_width/100, 4))
+            
+            # カラーマップとヒストグラムの設定
+            cm = plt.get_cmap('viridis')
+            bins = 20
+            
+            # angle分布をヒストグラムで表示
+            n1, bins1, patches1 = ax1.hist(angles, bins=bins, alpha=0.7, color='skyblue')
+            # 度数に応じた色付け
+            bin_centers1 = 0.5 * (bins1[:-1] + bins1[1:])
+            col1 = bin_centers1 - min(bin_centers1)
+            col1 = col1 / max(col1) if max(col1) > 0 else col1
+            for c, p in zip(col1, patches1):
+                plt.setp(p, 'facecolor', cm(c))
+            
+            # スタイル設定
+            ax1.set_title('Angle dist', fontsize=10)
+            # ax1.set_xlabel('Angle値 (-1.0～1.0)', fontsize=8)
+            # ax1.set_ylabel('頻度', fontsize=8)
+            ax1.tick_params(axis='both', which='major', labelsize=7)
+            ax1.grid(True, alpha=0.3)
+            ax1.set_xlim(-1.05, 1.05)
+                        
+            # throttle分布をヒストグラムで表示
+            n2, bins2, patches2 = ax2.hist(throttles, bins=bins, alpha=0.7, color='salmon')
+            # 度数に応じた色付け
+            bin_centers2 = 0.5 * (bins2[:-1] + bins2[1:])
+            col2 = bin_centers2 - min(bin_centers2)
+            col2 = col2 / max(col2) if max(col2) > 0 else col2
+            for c, p in zip(col2, patches2):
+                plt.setp(p, 'facecolor', cm(c))
+            
+            # スタイル設定
+            ax2.set_title('Throttle dist', fontsize=10)
+            # ax2.set_xlabel('Throttle値 (-1.0～1.0)', fontsize=8)
+            # ax2.set_ylabel('頻度', fontsize=8)
+            ax2.tick_params(axis='both', which='major', labelsize=7)
+            ax2.grid(True, alpha=0.3)
+            ax2.set_xlim(-1.05, 1.05)
+                        
+            # レイアウト調整
+            plt.tight_layout(pad=1.0)
+            
+            # メモリ上にグラフを保存
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+            buf.seek(0)
+            
+            # QImageに変換してQPixmapに設定
+            image = QImage.fromData(buf.getvalue())
+            pixmap = QPixmap.fromImage(image)
+            
+            # 分布グラフタイトルに削除分を除外している旨を追加
+            total_annotations = len(self.annotations)
+            deleted_count = sum(1 for idx in self.annotations if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes)
+            valid_count = total_annotations - deleted_count
+            
+            # グラフタイトルラベルを更新
+            if hasattr(self, 'distribution_label'):
+                self.distribution_label.setPixmap(pixmap)
+                self.distribution_label.setScaledContents(True)
+                
+                # グラフタイトルを更新（削除済み除外表示を追加）
+                if deleted_count > 0 and hasattr(self, 'graph_title') and isinstance(self.graph_title, QLabel):
+                    self.graph_title.setText(f"運転アノテーション分布 ({valid_count}件, 削除済み{deleted_count}件を除外)")
+            
+            # 後始末
+            plt.close(fig)
+            
+        except Exception as e:
+            print(f"分布グラフ作成中にエラー: {str(e)}")
+            traceback.print_exc()
+            self.distribution_label.setText(f"グラフ作成エラー: {str(e)}")
+
+    def update_segmentation_stats(self):
+        """セグメンテーションアノテーションの統計情報を更新"""
+        seg_count = len(self.segmentation_annotations) if hasattr(self, 'segmentation_annotations') else 0
+        
+        # 統計ラベルの更新（既存のstats_labelを拡張）
+        if hasattr(self, 'stats_label'):
+            current_text = self.stats_label.text()
+            if "Segmentations:" not in current_text:
+                self.stats_label.setText(f"{current_text} | Segmentations: {seg_count}")
+
+    def eventFilter(self, obj, event):
+        # キーイベントを処理
+        if event.type() == QEvent.KeyPress:
+            key = event.key()
+
+            # テキスト入力フィールドにフォーカスがある場合は、そのフィールドに処理を委ねる
+            focused_widget = QApplication.focusWidget()
+    
+            # テキスト入力系のウィジェットの場合は、アプリケーション固有のキー処理をスキップ
+            if isinstance(focused_widget, (QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox)):
+                # ただし、一部のキーは例外的に処理する
+                if key in [Qt.Key_F1, Qt.Key_F2, Qt.Key_F3, Qt.Key_F4, Qt.Key_F5]:
+                    # ファンクションキーは処理を続行
+                    pass
+                else:
+                    # その他のキーはウィジェットに委ねる（親クラスのイベントフィルターを呼び出す）
+                    return super().eventFilter(obj, event)
+
+            # Bキーでアノテーションモード切り替え
+            if key == Qt.Key_B:
+                self.toggle_annotation_mode()
+                return True
+
+            # 左右矢印キーでの画像移動
+            elif key == Qt.Key_Left:
+                self.skip_images(-10)
+                return True
+            elif key == Qt.Key_Right:
+                self.skip_images(10)
+                return True
+
+            # 削除キーが押された場合、選択されたバウンディングボックスを削除
+            elif key in [Qt.Key_Delete, Qt.Key_Backspace]:
+                if self.main_image_view.selected_bbox_index is not None:
+                        self.delete_selected_bbox()
+                if self.main_image_view.selected_segmentation_index is not None:
+                        self.delete_selected_segmentation()
+                return True  
+
+        # 親クラスのイベントフィルタを呼び出す
+        return super().eventFilter(obj, event)
+
+    def delete_selected_bbox(self):
+        """選択されたバウンディングボックスを削除する"""
+        if not self.images or not hasattr(self, 'main_image_view'):
+            return
+        
+        selected_index = self.main_image_view.selected_bbox_index
+        if selected_index is None:
+            # 選択されていない場合は何もしない
+            return
+        
+        # インデックスベースに変更
+        current_index = self.current_index
+        if (current_index is not None and 
+            isinstance(current_index, int) and 
+            current_index in self.bbox_annotations and 
+            selected_index is not None):
+            
+            bboxes = self.bbox_annotations[current_index]
+            if 0 <= selected_index < len(bboxes):
+                # ボックス情報を取得
+                bbox = bboxes[selected_index]
+                class_name = bbox.get('class', 'unknown')
+                                
+                # 削除実行
+                del bboxes[selected_index]
+                # 選択をクリア
+                self.main_image_view.selected_bbox_index = None
+
+                # 重要: last_bboxesを更新する（削除後の最新状態を保存）
+                if hasattr(self, 'last_bboxes'):
+                    # 現在の画像のバウンディングボックスリストを全て取得して保存
+                    self.last_bboxes = [bbox.copy() for bbox in bboxes]
+                    
+                    # last_bboxも更新（互換性のため）
+                    if self.last_bboxes:
+                        self.last_bbox = self.last_bboxes[-1].copy()
+                    else:
+                        self.last_bbox = None
+
+                # 画面更新
+                self.update_ui()
+                
+                # 確認メッセージ
+                self.statusBar().showMessage(f"'{class_name}' のバウンディングボックスを削除しました", 3000)
+
+    def delete_selected_segmentation(self, index=None):
+        """選択されたセグメンテーションを削除する"""
+        if not self.images or not hasattr(self, 'segmentation_annotations'):
+            return
+        
+        # インデックスベースに変更
+        current_index = self.current_index
+        
+        # current_indexの有効性をチェック
+        if current_index is None or not isinstance(current_index, int):
+            return
+        
+        if index is None:
+            index = self.main_image_view.selected_segmentation_index
+        
+        if (current_index in self.segmentation_annotations and 
+            index is not None):
+            segmentations = self.segmentation_annotations[current_index]
+            if 0 <= index < len(segmentations):
+                # 現在情報を取得
+                seg = segmentations[index]
+                class_name = seg.get('class', 'unknown')
+                
+                # 削除実行
+                del segmentations[index]
+                # 選択をクリア
+                self.main_image_view.selected_segmentation_index = None
+
+                # 削除後の最新状態を保存
+                if hasattr(self, 'last_segmentations'):
+                    # 現在のリストを全て取得して保存
+                    self.last_segmentations = [seg.copy() for seg in segmentations]
+
+                    # last_segmentationも更新（互換性のため）
+                    if self.last_segmentations:
+                        self.last_segmentation = self.last_segmentations[-1].copy()
+                    else:
+                        self.last_segmentation = None
+
+                # 画面更新
+                self.update_ui()
+
+                # 確認メッセージ
+                self.statusBar().showMessage(f"'{class_name}' のセグメンテーションを削除しました", 3000)
+
+    def toggle_auto_apply_segmentation(self, state):
+        """前回のセグメンテーションを自動適用するかどうかを設定"""
+        self.auto_apply_last_segmentation = (state == Qt.Checked)
+        
+        # 現在の画像に対して、前回のセグメンテーションを適用
+        if (self.auto_apply_last_segmentation and 
+            hasattr(self, 'last_segmentation') and 
+            self.last_segmentation and 
+            self.images):
+            
+            # インデックスベースに変更
+            current_index = self.current_index
+            
+            # current_indexの有効性をチェック
+            if current_index is None or not isinstance(current_index, int):
+                return
+            
+            # 削除済みの場合は適用しない
+            if hasattr(self, 'deleted_indexes') and current_index in self.deleted_indexes:
+                return
+            
+            # すでにアノテーションがある場合は確認
+            if (current_index in self.segmentation_annotations and 
+                self.segmentation_annotations[current_index]):
+                return
+            
+            # 前回のセグメンテーションを適用
+            self.add_segmentation_annotation(self.last_segmentation.copy())
+            
+    def calculate_and_store_diff_vector(self, index_or_path):
+        """教師データと推論結果の差分ベクトルを計算して保存する"""
+        # インデックスベースで処理
+        if isinstance(index_or_path, int):
+            index = index_or_path
+        else:
+            # パスからインデックスを取得
+            try:
+                index = self.images.index(index_or_path)
+            except ValueError:
+                print(f"警告: パス {index_or_path} からインデックスを取得できませんでした")
+                return
+        
+        # 教師データの取得（インデックスベース）
+        annotation = None
+        if index in self.annotations:
+            annotation = self.annotations[index]
+        
+        # 推論結果の取得（インデックスベース）
+        inference = None
+        if index in self.inference_results:
+            inference = self.inference_results[index]
+                
+        if annotation and inference:
+            # 角度と速度の差分を計算
+            if "pilot/angle" in inference and "pilot/throttle" in inference:
+                angle_diff = inference["pilot/angle"] - annotation["angle"]
+                throttle_diff = inference["pilot/throttle"] - annotation["throttle"]
+            else:
+                angle_diff = inference["angle"] - annotation["angle"]
+                throttle_diff = inference["throttle"] - annotation["throttle"]
+            
+            # ベクトルの大きさと角度を計算
+            import math
+            vector_magnitude = math.sqrt(angle_diff**2 + throttle_diff**2)
+            vector_angle = math.atan2(throttle_diff, angle_diff)
+            
+            # インデックスをキーとして差分ベクトルを保存
+            self.inference_diff_vectors[index] = {
+                'angle_diff': angle_diff,
+                'throttle_diff': throttle_diff,
+                'vector_magnitude': vector_magnitude,
+                'vector_angle': vector_angle
+            }
+            
+        else:
+            print(f"差分ベクトル計算スキップ: アノテーションまたは推論結果が不足")
+
+    def update_bbox_stats(self):
+        """
+        Update statistics for bounding box annotations
+        """
+        # Count the number of bounding box annotations
+        bbox_count = len(self.bbox_annotations) if hasattr(self, 'bbox_annotations') else 0
+        
+        # Update the stats label to show bounding box count
+        if hasattr(self, 'stats_label'):
+            self.stats_label.setText(f"Bounding Boxes: {bbox_count} / {len(self.images)}")
+            
+    def add_detection_inference_controls(self):
+        """物体検知推論表示コントロールを追加"""
+        # 推論結果表示オプションを配置する既存のレイアウトを探す
+        inference_layout = None
+        
+        # 既存の推論結果表示オプションの後に追加
+        if hasattr(self, 'inference_checkbox'):
+            inference_parent = self.inference_checkbox.parent()
+            if inference_parent:
+                # 親ウィジェットからレイアウトを取得
+                parent_layout = inference_parent.layout()
+                
+                # 親レイアウトが見つかった場合、同じ階層に新しいレイアウトを追加
+                if parent_layout:
+                    # 物体検知推論結果表示チェックボックス
+                    detection_inference_layout = QHBoxLayout()
+                    self.detection_inference_checkbox = QCheckBox("物体検知推論結果表示")
+                    self.detection_inference_checkbox.setChecked(False)
+                    self.detection_inference_checkbox.stateChanged.connect(self.toggle_detection_inference_display)
+                    detection_inference_layout.addWidget(self.detection_inference_checkbox)
+                    
+                    # レイアウトに追加
+                    parent_layout.addLayout(detection_inference_layout)
+        
+        # 物体検知推論結果表示フラグの初期化
+        self.show_detection_inference = False
+        
+        # 物体検知推論結果格納用の辞書を初期化
+        self.detection_inference_results = {}
+
+    def toggle_detection_inference_display(self, state):
+        """物体検知推論表示の切り替え"""
+        show_inference = (state == Qt.Checked)
+        print(f"物体検知推論表示切替: {show_inference} (state={state}, Qt.Checked={Qt.Checked})")
+
+        self.show_detection_inference = show_inference
+
+        # 画面更新
+        self.update_detection_info_panel()        
+        self.update_ui()
+        
+    def toggle_diff_vector_display(self, state):
+            """差分ベクトル矢印表示の切り替え"""
+            show_diff_vectors = (state == Qt.Checked)
+            self.show_diff_vectors = show_diff_vectors
+            
+            # 画面更新
+            self.update_ui()
+            
+    def toggle_location_inference_display(self, state):
+        """位置推論表示の切り替え"""
+        show_inference = (state == Qt.Checked)
+        print(f"位置推論表示切替: {show_inference} (state={state}, Qt.Checked={Qt.Checked})")
+
+        self.show_location_inference = show_inference
+
+        # 画面更新
+        self.update_ui()
+        
+
+    # location関連
+
+    def update_location_button_counts(self):
+        """各位置ボタンのアノテーション数を更新する"""
+        if not hasattr(self, 'location_buttons') or not self.location_buttons:
+            return
+
+        # 位置情報ごとのアノテーション数をカウント
+        location_counts = {}
+        #for img_path, anno in self.annotations.items():
+        for idx, anno in self.annotations.items():
+            if 'loc' in anno:
+                loc_value = anno['loc']
+                location_counts[loc_value] = location_counts.get(loc_value, 0) + 1
+
+        # 各ボタンのカウント表示を更新
+        for button in self.location_buttons:
+            loc_value = button.property("location_value")
+            count = location_counts.get(loc_value, 0)
+            
+            # ボタンのテキストを更新（数を追加）
+            button.setText(f"{count} | 位置 {loc_value}")
+            
+            # カウントに応じてスタイルを調整
+            color = get_location_color(loc_value)
+            if count > 0:
+                # アノテーションがある場合は少し濃い色にする
+                button.setStyleSheet(f"""
+                    QPushButton {{
+                        padding: 8px;
+                        border: 1px solid {color.name()};
+                        border-radius: 4px;
+                        background-color: {color.lighter(140).name()};
+                        color: black;
+                    }}
+                    QPushButton:checked {{
+                        background-color: {color.name()};
+                        color: white;
+                        font-weight: bold;
+                    }}
+                """)
+            else:
+                # アノテーションがない場合はグレーっぽくする
+                button.setStyleSheet(f"""
+                    QPushButton {{
+                        padding: 8px;
+                        border: 1px solid #cccccc;
+                        border-radius: 4px;
+                        background-color: #f0f0f0;
+                        color: #888888;
+                    }}
+                    QPushButton:checked {{
+                        background-color: {color.name()};
+                        color: white;
+                        font-weight: bold;
+                    }}
+                """)
+
+    def add_location_button(self):
+        """位置情報選択ボタンを追加する"""
+        location_value = self.new_location_input.value()
+        
+        # 同じ値のボタンが既にある場合は追加しない
+        for button in self.location_buttons:
+            if button.property("location_value") == location_value:
+                QMessageBox.warning(self, "警告", f"位置情報 {location_value} は既に存在します。")
+                return
+        
+        # 新しいボタンを作成
+        button = QPushButton(f"位置 {location_value}")
+        button.setProperty("location_value", location_value)
+        button.setCheckable(True)  # チェック可能に設定
+        button.clicked.connect(lambda checked, value=location_value: self.set_location(value))
+        
+        # スタイルシートを設定
+        button.setStyleSheet("""
+            QPushButton {
+                padding: 8px;
+                border: 1px solid #cccccc;
+                border-radius: 4px;
+                background-color: #f0f0f0;
+            }
+            QPushButton:checked {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+            }
+        """)
+        
+        # レイアウトに追加
+        self.location_buttons_layout.addWidget(button)
+        self.location_buttons.append(button)
+        
+        # 次の値にインクリメント
+        self.new_location_input.setValue(location_value + 1)
+        
+        # 初期ボタンを生成するだけの場合はメッセージを表示しない
+        if len(self.location_buttons) > 1:
+            QMessageBox.information(self, "追加完了", f"位置情報 {location_value} を追加しました。")
+
+    def set_location(self, location_value):
+        print("set location")
+        """位置情報を設定する - ユーザーが明示的に位置ボタンをクリックした時のみ呼ばれる"""
+        if not self.images:
+            return
+        
+        # 現在の画像パスを取得
+        current_img_path = self.images[self.current_index]
+        
+        # 削除済みの場合は処理しない
+        if hasattr(self, 'deleted_indexes') and self.current_index in self.deleted_indexes:
+            QMessageBox.warning(
+                self, 
+                "警告", 
+                "削除済みの画像には位置情報を設定できません。\n"
+                "先に「削除状態を復元」を実行してください。"
+            )
+            
+            # ボタンの選択状態をリセット（すべて非選択）
+            for button in self.location_buttons:
+                button.setChecked(False)
+                
+            return
+        
+        # デバッグ情報
+        print(f"位置情報を設定: {location_value} for image {os.path.basename(current_img_path)}")
+        
+        # 選択済みのボタンを選択
+        if self.current_location == location_value:
+            print("ボタン解除")
+            self.location_buttons[location_value].setChecked(False)
+            self.current_location = None
+
+            # 位置情報ラベルを更新
+            self.current_location_label.setText("現在の位置情報: なし")
+            self.current_location_label.setStyleSheet("")
+            
+            # アノテーションから位置情報を削除（すでにアノテーションがある場合）
+            if self.current_index in self.annotations:
+                if "loc" in self.annotations[self.current_index]:
+                    del self.annotations[self.current_index]["loc"]
+                
+                # 位置情報アノテーションからも削除
+                if self.current_index in self.location_annotations:
+                    del self.location_annotations[self.current_index]
+
+        else:
+            # 現在の位置情報を更新
+            self.current_location = location_value
+            
+            # すべてのボタンの選択状態を更新
+            for button in self.location_buttons:
+                button.setChecked(button.property("location_value") == location_value)
+            
+            # 位置情報アノテーションを更新
+            self.location_annotations[self.current_index] = location_value
+            
+            # 現在の位置情報ラベルを更新
+            loc_color = get_location_color(location_value)
+            self.current_location_label.setText(f"現在の位置情報: {location_value}")
+            self.current_location_label.setStyleSheet(f"color: {loc_color.name()}; font-weight: bold;")
+            
+            # アノテーションがある場合はアノテーションにも位置情報を追加
+            if self.current_index in self.annotations:
+                self.annotations[self.current_index]["loc"] = location_value
+        
+        # 保存用のデータ形式を更新するため、アノテーションタイムスタンプも更新
+        self.annotation_timestamps[current_img_path] = int(time.time() * 1000)
+        
+        # 位置ボタンのカウント表示を更新
+        self.update_location_button_counts()
+        
+        # UI更新
+        self.display_current_image()
+        self.update_gallery()
+
+    def on_method_changed(self, index):
+        """学習方法が変更されたときの処理"""
+        # モデル選択部分の表示/非表示は現在は常に表示するようにする
+        # 保存済みのモデルリストを更新
+        self.refresh_model_list()
+
+    def refresh_model_list(self):
+        """保存されているモデルのリストを更新 - モデルアーキによるフィルタリング機能付き"""
+        self.model_combo.clear()
+        
+        # 更新開始のダイアログを表示
+        self.statusBar().showMessage("モデルリストを更新中...")
+        QApplication.processEvents()
+                
+        # 現在選択しているモデルアーキ
+        current_arch = self.auto_method_combo.currentText()
+        
+        # モデルファイルを検索
+        all_model_files = [f for f in os.listdir(models_dir) if f.endswith('.pth')]
+        
+        # モデルアーキでフィルタリング
+        model_files = []
+        for model_file in all_model_files:
+            # モデルファイル名にアーキ名が含まれていれば対象とする
+            # 通常、モデルファイル名は「アーキ名_日時.pth」等の形式
+            if current_arch.lower() in model_file.lower():
+                model_files.append(model_file)
+        
+        if not model_files:
+            # フィルタリングした結果がなければ、その旨を表示
+            self.model_combo.addItem(f"{current_arch}のモデルが見つかりません")
+            self.statusBar().showMessage(f"{current_arch}のモデルが見つかりません。他のアーキを選択するか、モデルを学習してください", 3000)
+            return
+        
+        # モデルファイルを日付順にソート（新しいものが上）
+        model_files.sort(reverse=True)
+        
+        # コンボボックスに追加
+        for model_file in model_files:
+            self.model_combo.addItem(model_file)
+        
+        # 更新完了メッセージ
+        self.statusBar().showMessage(f"{len(model_files)}個の{current_arch}モデルを読み込みました", 3000)
+
+    def play_forward(self):
+        """自動再生（順方向）"""
+        # 再生中かどうかをチェック
+        is_playing = hasattr(self, 'auto_play_timer') and self.auto_play_timer.isActive()
+        
+        # 再生または停止
+        self.auto_play(forward=True)
+        
+        # 再生状態に応じてボタンテキストを更新
+        sender = self.sender()
+        if sender:
+            if is_playing:
+                # 停止した場合
+                sender.setText("⏵")
+                self.statusBar().clearMessage()
+            else:
+                # 再生開始した場合
+                sender.setText("⏹")
+
+    def auto_play(self, forward=True):
+        """画像を自動再生する（スキップ枚数対応、推論表示時は速度調整）"""
+        if not self.images:
+            return
+        
+        # 現在の自動再生状態を確認
+        if hasattr(self, 'auto_play_timer') and self.auto_play_timer.isActive():
+            # タイマーが動いている場合は停止
+            self.auto_play_timer.stop()
+            return
+        
+        # スキップ枚数を取得
+        skip_count = self.skip_count_spin.value()
+        
+        # 再生方向に基づいて、次の画像へ進むためのステップを決定
+        step = skip_count if forward else -skip_count
+        
+        # 再生タイマーをセットアップ
+        self.auto_play_timer = QTimer()
+        self.auto_play_timer.timeout.connect(lambda: self.skip_images(step))
+        
+        # タイマー開始（再生速度を設定）
+        # 推論表示がONの場合は速度を落とす
+        if self.inference_checkbox.isChecked():
+            interval = 100  # 推論表示ONのときは遅めに設定（150ミリ秒）
+        else:
+            interval = 20   # 通常は高速（20ミリ秒）
+        
+        self.auto_play_timer.start(interval)
+        
+        # 再生中であることをステータスバーに表示
+        direction = "順方向" if forward else "逆方向"
+        playback_speed = "低速" if self.inference_checkbox.isChecked() else "高速"
+        self.statusBar().showMessage(f"自動再生中 ({direction}, {skip_count}枚スキップ, {playback_speed}) - 停止するには再度ボタンをクリック")
+
+    def play_reverse(self):
+        """自動再生（逆方向）"""
+        # 再生中かどうかをチェック
+        is_playing = hasattr(self, 'auto_play_timer') and self.auto_play_timer.isActive()
+        
+        # 再生または停止
+        self.auto_play(forward=False)
+        
+        # 再生状態に応じてボタンテキストを更新
+        sender = self.sender()
+        if sender:
+            if is_playing:
+                # 停止した場合
+                sender.setText("⏪")
+                self.statusBar().clearMessage()
+            else:
+                # 再生開始した場合
+                sender.setText("⏹")
+
+    def on_variant_changed(self, variant):
+        """
+        ラジオボタンで選択された画像ソースキーが変更された時に呼ばれるメソッド
+        
+        Args:
+            variant (str): 選択された新しいキー名
+        """
+        # キー情報が初期化されていない場合は早期リターン
+        if not hasattr(self, 'available_variants') or not self.available_variants:
+            print("キー情報がまだ初期化されていません。load_images後に設定されます。")
+            self.current_variant = variant  # キー名だけは保存しておく
+            return
+        
+        # 以前と同じキーが選択された場合は何もしない
+        if hasattr(self, 'current_variant') and self.current_variant == variant:
+            return
+        
+        # 現在のキーを更新
+        self.current_variant = variant
+        print(f"キーを '{variant}' に変更しました")
+        
+        # キーに対応する画像リストを取得・更新
+        if hasattr(self, 'variant_images') and variant in self.variant_images:
+            # キー別の画像リストを設定
+            self.images = self.variant_images[variant]
+            print(f"キー '{variant}' の画像数: {len(self.images)}")
+            
+            # 同じインデックスを維持（可能であれば）
+            if self.current_index >= len(self.images):
+                self.current_index = 0
+            
+            # スライダーの設定を更新
+            if self.images:
+                self.image_slider.setMaximum(len(self.images) - 1)
+                self.image_slider.setValue(self.current_index)
+                self.slider_value_label.setText(f"{self.current_index + 1}/{len(self.images)}")
+            else:
+                self.image_slider.setMaximum(0)
+                self.image_slider.setValue(0)
+                self.slider_value_label.setText("0/0")
+            
+            # UI更新
+            self.display_current_image()
+            self.update_gallery()   
+            self.update_slider_deleted_indexes()
+        
+        # キーボタン群を更新
+        self.update_variant_buttons()
+
+    def update_variant_buttons(self):
+        """
+        available_variantsの内容に基づいてキーボタン群を更新する
+        """
+        # GroupBoxを探す
+        variant_box = None
+        left_panel = self.centralWidget().layout().itemAt(0).widget()
+        for i in range(left_panel.layout().count()):
+            item = left_panel.layout().itemAt(i).widget()
+            if isinstance(item, QGroupBox) and item.title() == "画像ソース":
+                variant_box = item
+                break
+        
+        if not variant_box:
+            print("画像ソースのGroupBoxが見つかりませんでした")
+            return
+        
+        # 現在のレイアウトと全てのボタンをクリア
+        variant_layout = variant_box.layout()
+        while variant_layout.count():
+            item = variant_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        
+        # ボタングループをリセット
+        if hasattr(self, 'variant_button_group'):
+            for button in self.variant_button_group.buttons():
+                self.variant_button_group.removeButton(button)
+        else:
+            self.variant_button_group = QButtonGroup(self)
+            self.variant_button_group.setExclusive(True)
+        
+        # 新しいキーボタンを追加
+        for var in self.available_variants:
+            rb = QRadioButton(var)
+            variant_layout.addWidget(rb)
+            self.variant_button_group.addButton(rb)
+            if var == self.current_variant:
+                rb.setChecked(True)
+            # 切替時、チェックされた変化のみ受け取る
+            rb.toggled.connect(lambda checked, v=var: self.on_variant_changed(v) if checked else None)
+
+    def update_images_for_variant(self):
+        """
+        選択されたキーに基づいて画像表示を更新する
+        """
+        # 現在のキーに応じた画像の読み込みや表示更新
+        # 実際のアプリケーションに合わせて実装
+        print(f"キー '{self.current_variant}' の画像を更新します")
+        
+        # 例：特定の処理を実行
+        if self.current_variant == "cam":
+            # カメラビュー用の処理
+            pass
+        elif self.current_variant == "cam1":
+            pass
+        elif self.current_variant == "lidar":
+            pass
+        
+        # 画像表示の更新
+        if hasattr(self, 'current_index') and self.images:
+            self.display_current_image()
+            self.update_gallery()
+
+    def toggle_auto_apply_location(self, state):
+        """位置情報の自動適用を有効/無効にする"""
+        self.auto_apply_location = (state == Qt.Checked)
+        
+        # チェックがオンになり、現在位置情報がない場合は即座に適用
+        if self.auto_apply_location and self.current_location is not None and self.images:
+            # 削除済みの場合は適用しない
+            if hasattr(self, 'deleted_indexes') and self.current_index in self.deleted_indexes:
+                return
+                
+            # 現在の画像に既に位置情報がある場合は上書きしない
+            if self.current_index in self.location_annotations:
+                return
+                
+            # 現在選択されている位置情報を適用
+            self.set_location(self.current_location)
+            
+            # ステータスバーに表示
+            self.statusBar().showMessage(f"位置情報 {self.current_location} を自動適用しました", 3000)
+
+    def toggle_auto_apply_bbox(self, state):
+        """前回のバウンディングボックスを自動適用するかどうかを設定"""
+        self.auto_apply_last_bbox = (state == Qt.Checked)
+        
+        # 現在の画像に対して、前回のバウンディングボックスを適用
+        if self.auto_apply_last_bbox and self.last_bbox is not None and self.images:
+            # インデックスベースに変更
+            current_index = self.current_index
+            
+            # current_indexの有効性をチェック
+            if current_index is None or not isinstance(current_index, int):
+                return
+            
+            # 削除済みの場合は適用しない
+            if hasattr(self, 'deleted_indexes') and current_index in self.deleted_indexes:
+                return
+            
+            # すでにアノテーションがある場合は確認
+            if (current_index in self.bbox_annotations and 
+                self.bbox_annotations[current_index]):
+                # すでにバウンディングボックスがある場合は適用しない
+                return
+            
+            # 前回のバウンディングボックスを適用
+            self.add_bbox_annotation(self.last_bbox.copy())
+            
+            # ステータスバーに表示
+            self.statusBar().showMessage(f"前回の '{self.last_bbox['class']}' バウンディングボックスを適用しました", 3000)
+
+    def toggle_detection_inference_display(self, state):
+        """物体検知推論表示の切り替え"""
+        show_inference = (state == Qt.Checked)
+        self.show_detection_inference = show_inference
+        
+        # 画面更新
+        self.main_image_view.update()
+        
+        # 表示状態をステータスバーに反映
+        if show_inference:
+            self.statusBar().showMessage("物体検知推論結果表示をオンにしました", 3000)
+        else:
+            self.statusBar().showMessage("物体検知推論結果表示をオフにしました", 3000)
+        
+        # 画像表示を更新
+        self.display_current_image()
+
+    def update_driving_info_panel(self):
+        """自動運転推論結果の情報パネルを更新する"""
+        if not self.images:
+            return False
+            
+        current_img_path = self.images[self.current_index]
+        
+        if hasattr(self, 'inference_checkbox') and self.inference_checkbox.isChecked() :
+            if current_img_path in self.inference_results:
+                # 推論結果を取得
+                inference = self.inference_results[current_img_path]
+                
+                # 新しいキー形式があればそれを使い、なければ古い形式を使う
+                if "pilot/angle" in inference and "pilot/throttle" in inference:
+                    angle = inference["pilot/angle"]
+                    throttle = inference["pilot/throttle"]
+                else:
+                    angle = inference["angle"]
+                    throttle = inference["throttle"]
+
+                # 推論情報のリッチテキスト
+                inference_text = f"<b>自動運転推論結果:</b><br>"
+                inference_text += f"angle = <span style='color: #6666FF;'>{angle:.4f}</span><br>"
+                inference_text += f"throttle = <span style='color: #6666FF;'>{throttle:.4f}</span>"
+
+                # 位置情報を取得
+                location = None
+                if "pilot/loc" in inference:
+                    location = inference["pilot/loc"]
+                elif "loc" in inference:
+                    location = inference["loc"]
+
+                # 位置情報があれば色付きバッジとして表示
+                if location is not None:
+                    loc_color = get_location_color(location)
+                    
+                    inference_text += f"<br><div style='margin-top: 10px;'>"
+                    inference_text += f"<div style='display: inline-block; background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 5px; border-radius: 5px;'>"
+                    inference_text += f"推論位置 {location}</div></div>"
+
+                # リッチテキストとして設定
+                if hasattr(self, 'inference_info_label'):
+                    self.inference_info_label.setText(inference_text)
+                    self.inference_info_label.setTextFormat(Qt.RichText)
+                    self.inference_info_label.repaint()
+                    QApplication.processEvents()  # UIを即時更新
+
+                # ImageLabelに推論ポイントを設定
+                self.main_image_view.inference_point = QPoint(inference['x'], inference['y'])
+                
+                return True
+                
+            elif hasattr(self, 'run_inference_check'):
+                # 推論結果がない場合は実行
+                self.run_inference_check(False)
+                
+                # 推論実行後に再度チェック
+                if current_img_path in self.inference_results:
+                    # 再帰的に呼び出して情報パネルを更新
+                    return self.update_driving_info_panel()
+                
+                return False
+        else:
+            # 表示がオフの場合は情報パネルをクリア
+            if hasattr(self, 'inference_info_label'):
+                self.inference_info_label.setText("")
+            
+            self.main_image_view.inference_point = None
+            
+            return False
+
+    def update_location_info_panel(self):
+        """位置推論結果の情報パネルを更新する"""
+        if not self.images:
+            return False
+                
+        current_img_path = self.images[self.current_index]
+        
+        if hasattr(self, 'location_inference_checkbox') and self.location_inference_checkbox.isChecked():
+            if current_img_path in self.location_inference_results:
+                # 推論結果を取得
+                inference = self.location_inference_results[current_img_path]
+                
+                # 位置推論情報のリッチテキスト
+                inference_text = "<b>位置推論結果:</b><br>"
+                
+                # 位置情報を取得
+                location = inference.get("loc", None)
+                
+                # 位置情報があれば色付きバッジとして表示
+                if location is not None:
+                    loc_color = get_location_color(location)
+                    
+                    inference_text += f"<br><div style='margin-top: 10px;'>"
+                    inference_text += f"<div style='display: inline-block; background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 5px; border-radius: 5px;'>"
+                    inference_text += f"推論位置 {location}</div></div>"
+
+                # リッチテキストとして設定
+                if hasattr(self, 'location_inference_info_label'):
+                    self.location_inference_info_label.setText(inference_text)
+                    self.location_inference_info_label.setTextFormat(Qt.RichText)
+                    self.location_inference_info_label.repaint()
+                    QApplication.processEvents()  # UIを即時更新
+
+                # ImageLabelに位置推論ポイントを設定（後で実装するdraw_location_inference関数用）
+                self.main_image_view.location_inference_result = inference
+                
+                return True
+                    
+            elif hasattr(self, 'run_location_inference_check'):
+                # 推論結果がない場合は実行
+                self.run_location_inference_check(False)
+                
+                # 推論実行後に再度チェック
+                if current_img_path in self.location_inference_results:
+                    # 再帰的に呼び出して情報パネルを更新
+                    return self.update_location_info_panel()
+                
+                return False
+        else:
+            # 表示がオフの場合は情報パネルをクリア
+            if hasattr(self, 'location_inference_info_label'):
+                self.location_inference_info_label.setText("")
+            
+            # 位置推論ポイントをクリア
+            if hasattr(self, 'main_image_view'):
+                self.main_image_view.location_inference_result = None
+            
+            return False
+
+    def toggle_training_mode(self):
+        """学習モードを切り替える"""
+        # 送信元ボタンを確認（クリックされたボタン）
+        sender = self.sender()
+        
+        if sender == self.auto_train_mode_button:
+            # 自動運転モデル学習モードが選択された
+            self.auto_train_mode_button.setChecked(True)
+            self.obj_train_mode_button.setChecked(False)
+            self.current_training_mode = 0  # 0 = 自動運転モデル学習モード
+            self.statusBar().showMessage("自動運転モデル学習モードに切り替えました。", 3000)
+            
+            # コンテナの表示/非表示を切り替え
+            self.auto_method_container.setVisible(True)
+            self.object_detection_container.setVisible(False)
+        elif sender == self.obj_train_mode_button:
+            # 物体検知モデル学習モードが選択された
+            self.auto_train_mode_button.setChecked(False)
+            self.obj_train_mode_button.setChecked(True)
+            self.current_training_mode = 1  # 1 = 物体検知モデル学習モード
+            self.statusBar().showMessage("物体検知モデル学習モードに切り替えました。", 3000)
+            
+            # コンテナの表示/非表示を切り替え
+            self.auto_method_container.setVisible(False)
+            self.object_detection_container.setVisible(True)
+
+    def toggle_annotation_mode(self, checked=None):
+        # 既存のコードを修正して3つのモードに対応
+        sender = self.sender()
+        
+        if sender == self.auto_mode_button:
+            self.current_mode = 0
+            self.auto_mode_button.setChecked(True)
+            self.detection_mode_button.setChecked(False)
+            self.segmentation_mode_button.setChecked(False)
+            self.statusBar().showMessage("自動運転アノテーションモードに切り替えました。", 3000)
+        elif sender == self.detection_mode_button:
+            self.current_mode = 1
+            self.auto_mode_button.setChecked(False)
+            self.detection_mode_button.setChecked(True)
+            self.segmentation_mode_button.setChecked(False)
+            self.statusBar().showMessage("物体検知アノテーションモードに切り替えました。", 3000)
+        elif sender == self.segmentation_mode_button:
+            self.current_mode = 2  # 新規追加
+            self.auto_mode_button.setChecked(False)
+            self.detection_mode_button.setChecked(False)
+            self.segmentation_mode_button.setChecked(True)
+            self.statusBar().showMessage("セグメンテーションアノテーションモードに切り替えました。", 3000)
+        else:
+            # Bキーでの切り替え（3つのモードをサイクル）
+            self.current_mode = (self.current_mode + 1) % 3
+            if self.current_mode == 0:
+                self.auto_mode_button.setChecked(True)
+                self.detection_mode_button.setChecked(False)
+                self.segmentation_mode_button.setChecked(False)
+                self.statusBar().showMessage("自動運転アノテーションモードに切り替えました。", 3000)
+            elif self.current_mode == 1:
+                self.auto_mode_button.setChecked(False)
+                self.detection_mode_button.setChecked(True)
+                self.segmentation_mode_button.setChecked(False)
+                self.statusBar().showMessage("物体検知アノテーションモードに切り替えました。", 3000)
+            else:
+                self.auto_mode_button.setChecked(False)
+                self.detection_mode_button.setChecked(False)
+                self.segmentation_mode_button.setChecked(True)
+                self.statusBar().showMessage("セグメンテーションアノテーションモードに切り替えました。", 3000)
+        
+        self.main_image_view.update()   
+
+    def add_segmentation_annotation(self, polygon_data):
+        """セグメンテーションアノテーションを追加"""
+        if not self.images:
+            return
+        
+        # インデックスベースに変更
+        current_index = self.current_index
+        
+        if current_index not in self.segmentation_annotations:
+            self.segmentation_annotations[current_index] = []
+        
+        self.segmentation_annotations[current_index].append(polygon_data)
+        
+        # 前回のセグメンテーションとして保存
+        self.last_segmentation = polygon_data.copy()
+        
+        # 現在のすべてのセグメンテーションを保存
+        self.last_segmentations = [seg.copy() for seg in self.segmentation_annotations[current_index]]
+        
+        # UI更新
+        self.main_image_view.update()
+        self.update_gallery()
+            
+    def train_yolo_unified(self):
+        """統合されたYOLO学習 - 学習時にタスクを選択（MLflow統合版）"""
+        
+        # アノテーションの確認
+        has_bbox = bool(getattr(self, 'bbox_annotations', {}))
+        has_seg = bool(getattr(self, 'segmentation_annotations', {}))
+        
+        if not has_bbox and not has_seg:
+            QMessageBox.warning(self, "警告", "学習用のアノテーションがありません。")
+            return
+
+        # 学習タスク選択ダイアログ
+        task_dialog = self._create_yolo_task_selection_dialog(has_bbox, has_seg)
+        
+        if not task_dialog.exec_():
+            return
+        
+        # 選択されたタスクに基づいて学習を実行
+        if task_dialog.detect_radio.isChecked():
+            self.train_and_save_yolo_model_internal("detect")
+        elif task_dialog.segment_radio.isChecked():
+            self.train_and_save_yolo_model_internal("segment")
+        else:
+            QMessageBox.warning(self, "警告", "タスクが選択されていません。")
+
+    def _create_yolo_task_selection_dialog(self, has_bbox, has_seg):
+        """YOLOタスク選択ダイアログを作成"""
+        
+        task_dialog = QDialog(self)
+        task_dialog.setWindowTitle("YOLO学習タスク選択")
+        task_dialog.setMinimumWidth(500)
+        
+        task_layout = QVBoxLayout(task_dialog)
+        
+        # タイトル
+        title_label = QLabel("学習するタスクを選択してください:")
+        title_label.setStyleSheet("font-size: 16px; font-weight: bold; margin-bottom: 10px;")
+        task_layout.addWidget(title_label)
+        
+        # アノテーション状況の表示
+        status_group = QGroupBox("アノテーション状況")
+        status_layout = QVBoxLayout(status_group)
+        
+        if has_bbox:
+            bbox_count = sum(len(bboxes) for bboxes in self.bbox_annotations.values())
+            bbox_images = len(self.bbox_annotations)
+            bbox_status = QLabel(f"✓ バウンディングボックス: {bbox_count}個 ({bbox_images}枚の画像)")
+            bbox_status.setStyleSheet("color: #2E7D32; font-weight: bold;")
+        else:
+            bbox_status = QLabel("✗ バウンディングボックス: なし")
+            bbox_status.setStyleSheet("color: #D32F2F;")
+        status_layout.addWidget(bbox_status)
+        
+        if has_seg:
+            seg_count = sum(len(segs) for segs in self.segmentation_annotations.values())
+            seg_images = len(self.segmentation_annotations)
+            seg_status = QLabel(f"✓ セグメンテーション: {seg_count}個 ({seg_images}枚の画像)")
+            seg_status.setStyleSheet("color: #2E7D32; font-weight: bold;")
+        else:
+            seg_status = QLabel("✗ セグメンテーション: なし")
+            seg_status.setStyleSheet("color: #D32F2F;")
+        status_layout.addWidget(seg_status)
+        
+        task_layout.addWidget(status_group)
+        
+        # タスク選択
+        task_group = QGroupBox("学習タスク")
+        task_group_layout = QVBoxLayout(task_group)
+        
+        # ラジオボタン
+        task_dialog.detect_radio = QRadioButton("物体検知 (Detection)")
+        task_dialog.detect_radio.setEnabled(has_bbox)
+        task_dialog.detect_radio.setToolTip("バウンディングボックスを使用した物体検知モデルを学習")
+        
+        task_dialog.segment_radio = QRadioButton("セグメンテーション (Segmentation)")
+        task_dialog.segment_radio.setEnabled(has_seg)
+        task_dialog.segment_radio.setToolTip("ポリゴンを使用したセグメンテーションモデルを学習")
+        
+        # デフォルト選択
+        if has_bbox and has_seg:
+            task_dialog.detect_radio.setChecked(True)  # 両方ある場合は検知を優先
+        elif has_bbox:
+            task_dialog.detect_radio.setChecked(True)
+        elif has_seg:
+            task_dialog.segment_radio.setChecked(True)
+        
+        task_group_layout.addWidget(task_dialog.detect_radio)
+        task_group_layout.addWidget(task_dialog.segment_radio)
+        task_layout.addWidget(task_group)
+        
+        # ボタン
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(task_dialog.accept)
+        button_box.rejected.connect(task_dialog.reject)
+        task_layout.addWidget(button_box)
+        
+        return task_dialog
+
+    def train_and_save_yolo_model_internal(self, task_type):
+        """YOLO学習の内部処理 - MLflow統合版"""
+        
+        # アノテーションの確認とバリデーション
+        annotations, annotation_info = self._validate_yolo_annotations(task_type)
+        if not annotations:
+            return
+        
+        # クラス設定
+        classes = self.get_current_classes()
+        if not classes:
+            QMessageBox.warning(self, "警告", "検知クラスが設定されていません。\n先にクラス設定を行ってください。")
+            return
+        
+        # モデルタイプの取得と調整
+        model_type = self.yolo_model_combo.currentText()
+        if task_type == "segment" and not model_type.endswith("-seg"):
+            model_type = model_type + "-seg"
+        
+        task_name = "物体検知" if task_type == "detect" else "セグメンテーション"
+        
+        # 学習設定ダイアログを表示
+        training_config = self._get_yolo_training_config(task_name, model_type)
+        if not training_config:
+            return
+        
+        # 進捗ダイアログを事前に初期化
+        progress = None
+        
+        try:
+            # データセット準備
+            dataset_info = self._prepare_yolo_dataset(task_type, classes, annotations)
+            
+            # MLflowManagerの初期化
+            if not hasattr(self, 'mlflow_manager'):
+                self.mlflow_manager = MLflowManager(self.folder_path)
+            
+            # Ultralytics YOLOモデルとMLflowのインポート
+            try:
+                from ultralytics import YOLO, settings
+                settings.update({"mlflow": False})
+
+            except ImportError as e:
+                missing_package = "ultralytics" if "ultralytics" in str(e) else "mlflow" if "mlflow" in str(e) else "依存パッケージ"
+                QMessageBox.critical(self, "エラー", f"{missing_package}パッケージがインストールされていません。\npip install {missing_package} でインストールしてください。")
+                return
+            
+            # デバイスの選択
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            print(f"Using device for YOLO training: {device}")
+            
+            # 学習用の進捗ダイアログ
+            progress = QProgressDialog(
+                f"YOLO{task_name}モデル '{model_type}' の学習準備中...", 
+                "キャンセル", 0, 100, self
+            )
+            progress.setWindowTitle(f"YOLO{task_name}モデル学習")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+            
+            # モデルの準備
+            model, pretrained_info = self._prepare_yolo_model(
+                model_type, training_config, progress
+            )
+            if not model:
+                return
+            
+            # MLflow環境設定
+            self._setup_yolo_mlflow_environment(task_type)
+            
+            # トレーニング設定のカスタマイズ
+            run_name = f"{model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            
+            progress.setLabelText(f"{task_name}学習開始...")
+            progress.setValue(20)
+            QApplication.processEvents()
+            
+            # YOLO学習実行
+            results = model.train(
+                data=dataset_info['yaml_file'],
+                epochs=training_config['num_epochs'],
+                batch=training_config['batch_size'],
+                imgsz=training_config['img_size'],
+                project=models_dir,
+                name=run_name,
+                device=device.type,
+                workers=0,
+                close_mosaic=10 if training_config['mosaic'] > 0 else 0,
+                patience=training_config['patience'],
+                exist_ok=True,
+                lr0=training_config['learning_rate'],
+                lrf=training_config['learning_rate'] / 10,
+                # オーグメンテーション設定
+                mosaic=training_config['mosaic'],
+                fliplr=training_config['fliplr'],
+                hsv_h=training_config['hsv_h'],
+                hsv_s=training_config['hsv_s'],
+                hsv_v=training_config['hsv_v'],
+                translate=training_config['translate'],
+                scale=training_config['scale'],
+                erasing=training_config['erasing']
+            )
+            
+            progress.setValue(90)
+            progress.setLabelText("MLflowに学習結果を記録中...")
+            QApplication.processEvents()
+            
+            # MLflowに学習結果を記録
+            mlflow_info = self._log_yolo_training(
+                task_type=task_type,
+                model_type=model_type,
+                results=results,
+                training_config=training_config,
+                dataset_info={
+                    "num_classes": len(classes),
+                    "classes": classes,
+                    "train_samples": len([f for f in os.listdir(os.path.join(dataset_info['train_dir'], "images")) if f.endswith(('.jpg', '.jpeg', '.png'))]),
+                    "val_samples": len([f for f in os.listdir(os.path.join(dataset_info['val_dir'], "images")) if f.endswith(('.jpg', '.jpeg', '.png'))]),
+                    "total_annotations": annotation_info['total_count'],
+                    "annotation_images": annotation_info['image_count'],
+                    "task_type": task_type
+                }
+            )
+            
+            # モデルリストを更新
+            self.refresh_yolo_unified_model_list()
+            
+            progress.setValue(100)
+            progress.close()
+            
+            # 学習結果を表示
+            self._show_yolo_training_success(
+                task_name=task_name,
+                model_type=model_type,
+                results=results,
+                device=device,
+                pretrained_info=pretrained_info,
+                run_name=run_name,
+                mlflow_info=mlflow_info
+            )
+            
+        except Exception as e:
+            if progress is not None:
+                progress.close()
+            traceback.print_exc()
+            QMessageBox.critical(
+                self,
+                "エラー",
+                f"YOLO{task_name}モデル学習中にエラーが発生しました: {str(e)}"
+            )
+
+    def _validate_yolo_annotations(self, task_type):
+        """YOLOアノテーションの検証"""
+        
+        if task_type == "detect":
+            if not self.bbox_annotations:
+                QMessageBox.warning(self, "警告", "物体検知アノテーションがありません。")
+                return None, None
+            
+            annotations = self.bbox_annotations
+            total_boxes = sum(len(boxes) for boxes in annotations.values())
+            
+            print(f"\n=== バウンディングボックスアノテーション確認 ===")
+            print(f"アノテーション数: {len(annotations)}")
+            print(f"総バウンディングボックス数: {total_boxes}")
+            print("=" * 50)
+            
+            return annotations, {"total_count": total_boxes, "image_count": len(annotations)}
+            
+        elif task_type == "segment":
+            if not self.segmentation_annotations:
+                QMessageBox.warning(self, "警告", "セグメンテーションアノテーションがありません。")
+                return None, None
+            
+            annotations = self.segmentation_annotations
+            
+            # セグメンテーションデータの詳細検証
+            total_segments = 0
+            valid_segments = 0
+            
+            for index, segments in annotations.items():
+                if segments:
+                    total_segments += len(segments)
+                    for seg in segments:
+                        points = None
+                        if isinstance(seg, dict):
+                            points = seg.get('points', [])
+                        else:
+                            points = getattr(seg, 'points', [])
+                        
+                        if points and len(points) >= 3:
+                            valid_segments += 1
+            
+            print(f"\n=== セグメンテーションアノテーション確認 ===")
+            print(f"アノテーション数: {len(annotations)}")
+            print(f"総セグメンテーション数: {total_segments}")
+            print(f"有効なセグメンテーション数: {valid_segments}")
+            print("=" * 50)
+            
+            if valid_segments == 0:
+                result = QMessageBox.question(
+                    self,
+                    "セグメンテーションデータなし",
+                    "有効なセグメンテーションアノテーションが見つかりません。\n\n"
+                    "バウンディングボックスから矩形セグメンテーションを自動生成しますか？\n"
+                    "（より高精度な結果を得るには、手動でポリゴンアノテーションを作成することを推奨します）",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+                
+                if result != QMessageBox.Yes:
+                    return None, None
+                
+                # バウンディングボックスからセグメンテーションを自動生成
+                self.generate_segmentation_from_bbox()
+            
+            return annotations, {"total_count": valid_segments, "image_count": len(annotations)}
+        
+        return None, None
+
+    # def _prepare_yolo_dataset(self, task_type, classes, annotations):
+    #     """YOLOデータセットの準備"""
+        
+    #     # データディレクトリ構造の作成
+    #     train_dir = os.path.join(yolo_dataset_dir, "train")
+    #     val_dir = os.path.join(yolo_dataset_dir, "val")
+    #     os.makedirs(os.path.join(train_dir, "images"), exist_ok=True)
+    #     os.makedirs(os.path.join(train_dir, "labels"), exist_ok=True)
+    #     os.makedirs(os.path.join(val_dir, "images"), exist_ok=True)
+    #     os.makedirs(os.path.join(val_dir, "labels"), exist_ok=True)
+        
+    #     # クラス名ファイルの保存
+    #     with open(os.path.join(yolo_dataset_dir, "classes.txt"), 'w') as f:
+    #         for cls in classes:
+    #             f.write(f"{cls}\n")
+        
+    #     # データセット設定YAMLファイルの作成
+    #     task_name = "物体検知" if task_type == "detect" else "セグメンテーション"
+    #     yaml_content = f"""# {task_name}用データセット設定
+    # path: {yolo_dataset_dir}
+    # train: train/images
+    # val: val/images
+
+    # # クラス数
+    # nc: {len(classes)}
+
+    # # クラス名
+    # names: {classes}
+    # """
+        
+    #     yaml_file = os.path.join(yolo_dataset_dir, "dataset.yaml")
+    #     with open(yaml_file, 'w') as f:
+    #         f.write(yaml_content)
+        
+    #     # タスクに応じたアノテーションデータのエクスポート
+    #     if task_type == "detect":
+    #         self.export_annotations_to_yolo(train_dir, val_dir, classes)
+    #     elif task_type == "segment":
+    #         if hasattr(self, 'export_segmentation_annotations_to_yolo'):
+    #             self.export_segmentation_annotations_to_yolo(train_dir, val_dir, classes)
+    #         else:
+    #             QMessageBox.critical(
+    #                 self, 
+    #                 "エラー", 
+    #                 "export_segmentation_annotations_to_yoloメソッドが実装されていません。"
+    #             )
+    #             raise Exception("Segmentation export method not implemented")
+        
+    #     return {
+    #         'train_dir': train_dir,
+    #         'val_dir': val_dir,
+    #         'yaml_file': yaml_file
+    #     }
+
+    def _prepare_yolo_dataset(self, task_type, classes, annotations):
+        """YOLOデータセットの準備 - タスク別データ分離版"""
+        
+        # データディレクトリ構造の作成
+        train_dir = os.path.join(yolo_dataset_dir, "train")
+        val_dir = os.path.join(yolo_dataset_dir, "val")
+        
+        # 既存のデータをクリア（混在を防ぐため）
+        import shutil
+        if os.path.exists(yolo_dataset_dir):
+            shutil.rmtree(yolo_dataset_dir)
+        
+        os.makedirs(os.path.join(train_dir, "images"), exist_ok=True)
+        os.makedirs(os.path.join(train_dir, "labels"), exist_ok=True)
+        os.makedirs(os.path.join(val_dir, "images"), exist_ok=True)
+        os.makedirs(os.path.join(val_dir, "labels"), exist_ok=True)
+        
+        # クラス名ファイルの保存
+        with open(os.path.join(yolo_dataset_dir, "classes.txt"), 'w') as f:
+            for cls in classes:
+                f.write(f"{cls}\n")
+        
+        # データセット設定YAMLファイルの作成
+        task_name = "物体検知" if task_type == "detect" else "セグメンテーション"
+        yaml_content = f"""# {task_name}用データセット設定
+    path: {yolo_dataset_dir}
+    train: train/images
+    val: val/images
+
+    # クラス数
+    nc: {len(classes)}
+
+    # クラス名
+    names: {classes}
+    """
+        
+        yaml_file = os.path.join(yolo_dataset_dir, "dataset.yaml")
+        with open(yaml_file, 'w') as f:
+            f.write(yaml_content)
+        
+        # **重要**: タスクに応じて適切なアノテーションのみをエクスポート
+        if task_type == "detect":
+            print("=== バウンディングボックス専用データセット作成 ===")
+            # バウンディングボックスのみをエクスポート
+            self.export_bbox_only_to_yolo(train_dir, val_dir, classes)
+        elif task_type == "segment":
+            print("=== セグメンテーション専用データセット作成 ===")
+            # セグメンテーションデータのみをエクスポート
+            self.export_segmentation_only_to_yolo(train_dir, val_dir, classes)
+        
+        return {
+            'train_dir': train_dir,
+            'val_dir': val_dir,
+            'yaml_file': yaml_file
+        }
+
+    def export_segmentation_only_to_yolo(self, train_dir, val_dir, classes):
+        """セグメンテーションデータのみをYOLO形式でエクスポート"""
+        
+        print("セグメンテーション専用アノテーションエクスポート開始")
+        
+        # クラス名のインデックスマッピング
+        class_to_index = {class_name: i for i, class_name in enumerate(classes)}
+        print(f"クラス-インデックスマッピング: {class_to_index}")
+        
+        # セグメンテーションアノテーションがあるインデックスのみを取得
+        valid_indices = []
+        for idx, segments in self.segmentation_annotations.items():
+            if segments and len(segments) > 0:
+                # 各セグメンテーションに有効な座標があるかチェック
+                has_valid_segments = False
+                for seg in segments:
+                    points = None
+                    if isinstance(seg, dict):
+                        points = seg.get('points', [])
+                    else:
+                        points = getattr(seg, 'points', [])
+                    
+                    if points and len(points) >= 3:  # 最低3点必要
+                        has_valid_segments = True
+                        break
+                
+                if has_valid_segments:
+                    valid_indices.append(idx)
+        
+        print(f"有効なセグメンテーションデータがあるインデックス: {len(valid_indices)}個")
+        
+        if len(valid_indices) == 0:
+            raise Exception("有効なセグメンテーションアノテーションが見つかりません。")
+        
+        # データを分割
+        import random
+        random.shuffle(valid_indices)
+        
+        split_point = int(len(valid_indices) * 0.8)
+        train_indices = valid_indices[:split_point]
+        val_indices = valid_indices[split_point:]
+        
+        print(f"学習用: {len(train_indices)}枚, 検証用: {len(val_indices)}枚")
+        
+        # 学習用データのエクスポート
+        train_success = self._export_segmentation_subset(train_indices, train_dir, class_to_index)
+        
+        # 検証用データのエクスポート
+        val_success = self._export_segmentation_subset(val_indices, val_dir, class_to_index)
+        
+        print(f"セグメンテーション専用アノテーションエクスポート完了")
+        print(f"学習用成功: {train_success}/{len(train_indices)}, 検証用成功: {val_success}/{len(val_indices)}")
+        
+        if train_success == 0 or val_success == 0:
+            raise Exception("セグメンテーションデータのエクスポートに失敗しました。")
+
+    # def _export_segmentation_subset(self, indices, output_dir, class_to_index):
+    #     """セグメンテーションサブセットのエクスポート"""
+        
+    #     success_count = 0
+        
+    #     for idx in indices:
+    #         if idx in self.segmentation_annotations:
+    #             try:
+    #                 # 画像をコピー
+    #                 source_image_path = self.images[idx]
+    #                 image_filename = os.path.basename(source_image_path)
+    #                 dest_image_path = os.path.join(output_dir, "images", image_filename)
+    #                 ####
+    #                 print(source_image_path, image_filename, dest_image_path)
+                    
+    #                 import shutil
+    #                 shutil.copy2(source_image_path, dest_image_path)
+                    
+    #                 # セグメンテーションアノテーションを処理
+    #                 label_filename = os.path.splitext(image_filename)[0] + ".txt"
+    #                 label_path = os.path.join(output_dir, "labels", label_filename)
+                    
+    #                 # 画像サイズを取得
+    #                 from PIL import Image
+    #                 with Image.open(source_image_path) as img:
+    #                     img_width, img_height = img.size
+                    
+    #                 # ラベルファイルを作成（セグメンテーション形式）
+    #                 with open(label_path, 'w') as f:
+    #                     for seg in self.segmentation_annotations[idx]:
+    #                         # クラス名を取得
+    #                         class_name = None
+    #                         if isinstance(seg, dict):
+    #                             class_name = seg.get('class_name')
+    #                             points = seg.get('points', [])
+    #                         else:
+    #                             class_name = getattr(seg, 'class_name', None)
+    #                             points = getattr(seg, 'points', [])
+                            
+    #                         if class_name in class_to_index and points and len(points) >= 3:
+    #                             class_id = class_to_index[class_name]
+                                
+    #                             # ポイントを正規化座標に変換
+    #                             normalized_points = []
+    #                             for point in points:
+    #                                 if isinstance(point, dict):
+    #                                     x = point.get('x', 0) / img_width
+    #                                     y = point.get('y', 0) / img_height
+    #                                 else:
+    #                                     x = getattr(point, 'x', 0) / img_width
+    #                                     y = getattr(point, 'y', 0) / img_height
+                                    
+    #                                 # 座標を0-1の範囲にクランプ
+    #                                 x = max(0.0, min(1.0, x))
+    #                                 y = max(0.0, min(1.0, y))
+                                    
+    #                                 normalized_points.extend([x, y])
+                                
+    #                             # YOLO セグメンテーション形式で書き込み
+    #                             # フォーマット: class_id x1 y1 x2 y2 x3 y3 ...
+    #                             if len(normalized_points) >= 6:  # 最低3点 (6座標)
+    #                                 points_str = ' '.join([f"{coord:.6f}" for coord in normalized_points])
+    #                                 f.write(f"{class_id} {points_str}\n")
+                    
+    #                 success_count += 1
+                    
+    #             except Exception as e:
+    #                 print(f"セグメンテーション インデックス {idx} の処理中にエラー: {e}")
+    #                 import traceback
+    #                 traceback.print_exc()
+        
+    #     return success_count
+
+    def export_bbox_only_to_yolo(self, train_dir, val_dir, classes):
+        """バウンディングボックスのみをYOLO形式でエクスポート（既存メソッドの改良版）"""
+        
+        print("バウンディングボックス専用アノテーションエクスポート開始")
+        
+        # クラス名のインデックスマッピング
+        class_to_index = {class_name: i for i, class_name in enumerate(classes)}
+        print(f"クラス-インデックスマッピング: {class_to_index}")
+        
+        # バウンディングボックスアノテーションがあるインデックスのみを使用
+        valid_indices = list(self.bbox_annotations.keys())
+        
+        import random
+        random.shuffle(valid_indices)
+        
+        split_point = int(len(valid_indices) * 0.8)
+        train_indices = valid_indices[:split_point]
+        val_indices = valid_indices[split_point:]
+        
+        print(f"学習用: {len(train_indices)}枚, 検証用: {len(val_indices)}枚")
+        
+        # 学習用データのエクスポート
+        train_success = self._export_bbox_subset(train_indices, train_dir, class_to_index)
+        
+        # 検証用データのエクスポート
+        val_success = self._export_bbox_subset(val_indices, val_dir, class_to_index)
+        
+        print(f"バウンディングボックス専用アノテーションエクスポート完了")
+        print(f"学習用成功: {train_success}/{len(train_indices)}, 検証用成功: {val_success}/{len(val_indices)}")
+
+    # def _export_bbox_subset(self, indices, output_dir, class_to_index):
+    #     """バウンディングボックスサブセットのエクスポート"""
+        
+    #     success_count = 0
+        
+    #     for idx in indices:
+    #         if idx in self.bbox_annotations:
+    #             try:
+    #                 # 画像をコピー
+    #                 source_image_path = self.images[idx]
+    #                 image_filename = os.path.basename(source_image_path)
+    #                 dest_image_path = os.path.join(output_dir, "images", image_filename)
+                    
+    #                 import shutil
+    #                 shutil.copy2(source_image_path, dest_image_path)
+                    
+    #                 # バウンディングボックスアノテーションを処理
+    #                 label_filename = os.path.splitext(image_filename)[0] + ".txt"
+    #                 label_path = os.path.join(output_dir, "labels", label_filename)
+                    
+    #                 # 画像サイズを取得
+    #                 from PIL import Image
+    #                 with Image.open(source_image_path) as img:
+    #                     img_width, img_height = img.size
+                    
+    #                 # ラベルファイルを作成（バウンディングボックス形式のみ）
+    #                 with open(label_path, 'w') as f:
+    #                     for bbox in self.bbox_annotations[idx]:
+    #                         if bbox.class_name in class_to_index:
+    #                             class_id = class_to_index[bbox.class_name]
+                                
+    #                             # 正規化座標に変換
+    #                             x_center = (bbox.x + bbox.width / 2) / img_width
+    #                             y_center = (bbox.y + bbox.height / 2) / img_height
+    #                             width = bbox.width / img_width
+    #                             height = bbox.height / img_height
+                                
+    #                             # YOLO 検出形式で書き込み
+    #                             # フォーマット: class_id x_center y_center width height
+    #                             f.write(f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}\n")
+                    
+    #                 success_count += 1
+                    
+    #             except Exception as e:
+    #                 print(f"バウンディングボックス インデックス {idx} の処理中にエラー: {e}")
+        
+    #     return success_count
+###
+    def _export_bbox_subset(self, indices, output_dir, class_to_index):
+        """バウンディングボックスサブセットのエクスポート（修正版）"""
+        
+        success_count = 0
+        
+        for idx in indices:
+            if idx in self.bbox_annotations:
+                try:
+                    # 画像をコピー
+                    source_image_path = self.images[idx]
+                    image_filename = os.path.basename(source_image_path)
+                    dest_image_path = os.path.join(output_dir, "images", image_filename)
+                    
+                    import shutil
+                    shutil.copy2(source_image_path, dest_image_path)
+                    
+                    # バウンディングボックスアノテーションを処理
+                    label_filename = os.path.splitext(image_filename)[0] + ".txt"
+                    label_path = os.path.join(output_dir, "labels", label_path)
+                    
+                    # ラベルファイルを作成（バウンディングボックス形式のみ）
+                    with open(label_path, 'w') as f:
+                        for bbox in self.bbox_annotations[idx]:
+                            # クラス名の取得（辞書形式とオブジェクト形式の両方に対応）
+                            class_name = None
+                            if isinstance(bbox, dict):
+                                class_name = bbox.get('class') or bbox.get('class_name')
+                            else:
+                                class_name = getattr(bbox, 'class', None) or getattr(bbox, 'class_name', None)
+                            
+                            if class_name and class_name in class_to_index:
+                                class_id = class_to_index[class_name]
+                                
+                                # バウンディングボックス座標を取得（既に正規化済み）
+                                if isinstance(bbox, dict):
+                                    # 辞書形式（現在のアプリケーション形式）
+                                    x1, y1, x2, y2 = bbox['x1'], bbox['y1'], bbox['x2'], bbox['y2']
+                                else:
+                                    # オブジェクト形式（古い形式への対応）
+                                    # 画像サイズを取得して正規化
+                                    from PIL import Image
+                                    with Image.open(source_image_path) as img:
+                                        img_width, img_height = img.size
+                                    
+                                    x1 = bbox.x / img_width
+                                    y1 = bbox.y / img_height
+                                    x2 = (bbox.x + bbox.width) / img_width
+                                    y2 = (bbox.y + bbox.height) / img_height
+                                
+                                # YOLO形式に変換（左上・右下座標 → 中心・幅・高さ）
+                                x_center = (x1 + x2) / 2
+                                y_center = (y1 + y2) / 2
+                                width = x2 - x1
+                                height = y2 - y1
+                                
+                                # YOLO検出形式で書き込み
+                                f.write(f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}\n")
+                    
+                    success_count += 1
+                    
+                except Exception as e:
+                    print(f"バウンディングボックス インデックス {idx} の処理中にエラー: {e}")
+                    import traceback
+                    traceback.print_exc()
+        
+        return success_count
+
+    def _export_segmentation_subset(self, indices, output_dir, class_to_index):
+        """セグメンテーションサブセットのエクスポート（修正版）"""
+        
+        success_count = 0
+        
+        for idx in indices:
+            if idx in self.segmentation_annotations:
+                try:
+                    # 画像をコピー
+                    source_image_path = self.images[idx]
+                    image_filename = os.path.basename(source_image_path)
+                    dest_image_path = os.path.join(output_dir, "images", image_filename)
+                    
+                    import shutil
+                    shutil.copy2(source_image_path, dest_image_path)
+                    
+                    # セグメンテーションアノテーションを処理
+                    label_filename = os.path.splitext(image_filename)[0] + ".txt"
+                    label_path = os.path.join(output_dir, "labels", label_filename)
+                    
+                    # 画像サイズを取得
+                    from PIL import Image
+                    with Image.open(source_image_path) as img:
+                        img_width, img_height = img.size
+                    
+                    # ラベルファイルを作成（セグメンテーション形式）
+                    with open(label_path, 'w') as f:
+                        for seg in self.segmentation_annotations[idx]:
+                            # クラス名を取得
+                            class_name = None
+                            if isinstance(seg, dict):
+                                class_name = seg.get('class') or seg.get('class_name')
+                                points = seg.get('points', [])
+                            else:
+                                class_name = getattr(seg, 'class', None) or getattr(seg, 'class_name', None)
+                                points = getattr(seg, 'points', [])
+                            
+                            if class_name and class_name in class_to_index and points and len(points) >= 3:
+                                class_id = class_to_index[class_name]
+                                
+                                # ポイントを正規化座標に変換
+                                normalized_points = []
+                                for point in points:
+                                    # アプリではピクセル座標で保存されているため正規化が必要
+                                    if isinstance(point, (list, tuple)) and len(point) >= 2:
+                                        # タプル/リスト形式: (x, y)
+                                        x = point[0] / img_width
+                                        y = point[1] / img_height
+                                    elif isinstance(point, dict):
+                                        # 辞書形式: {'x': x, 'y': y}
+                                        x = point.get('x', 0) / img_width
+                                        y = point.get('y', 0) / img_height
+                                    else:
+                                        # オブジェクト形式: point.x, point.y
+                                        x = getattr(point, 'x', 0) / img_width
+                                        y = getattr(point, 'y', 0) / img_height
+                                    
+                                    # 座標を0-1の範囲にクランプ
+                                    x = max(0.0, min(1.0, x))
+                                    y = max(0.0, min(1.0, y))
+                                    
+                                    normalized_points.extend([x, y])
+                                
+                                # YOLO セグメンテーション形式で書き込み
+                                if len(normalized_points) >= 6:  # 最低3点 (6座標)
+                                    points_str = ' '.join([f"{coord:.6f}" for coord in normalized_points])
+                                    f.write(f"{class_id} {points_str}\n")
+                    
+                    success_count += 1
+                    
+                except Exception as e:
+                    print(f"セグメンテーション インデックス {idx} の処理中にエラー: {e}")
+                    import traceback
+                    traceback.print_exc()
+        
+        return success_count
+
+
+    # セグメンテーション学習前のバリデーション強化
+    def _validate_yolo_annotations(self, task_type):
+        """YOLOアノテーションの検証 - セグメンテーション強化版"""
+        
+        if task_type == "detect":
+            if not self.bbox_annotations:
+                QMessageBox.warning(self, "警告", "物体検知アノテーションがありません。")
+                return None, None
+            
+            annotations = self.bbox_annotations
+            total_boxes = sum(len(boxes) for boxes in annotations.values())
+            
+            print(f"\n=== バウンディングボックスアノテーション確認 ===")
+            print(f"アノテーション数: {len(annotations)}")
+            print(f"総バウンディングボックス数: {total_boxes}")
+            print("=" * 50)
+            
+            return annotations, {"total_count": total_boxes, "image_count": len(annotations)}
+            
+        elif task_type == "segment":
+            if not self.segmentation_annotations:
+                QMessageBox.warning(self, "警告", "セグメンテーションアノテーションがありません。")
+                return None, None
+            
+            annotations = self.segmentation_annotations
+            
+            # セグメンテーションデータの詳細検証
+            total_segments = 0
+            valid_segments = 0
+            valid_images = 0
+            
+            for index, segments in annotations.items():
+                image_has_valid_segments = False
+                if segments and len(segments) > 0:
+                    total_segments += len(segments)
+                    for seg in segments:
+                        points = None
+                        if isinstance(seg, dict):
+                            points = seg.get('points', [])
+                        else:
+                            points = getattr(seg, 'points', [])
+                        
+                        if points and len(points) >= 3:  # 最低3点必要
+                            valid_segments += 1
+                            image_has_valid_segments = True
+                
+                if image_has_valid_segments:
+                    valid_images += 1
+            
+            print(f"\n=== セグメンテーションアノテーション確認 ===")
+            print(f"アノテーション辞書数: {len(annotations)}")
+            print(f"総セグメンテーション数: {total_segments}")
+            print(f"有効なセグメンテーション数: {valid_segments}")
+            print(f"有効なセグメンテーションがある画像数: {valid_images}")
+            print("=" * 50)
+            
+            if valid_segments == 0:
+                QMessageBox.critical(
+                    self,
+                    "セグメンテーションデータなし",
+                    "有効なセグメンテーションアノテーションが見つかりません。\n\n"
+                    "セグメンテーション学習には最低3点以上のポリゴンアノテーションが必要です。\n"
+                    "手動でポリゴンアノテーションを作成してから再試行してください。"
+                )
+                return None, None
+            
+            if valid_images < 4:  # 最低限の学習データ
+                QMessageBox.warning(
+                    self,
+                    "データ不足",
+                    f"有効なセグメンテーションデータが {valid_images} 枚しかありません。\n"
+                    f"セグメンテーション学習には最低4枚以上の画像が推奨されます。"
+                )
+            
+            return annotations, {"total_count": valid_segments, "image_count": valid_images}
+        
+        return None, None
+
+    def _prepare_yolo_model(self, model_type, training_config, progress):
+        """YOLOモデルの準備"""
+        
+        pretrained_model_path = None
+        model_path = None
+        
+        if training_config['use_pretrained']:
+            # 事前学習済みモデルをダウンロード
+            progress.setLabelText(f"事前学習済み {model_type} モデルをダウンロードしています...")
+            progress.setValue(5)
+            QApplication.processEvents()
+            
+            pretrained_model_path = self.download_pretrained_yolo_model(model_type)
+            if not pretrained_model_path:
+                progress.close()
+                QMessageBox.critical(self, "エラー", f"事前学習済み {model_type} モデルの準備に失敗しました。")
+                return None, None
+            
+            model = YOLO(pretrained_model_path)
+            pretrained_info = f"事前学習済みの重み (ダウンロード済み: {os.path.basename(pretrained_model_path)})"
+        else:
+            # 現在ロードされているモデルを使用
+            if hasattr(self, 'yolo_model_file') and os.path.exists(self.yolo_model_file):
+                model_path = self.yolo_model_file
+                model = YOLO(model_path)
+                pretrained_info = f"現在のモデル重み: {os.path.basename(model_path)}"
+            else:
+                progress.close()
+                QMessageBox.critical(self, "エラー", "現在のモデルが読み込まれていません。事前学習済みモデルを使用するか、モデルを読み込んでから再試行してください。")
+                return None, None
+        
+        return model, pretrained_info
+
+    def _setup_yolo_mlflow_environment(self, task_type):
+        """YOLO MLflow環境の設定"""
+        
+        # MLflowManagerを使用してYOLO実験を設定
+        if task_type == "detect":
+            self.mlflow_manager.set_experiment(ModelType.YOLO_DETECTION)
+        elif task_type == "segment":
+            self.mlflow_manager.set_experiment(ModelType.YOLO_SEGMENTATION)
+
+    def _log_yolo_training(self, task_type, model_type, results, training_config, dataset_info):
+        """YOLO学習結果をMLflowに記録"""
+        
+        try:
+            # 学習パラメータの準備
+            training_params = {
+                "epochs": training_config['num_epochs'],
+                "batch_size": training_config['batch_size'],
+                "img_size": training_config['img_size'],
+                "learning_rate": training_config['learning_rate'],
+                "patience": training_config['patience'],
+                "initial_weights": "pretrained" if training_config['use_pretrained'] else "current_model",
+                "augmentation_enabled": training_config['augmentation_enabled'],
+                "mosaic": training_config['mosaic'],
+                "fliplr": training_config['fliplr'],
+                "hsv_h": training_config['hsv_h'],
+                "hsv_s": training_config['hsv_s'],
+                "hsv_v": training_config['hsv_v'],
+                "translate": training_config['translate'],
+                "scale": training_config['scale'],
+                "erasing": training_config['erasing']
+            }
+            
+            # タスクタイプに応じてMLflowに記録
+            if task_type == "detect":
+                success = self.mlflow_manager.log_yolo_model(
+                    model_type=model_type,
+                    results=results,
+                    training_params=training_params,
+                    dataset_info=dataset_info
+                )
+            elif task_type == "segment":
+                success = self.mlflow_manager.log_yolo_segmentation_model(
+                    model_path=os.path.join(results.save_dir, "weights", "best.pt"),
+                    training_params={
+                        "model_type": model_type,
+                        "architecture": "yolo_segmentation",
+                        **training_params
+                    },
+                    metrics={
+                        "box_mAP": float(results.box.map) if hasattr(results, 'box') and hasattr(results.box, 'map') else 0.0,
+                        "mask_mAP": float(results.masks.map) if hasattr(results, 'masks') and hasattr(results.masks, 'map') else 0.0,
+                        "final_loss": 0.0  # YOLOの場合は最終損失を取得
+                    },
+                    dataset_info=dataset_info
+                )
+            
+            if success:
+                return "MLflowに学習履歴を記録しました。\n「MLflow比較」ボタンで結果を確認できます。"
+            else:
+                return "MLflowへの記録中にエラーが発生しました。"
+                
+        except Exception as e:
+            print(f"YOLO MLflow記録エラー: {e}")
+            return f"MLflowへの記録中にエラーが発生しました: {str(e)}"
+
+    def _show_yolo_training_success(self, task_name, model_type, results, device, pretrained_info, run_name, mlflow_info):
+        """YOLO学習成功メッセージを表示"""
+        
+        QMessageBox.information(
+            self,
+            "学習完了",
+            f"YOLO{task_name}モデルの学習が完了しました。\n"
+            f"最終mAP: {results.maps}\n"
+            f"使用デバイス: {device}\n"
+            f"初期化: {pretrained_info}\n\n"
+            f"モデル保存先: {os.path.join(models_dir, run_name, 'weights')}\n"
+            f"{mlflow_info}"
+        )
+
+    def _create_yolo_training_dialog(self, task_name, model_type):
+        """YOLO学習設定ダイアログを作成"""
+        
+        training_settings = QDialog(self)
+        training_settings.setWindowTitle(f"YOLO{task_name}モデル学習設定")
+        training_settings.setMinimumWidth(500)
+        training_settings.setMinimumHeight(600)
+        
+        settings_layout = QVBoxLayout(training_settings)
+        
+        # タブウィジェットを作成
+        tabs = QTabWidget()
+        
+        # 基本設定タブ
+        basic_tab = QWidget()
+        basic_layout = QVBoxLayout(basic_tab)
+        
+        # モデル初期化設定
+        init_group = QGroupBox("モデル初期化設定")
+        init_layout = QVBoxLayout(init_group)
+        
+        # 初期重みの選択
+        training_settings.weights_radio_pretrained = QRadioButton("事前学習済みの重みを使用 (推奨)")
+        training_settings.weights_radio_pretrained.setChecked(True)  # デフォルト選択
+        init_layout.addWidget(training_settings.weights_radio_pretrained)
+        
+        # 現在のモデルを選択
+        training_settings.weights_radio_current = QRadioButton("現在読み込まれているモデルの重みを使用")
+        init_layout.addWidget(training_settings.weights_radio_current)
+        
+        # 現在読み込まれているモデルの情報を表示
+        current_model_info = QLabel("現在のモデル: なし")
+        if hasattr(self, 'yolo_model') and hasattr(self, 'yolo_model_file'):
+            model_name = os.path.basename(self.yolo_model_file) if hasattr(self, 'yolo_model_file') else "Unknown"
+            current_model_info.setText(f"現在のモデル: {model_name}")
+            training_settings.weights_radio_current.setEnabled(True)
+        else:
+            training_settings.weights_radio_current.setEnabled(False)
+            current_model_info.setText("現在のモデル: なし（先にモデルを読み込んでください）")
+        
+        init_layout.addWidget(current_model_info)
+        basic_layout.addWidget(init_group)
+        
+        # エポック数設定
+        epoch_layout = QHBoxLayout()
+        epoch_layout.addWidget(QLabel("学習エポック数:"))
+        training_settings.epoch_spin = QSpinBox()
+        training_settings.epoch_spin.setRange(1, 1000)
+        training_settings.epoch_spin.setValue(30)  # デフォルト: 30エポック
+        epoch_layout.addWidget(training_settings.epoch_spin)
+        basic_layout.addLayout(epoch_layout)
+        
+        # バッチサイズ設定
+        batch_layout = QHBoxLayout()
+        batch_layout.addWidget(QLabel("バッチサイズ:"))
+        training_settings.batch_spin = QSpinBox()
+        training_settings.batch_spin.setRange(1, 128)
+        training_settings.batch_spin.setValue(16)  # デフォルト: 16
+        batch_layout.addWidget(training_settings.batch_spin)
+        basic_layout.addLayout(batch_layout)
+        
+        # 入力サイズ設定
+        size_layout = QHBoxLayout()
+        size_layout.addWidget(QLabel("入力画像サイズ:"))
+        training_settings.size_combo = QComboBox()
+        size_options = [str(self.original_image_size), "320", "416", "512", "640", "768", "896", "1024"]
+        default_index = 4  # デフォルトは640
+
+        # 説明ラベルを追加
+        size_layout.addWidget(QLabel(f"元画像: {self.original_image_width}×{self.original_image_height}"))
+
+        training_settings.size_combo.addItems(size_options)
+        training_settings.size_combo.setCurrentIndex(default_index)
+        size_layout.addWidget(training_settings.size_combo)
+        basic_layout.addLayout(size_layout)
+
+        # 注意書き
+        size_note = QLabel("注: 640以外のサイズを選択すると精度や速度に影響します")
+        size_note.setStyleSheet("color: #888; font-style: italic;")
+        basic_layout.addWidget(size_note)
+
+        # Early Stopping設定
+        training_settings.early_stopping_check = QCheckBox("Early Stopping を有効にする")
+        training_settings.early_stopping_check.setChecked(True)
+        basic_layout.addWidget(training_settings.early_stopping_check)
+        
+        patience_layout = QHBoxLayout()
+        patience_layout.addWidget(QLabel("忍耐エポック数:"))
+        training_settings.patience_spin = QSpinBox()
+        training_settings.patience_spin.setRange(1, 20)
+        training_settings.patience_spin.setValue(10)
+        training_settings.patience_spin.setEnabled(True)
+        patience_layout.addWidget(training_settings.patience_spin)
+        basic_layout.addLayout(patience_layout)
+        
+        # 学習率設定
+        lr_layout = QHBoxLayout()
+        lr_layout.addWidget(QLabel("学習率:"))
+        
+        training_settings.lr_combo = QComboBox()
+        learning_rates = ["0.01", "0.005", "0.001", "0.0005", "0.0001"]
+        training_settings.lr_combo.addItems(learning_rates)
+        training_settings.lr_combo.setCurrentIndex(2)  # デフォルト: 0.001
+        lr_layout.addWidget(training_settings.lr_combo)
+        basic_layout.addLayout(lr_layout)
+        
+        # タブに追加
+        tabs.addTab(basic_tab, "基本設定")
+        
+        # データオーグメンテーションタブ
+        aug_tab = QWidget()
+        aug_layout = QVBoxLayout(aug_tab)
+        
+        # データオーグメンテーション有効化チェックボックス
+        training_settings.aug_enable_check = QCheckBox("データオーグメンテーションを有効にする")
+        training_settings.aug_enable_check.setChecked(True)
+        aug_layout.addWidget(training_settings.aug_enable_check)
+        
+        # オーグメンテーション設定のスクロールエリア
+        aug_scroll = QScrollArea()
+        aug_scroll.setWidgetResizable(True)
+        aug_scroll.setFrameShape(QFrame.NoFrame)
+        
+        aug_scroll_content = QWidget()
+        aug_options_layout = QVBoxLayout(aug_scroll_content)
+        
+        # モザイク
+        mosaic_layout = QHBoxLayout()
+        training_settings.aug_mosaic_checkbox = QCheckBox("モザイク")
+        training_settings.aug_mosaic_checkbox.setChecked(True)
+        aug_mosaic_proba_label = QLabel("確率:")
+        training_settings.aug_mosaic_proba = QDoubleSpinBox()
+        training_settings.aug_mosaic_proba.setRange(0.0, 1.0)
+        training_settings.aug_mosaic_proba.setSingleStep(0.1)
+        training_settings.aug_mosaic_proba.setValue(1.0)
+        mosaic_layout.addWidget(training_settings.aug_mosaic_checkbox)
+        mosaic_layout.addWidget(aug_mosaic_proba_label)
+        mosaic_layout.addWidget(training_settings.aug_mosaic_proba)
+        mosaic_layout.addStretch()
+        aug_options_layout.addLayout(mosaic_layout)
+        
+        # 水平反転
+        flip_layout = QHBoxLayout()
+        training_settings.aug_flip_checkbox = QCheckBox("水平反転")
+        training_settings.aug_flip_checkbox.setChecked(True)
+        aug_flip_proba_label = QLabel("確率:")
+        training_settings.aug_flip_proba = QDoubleSpinBox()
+        training_settings.aug_flip_proba.setRange(0.0, 1.0)
+        training_settings.aug_flip_proba.setSingleStep(0.1)
+        training_settings.aug_flip_proba.setValue(0.5)
+        flip_layout.addWidget(training_settings.aug_flip_checkbox)
+        flip_layout.addWidget(aug_flip_proba_label)
+        flip_layout.addWidget(training_settings.aug_flip_proba)
+        flip_layout.addStretch()
+        aug_options_layout.addLayout(flip_layout)
+        
+        # HSV調整
+        hsv_layout = QHBoxLayout()
+        training_settings.aug_hsv_checkbox = QCheckBox("HSV調整")
+        training_settings.aug_hsv_checkbox.setChecked(True)
+        hsv_layout.addWidget(training_settings.aug_hsv_checkbox)
+        hsv_layout.addStretch()
+        aug_options_layout.addLayout(hsv_layout)
+        
+        # HSVの詳細設定
+        hsv_details_layout = QGridLayout()
+        hsv_details_layout.setContentsMargins(20, 0, 0, 0)
+        
+        hsv_details_layout.addWidget(QLabel("色相 (H):"), 0, 0)
+        training_settings.aug_hsv_h = QDoubleSpinBox()
+        training_settings.aug_hsv_h.setRange(0.0, 0.1)
+        training_settings.aug_hsv_h.setSingleStep(0.005)
+        training_settings.aug_hsv_h.setValue(0.015)
+        hsv_details_layout.addWidget(training_settings.aug_hsv_h, 0, 1)
+        
+        hsv_details_layout.addWidget(QLabel("彩度 (S):"), 1, 0)
+        training_settings.aug_hsv_s = QDoubleSpinBox()
+        training_settings.aug_hsv_s.setRange(0.0, 1.0)
+        training_settings.aug_hsv_s.setSingleStep(0.1)
+        training_settings.aug_hsv_s.setValue(0.7)
+        hsv_details_layout.addWidget(training_settings.aug_hsv_s, 1, 1)
+        
+        hsv_details_layout.addWidget(QLabel("明度 (V):"), 2, 0)
+        training_settings.aug_hsv_v = QDoubleSpinBox()
+        training_settings.aug_hsv_v.setRange(0.0, 1.0)
+        training_settings.aug_hsv_v.setSingleStep(0.1)
+        training_settings.aug_hsv_v.setValue(0.4)
+        hsv_details_layout.addWidget(training_settings.aug_hsv_v, 2, 1)
+        
+        aug_options_layout.addLayout(hsv_details_layout)
+        
+        # 幾何変換
+        geometry_layout = QHBoxLayout()
+        training_settings.aug_geometry_checkbox = QCheckBox("幾何変換")
+        training_settings.aug_geometry_checkbox.setChecked(True)
+        geometry_layout.addWidget(training_settings.aug_geometry_checkbox)
+        geometry_layout.addStretch()
+        aug_options_layout.addLayout(geometry_layout)
+        
+        # 幾何変換の詳細設定
+        geometry_details_layout = QGridLayout()
+        geometry_details_layout.setContentsMargins(20, 0, 0, 0)
+        
+        geometry_details_layout.addWidget(QLabel("平行移動:"), 0, 0)
+        training_settings.aug_translate = QDoubleSpinBox()
+        training_settings.aug_translate.setRange(0.0, 0.5)
+        training_settings.aug_translate.setSingleStep(0.05)
+        training_settings.aug_translate.setValue(0.1)
+        geometry_details_layout.addWidget(training_settings.aug_translate, 0, 1)
+        
+        geometry_details_layout.addWidget(QLabel("スケール:"), 1, 0)
+        training_settings.aug_scale = QDoubleSpinBox()
+        training_settings.aug_scale.setRange(0.0, 1.0)
+        training_settings.aug_scale.setSingleStep(0.05)
+        training_settings.aug_scale.setValue(0.5)
+        geometry_details_layout.addWidget(training_settings.aug_scale, 1, 1)
+        
+        aug_options_layout.addLayout(geometry_details_layout)
+        
+        # RandomErase
+        erase_layout = QHBoxLayout()
+        training_settings.aug_erase_checkbox = QCheckBox("ランダムイレース")
+        training_settings.aug_erase_checkbox.setChecked(True)
+        aug_erase_proba_label = QLabel("確率:")
+        training_settings.aug_erase_proba = QDoubleSpinBox()
+        training_settings.aug_erase_proba.setRange(0.0, 1.0)
+        training_settings.aug_erase_proba.setSingleStep(0.1)
+        training_settings.aug_erase_proba.setValue(0.4)
+        erase_layout.addWidget(training_settings.aug_erase_checkbox)
+        erase_layout.addWidget(aug_erase_proba_label)
+        erase_layout.addWidget(training_settings.aug_erase_proba)
+        erase_layout.addStretch()
+        aug_options_layout.addLayout(erase_layout)
+        
+        # オプションの有効/無効を連動させる
+        def toggle_aug_options(checked):
+            for w in aug_scroll_content.findChildren(QWidget):
+                if w != training_settings.aug_enable_check:
+                    w.setEnabled(checked)
+        
+        training_settings.aug_enable_check.toggled.connect(toggle_aug_options)
+        
+        # スクロールエリアに設定
+        aug_scroll.setWidget(aug_scroll_content)
+        aug_layout.addWidget(aug_scroll)
+        
+        # タブに追加
+        tabs.addTab(aug_tab, "データオーグメンテーション")
+        
+        # タブをレイアウトに追加
+        settings_layout.addWidget(tabs)
+        
+        # ボタンの配置
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(training_settings.accept)
+        button_box.rejected.connect(training_settings.reject)
+        settings_layout.addWidget(button_box)
+        
+        return training_settings
+
+    def _get_yolo_training_config(self, task_name, model_type):
+        """YOLO学習設定ダイアログから設定を取得（修正版）"""
+        
+        # 設定ダイアログを作成
+        training_settings = self._create_yolo_training_dialog(task_name, model_type)
+        
+        if not training_settings.exec_():
+            return None
+        
+        # 設定値の取得
+        return {
+            'use_pretrained': training_settings.weights_radio_pretrained.isChecked(),
+            'num_epochs': training_settings.epoch_spin.value(),
+            'batch_size': training_settings.batch_spin.value(),
+            'img_size': int(training_settings.size_combo.currentText()),
+            'use_early_stopping': training_settings.early_stopping_check.isChecked(),
+            'patience': training_settings.patience_spin.value() if training_settings.early_stopping_check.isChecked() else 0,
+            'learning_rate': float(training_settings.lr_combo.currentText()),
+            'augmentation_enabled': training_settings.aug_enable_check.isChecked(),
+            'mosaic': training_settings.aug_mosaic_proba.value() if training_settings.aug_mosaic_checkbox.isChecked() and training_settings.aug_enable_check.isChecked() else 0.0,
+            'fliplr': training_settings.aug_flip_proba.value() if training_settings.aug_flip_checkbox.isChecked() and training_settings.aug_enable_check.isChecked() else 0.0,
+            'hsv_h': training_settings.aug_hsv_h.value() if training_settings.aug_hsv_checkbox.isChecked() and training_settings.aug_enable_check.isChecked() else 0.0,
+            'hsv_s': training_settings.aug_hsv_s.value() if training_settings.aug_hsv_checkbox.isChecked() and training_settings.aug_enable_check.isChecked() else 0.0,
+            'hsv_v': training_settings.aug_hsv_v.value() if training_settings.aug_hsv_checkbox.isChecked() and training_settings.aug_enable_check.isChecked() else 0.0,
+            'translate': training_settings.aug_translate.value() if training_settings.aug_geometry_checkbox.isChecked() and training_settings.aug_enable_check.isChecked() else 0.0,
+            'scale': training_settings.aug_scale.value() if training_settings.aug_geometry_checkbox.isChecked() and training_settings.aug_enable_check.isChecked() else 0.0,
+            'erasing': training_settings.aug_erase_proba.value() if training_settings.aug_erase_checkbox.isChecked() and training_settings.aug_enable_check.isChecked() else 0.0
+        }
+    #
+
+    def generate_segmentation_from_bbox(self):
+        """バウンディングボックスから矩形セグメンテーションを自動生成"""
+        if not self.bbox_annotations:
+            return
+        
+        generated_count = 0
+        
+        # インデックスベースでバウンディングボックスを処理
+        for index, bboxes in self.bbox_annotations.items():
+            if not bboxes:
+                continue
+                
+            # 対応する画像のサイズを取得
+            if index < len(self.images):
+                img_path = self.images[index]
+                
+                # 画像サイズを取得
+                try:
+                    from PIL import Image
+                    with Image.open(img_path) as img:
+                        img_width, img_height = img.size
+                except:
+                    print(f"画像 {img_path} のサイズ取得に失敗")
+                    continue
+                
+                # このインデックスのセグメンテーションリストを初期化
+                if index not in self.segmentation_annotations:
+                    self.segmentation_annotations[index] = []
+                
+                # 各バウンディングボックスを矩形セグメンテーションに変換
+                for bbox in bboxes:
+                    # 正規化座標から実際の座標に変換
+                    x1 = int(bbox['x1'] * img_width)
+                    y1 = int(bbox['y1'] * img_height)
+                    x2 = int(bbox['x2'] * img_width)
+                    y2 = int(bbox['y2'] * img_height)
+                    
+                    # 矩形の4つの角をポイントとして作成
+                    points = [
+                        (x1, y1),  # 左上
+                        (x2, y1),  # 右上
+                        (x2, y2),  # 右下
+                        (x1, y2)   # 左下
+                    ]
+                    
+                    # セグメンテーションデータを作成
+                    seg_data = {
+                        'class': bbox.get('class', 'unknown'),
+                        'points': points
+                    }
+                    
+                    self.segmentation_annotations[index].append(seg_data)
+                    generated_count += 1
+        
+        print(f"バウンディングボックスから {generated_count}個のセグメンテーションを自動生成しました")
+        
+        # UI更新
+        self.update_ui()
+
+    def toggle_segmentation_inference_display(self, state):
+        """セグメンテーション推論表示の切り替え"""
+        show_inference = (state == Qt.Checked)
+        self.show_segmentation_inference = show_inference
+        
+        # 画面更新
+        self.main_image_view.update()
+        
+        if show_inference:
+            self.statusBar().showMessage("セグメンテーション推論結果表示をオンにしました", 3000)
+        else:
+            self.statusBar().showMessage("セグメンテーション推論結果表示をオフにしました", 3000)
+
+    def refresh_yolo_unified_model_list(self):
+        """統合されたYOLOモデルリストを更新 - 物体検知とセグメンテーションを統合"""
+        if not hasattr(self, 'yolo_unified_model_combo'):
+            return
+                    
+        self.yolo_unified_model_combo.clear()
+        
+        # 更新開始のメッセージを表示
+        self.statusBar().showMessage("統合YOLOモデルリストを更新中...")
+        
+        # 現在選択されているモデルタイプを取得
+        selected_model_type = self.yolo_model_combo.currentText()
+        
+        # YOLOモデルファイルを検索 - 物体検知とセグメンテーション両方
+        unified_model_files = []
+        
+        # 1. 直下の.ptファイルを検索
+        for file in os.listdir(models_dir):
+            if file.endswith('.pt') and ('yolo' in file.lower()) and (selected_model_type.lower() in file.lower()):
+                # タスクタイプを判定
+                task_type = "セグメンテーション" if 'seg' in file.lower() else "物体検知"
+                
+                model_info = {
+                    'path': file,
+                    'parent': 'root',
+                    'type': 'model',
+                    'task': task_type,
+                    'date': ''
+                }
+                unified_model_files.append(model_info)
+        
+        # 2. サブフォルダを検索
+        for root, dirs, files in os.walk(models_dir):
+            if root == models_dir:
+                continue
+                    
+            for file in files:
+                if file.endswith('.pt') and ('best' in file.lower() or 'last' in file.lower()):
+                    full_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(full_path, models_dir)
+                    
+                    folder_name = os.path.basename(root)
+                    parent_folder_name = os.path.basename(os.path.dirname(root))
+                    
+                    # モデルタイプがフォルダ名に含まれているかチェック
+                    model_match = (
+                        selected_model_type.lower() in folder_name.lower() or 
+                        selected_model_type.lower() in parent_folder_name.lower()
+                    )
+                    
+                    if not model_match:
+                        continue
+                    
+                    # タスクタイプを判定（フォルダ名とファイル名から）
+                    if ('seg' in folder_name.lower() or 'segment' in folder_name.lower() or 
+                        'seg' in file.lower() or 'segment' in file.lower()):
+                        task_type = "セグメンテーション"
+                    else:
+                        task_type = "物体検知"
+                    
+                    # 日時情報を取得
+                    date_info = ""
+                    parts = folder_name.split('_')
+                    if len(parts) >= 3:
+                        date_info = '_'.join(parts[1:])
+                    else:
+                        parent_parts = parent_folder_name.split('_')
+                        if len(parent_parts) >= 3:
+                            date_info = '_'.join(parent_parts[1:])
+                    
+                    model_info = {
+                        'path': rel_path,
+                        'parent': folder_name,
+                        'type': 'best' if 'best' in file.lower() else 'last',
+                        'task': task_type,
+                        'date': date_info
+                    }
+                    unified_model_files.append(model_info)
+        
+        if not unified_model_files:
+            self.yolo_unified_model_combo.addItem(f"{selected_model_type}のYOLOモデルが見つかりません")
+            self.statusBar().showMessage(f"{selected_model_type}のYOLOモデルが見つかりません", 3000)
+            return
+        
+        # モデルファイルをソート（タスクタイプ順、その後日付順）
+        def sort_key(model_info):
+            task_priority = 0 if model_info['task'] == "物体検知" else 1  # 物体検知を優先
+            if model_info['parent'] == 'root':
+                return (task_priority, '0', '')
+            else:
+                return (task_priority, '1', model_info['date'])
+        
+        unified_model_files.sort(key=sort_key, reverse=False)
+        
+        # コンボボックスに追加
+        for model_info in unified_model_files:
+            if model_info['parent'] == 'root':
+                display_name = f"[{model_info['task']}] {model_info['path']}"
+            else:
+                display_name = f"[{model_info['task']}] {model_info['parent'].split('_')[0]} [{model_info['date']}] ({model_info['type']})"
+            
+            self.yolo_unified_model_combo.addItem(display_name, model_info['path'])
+
+
+        # 更新完了メッセージ
+        detection_count = sum(1 for m in unified_model_files if m['task'] == "物体検知")
+        segmentation_count = sum(1 for m in unified_model_files if m['task'] == "セグメンテーション")
+        
+        self.statusBar().showMessage(
+            f"{len(unified_model_files)}個の{selected_model_type}モデルを読み込みました "
+            f"(物体検知: {detection_count}, セグメンテーション: {segmentation_count})", 3000
+        )
+
+    def load_yolo_model_unified(self):
+        """統合されたYOLOモデル読み込み - タスクタイプを自動判別"""
+        if not self.images:
+            QMessageBox.warning(self, "警告", "画像が読み込まれていません。")
+            return
+        
+        # 選択されたモデル情報を取得
+        current_index = self.yolo_unified_model_combo.currentIndex()
+        selected_model_display = self.yolo_unified_model_combo.currentText()
+        relative_path = self.yolo_unified_model_combo.itemData(current_index)
+        
+        if not relative_path or "が見つかりません" in selected_model_display:
+            QMessageBox.warning(self, "警告", "有効なYOLOモデルが選択されていません。")
+            return
+        
+        # タスクタイプを判定
+        is_segmentation = "[セグメンテーション]" in selected_model_display
+        task_type = "セグメンテーション" if is_segmentation else "物体検知"
+        
+        # モデルパスを構築
+        model_path = os.path.join(models_dir, relative_path)
+        
+        if not os.path.exists(model_path):
+            QMessageBox.warning(self, "警告", f"選択されたモデルが見つかりません: {model_path}")
+            return
+        
+        # 信頼度閾値の設定
+        confidence, ok = QInputDialog.getDouble(
+            self, 
+            f"{task_type}モデル信頼度設定", 
+            f"{task_type}の信頼度閾値 (0.0-1.0):",
+            0.6, 0.01, 1.0, 2
+        )
+        
+        if not ok:
+            return
+        
+        # 進捗ダイアログ
+        progress = QProgressDialog(
+            f"{task_type}モデル '{os.path.basename(model_path)}' を読み込み中...",
+            "キャンセル", 0, 100, self
+        )
+        progress.setWindowTitle("統合モデル読み込み")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+        
+        try:
+            from ultralytics import YOLO
+            
+            progress.setValue(30)
+            progress.setLabelText(f"{task_type}モデルをメモリに読み込み中...")
+            QApplication.processEvents()
+            
+            # モデルを読み込み
+            yolo_model = YOLO(model_path)
+            
+            progress.setValue(50)
+            QApplication.processEvents()
+            
+            # タスクタイプに応じてモデルを適切な変数に設定
+            if is_segmentation:
+                self.yolo_seg_model = yolo_model
+                self.yolo_seg_confidence_threshold = confidence
+                self.yolo_seg_model_file = model_path
+                
+                # セグメンテーション推論チェックボックスをオン
+                if hasattr(self, 'segmentation_inference_checkbox'):
+                    self.segmentation_inference_checkbox.setChecked(True)
+            else:
+                self.yolo_model = yolo_model
+                self.yolo_confidence_threshold = confidence
+                self.yolo_model_file = model_path
+                
+                # 物体検知推論チェックボックスをオン
+                if hasattr(self, 'detection_inference_checkbox'):
+                    self.detection_inference_checkbox.setChecked(True)
+            
+            progress.setValue(70)
+            progress.setLabelText("推論テストを実行中...")
+            QApplication.processEvents()
+            
+            # 現在の画像で推論テスト
+            if is_segmentation:
+                # セグメンテーション推論テスト（実装が必要な場合）
+                pass
+            else:
+                self.run_single_yolo_inference()
+            
+            progress.setValue(100)
+            progress.close()
+            
+            # 成功メッセージ
+            model_name = os.path.basename(model_path)
+            QMessageBox.information(
+                self,
+                "モデル読み込み完了",
+                f"{task_type}モデル「{model_name}」を読み込みました。\n"
+                f"信頼度閾値: {confidence}\n\n"
+                f"画像送りごとに自動的に{task_type}推論が実行されます。"
+            )
+            
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(
+                self,
+                "エラー",
+                f"{task_type}モデルの読み込み中にエラーが発生しました: {str(e)}"
+            )
+
+    def on_yolo_model_type_changed(self, index):
+        """YOLOモデルタイプが変更されたときの処理"""
+        # 現在選択されているモデルタイプを取得
+        selected_model_type = self.yolo_model_combo.currentText()
+        self.statusBar().showMessage(f"YOLOモデルタイプを「{selected_model_type}」に変更しました。モデルリストを更新します...")
+        
+        # モデルリストを更新
+        #self.refresh_yolo_model_list()
+        self.refresh_yolo_unified_model_list()                
+
+    # def export_bbox_yolo_format(self, output_folder, classes, progress=None):
+    #     """バウンディングボックスをYOLO形式でエクスポート（セグメンテーションと同じ構造）"""
+    #     import shutil
+        
+    #     # セグメンテーションと同じフォルダ構造を作成
+    #     images_dir = os.path.join(output_folder, 'images')
+    #     labels_dir = os.path.join(output_folder, 'labels')
+    #     os.makedirs(images_dir, exist_ok=True)
+    #     os.makedirs(labels_dir, exist_ok=True)
+        
+    #     # 削除されたインデックスを除外
+    #     deleted_indexes = getattr(self, 'deleted_indexes', set())
+        
+    #     # アノテーションがある画像のリストを作成
+    #     annotated_images = list(self.bbox_annotations.keys()) if hasattr(self, 'bbox_annotations') else []
+        
+    #     # 削除されたインデックスに対応する画像を除外
+    #     if hasattr(self, 'images') and deleted_indexes:
+    #         excluded_images = {self.images[i] for i in deleted_indexes if i < len(self.images)}
+    #         annotated_images = [img for img in annotated_images if img not in excluded_images]
+        
+    #     total_images = len(annotated_images)
+        
+    #     for i, img_path in enumerate(annotated_images):
+    #         if progress and progress.wasCanceled():
+    #             break
+            
+    #         if progress:
+    #             progress_value = int((i / total_images) * 100) if total_images > 0 else 100
+    #             progress.setValue(progress_value)
+    #             progress.setLabelText(f"バウンディングボックスエクスポート中: {os.path.basename(img_path)}")
+    #             QApplication.processEvents()
+            
+    #         # 画像をコピー
+    #         img_filename = os.path.basename(img_path)
+    #         try:
+    #             shutil.copy2(img_path, os.path.join(images_dir, img_filename))
+    #         except Exception as e:
+    #             print(f"画像コピーエラー: {img_path} - {e}")
+    #             continue
+            
+    #         # ラベルファイルを作成
+    #         label_filename = os.path.splitext(img_filename)[0] + '.txt'
+    #         label_path = os.path.join(labels_dir, label_filename)
+            
+    #         # 画像サイズを取得
+    #         try:
+    #             from PIL import Image
+    #             img = Image.open(img_path)
+    #             img_width, img_height = img.size
+    #         except Exception as e:
+    #             print(f"画像読み込みエラー: {img_path} - {e}")
+    #             continue
+            
+    #         # バウンディングボックスのラベルを作成
+    #         with open(label_path, 'w') as f:
+    #             if img_path in self.bbox_annotations:
+    #                 for bbox in self.bbox_annotations[img_path]:
+    #                     class_name = bbox.get('class', 'unknown')
+    #                     if class_name in classes:
+    #                         class_id = classes.index(class_name)
+                            
+    #                         # YOLO形式に変換（正規化された座標）
+    #                         center_x = ((bbox['x1'] + bbox['x2']) / 2) / img_width
+    #                         center_y = ((bbox['y1'] + bbox['y2']) / 2) / img_height
+    #                         width = (bbox['x2'] - bbox['x1']) / img_width
+    #                         height = (bbox['y2'] - bbox['y1']) / img_height
+                            
+    #                         f.write(f"{class_id} {center_x:.6f} {center_y:.6f} {width:.6f} {height:.6f}\n")
+        
+    #     # classes.txtを作成
+    #     classes_path = os.path.join(output_folder, 'classes.txt')
+    #     with open(classes_path, 'w', encoding='utf-8') as f:
+    #         for class_name in classes:
+    #             f.write(f"{class_name}\n")
+        
+    #     # dataset.yamlを作成
+    #     yaml_content = f"""path: {output_folder}
+    # train: images
+    # val: images
+    # test: images
+
+    # nc: {len(classes)}
+    # names: {classes}
+
+    # # バウンディングボックス検知用データセット
+    # # フォーマット: class_id center_x center_y width height (全て正規化済み)
+    # """
+        
+    #     yaml_path = os.path.join(output_folder, 'dataset.yaml')
+    #     with open(yaml_path, 'w', encoding='utf-8') as f:
+    #         f.write(yaml_content)
+        
+    #     return yaml_path
+    
+    def show_unified_export_dialog(self, export_type):
+        """統一エクスポート設定ダイアログを表示
+        
+        Args:
+            export_type: "donkey", "jetracer"
+            
+        Returns:
+            設定辞書またはNone（キャンセル時）
+        """
+        # フォルダ名とタイトル
+        type_config = {
+            "donkey": {
+                "folder_name": "data_donkey",
+                "title": "Donkeycarエクスポート設定",
+                "format_name": "Donkeycar"
+            },
+            "jetracer": {
+                "folder_name": "data_jetracer", 
+                "title": "Jetracerエクスポート設定",
+                "format_name": "Jetracer"
+            }
+        }
+        
+        config = type_config.get(export_type, type_config["donkey"])
+        default_folder_name = config["folder_name"]
+        dialog_title = config["title"]
+        format_name = config["format_name"]
+        
+        # 読み込み元フォルダがある場合はその名前を追加（重複を避ける）
+        if hasattr(self, 'folder_path') and self.folder_path:
+            parent_folder_name = os.path.basename(self.folder_path)
+            if parent_folder_name and parent_folder_name not in default_folder_name:
+                default_folder_name = f"{default_folder_name}_{parent_folder_name}"
+        
+        # ダイアログを作成
+        dialog = QDialog(self)
+        dialog.setWindowTitle(dialog_title)
+        dialog.setMinimumWidth(500)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # 保存先フォルダ選択
+        folder_group = QGroupBox("保存先設定")
+        folder_layout = QVBoxLayout(folder_group)
+        
+        # 保存先フォルダ選択
+        folder_selection_layout = QHBoxLayout()
+        folder_selection_layout.addWidget(QLabel("保存先フォルダ:"))
+        
+        folder_input = QLineEdit()
+        # annotationフォルダ内に保存するように修正
+        if hasattr(self, 'folder_path') and self.folder_path:
+            # 親フォルダのannotationフォルダ内に保存
+            annotation_base = os.path.join(self.folder_path, "annotation") 
+        else:
+            # デフォルトの場合
+            annotation_base = annotation_folder
+        
+        default_output_path = os.path.join(annotation_base, default_folder_name)
+        folder_input.setText(default_output_path)
+        folder_selection_layout.addWidget(folder_input)
+        
+        browse_folder_button = QPushButton("参照...")
+        browse_folder_button.clicked.connect(lambda: self.browse_output_folder(folder_input))
+        folder_selection_layout.addWidget(browse_folder_button)
+        
+        folder_layout.addLayout(folder_selection_layout)
+        layout.addWidget(folder_group)
+                
+        # 画像ソース選択（Donkeycarの場合のみ）
+        selected_variants = []
+        variant_keys = {}
+        image_map = {}
+        
+        if export_type == "donkey" and hasattr(self, 'available_variants') and self.available_variants:
+            # 画像ソース選択グループ
+            source_group = QGroupBox("画像ソース選択")
+            source_layout = QVBoxLayout(source_group)
+            
+            # 説明ラベル
+            info_label = QLabel("エクスポートする画像ソースを選択してください（複数選択可）：")
+            source_layout.addWidget(info_label)
+            
+            # 利用可能な画像ソースに基づいてチェックボックスを作成
+            source_checks = {}
+            for variant in self.available_variants:
+                check = QCheckBox(f"{variant} ({len(self.variant_images.get(variant, []))}枚)")
+                check.setProperty("variant", variant)
+                # 現在のバリアントは自動的にチェック
+                if variant == getattr(self, 'current_variant', None):
+                    check.setChecked(True)
+                source_layout.addWidget(check)
+                source_checks[variant] = check
+            
+            layout.addWidget(source_group)
+            
+            # カタログキー設定
+            keys_group = QGroupBox("カタログキー設定")
+            keys_layout = QVBoxLayout(keys_group)
+            
+            # 各ソースタイプのキー名設定
+            key_inputs = {}
+            for variant in self.available_variants:
+                key_layout = QHBoxLayout()
+                key_layout.addWidget(QLabel(f"{variant} キー名:"))
+                default_key = f"{variant}/image_array"
+                key_input = QLineEdit(default_key)
+                key_layout.addWidget(key_input)
+                keys_layout.addLayout(key_layout)
+                key_inputs[variant] = key_input
+            
+            # 説明ラベル
+            key_note = QLabel("※ Donkeycarのデフォルトキーは 'cam/image_array' です。")
+            key_note.setStyleSheet("color: #666; font-style: italic;")
+            keys_layout.addWidget(key_note)
+            
+            layout.addWidget(keys_group)
+        
+        # 削除したインデックスの情報表示
+        if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
+            deletion_info = QLabel(f"削除済みインデックス数: {len(self.deleted_indexes)}個（エクスポートから除外されます）")
+            deletion_info.setStyleSheet("color: #666; font-style: italic;")
+            layout.addWidget(deletion_info)
+        
+        # ボタン
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        # ダイアログ表示
+        if not dialog.exec_():
+            return None
+        
+        # 設定値を取得
+        output_folder = folder_input.text().strip()
+        if not output_folder:
+            QMessageBox.warning(self, "警告", "保存先フォルダが指定されていません。")
+            return None
+                
+        # Donkeycarの場合は画像ソース設定を取得
+        if export_type == "donkey" and hasattr(self, 'available_variants') and self.available_variants:
+            # 選択された画像ソースを取得
+            for variant, check in source_checks.items():
+                if check.isChecked():
+                    selected_variants.append(variant)
+                    # 対応するキー名を取得
+                    variant_keys[variant] = key_inputs[variant].text().strip()
+                    if not variant_keys[variant]:
+                        variant_keys[variant] = f"{variant}/image_array"
+            
+            if not selected_variants:
+                QMessageBox.warning(self, "警告", "画像ソースが選択されていません。")
+                return None
+            
+            # 画像マップを作成
+            for variant in selected_variants:
+                variant_images = self.variant_images.get(variant, [])
+                if not variant_images:
+                    continue
+                    
+                for img_path in variant_images:
+                    try:
+                        basename = os.path.basename(img_path)
+                        # 通常形式とJetracer形式の両方に対応
+                        normal_match = re.match(r'^(\d+)_', basename)
+                        jetracer_match = re.match(r'^\d+_\d+_(\d+)_', basename)
+                        
+                        if normal_match:
+                            idx = int(normal_match.group(1))
+                        elif jetracer_match:
+                            idx = int(jetracer_match.group(1))
+                        else:
+                            continue
+                            
+                        if idx not in image_map:
+                            image_map[idx] = {}
+                        image_map[idx][variant] = img_path
+                    except Exception as e:
+                        print(f"インデックス抽出エラー ({img_path}): {e}")
+        else:
+            # 他のエクスポート形式の場合はデフォルト値を設定
+            selected_variants = ["cam"]  # デフォルト
+        
+        # 確認メッセージ
+        confirm_message = f"以下の設定で{format_name}形式でエクスポートします：\n\n"
+        confirm_message += f"保存先: {output_folder}\n"
+        
+        if export_type == "donkey" and selected_variants:
+            for variant in selected_variants:
+                image_count = len(self.variant_images.get(variant, []))
+                confirm_message += f"・画像ソース: {variant} ({image_count}枚)\n"
+                if variant in variant_keys:
+                    confirm_message += f"  キー名: {variant_keys[variant]}\n"
+                
+        if export_type == "donkey":
+            confirm_message += f"\nアノテーション数: {len(self.annotations)}個"
+        
+        if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
+            confirm_message += f"\n削除済みインデックス数: {len(self.deleted_indexes)}個"
+        
+        reply = QMessageBox.question(
+            self, f"{format_name}エクスポート確認", confirm_message + "\n\n続行しますか？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+        )
+        
+        if reply == QMessageBox.No:
+            return None
+        
+        return {
+            'output_folder': output_folder,
+            'selected_variants': selected_variants,
+            'variant_keys': variant_keys,
+            'image_map': image_map,
+            'export_type': export_type,
+        }
+
+    def export_to_yolo_unified(self):
+        """統合YOLO形式でエクスポートする - バウンディングボックスとセグメンテーションを統合"""
+        # アノテーション状況を確認（修正版）
+        has_bbox = bool(getattr(self, 'bbox_annotations', {}))
+        has_seg = bool(getattr(self, 'segmentation_annotations', {}))
+                
+        if not has_bbox and not has_seg:
+            QMessageBox.information(self, "情報", "エクスポートするアノテーションがありません。")
+            return
+
+        # 統合YOLOエクスポートダイアログを表示
+        export_config = self.show_yolo_unified_export_dialog(has_bbox, has_seg)
+        if not export_config:
+            return  # キャンセルされた場合
+        
+        try:
+            # エクスポート実行
+            self.execute_yolo_unified_export(export_config)
+            
+        except Exception as e:
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"YOLO統合エクスポート中にエラーが発生しました: {str(e)}"
+            )
+
+    def show_yolo_unified_export_dialog(self, has_bbox, has_seg):
+        """統合YOLOエクスポートダイアログを表示
+        
+        Args:
+            has_bbox: バウンディングボックスアノテーションの有無
+            has_seg: セグメンテーションアノテーションの有無
+            
+        Returns:
+            設定辞書またはNone（キャンセル時）
+        """
+        # ダイアログを作成
+        dialog = QDialog(self)
+        dialog.setWindowTitle("YOLO統合エクスポート設定")
+        dialog.setMinimumWidth(550)
+        dialog.setMinimumHeight(400)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # タイトル情報
+        title_label = QLabel("YOLOアノテーションエクスポート")
+        title_label.setStyleSheet("font-size: 16px; font-weight: bold; margin-bottom: 10px;")
+        layout.addWidget(title_label)
+        
+        # アノテーション状況の表示
+        status_group = QGroupBox("アノテーション状況")
+        status_layout = QVBoxLayout(status_group)
+        
+        # バウンディングボックス状況
+        if has_bbox:
+            bbox_count = sum(len(bboxes) for bboxes in self.bbox_annotations.values())
+            bbox_images = len(self.bbox_annotations)
+            bbox_status = QLabel(f"✓ バウンディングボックス: {bbox_count}個 ({bbox_images}枚の画像)")
+            bbox_status.setStyleSheet("color: #2E7D32; font-weight: bold;")
+        else:
+            bbox_status = QLabel("✗ バウンディングボックス: なし")
+            bbox_status.setStyleSheet("color: #D32F2F;")
+        status_layout.addWidget(bbox_status)
+        
+        # セグメンテーション状況
+        if has_seg:
+            seg_count = sum(len(segs) for segs in self.segmentation_annotations.values())
+            seg_images = len(self.segmentation_annotations)
+            seg_status = QLabel(f"✓ セグメンテーション: {seg_count}個 ({seg_images}枚の画像)")
+            seg_status.setStyleSheet("color: #2E7D32; font-weight: bold;")
+        else:
+            seg_status = QLabel("✗ セグメンテーション: なし")
+            seg_status.setStyleSheet("color: #D32F2F;")
+        status_layout.addWidget(seg_status)
+        
+        layout.addWidget(status_group)
+        
+        # エクスポート形式選択
+        export_group = QGroupBox("エクスポート形式選択")
+        export_layout = QVBoxLayout(export_group)
+        
+        # バウンディングボックスエクスポートチェックボックス
+        bbox_check = QCheckBox("バウンディングボックス (物体検知用)")
+        bbox_check.setChecked(has_bbox)  # アノテーションがある場合は自動でチェック
+        bbox_check.setEnabled(has_bbox)  # アノテーションがない場合は無効
+        if has_bbox:
+            bbox_count = sum(len(bboxes) for bboxes in self.bbox_annotations.values())
+            bbox_check.setToolTip(f"{bbox_count}個のバウンディングボックスをエクスポートします")
+        else:
+            bbox_check.setToolTip("バウンディングボックスアノテーションがありません")
+        export_layout.addWidget(bbox_check)
+        
+        # セグメンテーションエクスポートチェックボックス
+        seg_check = QCheckBox("セグメンテーション (インスタンスセグメンテーション用)")
+        seg_check.setChecked(has_seg)  # アノテーションがある場合は自動でチェック
+        seg_check.setEnabled(has_seg)  # アノテーションがない場合は無効
+        if has_seg:
+            seg_count = sum(len(segs) for segs in self.segmentation_annotations.values())
+            seg_check.setToolTip(f"{seg_count}個のセグメンテーションをエクスポートします")
+        else:
+            seg_check.setToolTip("セグメンテーションアノテーションがありません")
+        export_layout.addWidget(seg_check)
+        
+        # 統合エクスポートオプション
+        if has_bbox and has_seg:
+            unified_check = QCheckBox("統合形式 (1つのデータセットに両方を含める)")
+            unified_check.setChecked(False)  # デフォルトは個別エクスポート
+            unified_check.setToolTip("バウンディングボックスとセグメンテーションを1つのYOLOデータセットに統合します")
+            export_layout.addWidget(unified_check)
+        else:
+            unified_check = QCheckBox("統合形式 (利用不可)")
+            unified_check.setChecked(False)
+            unified_check.setEnabled(False)
+            unified_check.setToolTip("両方のアノテーション形式が必要です")
+            export_layout.addWidget(unified_check)
+        
+        layout.addWidget(export_group)
+        
+        # クラス設定
+        class_group = QGroupBox("クラス設定")
+        class_layout = QVBoxLayout(class_group)
+        
+        classes_layout = QHBoxLayout()
+        classes_layout.addWidget(QLabel("検知クラス:"))
+        classes_input = QLineEdit("car,person,sign,cone")
+        classes_input.setPlaceholderText("カンマ区切りでクラス名を入力")
+        classes_layout.addWidget(classes_input)
+        class_layout.addLayout(classes_layout)
+        
+        layout.addWidget(class_group)
+        
+        # 保存先設定
+        folder_group = QGroupBox("保存先設定")
+        folder_layout = QVBoxLayout(folder_group)
+        
+        # 自動保存先の生成
+        if hasattr(self, 'folder_path') and self.folder_path:
+            annotation_base = os.path.join(self.folder_path, "annotation")
+        else:
+            annotation_base = annotation_folder
+        
+        default_output_path = os.path.join(annotation_base, "data_yolo")
+        
+        folder_selection_layout = QHBoxLayout()
+        folder_selection_layout.addWidget(QLabel("保存先フォルダ:"))
+        
+        folder_input = QLineEdit()
+        folder_input.setText(default_output_path)
+        folder_selection_layout.addWidget(folder_input)
+        
+        browse_folder_button = QPushButton("参照...")
+        browse_folder_button.clicked.connect(lambda: self.browse_output_folder(folder_input))
+        folder_selection_layout.addWidget(browse_folder_button)
+        
+        folder_layout.addLayout(folder_selection_layout)
+        layout.addWidget(folder_group)
+        
+        # 削除したインデックスの情報表示
+        if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
+            deletion_info = QLabel(f"削除済みインデックス数: {len(self.deleted_indexes)}個（エクスポートから除外されます）")
+            deletion_info.setStyleSheet("color: #666; font-style: italic; margin-top: 10px;")
+            layout.addWidget(deletion_info)
+        
+        # ボタン
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        # ダイアログ表示
+        if not dialog.exec_():
+            return None
+        
+        # 設定値を取得
+        output_folder = folder_input.text().strip()
+        if not output_folder:
+            QMessageBox.warning(self, "警告", "保存先フォルダが指定されていません。")
+            return None
+        
+        # エクスポート形式の確認
+        export_bbox = bbox_check.isChecked()
+        export_seg = seg_check.isChecked()
+        export_unified = unified_check.isChecked() if has_bbox and has_seg else False
+        
+        if not export_bbox and not export_seg:
+            QMessageBox.warning(self, "警告", "エクスポートする形式が選択されていません。")
+            return None
+        
+        # クラス設定の取得
+        classes = [cls.strip() for cls in classes_input.text().split(',') if cls.strip()]
+        if not classes:
+            QMessageBox.warning(self, "警告", "クラスが設定されていません。")
+            return None
+        
+        # 確認メッセージの生成
+        confirm_message = "以下の設定でYOLO形式でエクスポートします：\n\n"
+        confirm_message += f"保存先: {output_folder}\n"
+        confirm_message += f"クラス: {', '.join(classes)}\n\n"
+        
+        export_items = []
+        if export_bbox:
+            bbox_count = sum(len(bboxes) for bboxes in self.bbox_annotations.values())
+            export_items.append(f"バウンディングボックス: {bbox_count}個")
+        if export_seg:
+            seg_count = sum(len(segs) for segs in self.segmentation_annotations.values())
+            export_items.append(f"セグメンテーション: {seg_count}個")
+        
+        confirm_message += "エクスポート内容:\n"
+        for item in export_items:
+            confirm_message += f"・{item}\n"
+        
+        if export_unified:
+            confirm_message += "\n※ 統合形式で1つのデータセットに保存されます"
+        else:
+            confirm_message += "\n※ 各形式別々のデータセットとして保存されます"
+        
+        if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
+            confirm_message += f"\n\n削除済みインデックス: {len(self.deleted_indexes)}個（除外）"
+        
+        reply = QMessageBox.question(
+            self, "YOLO統合エクスポート確認", confirm_message + "\n\n続行しますか？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+        )
+        
+        if reply == QMessageBox.No:
+            return None
+        
+        return {
+            'output_folder': output_folder,
+            'classes': classes,
+            'export_bbox': export_bbox,
+            'export_seg': export_seg,
+            'export_unified': export_unified,
+            'has_bbox': has_bbox,
+            'has_seg': has_seg
+        }
+
+    def execute_yolo_unified_export(self, config):
+        """統合YOLOエクスポートを実行"""
+        output_folder = config['output_folder']
+        classes = config['classes']
+        export_bbox = config['export_bbox']
+        export_seg = config['export_seg']
+        export_unified = config['export_unified']
+        
+        # プログレスダイアログを表示
+        total_steps = (1 if export_bbox else 0) + (1 if export_seg else 0) + (1 if export_unified else 0)
+        progress = QProgressDialog("YOLOエクスポート準備中...", "キャンセル", 0, total_steps * 100, self)
+        progress.setWindowTitle("エクスポート実行中")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+        
+        try:
+            current_step = 0
+            results = []
+            
+            if export_unified:
+                # 統合エクスポート
+                progress.setLabelText("統合YOLO形式でエクスポート中...")
+                progress.setValue(current_step * 100)
+                
+                unified_folder = os.path.join(output_folder, "unified")
+                yaml_path = self.export_unified_yolo_format(unified_folder, classes, progress)
+                
+                if yaml_path:
+                    results.append(f"統合形式: {unified_folder}")
+                
+                current_step += 1
+            
+            else:
+                # 個別エクスポート（統一されたフォルダ構造）
+                if export_bbox:
+                    progress.setLabelText("バウンディングボックス形式でエクスポート中...")
+                    progress.setValue(current_step * 100)
+                    
+                    bbox_folder = os.path.join(output_folder, "detection")
+                    os.makedirs(bbox_folder, exist_ok=True)
+                    
+                    # インデックスベースのバウンディングボックスエクスポート
+                    yaml_path = self.export_bbox_yolo_format_index_based(bbox_folder, classes, progress)
+                    
+                    if yaml_path:
+                        results.append(f"物体検知: {bbox_folder}")
+                    
+                    current_step += 1
+                    progress.setValue(current_step * 100)
+                
+                if export_seg:
+                    progress.setLabelText("セグメンテーション形式でエクスポート中...")
+                    progress.setValue(current_step * 100)
+                    
+                    seg_folder = os.path.join(output_folder, "segmentation")
+                    os.makedirs(seg_folder, exist_ok=True)
+                    
+                    # インデックスベースのセグメンテーションエクスポート
+                    yaml_path = self.export_segmentation_yolo_format_index_based(seg_folder, classes, progress)
+                    
+                    if yaml_path:
+                        results.append(f"セグメンテーション: {seg_folder}")
+                    
+                    current_step += 1
+                    progress.setValue(current_step * 100)
+            
+            progress.close()
+            
+            # 結果表示
+            if results:
+                # 統計情報の計算
+                bbox_count = sum(len(bboxes) for bboxes in self.bbox_annotations.values()) if export_bbox and hasattr(self, 'bbox_annotations') else 0
+                seg_count = sum(len(segs) for segs in self.segmentation_annotations.values()) if export_seg and hasattr(self, 'segmentation_annotations') else 0
+                
+                result_message = "YOLOエクスポートが完了しました。\n\n"
+                result_message += "保存先:\n"
+                for result in results:
+                    result_message += f"・{result}\n"
+                
+                result_message += f"\nエクスポート統計:\n"
+                if export_bbox:
+                    result_message += f"・バウンディングボックス: {bbox_count}個\n"
+                if export_seg:
+                    result_message += f"・セグメンテーション: {seg_count}個\n"
+                result_message += f"・クラス: {', '.join(classes)}"
+                
+                QMessageBox.information(self, "エクスポート完了", result_message)
+            else:
+                QMessageBox.warning(self, "警告", "エクスポートに失敗しました。")
+        
+        except Exception as e:
+            progress.close()
+            raise e
+
+    def export_bbox_yolo_format_index_based(self, output_folder, classes, progress=None):
+        """インデックスベースでバウンディングボックスをYOLO形式でエクスポート"""
+        import shutil
+        
+        # フォルダ構造を作成
+        images_dir = os.path.join(output_folder, 'images')
+        labels_dir = os.path.join(output_folder, 'labels')
+        os.makedirs(images_dir, exist_ok=True)
+        os.makedirs(labels_dir, exist_ok=True)
+        
+        # 削除されたインデックスを除外
+        deleted_indexes = getattr(self, 'deleted_indexes', set())
+        
+        # アノテーションがあるインデックスのリストを作成
+        annotated_indexes = list(self.bbox_annotations.keys()) if hasattr(self, 'bbox_annotations') else []
+        
+        # 削除されたインデックスを除外
+        valid_indexes = [idx for idx in annotated_indexes if idx not in deleted_indexes]
+        
+        total_images = len(valid_indexes)
+        
+        for i, idx in enumerate(valid_indexes):
+            if progress and progress.wasCanceled():
+                break
+            
+            if progress:
+                progress_value = int((i / total_images) * 100) if total_images > 0 else 100
+                progress.setValue(progress_value)
+                
+            # インデックスから画像パスを取得
+            if not hasattr(self, 'images') or idx >= len(self.images):
+                continue
+                
+            img_path = self.images[idx]
+            img_filename = os.path.basename(img_path)
+            
+            if progress:
+                progress.setLabelText(f"バウンディングボックスエクスポート中: {img_filename}")
+                QApplication.processEvents()
+            
+            # 画像をコピー
+            try:
+                shutil.copy2(img_path, os.path.join(images_dir, img_filename))
+            except Exception as e:
+                print(f"画像コピーエラー: {img_path} - {e}")
+                continue
+            
+            # ラベルファイルを作成
+            label_filename = os.path.splitext(img_filename)[0] + '.txt'
+            label_path = os.path.join(labels_dir, label_filename)
+            
+            # 画像サイズを取得
+            try:
+                from PIL import Image
+                img = Image.open(img_path)
+                img_width, img_height = img.size
+            except Exception as e:
+                print(f"画像読み込みエラー: {img_path} - {e}")
+                continue
+            
+            # バウンディングボックスのラベルを作成
+            with open(label_path, 'w') as f:
+                if idx in self.bbox_annotations:
+                    for bbox in self.bbox_annotations[idx]:
+                        class_name = bbox.get('class', 'unknown')
+                        if class_name in classes:
+                            class_id = classes.index(class_name)
+                            
+                            # YOLO形式に変換
+                            center_x = ((bbox['x1'] + bbox['x2']) / 2) 
+                            center_y = ((bbox['y1'] + bbox['y2']) / 2) 
+                            width = (bbox['x2'] - bbox['x1']) 
+                            height = (bbox['y2'] - bbox['y1']) 
+                            
+                            f.write(f"{class_id} {center_x:.6f} {center_y:.6f} {width:.6f} {height:.6f}\n")
+        
+        # classes.txtを作成
+        classes_path = os.path.join(output_folder, 'classes.txt')
+        with open(classes_path, 'w', encoding='utf-8') as f:
+            for class_name in classes:
+                f.write(f"{class_name}\n")
+        
+        # dataset.yamlを作成
+        yaml_content = f"""path: {output_folder}
+    train: images
+    val: images
+    test: images
+
+    nc: {len(classes)}
+    names: {classes}
+
+    # バウンディングボックス検知用データセット
+    # フォーマット: class_id center_x center_y width height (全て正規化済み)
+    """
+        
+        yaml_path = os.path.join(output_folder, 'dataset.yaml')
+        with open(yaml_path, 'w', encoding='utf-8') as f:
+            f.write(yaml_content)
+        
+        return yaml_path
+
+    def export_segmentation_yolo_format_index_based(self, output_folder, classes, progress=None):
+        """インデックスベースでセグメンテーションをYOLO形式でエクスポート"""
+        import shutil
+        
+        # フォルダ構造を作成
+        images_dir = os.path.join(output_folder, 'images')
+        labels_dir = os.path.join(output_folder, 'labels')
+        os.makedirs(images_dir, exist_ok=True)
+        os.makedirs(labels_dir, exist_ok=True)
+        
+        # 削除されたインデックスを除外
+        deleted_indexes = getattr(self, 'deleted_indexes', set())
+        
+        # アノテーションがあるインデックスのリストを作成
+        annotated_indexes = list(self.segmentation_annotations.keys()) if hasattr(self, 'segmentation_annotations') else []
+        
+        # 削除されたインデックスを除外
+        valid_indexes = [idx for idx in annotated_indexes if idx not in deleted_indexes]
+        
+        total_images = len(valid_indexes)
+        
+        for i, idx in enumerate(valid_indexes):
+            if progress and progress.wasCanceled():
+                break
+            
+            if progress:
+                progress_value = int((i / total_images) * 100) if total_images > 0 else 100
+                progress.setValue(progress_value)
+                
+            # インデックスから画像パスを取得
+            if not hasattr(self, 'images') or idx >= len(self.images):
+                continue
+                
+            img_path = self.images[idx]
+            img_filename = os.path.basename(img_path)
+            
+            if progress:
+                progress.setLabelText(f"セグメンテーションエクスポート中: {img_filename}")
+                QApplication.processEvents()
+            
+            # 画像をコピー
+            try:
+                shutil.copy2(img_path, os.path.join(images_dir, img_filename))
+            except Exception as e:
+                print(f"画像コピーエラー: {img_path} - {e}")
+                continue
+            
+            # ラベルファイルを作成
+            label_filename = os.path.splitext(img_filename)[0] + '.txt'
+            label_path = os.path.join(labels_dir, label_filename)
+            
+            # 画像サイズを取得
+            try:
+                from PIL import Image
+                img = Image.open(img_path)
+                img_width, img_height = img.size
+            except Exception as e:
+                print(f"画像読み込みエラー: {img_path} - {e}")
+                continue
+            
+            # セグメンテーションのラベルを作成
+            with open(label_path, 'w') as f:
+                if idx in self.segmentation_annotations:
+                    for seg in self.segmentation_annotations[idx]:
+                        class_name = seg.get('class', 'unknown')
+                        if class_name in classes:
+                            class_id = classes.index(class_name)
+                            
+                            # ポリゴンポイントを正規化
+                            normalized_points = []
+                            points = seg.get('points', [])
+                            
+                            for point in points:
+                                if isinstance(point, (list, tuple)) and len(point) >= 2:
+                                    norm_x = point[0] / img_width
+                                    norm_y = point[1] / img_height
+                                    normalized_points.extend([norm_x, norm_y])
+                            
+                            if normalized_points:
+                                # YOLO形式でポリゴンを出力
+                                points_str = ' '.join(f"{p:.6f}" for p in normalized_points)
+                                f.write(f"{class_id} {points_str}\n")
+        
+        # classes.txtを作成
+        classes_path = os.path.join(output_folder, 'classes.txt')
+        with open(classes_path, 'w', encoding='utf-8') as f:
+            for class_name in classes:
+                f.write(f"{class_name}\n")
+        
+        # dataset.yamlを作成
+        yaml_content = f"""path: {output_folder}
+    train: images
+    val: images
+    test: images
+
+    nc: {len(classes)}
+    names: {classes}
+
+    # セグメンテーション用データセット
+    # フォーマット: class_id x1 y1 x2 y2 ... xn yn (全て正規化済み)
+    """
+        
+        yaml_path = os.path.join(output_folder, 'dataset.yaml')
+        with open(yaml_path, 'w', encoding='utf-8') as f:
+            f.write(yaml_content)
+        
+        return yaml_path
+
+
+    ### TODO:統合
+    # def export_all_to_yolo(self):
+    #     """物体検知とセグメンテーションを統合してYOLO形式でエクスポートする"""
+    #     has_bbox = hasattr(self, 'bbox_annotations') and self.bbox_annotations
+    #     has_seg = hasattr(self, 'segmentation_annotations') and self.segmentation_annotations
+        
+    #     if not has_bbox and not has_seg:
+    #         QMessageBox.information(self, "情報", "エクスポートするアノテーションがありません。")
+    #         return
+        
+    #     # アノテーションフォルダを作成
+    #     annotation_folder = os.path.join(self.folder_path, ANNOTATION_DIR_NAME)
+    #     yolo_export_folder = os.path.join(annotation_folder, "yolo_unified")
+    #     os.makedirs(yolo_export_folder, exist_ok=True)
+        
+    #     try:
+    #         # プログレスダイアログを表示
+    #         total_images = len(set(list(self.bbox_annotations.keys() if has_bbox else []) + 
+    #                             list(self.segmentation_annotations.keys() if has_seg else [])))
+    #         progress = QProgressDialog("YOLO統合データをエクスポート中...", "キャンセル", 0, total_images, self)
+    #         progress.setWindowTitle("エクスポート")
+    #         progress.setWindowModality(Qt.WindowModal)
+    #         progress.show()
+            
+    #         # クラス名を取得
+    #         classes = [cls.strip() for cls in self.classes_input.text().split(',') if cls.strip()]
+            
+    #         # エクスポート実行
+    #         yaml_path = self.export_unified_yolo_format(yolo_export_folder, classes, progress)
+            
+    #         progress.setValue(total_images)
+    #         progress.close()
+            
+    #         # 統計情報を計算
+    #         bbox_count = sum(len(bboxes) for bboxes in self.bbox_annotations.values()) if has_bbox else 0
+    #         seg_count = sum(len(segs) for segs in self.segmentation_annotations.values()) if has_seg else 0
+            
+    #         QMessageBox.information(
+    #             self, 
+    #             "エクスポート完了", 
+    #             f"アノテーションをYOLO統合形式でエクスポートしました。\n"
+    #             f"保存先: {yolo_export_folder}\n"
+    #             f"処理画像数: {total_images}\n"
+    #             f"バウンディングボックス数: {bbox_count}\n"
+    #             f"セグメンテーション数: {seg_count}\n"
+    #             f"クラス: {', '.join(classes)}"
+    #         )
+            
+    #     except Exception as e:
+    #         QMessageBox.critical(
+    #             self, 
+    #             "エラー", 
+    #             f"YOLO統合エクスポート中にエラーが発生しました: {str(e)}"
+    #         )
+
+    def export_unified_yolo_format(self, output_folder, classes, progress=None):
+        """物体検知とセグメンテーションを統合してYOLO形式でエクスポート"""
+        import shutil
+        
+        # フォルダ構造を作成
+        images_dir = os.path.join(output_folder, 'images')
+        labels_dir = os.path.join(output_folder, 'labels')
+        os.makedirs(images_dir, exist_ok=True)
+        os.makedirs(labels_dir, exist_ok=True)
+        
+        # 全ての画像を取得
+        all_images = set()
+        if hasattr(self, 'bbox_annotations'):
+            all_images.update(self.bbox_annotations.keys())
+        if hasattr(self, 'segmentation_annotations'):
+            all_images.update(self.segmentation_annotations.keys())
+        
+        all_images = list(all_images)
+        
+        for i, img_path in enumerate(all_images):
+            if progress and progress.wasCanceled():
+                break
+            
+            if progress:
+                progress.setValue(i)
+                progress.setLabelText(f"処理中: {os.path.basename(img_path)}")
+                QApplication.processEvents()
+            
+            # 画像をコピー
+            img_filename = os.path.basename(img_path)
+            shutil.copy2(img_path, os.path.join(images_dir, img_filename))
+            
+            # ラベルファイルを作成
+            label_filename = os.path.splitext(img_filename)[0] + '.txt'
+            label_path = os.path.join(labels_dir, label_filename)
+            
+            # 画像サイズを取得
+            img = Image.open(img_path)
+            img_width, img_height = img.size
+            
+            with open(label_path, 'w') as f:
+                # バウンディングボックスの処理
+                if hasattr(self, 'bbox_annotations') and img_path in self.bbox_annotations:
+                    for bbox in self.bbox_annotations[img_path]:
+                        class_name = bbox.get('class', 'unknown')
+                        if class_name in classes:
+                            class_id = classes.index(class_name)
+                            
+                            # YOLO形式に変換 (中心x, 中心y, 幅, 高さ)
+                            center_x = (bbox['x1'] + bbox['x2']) / 2
+                            center_y = (bbox['y1'] + bbox['y2']) / 2
+                            width = bbox['x2'] - bbox['x1']
+                            height = bbox['y2'] - bbox['y1']
+                            
+                            f.write(f"{class_id} {center_x:.6f} {center_y:.6f} {width:.6f} {height:.6f}\n")
+                
+                # セグメンテーションの処理
+                if hasattr(self, 'segmentation_annotations') and img_path in self.segmentation_annotations:
+                    for seg in self.segmentation_annotations[img_path]:
+                        class_name = seg.get('class', 'unknown')
+                        points = seg.get('points', [])
+                        
+                        if class_name in classes and len(points) >= 3:
+                            class_id = classes.index(class_name)
+                            
+                            # ポリゴンの座標を正規化
+                            normalized_points = []
+                            for x, y in points:
+                                norm_x = x / img_width
+                                norm_y = y / img_height
+                                normalized_points.extend([norm_x, norm_y])
+                            
+                            # YOLO セグメンテーション形式
+                            line = f"{class_id} " + " ".join(f"{coord:.6f}" for coord in normalized_points)
+                            f.write(line + '\n')
+        
+        # classes.txtを作成
+        classes_path = os.path.join(output_folder, 'classes.txt')
+        with open(classes_path, 'w') as f:
+            for class_name in classes:
+                f.write(f"{class_name}\n")
+        
+        # dataset.yamlを作成
+        yaml_content = f"""path: {output_folder}
+    train: images
+    val: images
+    test: images
+
+    nc: {len(classes)}
+    names: {classes}
+
+    # 物体検知とセグメンテーションの統合データセット
+    # バウンディングボックス: class_id center_x center_y width height
+    # セグメンテーション: class_id x1 y1 x2 y2 x3 y3 ...
+    """
+        
+        yaml_path = os.path.join(output_folder, 'dataset.yaml')
+        with open(yaml_path, 'w') as f:
+            f.write(yaml_content)
+        
+        return yaml_path
+
+    def refresh_yolo_model_list(self):
+        """保存されているYOLOモデルのリストを更新 - サブフォルダとweightsフォルダ内も検索し、直下のモデルも含める - 選択したタイプでフィルタリング"""
+        if not hasattr(self, 'yolo_saved_model_combo'):
+            return
+                    
+        self.yolo_saved_model_combo.clear()
+        
+        # 更新開始のメッセージを表示
+        self.statusBar().showMessage("YOLOモデルリストを更新中...")
+        
+        # 現在選択されているモデルタイプを取得
+        selected_model_type = self.yolo_model_combo.currentText()
+                            
+        # YOLOモデルファイルを検索 - サブフォルダも含めて
+        yolo_model_files = []
+        
+        # 1. まず直下の.ptファイルを検索 - 選択したタイプのモデルのみ
+        for file in os.listdir(models_dir):
+            if file.endswith('.pt') and ('yolo' in file.lower()) and (selected_model_type.lower() in file.lower()):
+                # ファイルのフルパスを取得
+                full_path = os.path.join(models_dir, file)
+                
+                # 各ファイルに関する情報をまとめる
+                model_info = {
+                    'path': file,  # 直下のファイルは相対パスとしてファイル名のみ
+                    'parent': 'root',  # 直下のファイルは親フォルダを'root'として識別
+                    'type': 'model',  # 通常のモデルファイル
+                    'date': ''  # 日付情報なし
+                }
+                yolo_model_files.append(model_info)
+        
+        # 2. サブフォルダを含めて再帰的に検索（既存の処理）- 選択したタイプのモデルのみ
+        for root, dirs, files in os.walk(models_dir):
+            if root == models_dir:
+                continue  # 直下のファイルは上で既に処理したのでスキップ
+                    
+            for file in files:
+                if file.endswith('.pt') and ('best' in file.lower() or 'last' in file.lower()):
+                    # ファイルのフルパスを取得
+                    full_path = os.path.join(root, file)
+                    # models_dir からの相対パスに変換
+                    rel_path = os.path.relpath(full_path, models_dir)
+                    
+                    # サブフォルダ名またはその親フォルダ名を確認
+                    folder_name = os.path.basename(root)
+                    parent_folder_name = os.path.basename(os.path.dirname(root))
+                    
+                    # 選択したモデルタイプがフォルダ名に含まれているかチェック
+                    model_match = (
+                        selected_model_type.lower() in folder_name.lower() or 
+                        selected_model_type.lower() in parent_folder_name.lower()
+                    )
+                    
+                    if not model_match:
+                        continue  # モデルタイプが一致しない場合はスキップ
+                    
+                    # 日時情報を取得するための処理
+                    # フォルダ名からモデル名と日時情報を抽出（例: yolov8n_20250502_204810）
+                    date_info = ""
+                    parts = folder_name.split('_')
+                    if len(parts) >= 3:  # モデル名_日付_時間 の形式を想定
+                        date_parts = parts[1:]  # モデル名を除いた部分を日時情報として使用
+                        date_info = '_'.join(date_parts)
+                    else:
+                        # 親フォルダから日時情報を取得
+                        parent_parts = parent_folder_name.split('_')
+                        if len(parent_parts) >= 3:
+                            date_info = '_'.join(parent_parts[1:])
+                    
+                    # パス情報と一緒にモデル種類と日時情報を保持
+                    model_info = {
+                        'path': rel_path,
+                        'parent': folder_name,
+                        'type': 'best' if 'best' in file.lower() else 'last',
+                        'date': date_info
+                    }
+                    yolo_model_files.append(model_info)
+        
+        if not yolo_model_files:
+            self.yolo_saved_model_combo.addItem(f"{selected_model_type}のYOLOモデルが見つかりません")
+            self.statusBar().showMessage(f"{selected_model_type}のYOLOモデルが見つかりません。学習を実行するか他のタイプを選択してください", 3000)
+            return
+        
+        # モデルファイルをソート - 直下のモデルを最初に、次に日付が新しいもの順にソート
+        def sort_key(model_info):
+            if model_info['parent'] == 'root':
+                return ('0', '')  # 直下のファイルを最初に
+            else:
+                return ('1', model_info['date'])  # 次に日付の新しい順
+        
+        yolo_model_files.sort(key=sort_key, reverse=False)  # 直下のファイルを先頭に
+        
+        # コンボボックスに追加
+        for model_info in yolo_model_files:
+            if model_info['parent'] == 'root':
+                # 直下のファイルの表示名: "yolov8n.pt"
+                model_name = f"{model_info['path']} "
+            else:
+                # サブフォルダ内のファイルの表示名: "yolov8n [20250411_183737] (best)"
+                model_name = f"{model_info['parent'].split('_')[0]} [{model_info['date']}] ({model_info['type']})"
+            
+            # コンボボックスにアイテムを追加し、ユーザーデータとして相対パスを設定
+            self.yolo_saved_model_combo.addItem(model_name, model_info['path'])
+        
+        # 更新完了メッセージ
+        self.statusBar().showMessage(f"{len(yolo_model_files)}個の{selected_model_type}モデルを読み込みました", 3000)
+
+    def download_pretrained_yolo_model(self, model_type):
+        """事前学習済みのYOLOモデルをダウンロードしてmodelsフォルダに保存する"""
+        if not model_type or not model_type.startswith("yolov8"):
+            return None
+        
+        # モデルファイル名（例: yolov8n.pt）
+        model_filename = f"{model_type}.pt"
+        
+        # 保存先パス
+        save_path = os.path.join(models_dir, model_filename)
+        
+        # 既にファイルが存在する場合はそのパスを返す
+        if os.path.exists(save_path):
+            return save_path
+        
+        # 進捗ダイアログを表示
+        progress = QProgressDialog(
+            f"事前学習済み {model_type} モデルをダウンロード中...", 
+            "キャンセル", 0, 100, self
+        )
+        progress.setWindowTitle("モデルダウンロード")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+        progress.setValue(10)
+        QApplication.processEvents()
+        
+        try:
+            # UltralyticsのYOLOモデルをダウンロード
+            progress.setLabelText(f"{model_type} モデルをダウンロード中...")
+            progress.setValue(30)
+            QApplication.processEvents()
+            
+            # YOLO.hubから直接モデルをダウンロード
+            model = YOLO(model_type)
+            
+            progress.setLabelText(f"{model_type} モデルをmodelsフォルダに保存中...")
+            progress.setValue(70)
+            QApplication.processEvents()
+            
+            # モデルファイルをmodelsフォルダにコピー
+            model_path = model.ckpt_path
+            if os.path.exists(model_path):
+                shutil.copy2(model_path, save_path)
+            
+            progress.setValue(100)
+            progress.close()
+            
+            # モデルリストを更新
+            #self.refresh_yolo_model_list()
+            self.refresh_yolo_unified_model_list()                
+            
+            self.statusBar().showMessage(f"事前学習済み {model_type} モデルをmodelsフォルダに保存しました: {save_path}", 3000)
+            return save_path
+        
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"事前学習済みモデルのダウンロード中にエラーが発生しました: {str(e)}"
+            )
+            return None
+
+    def load_yolo_model(self):
+        """選択されたYOLOモデルを読み込む - サブフォルダ対応版"""
+        if not self.images:
+            QMessageBox.warning(self, "警告", "画像が読み込まれていません。")
+            return
+        
+        # モデル情報を取得 - 表示名と実際のパス
+        current_index = self.yolo_saved_model_combo.currentIndex()
+        selected_model_display = self.yolo_saved_model_combo.currentText()
+        
+        # ユーザーデータからパスを取得（相対パス）
+        relative_path = self.yolo_saved_model_combo.itemData(current_index)
+        
+        if not relative_path or selected_model_display == "YOLOモデルが見つかりません" :
+            QMessageBox.warning(self, "警告", "有効なYOLOモデルが選択されていません。")
+            return
+        
+        # モデルのパスを取得 - 相対パスからフルパスに変換
+        # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+        model_path = os.path.join(models_dir, relative_path)
+        
+        # モデルが存在するか確認
+        if not os.path.exists(model_path):
+            QMessageBox.warning(self, "警告", f"選択されたモデルが見つかりません: {model_path}")
+            return
+            
+        # 進捗ダイアログを表示
+        progress = QProgressDialog(
+            f"YOLOモデル '{selected_model_display}' を読み込み中...",
+            "キャンセル", 0, 100, self
+        )
+        progress.setWindowTitle("モデル読み込み")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+        
+        try:            
+            # 信頼度閾値の設定
+            confidence, ok = QInputDialog.getDouble(
+                self, 
+                "検出閾値", 
+                "検出信頼度閾値 (0.0-1.0):",
+                0.6, 0.01, 1.0, 2
+            )
+            
+            if not ok:
+                progress.close()
+                return
+            
+            # 進捗更新
+            progress.setValue(30)
+            QApplication.processEvents()
+            
+            # モデルをロード
+            progress.setLabelText(f"モデル '{selected_model_display}' をメモリに読み込み中...")
+            progress.setValue(50)
+            QApplication.processEvents()
+            
+            # モデルを読み込み
+            self.yolo_model = YOLO(model_path)
+            self.yolo_confidence_threshold = confidence
+            
+            # モデル情報を保存
+            self.yolo_model_file = model_path
+            
+            progress.setValue(70)
+            QApplication.processEvents()
+            
+            # 現在の画像に対して推論を実行
+            progress.setLabelText("現在の画像に対して推論実行中...")
+            progress.setValue(80)
+            QApplication.processEvents()
+            
+            self.run_single_yolo_inference()
+            
+            progress.setValue(90)
+            QApplication.processEvents()
+            
+            # 推論結果表示チェックボックスを自動的にオンにする
+            if hasattr(self, 'detection_inference_checkbox'):
+                self.detection_inference_checkbox.setChecked(True)
+            
+            progress.setValue(100)
+            QApplication.processEvents()
+            
+            # 成功メッセージ
+            model_name = os.path.basename(model_path)
+            QMessageBox.information(
+                self,
+                "モデル読み込み完了",
+                f"YOLOモデル「{model_name}」を読み込みました。\n"
+                f"検出閾値: {confidence}\n\n"
+                f"画像送りごとに自動的に推論が実行されます。"
+            )
+            
+            progress.close()
+            
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(
+                self,
+                "エラー",
+                f"YOLOモデルの読み込み中にエラーが発生しました: {str(e)}"
+            )
+
+    # def load_yolo_annotations(self):
+    #     """YOLO形式のアノテーションを読み込む"""
+    #     if not self.images:
+    #         QMessageBox.warning(self, "警告", "先に画像を読み込んでください。")
+    #         return
+        
+    #     # YOLOアノテーションフォルダを選択
+    #     yolo_dir = QFileDialog.getExistingDirectory(
+    #         self, "YOLOアノテーションフォルダを選択", 
+    #         self.folder_path,
+    #         QFileDialog.ShowDirsOnly
+    #     )
+        
+    #     if not yolo_dir:
+    #         return
+        
+    #     # ラベルフォルダを確認
+    #     labels_dir = os.path.join(yolo_dir, "labels")
+    #     if not os.path.exists(labels_dir):
+    #         # 直接選択されたフォルダがlabelsフォルダかもしれない
+    #         if os.path.basename(yolo_dir) == "labels":
+    #             labels_dir = yolo_dir
+    #         else:
+    #             # サブフォルダの中にlabelsディレクトリがあるか確認
+    #             possible_labels_dir = [
+    #                 os.path.join(yolo_dir, d, "labels") 
+    #                 for d in os.listdir(yolo_dir) 
+    #                 if os.path.isdir(os.path.join(yolo_dir, d))
+    #             ]
+    #             possible_labels_dir = [d for d in possible_labels_dir if os.path.exists(d)]
+                
+    #             if possible_labels_dir:
+    #                 labels_dir = possible_labels_dir[0]
+    #             else:
+    #                 QMessageBox.warning(
+    #                     self, "警告", 
+    #                     "選択されたフォルダ内にlabelsディレクトリが見つかりません。"
+    #                 )
+    #                 return
+        
+    #     # クラス情報を読み込む
+    #     classes_path = os.path.join(os.path.dirname(labels_dir), "classes.txt")
+    #     classes = []
+        
+    #     if os.path.exists(classes_path):
+    #         with open(classes_path, 'r') as f:
+    #             classes = [line.strip() for line in f.readlines()]
+    #     else:
+    #         # クラス情報がない場合は選択してもらう
+    #         text, ok = QInputDialog.getText(
+    #             self, 
+    #             "クラス情報", 
+    #             "クラス名をカンマで区切って入力してください（例: car,person,sign,cone）:",
+    #             text=self.classes_input.text() if hasattr(self, 'classes_input') else "car,person,sign,cone"
+    #         )
+            
+    #         if ok and text:
+    #             classes = [cls.strip() for cls in text.split(',') if cls.strip()]
+    #         else:
+    #             return
+        
+    #     # プログレスダイアログ
+    #     progress = QProgressDialog("YOLOアノテーションを読み込み中...", "キャンセル", 0, len(self.images), self)
+    #     progress.setWindowTitle("読み込み中")
+    #     progress.setWindowModality(Qt.WindowModal)
+    #     progress.show()
+        
+    #     # 既存のアノテーションがある場合は確認
+    #     if hasattr(self, 'bbox_annotations') and self.bbox_annotations:
+    #         reply = QMessageBox.question(
+    #             self,
+    #             "既存のアノテーション",
+    #             "既存のバウンディングボックスアノテーションを上書きしますか？",
+    #             QMessageBox.Yes | QMessageBox.No,
+    #             QMessageBox.No
+    #         )
+            
+    #         if reply == QMessageBox.Yes:
+    #             self.bbox_annotations = {}
+    #         else:
+    #             # 既存のアノテーションに追加
+    #             pass
+    #     else:
+    #         self.bbox_annotations = {}
+        
+    #     # 各画像のアノテーションを読み込む
+    #     loaded_count = 0
+        
+    #     try:
+    #         for i, img_path in enumerate(self.images):
+    #             if progress.wasCanceled():
+    #                 break
+                
+    #             progress.setValue(i)
+                
+    #             # 画像ファイル名からラベルファイル名を生成
+    #             img_basename = os.path.splitext(os.path.basename(img_path))[0]
+    #             label_path = os.path.join(labels_dir, f"{img_basename}.txt")
+                
+    #             # ラベルファイルが存在する場合のみ処理
+    #             if os.path.exists(label_path):
+    #                 # 画像サイズを取得（正規化された座標を元に戻すため）
+    #                 img = Image.open(img_path)
+    #                 img_width, img_height = img.size
+                    
+    #                 # ラベルファイルを読み込む
+    #                 bboxes = []
+                    
+    #                 with open(label_path, 'r') as f:
+    #                     for line in f:
+    #                         parts = line.strip().split()
+    #                         if len(parts) == 5:  # クラスID, x_center, y_center, width, height
+    #                             class_id = int(parts[0])
+    #                             x_center = float(parts[1])
+    #                             y_center = float(parts[2])
+    #                             width = float(parts[3])
+    #                             height = float(parts[4])
+                                
+    #                             # YOLO形式（中心x,y,幅,高さ）から左上と右下の座標に変換
+    #                             x1 = x_center - (width / 2)
+    #                             y1 = y_center - (height / 2)
+    #                             x2 = x_center + (width / 2)
+    #                             y2 = y_center + (height / 2)
+                                
+    #                             # クラス名を取得
+    #                             class_name = "unknown"
+    #                             if 0 <= class_id < len(classes):
+    #                                 class_name = classes[class_id]
+                                
+    #                             # バウンディングボックスを追加
+    #                             bbox = {
+    #                                 'x1': x1,
+    #                                 'y1': y1,
+    #                                 'x2': x2,
+    #                                 'y2': y2,
+    #                                 'class': class_name
+    #                             }
+                                
+    #                             bboxes.append(bbox)
+                    
+    #                 # アノテーションを保存
+    #                 if bboxes:
+    #                     self.bbox_annotations[img_path] = bboxes
+    #                     loaded_count += 1
+            
+    #         progress.close()
+            
+    #         # 統計情報を更新
+    #         self.update_bbox_stats()
+            
+    #         # 表示を更新
+    #         self.display_current_image()
+    #         self.update_gallery()
+            
+    #         # 完了メッセージ
+    #         QMessageBox.information(
+    #             self,
+    #             "読み込み完了",
+    #             f"YOLOアノテーションを読み込みました。\n処理画像数: {loaded_count}/{len(self.images)}\nクラス: {', '.join(classes)}"
+    #         )
+        
+    #     except Exception as e:
+    #         progress.close()
+    #         QMessageBox.critical(
+    #             self,
+    #             "エラー",
+    #             f"YOLOアノテーションの読み込み中にエラーが発生しました: {str(e)}"
+    #         )
+    def load_yolo_annotations(self):
+        """YOLO形式のアノテーションを読み込む - 表示スケール対応版"""
+        if not self.images:
+            QMessageBox.warning(self, "警告", "先に画像を読み込んでください。")
+            return
+        
+        # zoom_factorを確認・設定
+        if not hasattr(self, 'zoom_factor'):
+            self.zoom_factor = 2.5  # デフォルト値
+        
+        # YOLOアノテーションフォルダを選択
+        yolo_dir = QFileDialog.getExistingDirectory(
+            self, "YOLOアノテーションフォルダを選択", 
+            self.folder_path,
+            QFileDialog.ShowDirsOnly
+        )
+        
+        if not yolo_dir:
+            return
+        
+        # ラベルフォルダを確認・検索
+        labels_dir = self._find_labels_directory(yolo_dir)
+        if not labels_dir:
+            return
+        
+        # クラス情報を読み込む
+        classes = self._load_yolo_classes(labels_dir)
+        if not classes:
+            return
+        
+        # 既存のアノテーションがある場合は確認
+        if not self._confirm_annotation_overwrite():
+            return
+        
+        # アノテーション読み込み実行
+        self._execute_yolo_annotation_loading(labels_dir, classes)
+
+    def _find_labels_directory(self, yolo_dir):
+        """YOLOアノテーションのlabelsディレクトリを検索"""
+        # 直接指定されたフォルダがlabelsフォルダかチェック
+        if os.path.basename(yolo_dir) == "labels":
+            return yolo_dir
+        
+        # 指定フォルダ内にlabelsディレクトリがあるかチェック
+        labels_dir = os.path.join(yolo_dir, "labels")
+        if os.path.exists(labels_dir):
+            return labels_dir
+        
+        # サブフォルダの中にlabelsディレクトリがあるか確認
+        try:
+            for subdir in os.listdir(yolo_dir):
+                subdir_path = os.path.join(yolo_dir, subdir)
+                if os.path.isdir(subdir_path):
+                    potential_labels_dir = os.path.join(subdir_path, "labels")
+                    if os.path.exists(potential_labels_dir):
+                        return potential_labels_dir
+        except (OSError, PermissionError):
+            pass
+        
+        QMessageBox.warning(
+            self, "警告", 
+            "選択されたフォルダ内にlabelsディレクトリが見つかりません。\n"
+            "YOLOデータセットの構造:\n"
+            "- dataset/\n"
+            "  - images/\n"
+            "  - labels/\n"
+            "  - classes.txt"
+        )
+        return None
+
+    def _load_yolo_classes(self, labels_dir):
+        """YOLOクラス情報を読み込む"""
+        classes = []
+        
+        # classes.txtファイルを探す
+        possible_class_files = [
+            os.path.join(os.path.dirname(labels_dir), "classes.txt"),
+            os.path.join(labels_dir, "classes.txt"),
+            os.path.join(os.path.dirname(os.path.dirname(labels_dir)), "classes.txt")
+        ]
+        
+        for classes_path in possible_class_files:
+            if os.path.exists(classes_path):
+                try:
+                    with open(classes_path, 'r', encoding='utf-8') as f:
+                        classes = [line.strip() for line in f.readlines() if line.strip()]
+                    break
+                except (IOError, UnicodeDecodeError) as e:
+                    print(f"クラスファイル読み込みエラー: {e}")
+                    continue
+        
+        # クラス情報がない場合は手動入力
+        if not classes:
+            classes = self._get_classes_from_user()
+        
+        return classes
+
+    def _get_classes_from_user(self):
+        """ユーザーからクラス情報を取得"""
+        default_classes = "car,person,sign,cone"
+        if hasattr(self, 'classes_input') and self.classes_input.text():
+            default_classes = self.classes_input.text()
+        
+        text, ok = QInputDialog.getText(
+            self, 
+            "クラス情報", 
+            "クラス名をカンマで区切って入力してください（例: car,person,sign,cone）:",
+            text=default_classes
+        )
+        
+        if ok and text:
+            return [cls.strip() for cls in text.split(',') if cls.strip()]
+        return []
+
+    def _confirm_annotation_overwrite(self):
+        """既存のアノテーションがある場合の上書き確認"""
+        has_bbox = hasattr(self, 'bbox_annotations') and self.bbox_annotations
+        has_seg = hasattr(self, 'segmentation_annotations') and self.segmentation_annotations
+        
+        if has_bbox or has_seg:
+            reply = QMessageBox.question(
+                self,
+                "既存のアノテーション",
+                "既存のアノテーションを上書きしますか？\n"
+                "「いいえ」を選択すると既存のアノテーションに追加されます。",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Cancel:
+                return False
+            elif reply == QMessageBox.Yes:
+                # 既存のアノテーションをクリア
+                self.bbox_annotations = {}
+                self.segmentation_annotations = {}
+                # 関連する変数もクリア
+                self.last_bbox = None
+                self.last_bboxes = []
+                self.last_segmentation = None
+                self.last_segmentations = []
+            # reply == QMessageBox.No の場合は既存のアノテーションを保持
+        else:
+            # 初回読み込み時はアノテーション辞書を初期化
+            if not hasattr(self, 'bbox_annotations'):
+                self.bbox_annotations = {}
+            if not hasattr(self, 'segmentation_annotations'):
+                self.segmentation_annotations = {}
+        
+        return True
+
+    def _execute_yolo_annotation_loading(self, labels_dir, classes):
+        """YOLOアノテーション読み込みのメイン処理"""
+        # プログレスダイアログ
+        progress = QProgressDialog(
+            "YOLOアノテーションを読み込み中...", 
+            "キャンセル", 0, len(self.images), self
+        )
+        progress.setWindowTitle("読み込み中")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+        
+        # 統計情報を記録
+        loading_stats = {
+            'total_images': len(self.images),
+            'processed_images': 0,
+            'images_with_annotations': 0,
+            'total_bbox_annotations': 0,
+            'total_seg_annotations': 0,
+            'class_distribution': {cls: 0 for cls in classes},
+            'errors': []
+        }
+        
+        try:
+            for i, img_path in enumerate(self.images):
+                if progress.wasCanceled():
+                    break
+                
+                progress.setValue(i)
+                progress.setLabelText(f"処理中: {os.path.basename(img_path)}")
+                QApplication.processEvents()
+                
+                # 画像ファイル名を基準にアノテーション読み込み
+                bbox_annotations, seg_annotations = self._load_single_image_annotations(
+                    img_path, i, labels_dir, classes, loading_stats
+                )
+                
+                # バウンディングボックスアノテーションを保存（インデックスベース）
+                if bbox_annotations:
+                    if i not in self.bbox_annotations:
+                        self.bbox_annotations[i] = []
+                    self.bbox_annotations[i].extend(bbox_annotations)
+                    loading_stats['images_with_annotations'] += 1
+                
+                # セグメンテーションアノテーションを保存（インデックスベース）
+                if seg_annotations:
+                    if i not in self.segmentation_annotations:
+                        self.segmentation_annotations[i] = []
+                    self.segmentation_annotations[i].extend(seg_annotations)
+                
+                loading_stats['processed_images'] += 1
+            
+            progress.close()
+            
+            # 結果の表示と更新
+            self._finalize_yolo_annotation_loading(loading_stats, classes)
+            
+        except Exception as e:
+            progress.close()
+            loading_stats['errors'].append(f"予期しないエラー: {str(e)}")
+            self._show_loading_error(loading_stats)
+
+    def _load_single_image_annotations(self, img_path, img_index, labels_dir, classes, stats):
+        """単一画像のYOLOアノテーションを読み込む（画像ファイル名ベースでマッチング）"""
+        try:
+            # 画像ファイル名からラベルファイル名を生成
+            img_basename = os.path.splitext(os.path.basename(img_path))[0]
+            label_path = os.path.join(labels_dir, f"{img_basename}.txt")
+            
+            # 対応するラベルファイルが存在しない場合は空のリストを返す
+            if not os.path.exists(label_path):
+                return [], []
+            
+            # 画像サイズを取得（正規化された座標を元に戻すため）
+            try:
+                from PIL import Image
+                with Image.open(img_path) as img:
+                    img_width, img_height = img.size
+            except Exception as e:
+                stats['errors'].append(f"画像サイズ取得エラー {img_basename}: {str(e)}")
+                return [], []
+            
+            # ラベルファイルを読み込む
+            bbox_annotations = []
+            seg_annotations = []
+            
+            with open(label_path, 'r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    try:
+                        # アノテーション解析（バウンディングボックス or セグメンテーション）
+                        bbox_annotation, seg_annotation = self._parse_yolo_annotation_line(
+                            line, classes, img_width, img_height, 
+                            img_basename, line_num, stats
+                        )
+                        
+                        if bbox_annotation:
+                            bbox_annotations.append(bbox_annotation)
+                            stats['total_bbox_annotations'] += 1
+                        
+                        if seg_annotation:
+                            seg_annotations.append(seg_annotation)
+                            stats['total_seg_annotations'] += 1
+                            
+                    except Exception as e:
+                        stats['errors'].append(
+                            f"アノテーション解析エラー {img_basename}:{line_num}: {str(e)}"
+                        )
+            
+            # デバッグ用ログ出力
+            if bbox_annotations or seg_annotations:
+                print(f"読み込み完了: {img_basename} -> インデックス{img_index} "
+                    f"(bbox: {len(bbox_annotations)}, seg: {len(seg_annotations)})")
+            
+            return bbox_annotations, seg_annotations
+            
+        except Exception as e:
+            stats['errors'].append(f"ファイル読み込みエラー {img_basename}: {str(e)}")
+            return [], []
+
+    def _parse_yolo_annotation_line(self, line, classes, img_width, img_height, 
+                                img_basename, line_num, stats):
+        """YOLOアノテーション行を解析（アプリの座標形式に合わせた変換）"""
+        parts = line.split()
+        
+        if len(parts) < 5:
+            stats['errors'].append(
+                f"不正なアノテーション形式 {img_basename}:{line_num}: {line}"
+            )
+            return None, None
+        
+        try:
+            class_id = int(parts[0])
+            
+            # クラス名を取得
+            if 0 <= class_id < len(classes):
+                class_name = classes[class_id]
+                stats['class_distribution'][class_name] += 1
+            else:
+                class_name = f"unknown_class_{class_id}"
+                stats['errors'].append(
+                    f"不明なクラスID {img_basename}:{line_num}: {class_id}"
+                )
+            
+            # バウンディングボックス形式の場合（5つの値）
+            if len(parts) == 5:
+                x_center = float(parts[1])
+                y_center = float(parts[2])
+                width = float(parts[3])
+                height = float(parts[4])
+                
+                # 正規化座標の範囲チェック
+                if not (0 <= x_center <= 1 and 0 <= y_center <= 1 and 
+                        0 <= width <= 1 and 0 <= height <= 1):
+                    stats['errors'].append(
+                        f"座標範囲エラー {img_basename}:{line_num}: 正規化座標が範囲外"
+                    )
+                    return None, None
+                
+                # YOLO形式（中心x,y,幅,高さ）から左上と右下の座標に変換
+                x1_norm = max(0, min(1, x_center - (width / 2)))
+                y1_norm = max(0, min(1, y_center - (height / 2)))
+                x2_norm = max(0, min(1, x_center + (width / 2)))
+                y2_norm = max(0, min(1, y_center + (height / 2)))
+                
+                # アプリ内のフォーマットに合わせた正規化座標のバウンディングボックス情報
+                # マウスイベントと同じ形式（正規化座標）
+                bbox = {
+                    'x1': x1_norm,  # 0-1の範囲
+                    'y1': y1_norm,  # 0-1の範囲
+                    'x2': x2_norm,  # 0-1の範囲
+                    'y2': y2_norm,  # 0-1の範囲
+                    'class': class_name,
+                    'confidence': 1.0,
+                    'source': 'yolo_annotation'
+                }
+                
+                print(bbox)
+                return bbox, None
+            
+            # セグメンテーション形式の場合（6つ以上の値、座標ペア）
+            elif len(parts) >= 6 and len(parts) % 2 == 1:  # class_id + 座標ペア
+                coordinates = []
+                
+                for i in range(1, len(parts), 2):
+                    x_norm = float(parts[i])
+                    y_norm = float(parts[i + 1])
+                    
+                    # 正規化座標の範囲チェック
+                    if not (0 <= x_norm <= 1 and 0 <= y_norm <= 1):
+                        stats['errors'].append(
+                            f"セグメンテーション座標範囲エラー {img_basename}:{line_num}"
+                        )
+                        return None, None
+                    
+                    # 実際の画像サイズにスケール（セグメンテーションはピクセル座標で保存）
+                    x = int(x_norm * img_width)
+                    y = int(y_norm * img_height)
+                    coordinates.append((x, y))  # タプル形式で保存
+                
+                # アプリ内のフォーマットに合わせたセグメンテーション情報（ピクセル座標）
+                segmentation = {
+                    'points': coordinates,
+                    'class': class_name,
+                    'confidence': 1.0,
+                    'source': 'yolo_annotation'
+                }
+                
+                return None, segmentation
+            
+            else:
+                stats['errors'].append(
+                    f"不明なアノテーション形式 {img_basename}:{line_num}: {len(parts)}個の値"
+                )
+                return None, None
+                
+        except (ValueError, IndexError) as e:
+            stats['errors'].append(
+                f"データ変換エラー {img_basename}:{line_num}: {str(e)}"
+            )
+            return None, None
+
+    def get_current_zoom_factor(self):
+        """現在のズーム係数を取得"""
+        # main_image_viewからzoom_factorを取得
+        if hasattr(self, 'main_image_view') and hasattr(self.main_image_view, 'zoom_factor'):
+            return self.main_image_view.zoom_factor
+        
+        # アプリ全体のzoom_factorを取得
+        if hasattr(self, 'zoom_factor'):
+            return self.zoom_factor
+        
+        # デフォルト値を返す
+        return 2.5
+
+    def update_yolo_annotations_with_zoom(self):
+        """既存のYOLOアノテーションをズーム変更に合わせて更新"""
+        if not hasattr(self, 'bbox_annotations') or not self.bbox_annotations:
+            return
+        
+        current_zoom = self.get_current_zoom_factor()
+        
+        # 既存のアノテーションがYOLOソースの場合、ズーム変更に対応
+        for index, annotations in self.bbox_annotations.items():
+            for bbox in annotations:
+                if bbox.get('source') == 'yolo_annotation':
+                    # 元の正規化座標から再計算する場合は、
+                    # 元の座標情報を保持する必要がある
+                    # 今回は簡単のため、比率で調整
+                    pass  # 実装は必要に応じて
+
+    def _finalize_yolo_annotation_loading(self, stats, classes):
+        """YOLOアノテーション読み込み完了後の処理"""
+        # 統計情報を更新
+        if hasattr(self, 'update_bbox_stats'):
+            self.update_bbox_stats()
+        
+        # 表示を更新
+        if hasattr(self, 'display_current_image'):
+            self.display_current_image()
+        
+        if hasattr(self, 'update_gallery'):
+            self.update_gallery()
+        
+        # 画像ビューを更新
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+        
+        # クラス情報を更新（アプリにクラス設定機能がある場合）
+        if hasattr(self, 'update_class_list'):
+            self.update_class_list(classes)
+        
+        # 読み込み完了をログに記録
+        print(f"YOLOアノテーション読み込み完了: ズーム係数={self.get_current_zoom_factor()}")
+        
+        # 成功メッセージを表示
+        self._show_loading_success(stats, classes)
+
+    def _show_loading_success(self, stats, classes):
+        """読み込み成功メッセージを表示"""
+        # クラス分布情報を作成
+        class_info = []
+        for cls, count in stats['class_distribution'].items():
+            if count > 0:
+                class_info.append(f"{cls}: {count}")
+        
+        class_summary = "\n".join(class_info) if class_info else "アノテーションが見つかりませんでした"
+        
+        # エラー情報
+        error_summary = ""
+        if stats['errors']:
+            error_count = len(stats['errors'])
+            error_summary = f"\n\n警告: {error_count}件のエラーが発生しました"
+            if error_count <= 5:
+                error_summary += ":\n" + "\n".join(stats['errors'][:5])
+            else:
+                error_summary += f":\n" + "\n".join(stats['errors'][:3]) + f"\n...他{error_count-3}件"
+        
+        # 完了メッセージ
+        message = (
+            f"YOLOアノテーションを読み込みました。\n\n"
+            f"処理画像数: {stats['processed_images']}/{stats['total_images']}\n"
+            f"アノテーション付き画像: {stats['images_with_annotations']}\n"
+            f"バウンディングボックス: {stats['total_bbox_annotations']}\n"
+            f"セグメンテーション: {stats['total_seg_annotations']}\n"
+            f"クラス: {', '.join(classes)}\n\n"
+            f"クラス別アノテーション数:\n{class_summary}"
+            f"{error_summary}"
+        )
+        
+        if stats['errors']:
+            QMessageBox.warning(self, "読み込み完了（警告あり）", message)
+        else:
+            QMessageBox.information(self, "読み込み完了", message)
+
+    def _show_loading_error(self, stats):
+        """読み込みエラーメッセージを表示"""
+        error_summary = "\n".join(stats['errors'][:10])  # 最初の10件のエラーを表示
+        
+        message = (
+            f"YOLOアノテーションの読み込み中にエラーが発生しました。\n\n"
+            f"処理済み画像: {stats['processed_images']}/{stats['total_images']}\n"
+            f"読み込み済みバウンディングボックス: {stats['total_bbox_annotations']}\n"
+            f"読み込み済みセグメンテーション: {stats['total_seg_annotations']}\n\n"
+            f"エラー詳細:\n{error_summary}"
+        )
+        
+        if len(stats['errors']) > 10:
+            message += f"\n...他{len(stats['errors'])-10}件のエラー"
+        
+        QMessageBox.critical(self, "読み込みエラー", message)
+
+    def get_current_classes(self):
+        """現在設定されているクラス情報を取得"""
+        if hasattr(self, 'classes_input') and self.classes_input.text():
+            return [cls.strip() for cls in self.classes_input.text().split(',') if cls.strip()]
+        
+        # bbox_annotationsとsegmentation_annotationsからクラス情報を抽出
+        classes = set()
+        
+        if hasattr(self, 'bbox_annotations') and self.bbox_annotations:
+            for annotations in self.bbox_annotations.values():
+                for annotation in annotations:
+                    if 'class' in annotation:
+                        classes.add(annotation['class'])
+        
+        if hasattr(self, 'segmentation_annotations') and self.segmentation_annotations:
+            for annotations in self.segmentation_annotations.values():
+                for annotation in annotations:
+                    if 'class' in annotation:
+                        classes.add(annotation['class'])
+        
+        return sorted(list(classes))
+
+    def run_single_yolo_inference(self):
+        """現在表示中の画像に対してYOLO推論を実行"""
+        if not self.images or not hasattr(self, 'yolo_model'):
+            return
+        
+        current_img_path = self.images[self.current_index]
+        
+        try:
+            # 推論実行
+            results = self.yolo_model(current_img_path, conf=self.yolo_confidence_threshold)
+            
+            # 推論結果をクリア（現在の画像のみ）
+            if current_img_path in self.detection_inference_results:
+                del self.detection_inference_results[current_img_path]
+            
+            # 検出結果を保存
+            bboxes = []
+            
+            # 画像サイズを取得
+            img = Image.open(current_img_path)
+            img_width, img_height = img.size
+            
+            for result in results:
+                for det in result.boxes.data.cpu().numpy():
+                    if len(det) >= 6:  # x1, y1, x2, y2, confidence, class_id
+                        x1, y1, x2, y2, conf, class_id = det[:6]
+                        
+                        # 画像サイズで正規化（0-1の範囲に）
+                        x1_norm = x1 / img_width
+                        y1_norm = y1 / img_height
+                        x2_norm = x2 / img_width
+                        y2_norm = y2 / img_height
+                        
+                        # クラス名を取得
+                        class_id = int(class_id)
+                        class_name = result.names[class_id] if class_id in result.names else f"class_{class_id}"
+                        
+                        # バウンディングボックスを追加
+                        bbox = {
+                            'x1': x1_norm,
+                            'y1': y1_norm,
+                            'x2': x2_norm,
+                            'y2': y2_norm,
+                            'class': class_name,
+                            'confidence': float(conf)
+                        }
+                        
+                        bboxes.append(bbox)
+            
+            # 推論結果を保存
+            if bboxes:
+                self.detection_inference_results[current_img_path] = bboxes
+            
+            # 表示を更新
+            self.main_image_view.update()
+            
+            # 情報パネル更新
+            if hasattr(self, 'update_detection_inference_display'):
+                self.update_detection_inference_display()
+            
+            return True
+        
+        except Exception as e:
+            print(f"単一画像YOLO推論エラー: {e}")
+            return False
+
+    # 5. 情報パネルに物体検知推論結果を表示する処理の追加
+    def update_detection_inference_display(self):
+        """物体検知推論結果の表示を更新"""
+        if not self.images:
+            return
+        
+        current_img_path = self.images[self.current_index]
+        
+        # 削除済みか推論表示OFFの場合は何も表示しない
+        if not self.show_detection_inference:
+            return
+        
+        # 物体検知推論結果がある場合は表示を更新
+        if current_img_path in self.detection_inference_results:
+            inference_bboxes = self.detection_inference_results[current_img_path]
+            
+            # クラスごとのカウント辞書
+            class_counts = {}
+            for bbox in inference_bboxes:
+                class_name = bbox.get('class', 'unknown')
+                class_counts[class_name] = class_counts.get(class_name, 0) + 1
+            
+            # 既存の推論情報ラベルに追加（または新規作成）
+            inference_text = "<b>物体検知推論結果:</b><br>"
+            inference_text += "検出オブジェクト:<br>"
+            
+            for class_name, count in class_counts.items():
+                # クラスに応じた色を設定
+                class_colors = DETECTION_INFERENCE_TEXT_COLORS
+                color = class_colors.get(class_name, "#FF0000")
+                
+                inference_text += f"<span style='color: {color}; font-weight: bold;'>● {class_name}</span>: {count}個<br>"
+            
+            inference_text += f"合計: {len(inference_bboxes)}個のオブジェクト<br>"
+            
+            # 既存の推論情報ラベルがあればそれを更新
+            if hasattr(self, 'detection_inference_info_label'):
+                self.detection_inference_info_label.setText(inference_text)
+                self.detection_inference_info_label.setTextFormat(Qt.RichText)
+            else:
+                # 既存の推論情報ラベルが見つからない場合は新規作成
+                # アノテーション情報ラベルと同じ場所に表示するか、
+                # 別の場所に配置して表示することができる
+                self.detection_inference_info_label = QLabel(inference_text)
+                self.detection_inference_info_label.setTextFormat(Qt.RichText)
+                
+                # レイアウトに追加（例: 推論情報ラベルの下に配置）
+                if hasattr(self, 'inference_info_label') and self.inference_info_label.parent():
+                    parent_layout = self.inference_info_label.parent().layout()
+                    if parent_layout:
+                        parent_layout.addWidget(self.detection_inference_info_label)
+        else:
+            # 推論結果がない場合は表示をクリア
+            if hasattr(self, 'detection_inference_info_label'):
+                self.detection_inference_info_label.setText("")
+    
+    # def train_and_save_yolo_model(self):
+    #     """Ultralytics YOLOモデルを学習し保存する - 事前学習済みモデルを自動ダウンロード"""        
+    #     if not self.bbox_annotations:
+    #         QMessageBox.warning(self, "警告", "物体検知アノテーションがありません。")
+    #         return
+        
+    #     # 動的にクラスを取得
+    #     classes = self.get_current_classes()
+
+    #     if not classes:
+    #         QMessageBox.warning(self, "警告", "検知クラスが設定されていません。\n先にクラス設定を行ってください。")
+    #         return
+        
+    #     # 学習設定ダイアログで現在のクラス設定を表示
+    #     model_type = self.yolo_model_combo.currentText()
+        
+    #     # 学習設定ダイアログを表示
+    #     training_settings = QDialog(self)
+    #     training_settings.setWindowTitle("YOLOモデル学習設定")
+    #     training_settings.setMinimumWidth(500)
+    #     training_settings.setMinimumHeight(600)
+        
+    #     settings_layout = QVBoxLayout(training_settings)
+        
+    #     # タブウィジェットを作成
+    #     tabs = QTabWidget()
+        
+    #     # 基本設定タブ
+    #     basic_tab = QWidget()
+    #     basic_layout = QVBoxLayout(basic_tab)
+        
+    #     # モデル初期化設定
+    #     init_group = QGroupBox("モデル初期化設定")
+    #     init_layout = QVBoxLayout(init_group)
+        
+    #     # 初期重みの選択
+    #     weights_radio_pretrained = QRadioButton("事前学習済みの重みを使用 (推奨)")
+    #     weights_radio_pretrained.setChecked(True)  # デフォルト選択
+    #     init_layout.addWidget(weights_radio_pretrained)
+        
+    #     # 現在のモデルを選択
+    #     weights_radio_current = QRadioButton("現在読み込まれているモデルの重みを使用")
+    #     init_layout.addWidget(weights_radio_current)
+        
+    #     # 現在読み込まれているモデルの情報を表示
+    #     current_model_info = QLabel("現在のモデル: なし")
+    #     if hasattr(self, 'yolo_model') and hasattr(self, 'yolo_model_file'):
+    #         model_name = os.path.basename(self.yolo_model_file) if hasattr(self, 'yolo_model_file') else "Unknown"
+    #         current_model_info.setText(f"現在のモデル: {model_name}")
+    #         weights_radio_current.setEnabled(True)
+    #     else:
+    #         weights_radio_current.setEnabled(False)
+    #         current_model_info.setText("現在のモデル: なし（先にモデルを読み込んでください）")
+        
+    #     init_layout.addWidget(current_model_info)
+    #     basic_layout.addWidget(init_group)
+        
+    #     # エポック数設定
+    #     epoch_layout = QHBoxLayout()
+    #     epoch_layout.addWidget(QLabel("学習エポック数:"))
+    #     epoch_spin = QSpinBox()
+    #     epoch_spin.setRange(1, 1000)
+    #     epoch_spin.setValue(30)  # デフォルト: 30エポック
+    #     epoch_layout.addWidget(epoch_spin)
+    #     basic_layout.addLayout(epoch_layout)
+        
+    #     # バッチサイズ設定
+    #     batch_layout = QHBoxLayout()
+    #     batch_layout.addWidget(QLabel("バッチサイズ:"))
+    #     batch_spin = QSpinBox()
+    #     batch_spin.setRange(1, 128)
+    #     batch_spin.setValue(16)  # デフォルト: 16
+    #     batch_layout.addWidget(batch_spin)
+    #     basic_layout.addLayout(batch_layout)
+        
+    #     # 入力サイズ設定
+    #     size_layout = QHBoxLayout()
+    #     size_layout.addWidget(QLabel("入力画像サイズ:"))
+    #     size_combo = QComboBox()
+    #     size_options = [str(self.original_image_size),"320", "416", "512", "640", "768", "896", "1024"]
+    #     default_index = 4  # デフォルトは640
+
+    #     # 説明ラベルを追加
+    #     size_layout.addWidget(QLabel(f"元画像: {self.original_image_width}×{self.original_image_height}"))
+
+    #     size_combo.addItems(size_options)
+    #     size_combo.setCurrentIndex(default_index)
+    #     size_layout.addWidget(size_combo)
+    #     basic_layout.addLayout(size_layout)
+
+    #     # 注意書き
+    #     size_note = QLabel("注: 640以外のサイズを選択すると精度や速度に影響します")
+    #     size_note.setStyleSheet("color: #888; font-style: italic;")
+    #     basic_layout.addWidget(size_note)
+
+    #     # Early Stopping設定
+    #     early_stopping_check = QCheckBox("Early Stopping を有効にする")
+    #     early_stopping_check.setChecked(True)
+    #     basic_layout.addWidget(early_stopping_check)
+        
+    #     patience_layout = QHBoxLayout()
+    #     patience_layout.addWidget(QLabel("忍耐エポック数:"))
+    #     patience_spin = QSpinBox()
+    #     patience_spin.setRange(1, 20)
+    #     patience_spin.setValue(10)
+    #     patience_spin.setEnabled(True)
+    #     patience_layout.addWidget(patience_spin)
+    #     basic_layout.addLayout(patience_layout)
+        
+    #     # 学習率設定
+    #     lr_layout = QHBoxLayout()
+    #     lr_layout.addWidget(QLabel("学習率:"))
+        
+    #     lr_combo = QComboBox()
+    #     learning_rates = ["0.01", "0.005", "0.001", "0.0005", "0.0001"]
+    #     lr_combo.addItems(learning_rates)
+    #     lr_combo.setCurrentIndex(2)  # デフォルト: 0.001
+    #     lr_layout.addWidget(lr_combo)
+    #     basic_layout.addLayout(lr_layout)
+        
+    #     # タブに追加
+    #     tabs.addTab(basic_tab, "基本設定")
+        
+    #     # データオーグメンテーションタブ
+    #     aug_tab = QWidget()
+    #     aug_layout = QVBoxLayout(aug_tab)
+        
+    #     # データオーグメンテーション有効化チェックボックス
+    #     aug_enable_check = QCheckBox("データオーグメンテーションを有効にする")
+    #     aug_enable_check.setChecked(True)
+    #     aug_layout.addWidget(aug_enable_check)
+        
+    #     # オーグメンテーション設定のスクロールエリア
+    #     aug_scroll = QScrollArea()
+    #     aug_scroll.setWidgetResizable(True)
+    #     aug_scroll.setFrameShape(QFrame.NoFrame)
+        
+    #     aug_scroll_content = QWidget()
+    #     aug_options_layout = QVBoxLayout(aug_scroll_content)
+        
+    #     # モザイク
+    #     mosaic_layout = QHBoxLayout()
+    #     aug_mosaic_checkbox = QCheckBox("モザイク")
+    #     aug_mosaic_checkbox.setChecked(True)
+    #     aug_mosaic_proba_label = QLabel("確率:")
+    #     aug_mosaic_proba = QDoubleSpinBox()
+    #     aug_mosaic_proba.setRange(0.0, 1.0)
+    #     aug_mosaic_proba.setSingleStep(0.1)
+    #     aug_mosaic_proba.setValue(1.0)
+    #     mosaic_layout.addWidget(aug_mosaic_checkbox)
+    #     mosaic_layout.addWidget(aug_mosaic_proba_label)
+    #     mosaic_layout.addWidget(aug_mosaic_proba)
+    #     mosaic_layout.addStretch()
+    #     aug_options_layout.addLayout(mosaic_layout)
+        
+    #     # 水平反転
+    #     flip_layout = QHBoxLayout()
+    #     aug_flip_checkbox = QCheckBox("水平反転")
+    #     aug_flip_checkbox.setChecked(True)
+    #     aug_flip_proba_label = QLabel("確率:")
+    #     aug_flip_proba = QDoubleSpinBox()
+    #     aug_flip_proba.setRange(0.0, 1.0)
+    #     aug_flip_proba.setSingleStep(0.1)
+    #     aug_flip_proba.setValue(0.5)
+    #     flip_layout.addWidget(aug_flip_checkbox)
+    #     flip_layout.addWidget(aug_flip_proba_label)
+    #     flip_layout.addWidget(aug_flip_proba)
+    #     flip_layout.addStretch()
+    #     aug_options_layout.addLayout(flip_layout)
+        
+    #     # HSV調整
+    #     hsv_layout = QHBoxLayout()
+    #     aug_hsv_checkbox = QCheckBox("HSV調整")
+    #     aug_hsv_checkbox.setChecked(True)
+    #     hsv_layout.addWidget(aug_hsv_checkbox)
+    #     hsv_layout.addStretch()
+    #     aug_options_layout.addLayout(hsv_layout)
+        
+    #     # HSVの詳細設定
+    #     hsv_details_layout = QGridLayout()
+    #     hsv_details_layout.setContentsMargins(20, 0, 0, 0)
+        
+    #     hsv_details_layout.addWidget(QLabel("色相 (H):"), 0, 0)
+    #     aug_hsv_h = QDoubleSpinBox()
+    #     aug_hsv_h.setRange(0.0, 0.1)
+    #     aug_hsv_h.setSingleStep(0.005)
+    #     aug_hsv_h.setValue(0.015)
+    #     hsv_details_layout.addWidget(aug_hsv_h, 0, 1)
+        
+    #     hsv_details_layout.addWidget(QLabel("彩度 (S):"), 1, 0)
+    #     aug_hsv_s = QDoubleSpinBox()
+    #     aug_hsv_s.setRange(0.0, 1.0)
+    #     aug_hsv_s.setSingleStep(0.1)
+    #     aug_hsv_s.setValue(0.7)
+    #     hsv_details_layout.addWidget(aug_hsv_s, 1, 1)
+        
+    #     hsv_details_layout.addWidget(QLabel("明度 (V):"), 2, 0)
+    #     aug_hsv_v = QDoubleSpinBox()
+    #     aug_hsv_v.setRange(0.0, 1.0)
+    #     aug_hsv_v.setSingleStep(0.1)
+    #     aug_hsv_v.setValue(0.4)
+    #     hsv_details_layout.addWidget(aug_hsv_v, 2, 1)
+        
+    #     aug_options_layout.addLayout(hsv_details_layout)
+        
+    #     # 幾何変換
+    #     geometry_layout = QHBoxLayout()
+    #     aug_geometry_checkbox = QCheckBox("幾何変換")
+    #     aug_geometry_checkbox.setChecked(True)
+    #     geometry_layout.addWidget(aug_geometry_checkbox)
+    #     geometry_layout.addStretch()
+    #     aug_options_layout.addLayout(geometry_layout)
+        
+    #     # 幾何変換の詳細設定
+    #     geometry_details_layout = QGridLayout()
+    #     geometry_details_layout.setContentsMargins(20, 0, 0, 0)
+        
+    #     geometry_details_layout.addWidget(QLabel("平行移動:"), 0, 0)
+    #     aug_translate = QDoubleSpinBox()
+    #     aug_translate.setRange(0.0, 0.5)
+    #     aug_translate.setSingleStep(0.05)
+    #     aug_translate.setValue(0.1)
+    #     geometry_details_layout.addWidget(aug_translate, 0, 1)
+        
+    #     geometry_details_layout.addWidget(QLabel("スケール:"), 1, 0)
+    #     aug_scale = QDoubleSpinBox()
+    #     aug_scale.setRange(0.0, 1.0)
+    #     aug_scale.setSingleStep(0.05)
+    #     aug_scale.setValue(0.5)
+    #     geometry_details_layout.addWidget(aug_scale, 1, 1)
+        
+    #     aug_options_layout.addLayout(geometry_details_layout)
+        
+    #     # RandomErase
+    #     erase_layout = QHBoxLayout()
+    #     aug_erase_checkbox = QCheckBox("ランダムイレース")
+    #     aug_erase_checkbox.setChecked(True)
+    #     aug_erase_proba_label = QLabel("確率:")
+    #     aug_erase_proba = QDoubleSpinBox()
+    #     aug_erase_proba.setRange(0.0, 1.0)
+    #     aug_erase_proba.setSingleStep(0.1)
+    #     aug_erase_proba.setValue(0.4)
+    #     erase_layout.addWidget(aug_erase_checkbox)
+    #     erase_layout.addWidget(aug_erase_proba_label)
+    #     erase_layout.addWidget(aug_erase_proba)
+    #     erase_layout.addStretch()
+    #     aug_options_layout.addLayout(erase_layout)
+        
+    #     # オプションの有効/無効を連動させる
+    #     def toggle_aug_options(checked):
+    #         for w in aug_scroll_content.findChildren(QWidget):
+    #             if w != aug_enable_check:
+    #                 w.setEnabled(checked)
+        
+    #     aug_enable_check.toggled.connect(toggle_aug_options)
+        
+    #     # スクロールエリアに設定
+    #     aug_scroll.setWidget(aug_scroll_content)
+    #     aug_layout.addWidget(aug_scroll)
+        
+    #     # タブに追加
+    #     tabs.addTab(aug_tab, "データオーグメンテーション")
+        
+    #     # タブをレイアウトに追加
+    #     settings_layout.addWidget(tabs)
+        
+    #     # ボタンの配置
+    #     button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+    #     button_box.accepted.connect(training_settings.accept)
+    #     button_box.rejected.connect(training_settings.reject)
+    #     settings_layout.addWidget(button_box)
+        
+    #     # ダイアログを表示
+    #     if not training_settings.exec_():
+    #         return
+        
+    #     # 設定値の取得
+    #     use_pretrained = weights_radio_pretrained.isChecked()
+    #     num_epochs = epoch_spin.value()
+    #     batch_size = batch_spin.value()
+    #     img_size = int(size_combo.currentText())
+    #     use_early_stopping = early_stopping_check.isChecked()
+    #     patience = patience_spin.value() if use_early_stopping else 0
+    #     learning_rate = float(lr_combo.currentText())
+        
+    #     # オーグメンテーション設定の取得
+    #     augmentation_enabled = aug_enable_check.isChecked()
+    #     mosaic = aug_mosaic_proba.value() if aug_mosaic_checkbox.isChecked() and augmentation_enabled else 0.0
+    #     fliplr = aug_flip_proba.value() if aug_flip_checkbox.isChecked() and augmentation_enabled else 0.0
+    #     hsv_h = aug_hsv_h.value() if aug_hsv_checkbox.isChecked() and augmentation_enabled else 0.0
+    #     hsv_s = aug_hsv_s.value() if aug_hsv_checkbox.isChecked() and augmentation_enabled else 0.0
+    #     hsv_v = aug_hsv_v.value() if aug_hsv_checkbox.isChecked() and augmentation_enabled else 0.0
+    #     translate = aug_translate.value() if aug_geometry_checkbox.isChecked() and augmentation_enabled else 0.0
+    #     scale = aug_scale.value() if aug_geometry_checkbox.isChecked() and augmentation_enabled else 0.0
+    #     erasing = aug_erase_proba.value() if aug_erase_checkbox.isChecked() and augmentation_enabled else 0.0
+        
+    #     # YOLOフォーマット用のデータを生成（YOLO用ディレクトリ構造を作成）
+    #     try:            
+    #         # データディレクトリ構造の作成
+    #         train_dir = os.path.join(yolo_dataset_dir, "train")
+    #         val_dir = os.path.join(yolo_dataset_dir, "val")
+    #         os.makedirs(os.path.join(train_dir, "images"), exist_ok=True)
+    #         os.makedirs(os.path.join(train_dir, "labels"), exist_ok=True)
+    #         os.makedirs(os.path.join(val_dir, "images"), exist_ok=True)
+    #         os.makedirs(os.path.join(val_dir, "labels"), exist_ok=True)
+            
+    #         # クラス名ファイルの保存
+    #         with open(os.path.join(yolo_dataset_dir, "classes.txt"), 'w') as f:
+    #             for cls in classes:
+    #                 f.write(f"{cls}\n")
+            
+    #         # データセット設定YAMLファイルの作成
+    #         yaml_content = f"""
+    # path:
+    # train: train/images
+    # val: val/images
+    # test: test/images
+
+    # nc: {len(classes)}
+    # names: {classes}
+    #         """
+            
+    #         yaml_file = os.path.join(yolo_dataset_dir, "dataset.yaml")
+    #         with open(yaml_file, 'w') as f:
+    #             f.write(yaml_content)
+            
+    #         # アノテーションデータのエクスポート
+    #         self.export_annotations_to_yolo(train_dir, val_dir, classes)
+            
+    #         # Ultralytics YOLOモデルとMLflowのインポート
+    #         try:
+    #             settings.update({"mlflow": True})
+    #         except ImportError as e:
+    #             missing_package = "ultralytics" if "ultralytics" in str(e) else "mlflow" if "mlflow" in str(e) else "依存パッケージ"
+    #             QMessageBox.critical(self, "エラー", f"{missing_package}パッケージがインストールされていません。\npip install {missing_package} でインストールしてください。")
+    #             return
+            
+    #         # デバイスの選択
+    #         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    #         print(f"Using device for YOLO training: {device}")
+            
+    #         # 学習用の進捗ダイアログ
+    #         progress = QProgressDialog(
+    #             f"YOLOモデル '{model_type}' の学習準備中...", 
+    #             "キャンセル", 0, 100, self
+    #         )
+    #         progress.setWindowTitle("YOLOモデル学習")
+    #         progress.setWindowModality(Qt.WindowModal)
+    #         progress.show()
+            
+    #         # ここが新しい部分: 事前学習済みモデルを自動ダウンロード
+    #         pretrained_model_path = None
+    #         model_path = None
+            
+    #         if use_pretrained:
+    #             # 事前学習済みモデルをダウンロード
+    #             progress.setLabelText(f"事前学習済み {model_type} モデルをダウンロードしています...")
+    #             progress.setValue(5)
+    #             QApplication.processEvents()
+                
+    #             pretrained_model_path = self.download_pretrained_yolo_model(model_type)
+    #             if not pretrained_model_path:
+    #                 progress.close()
+    #                 QMessageBox.critical(self, "エラー", f"事前学習済み {model_type} モデルの準備に失敗しました。")
+    #                 return
+    #         else:
+    #             # 現在ロードされているモデルを使用
+    #             if hasattr(self, 'yolo_model_file') and os.path.exists(self.yolo_model_file):
+    #                 model_path = self.yolo_model_file
+    #             else:
+    #                 progress.close()
+    #                 QMessageBox.critical(self, "エラー", "現在のモデルが読み込まれていません。事前学習済みモデルを使用するか、モデルを読み込んでから再試行してください。")
+    #                 return
+                            
+            
+    #         # Windows環境での正しいURI形式を構築
+    #         if sys.platform.startswith('win'):
+    #             tracking_uri = f"file:///{normalized_path}"
+    #         else:
+    #             tracking_uri = f"file://{normalized_path}"
+            
+    #         print(f"YOLOトレーニング用MLflowトラッキングURI: {tracking_uri}")
+                                    
+    #         # 重要: 実験名を固定の文字列に設定
+    #         experiment_name = "yolo_training"
+            
+    #         # 実験が存在するか確認し、なければ作成
+    #         experiment = mlflow.get_experiment_by_name(experiment_name)
+    #         if experiment is None:
+    #             mlflow.create_experiment(experiment_name)
+            
+    #         # YOLOの設定は環境変数から読み込みになる
+    #         os.environ["MLFLOW_TRACKING_URI"] = tracking_uri
+    #         os.environ["MLFLOW_EXPERIMENT_NAME"] = experiment_name
+                        
+    #         # トレーニング設定のカスタマイズ
+    #         run_name = f"{model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            
+    #         progress.setLabelText("YOLOモデルを初期化中...")
+    #         progress.setValue(10)
+    #         QApplication.processEvents()
+                        
+    #         # 分離プロセスで学習を実行
+    #         try:
+    #             # モデルの読み込み - 選択に基づいて初期重みを設定
+    #             if use_pretrained:
+    #                 # ダウンロードした事前学習済みモデルを使用
+    #                 model = YOLO(pretrained_model_path)
+    #                 pretrained_info = f"事前学習済みの重み (ダウンロード済み: {os.path.basename(pretrained_model_path)})"
+    #             else:
+    #                 # 現在読み込まれているモデルを使用
+    #                 model = YOLO(model_path)
+    #                 pretrained_info = f"現在のモデル重み: {os.path.basename(model_path)}"
+                
+    #             progress.setLabelText("学習開始...")
+    #             progress.setValue(20)
+    #             QApplication.processEvents()
+                
+    #             # 学習設定
+    #             results = model.train(
+    #                 data=yaml_file,
+    #                 epochs=num_epochs,
+    #                 batch=batch_size,
+    #                 imgsz=img_size,
+    #                 project=models_dir,
+    #                 name=run_name,
+    #                 device=device.type,
+    #                 workers=0,
+    #                 close_mosaic=10 if mosaic > 0 else 0,
+    #                 patience=patience,
+    #                 exist_ok=True,
+    #                 lr0=learning_rate,
+    #                 lrf=learning_rate / 10,
+    #                 # オーグメンテーション設定
+    #                 mosaic=mosaic,
+    #                 fliplr=fliplr,
+    #                 hsv_h=hsv_h,
+    #                 hsv_s=hsv_s,
+    #                 hsv_v=hsv_v,
+    #                 translate=translate,
+    #                 scale=scale,
+    #                 erasing=erasing
+    #             )
+                
+    #             progress.setValue(95)
+    #             QApplication.processEvents()
+                
+    #             # モデルリストを更新 - 選択したタイプでフィルタリングするように変更
+    #             #self.refresh_yolo_model_list()
+    #             self.refresh_yolo_unified_model_list()                
+
+    #             progress.setValue(100)
+    #             progress.close()
+                
+    #             # 学習結果を表示
+    #             QMessageBox.information(
+    #                 self,
+    #                 "学習完了",
+    #                 f"YOLOモデルの学習が完了しました。\n"
+    #                 f"最終mAP: {results.maps}\n"
+    #                 f"使用デバイス: {device}\n"
+    #                 f"初期化: {pretrained_info}\n\n"
+    #                 f"モデル保存先: {os.path.join(models_dir, run_name, 'weights')}\n"
+    #                 f"MLflow実験名: {experiment_name}"
+    #             )
+            
+    #         except Exception as inner_e:
+    #             print(f"YOLO学習中の内部エラー: {str(inner_e)}")
+    #             progress.close()
+    #             QMessageBox.critical(
+    #                 self,
+    #                 "トレーニングエラー",
+    #                 f"YOLO学習プロセス中にエラーが発生しました: {str(inner_e)}"
+    #             )
+            
+    #     except Exception as e:
+    #         if 'progress' in locals():
+    #             progress.close()
+    #         traceback.print_exc()
+    #         QMessageBox.critical(
+    #             self,
+    #             "エラー",
+    #             f"YOLOモデル学習中にエラーが発生しました: {str(e)}"
+    #         )
+
+    ###TODO:統合
+    def on_classes_changed(self, text):
+        """クラス入力フィールドが変更された時の処理"""
+        classes = [cls.strip() for cls in text.split(',') if cls.strip()]
+        if classes:
+            self.classes_display_label.setText(f"現在のクラス: {', '.join(classes)}")
+        else:
+            self.classes_display_label.setText("クラスが入力されていません")
+
+    def show_class_preset_dialog(self):
+        """クラスプリセット選択ダイアログを表示"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("クラスプリセット選択")
+        dialog.setMinimumWidth(500)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # タイトル
+        title_label = QLabel("よく使われるクラスセットを選択してください:")
+        title_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(title_label)
+        
+        # プリセット定義
+        presets = {
+            "基本セット": "car,person,bicycle,motorcycle",
+            "交通セット": "car,truck,bus,motorcycle,bicycle,person,traffic_light,stop_sign",
+            "COCO基本": "person,bicycle,car,motorcycle,airplane,bus,train,truck",
+            "自動運転基本": "car,person,bicycle,motorcycle,truck,bus,traffic_light,stop_sign,cone",
+            "ミニカー用": "car,person,sign,cone,obstacle,barrier",
+            "屋内ロボット": "person,chair,table,laptop,cell_phone,book,bottle,cup",
+            "建設現場": "person,truck,excavator,cone,barrier,hard_hat,safety_vest",
+            "カスタム": ""  # 空文字列でカスタム入力を示す
+        }
+        
+        # プリセットボタンを作成
+        preset_buttons = QButtonGroup(dialog)
+        preset_buttons.setExclusive(True)
+        
+        for preset_name, preset_classes in presets.items():
+            radio = QRadioButton(preset_name)
+            radio.setProperty("preset_classes", preset_classes)
+            
+            # 説明を追加
+            if preset_classes:
+                description = f"({preset_classes})"
+                radio.setToolTip(description)
+            else:
+                radio.setToolTip("現在の入力内容を保持")
+            
+            preset_buttons.addButton(radio)
+            layout.addWidget(radio)
+            
+            # 現在の設定と一致するものがあれば選択
+            current_classes = self.classes_input.text().strip()
+            if preset_classes == current_classes:
+                radio.setChecked(True)
+        
+        # カスタム入力フィールド
+        custom_layout = QHBoxLayout()
+        custom_layout.addWidget(QLabel("カスタム:"))
+        custom_input = QLineEdit()
+        custom_input.setPlaceholderText("カンマ区切りでクラス名を入力")
+        custom_input.setText(self.classes_input.text())
+        custom_layout.addWidget(custom_input)
+        layout.addLayout(custom_layout)
+        
+        # ボタン
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        # ダイアログを表示
+        if dialog.exec_():
+            # 選択されたプリセットを適用
+            for button in preset_buttons.buttons():
+                if button.isChecked():
+                    preset_classes = button.property("preset_classes")
+                    if preset_classes is None:  # カスタムが選択された場合
+                        preset_classes = custom_input.text().strip()
+                    if preset_classes:
+                        self.classes_input.setText(preset_classes)
+                    break
+
+    def validate_classes(self):
+        """入力されたクラス名をバリデート"""
+        text = self.classes_input.text().strip()
+        if not text:
+            QMessageBox.warning(self, "警告", "クラス名が入力されていません。")
+            return
+        
+        classes = [cls.strip() for cls in text.split(',') if cls.strip()]
+        
+        if not classes:
+            QMessageBox.warning(self, "警告", "有効なクラス名がありません。")
+            return
+        
+        # 重複チェック
+        unique_classes = list(set(classes))
+        if len(unique_classes) != len(classes):
+            duplicates = [cls for cls in classes if classes.count(cls) > 1]
+            QMessageBox.warning(
+                self, "警告", 
+                f"重複するクラス名があります: {', '.join(set(duplicates))}"
+            )
+            return
+        
+        # 文字チェック
+        invalid_chars = []
+        for cls in classes:
+            if not cls.replace('_', '').replace('-', '').isalnum():
+                invalid_chars.append(cls)
+        
+        if invalid_chars:
+            QMessageBox.warning(
+                self, "警告",
+                f"無効な文字を含むクラス名があります: {', '.join(invalid_chars)}\n"
+                "英数字、アンダースコア(_)、ハイフン(-)のみ使用可能です。"
+            )
+            return
+        
+        # 成功メッセージ
+        QMessageBox.information(
+            self, "確認完了",
+            f"有効なクラス設定です。\n"
+            f"クラス数: {len(classes)}\n"
+            f"クラス: {', '.join(classes)}"
+        )
+
+    def get_current_classes(self):
+        """現在設定されているクラスリストを取得"""
+        text = self.classes_input.text().strip()
+        if not text:
+            return []
+        return [cls.strip() for cls in text.split(',') if cls.strip()]
+
+    def select_object_class(self):
+            """物体クラスを選択するダイアログを表示 - 動的クラス対応"""
+            classes = self.get_current_classes()
+            
+            if not classes:
+                QMessageBox.warning(self, "警告", "検知クラスが設定されていません。\n先にクラス設定を行ってください。")
+                return None
+            
+            # 前回選択したクラスのインデックスを取得
+            default_index = 0
+            if self.last_selected_bbox_class and self.last_selected_bbox_class in classes:
+                default_index = classes.index(self.last_selected_bbox_class)
+            
+            class_name, ok = QInputDialog.getItem(
+                self, 
+                "クラス選択", 
+                "オブジェクトのクラスを選択してください:",
+                classes, 
+                default_index,
+                False
+            )
+            
+            if ok and class_name:
+                self.last_selected_bbox_class = class_name
+                return class_name
+            return None
+
+    def add_bbox_annotation(self, bbox):
+        """バウンディングボックスアノテーションを追加"""
+        if not self.images:
+            return
+        
+        # インデックスベースに変更
+        current_index = self.current_index
+        
+        if current_index not in self.bbox_annotations:
+            self.bbox_annotations[current_index] = []
+        
+        self.bbox_annotations[current_index].append(bbox)
+        
+        ###
+        print(bbox)
+
+        # 前回のバウンディングボックスとして保存
+        self.last_bbox = bbox.copy()
+        
+        # 現在のすべてのバウンディングボックスを保存
+        self.last_bboxes = [box.copy() for box in self.bbox_annotations[current_index]]
+        
+        # 統計情報更新
+        self.update_bbox_stats()
+        
+        # 画面更新
+        self.main_image_view.update()
+        self.update_gallery()
+
+    def add_session_check_to_init_ui(self):
+        """init_uiメソッドの最後に追加する初期セッション確認コード"""
+        # 保存されたセッション情報を読み込む
+        session_info = self.load_session_info()
+        
+        # 複数フォルダを優先的に使用
+        has_folders = False
+        
+        # 前回の複数フォルダパスがあるか確認
+        if session_info and "last_folder_paths" in session_info and session_info["last_folder_paths"]:
+            folder_paths = session_info["last_folder_paths"]
+            
+            # フォルダが存在するか確認
+            valid_paths = [path for path in folder_paths if os.path.exists(path)]
+            
+            if valid_paths:
+                # 確認ダイアログを表示
+                reply = QMessageBox.question(
+                    self, 
+                    "前回のセッションを復元", 
+                    f"前回の作業フォルダ（{len(valid_paths)}個）を読み込みますか？\n\n"
+                    f"最初のフォルダ: {valid_paths[0]}\n" +
+                    (f"他 {len(valid_paths)-1} フォルダ" if len(valid_paths) > 1 else ""),
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                
+                if reply == QMessageBox.Yes:
+                    # フォルダパスを設定し、画像を読み込む
+                    self.folder_input.setText(";".join(valid_paths))
+                    has_folders = True
+                    
+                    # UIが完全に初期化された後で画像読み込みを実行するために遅延実行
+                    QTimer.singleShot(100, self.load_images)
+        
+        # 複数フォルダが見つからなかった場合は単一フォルダを使用
+        if not has_folders and session_info and "last_folder_path" in session_info and session_info["last_folder_path"]:
+            last_folder = session_info["last_folder_path"]
+            
+            # フォルダが存在するか確認
+            if os.path.exists(last_folder):
+                # 確認ダイアログを表示
+                reply = QMessageBox.question(
+                    self, 
+                    "前回のセッションを復元", 
+                    f"前回の作業フォルダを読み込みますか？\n\nフォルダ: {last_folder}",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                
+                if reply == QMessageBox.Yes:
+                    # フォルダパスを設定し、画像を読み込む
+                    self.folder_input.setText(last_folder)
+                    
+                    # UIが完全に初期化された後で画像読み込みを実行するために遅延実行
+                    QTimer.singleShot(100, self.load_images)
+
+    def set_annotation_buttons_enabled(self, enabled):
+        """アノテーション関連ボタンの有効/無効を一括制御する"""
+        # 無効化対象となるアノテーション関連ボタンのリスト
+        annotation_buttons = [
+            self.load_annotation_button,       # アノテーションデータを読込ボタン
+            self.model_load_button,            # モデル読込ボタン
+            # self.model_refresh_button,         # モデル一覧更新ボタン
+            self.inference_checkbox,           # 推論結果表示チェックボックス
+        ]
+        
+        # 検索してボタン追加（UIから見つける方法）
+        additional_buttons = []
+        for button in self.findChildren(QPushButton):
+            # ボタンのテキストで判断
+            button_text = button.text()
+            if any(keyword in button_text for keyword in [
+                "Donkeycar", "Jetracer", "アノテーション動画作成", 
+                "オートアノテーション実行", "一括推論実行",
+                "モデルを学習・保存"
+            ]):
+                additional_buttons.append(button)
+        
+        # すべてのボタンリストを統合
+        all_buttons = annotation_buttons + additional_buttons
+        
+        # ボタンの有効/無効を設定
+        for button in all_buttons:
+            if button:  # Noneでない場合のみ設定
+                button.setEnabled(enabled)
+        
+        # ボタンの色も状態に応じて変更
+        button_style = "" if enabled else "QPushButton:disabled { color: #aaaaaa; }"
+        for button in all_buttons:
+            if button and not isinstance(button, QCheckBox):  # チェックボックス以外のボタンにスタイル適用
+                current_style = button.styleSheet()
+                if "background-color" not in current_style:  # 特殊スタイルがないボタンのみ
+                    button.setStyleSheet(button_style)
+
+    def set_clip_start_to_current(self):
+        """現在のインデックスをクリップ開始位置に設定する"""
+        if not self.images:
+            return
+        
+        self.clip_start_spin.setValue(self.current_index)
+
+    def set_clip_end_to_current(self):
+        """現在のインデックスをクリップ終了位置に設定する"""
+        if not self.images:
+            return
+        
+        self.clip_end_spin.setValue(self.current_index)
+
+    def delete_current_annotation(self):
+        """現在表示中の画像を削除済みとしてマークする（アノテーションの有無を問わない）"""
+        if not self.images:
+            return
+                    
+        current_img_path = self.images[self.current_index]
+        
+        # 確認ダイアログ
+        reply = QMessageBox.question(
+            self, 
+            "削除確認", 
+            f"現在の画像（インデックス: {self.current_index}）を削除済みとしてマークしますか？\n"
+            f"ファイル: {os.path.basename(current_img_path)}",
+            QMessageBox.Yes | QMessageBox.No, 
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.No:
+            return
+        
+        # 削除したインデックスを記録
+        # 元のインデックスがある場合はそれを使用
+        if self.current_index in self.annotations and "original_index" in self.annotations[self.current_index]:
+            original_index = self.annotations[self.current_index]["original_index"]
+            self.deleted_indexes.append(original_index)
+        else:
+            self.deleted_indexes.append(self.current_index)
+            
+        # 削除したインデックスをソートして保持（重複を排除）
+        self.deleted_indexes = sorted(list(set(self.deleted_indexes)))
+                
+        # UI更新
+        self.display_current_image()
+        self.update_gallery()
+        if hasattr(self, 'update_location_button_counts'):
+            self.update_location_button_counts()
+        self.update_distribution_graph()
+        self.update_slider_deleted_indexes()
+        
+        QMessageBox.information(
+                self, 
+                "削除完了", 
+                f"インデックス {self.current_index} を削除済みとしてマークしました。\n"
+                f"アノテーションデータは保持されています。\n"
+                f"\n削除済みインデックス数: {len(self.deleted_indexes)}"
+            )
+
+    def delete_clip_range(self):
+        """指定範囲の画像を削除済みとしてマークする（アノテーションの有無を問わない）"""
+        if not self.images:
+            return
+        
+        # スピンボックスから範囲を取得
+        start_idx = self.clip_start_spin.value()
+        end_idx = self.clip_end_spin.value()
+        
+        # 範囲の正当性をチェック
+        if start_idx > end_idx:
+            QMessageBox.warning(
+                self, 
+                "警告", 
+                "開始インデックスは終了インデックス以下にしてください。"
+            )
+            return
+        
+        if start_idx < 0 or end_idx >= len(self.images):
+            QMessageBox.warning(
+                self, 
+                "警告", 
+                f"インデックスの範囲は0から{len(self.images)-1}の間で指定してください。"
+            )
+            return
+        
+        # 範囲内の画像数をカウント
+        target_paths = self.images[start_idx:end_idx+1]
+        
+        # 範囲内のアノテーション数をカウント（情報表示用）
+        annotations_in_range = sum(1 for idx in range(start_idx, end_idx + 1) if idx in self.annotations)
+
+        # 確認ダイアログ
+        reply = QMessageBox.question(
+            self, 
+            "範囲削除確認", 
+            f"インデックス {start_idx} から {end_idx} までの"
+            f"\n{len(target_paths)}個の画像を削除済みとしてマークします。"
+            f"\n（このうち{annotations_in_range}個には既にアノテーションがあります）"
+            f"\n\nこの操作は「復元」ボタンで元に戻せます。続行しますか？",
+            QMessageBox.Yes | QMessageBox.No, 
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.No:
+            return
+        
+        # 削除済みとして登録するインデックスのリスト
+        indices_to_delete = list(range(start_idx, end_idx + 1))
+        
+        # アノテーション削除カウント用
+        marked_as_deleted_count = 0
+        
+        # 各インデックスを処理
+        for idx in indices_to_delete:
+            # すでに削除済みの場合はスキップ
+            if idx in self.deleted_indexes:
+                continue
+                
+            # 削除したインデックスを記録
+            # 元のインデックスがある場合はそれを使用
+            if idx in self.annotations and "original_index" in self.annotations[idx]:
+                original_index = self.annotations[idx]["original_index"]
+                self.deleted_indexes.append(original_index)
+            else:
+                self.deleted_indexes.append(idx)
+            
+            marked_as_deleted_count += 1
+
+        # 削除したインデックスをソートして重複を排除
+        self.deleted_indexes = sorted(list(set(self.deleted_indexes)))
+        
+        # アノテーション数を更新
+        self.annotated_count = len(self.annotations)
+        
+        # UI更新
+        self.display_current_image()
+        self.update_gallery()
+        self.update_location_button_counts()
+        self.update_distribution_graph()
+        self.update_slider_deleted_indexes()
+        
+        QMessageBox.information(
+            self, 
+            "範囲削除完了", 
+            f"インデックス {start_idx} から {end_idx} までの範囲から"
+            f"\n{marked_as_deleted_count}個の画像を削除済みとしてマークしました。"
+            f"\nアノテーションデータは保持されています。"
+            f"\n\n削除済みインデックスの合計数: {len(self.deleted_indexes)}"
+        )
+
+    def on_folder_path_changed(self, text):
+        """フォルダパスが変更されたときの処理"""
+        # パスが入力されているかどうかでボタンの有効/無効を切り替え
+        has_path = bool(text.strip())
+        self.load_button.setEnabled(has_path)
+        self.load_annotation_button.setEnabled(has_path)
+        
+        # アノテーション関連ボタンは画像が読み込まれるまで無効化
+        # 画像読み込みボタンと直接関連するアノテーション読み込みボタンは例外
+        if not self.images:
+            self.set_annotation_buttons_enabled(False)
+
+    def load_sibling_annotations(self):
+        """選択したフォルダと同じ階層にあるアノテーションデータを読み込む - imagesフォルダと同階層のみに限定"""
+        if not self.folder_path or not self.images:
+            QMessageBox.warning(self, "警告", "先に画像フォルダを選択して画像を読み込んでください。")
+            return
+                
+        # アノテーションデータの検索と読み込みを実行
+        annotations_loaded = False
+        
+        try:
+            # 読み込み前に既存のデータをクリア（安全のため）
+            if self.annotations:
+                self.clear_annotations()
+                
+            # フォルダ直下（imagesフォルダと同じ階層）のマニフェストファイルを確認
+            manifest_path = os.path.join(self.folder_path, "manifest.json")
+            if os.path.exists(manifest_path):
+                # マニフェストベースの読み込み（複数カタログ対応）
+                if self.load_catalog_annotations(self.folder_path):
+                    annotations_loaded = True
+                    QMessageBox.information(
+                        self, 
+                        "読み込み成功", 
+                        f"同階層から{len(self.annotations)}個のアノテーションを読み込みました。"
+                    )
+            else:
+                # 単一カタログファイルの確認 - フォルダ直下のみ
+                catalog_files = [f for f in os.listdir(self.folder_path) if f.endswith('.catalog')]
+                if catalog_files:
+                    catalog_path = os.path.join(self.folder_path, catalog_files[0])
+                    if self.load_catalog_annotations(os.path.dirname(catalog_path)):
+                        annotations_loaded = True
+                        QMessageBox.information(
+                            self, 
+                            "読み込み成功", 
+                            f"同階層から{len(self.annotations)}個のアノテーションを読み込みました。"
+                        )
+            
+            if not annotations_loaded:
+                QMessageBox.warning(
+                    self, 
+                    "警告", 
+                    "選択したフォルダと同じ階層から読み込めるアノテーションデータがありませんでした。"
+                )
+                return
+            
+            # Update UI
+            self.display_current_image()
+            self.update_gallery()
+            self.update_slider_deleted_indexes()
+            
+            # 位置ボタンのカウント表示を更新
+            self.update_location_button_counts()
+            
+            print(f"同階層アノテーション読み込み完了: {len(self.annotations)}個のアノテーション")
+            
+        except Exception as e:
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"同階層アノテーションの読み込み中にエラーが発生しました: {str(e)}"
+            )
+
+    def update_skip_button_labels(self, value):
+        """スキップボタンのラベルを更新する"""
+        self.prev_multi_button.setText(f"◀◀ -{value}")
+        self.next_multi_button.setText(f"+{value} ▶▶")
+        
+        # 再生停止中の場合のみ再生ボタンのラベルを更新
+        if not hasattr(self, 'auto_play_timer') or not self.auto_play_timer.isActive():
+            # 逆再生と順再生のボタンを見つける
+            for button in self.findChildren(QPushButton):
+                if button.text() == "⏪":
+                    button.setText("⏪")
+                elif button.text() == "⏵":
+                    button.setText("⏵")
+
+    def slider_changed(self, value):
+        """スライダーの値が変更されたときの処理"""
+        if self.images and value != self.current_index:
+            self.current_index = value
+            self.display_current_image()
+            
+            # 推論表示チェックボックスがONの場合、自動的に現在の画像の推論を実行
+            if self.inference_checkbox.isChecked():
+                current_img_path = self.images[self.current_index]
+                # 推論結果がまだない場合のみ推論を実行
+                if current_img_path not in self.inference_results:
+                    self.run_inference_check(False)
+            
+            # 物体検知推論表示の更新
+            if self.detection_inference_checkbox.isChecked():
+                current_img_path = self.images[self.current_index]
+                # 推論結果がまだない場合のみ推論を実行
+                if current_img_path not in self.detection_inference_results:
+                    self.update_detection_info_panel()
+            
+            self.update_ui()
+
+    def toggle_inference_display(self, state):
+        show_inference = (state == Qt.Checked)
+        self.main_image_view.show_inference = show_inference
+        
+        # 表示を更新
+        self.update_inference_display()
+        self.main_image_view.update()
+        
+        # 再生中なら一度停止して再開（速度調整のため）
+        if hasattr(self, 'auto_play_timer') and self.auto_play_timer.isActive():
+            is_forward = True  # デフォルト方向
+            
+            # 再生方向を特定（現在実装では確実に特定できる方法がないため概算）
+            if hasattr(self, 'prev_index') and self.prev_index > self.current_index:
+                is_forward = False
+                
+            # 一度停止
+            self.auto_play_timer.stop()
+            
+            # 少し待ってから再開（UIが更新される時間を確保）
+            QTimer.singleShot(100, lambda: self.auto_play(is_forward))
+        
+        # モデル選択部分を更新
+        if hasattr(self, 'model_combo'):
+            self.refresh_model_list()    
+    
+    def run_inference_check(self, all_images=False):
+        """推論を実行するメソッド - モデル情報表示を強化、推論実行後に推論表示をオン"""
+        if not self.images:
+            return
+        
+        # 現在のモデル情報を取得
+        model_type = self.auto_method_combo.currentText()
+        selected_model = self.model_combo.currentText()
+        
+        # 推論対象の画像を決定
+        if all_images:
+            # 既存の推論結果がある場合は確認ダイアログを表示
+            if self.inference_results and len(self.inference_results) > 0:
+                reply = QMessageBox.question(
+                    self, 
+                    "推論結果の再計算確認", 
+                    f"現在、{len(self.inference_results)}個の推論結果が保存されています。\n"
+                    f"一括推論を実行すると、すべての推論結果が現在のモデル '{model_type} ({selected_model})' を使って再計算されます。\n\n"
+                    "続行しますか？",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                
+                if reply == QMessageBox.No:
+                    return  # 操作をキャンセル
+            
+            target_images = self.images
+            progress_title = "全画像の推論を実行中..."
+        else:
+            target_images = [self.images[self.current_index]]
+            progress_title = "推論実行中..."
+        
+        # モデルのパスを取得 (コンボボックスから選択されたモデル)
+        model_path = None
+        if hasattr(self, 'model_combo') and self.model_combo.currentText() not in ["モデルが見つかりません", "フォルダを選択してください"] and "が見つかりません" not in self.model_combo.currentText():
+            # アノテーションフォルダ内のモデルのフルパスを作成
+            selected_model = self.model_combo.currentText()
+            # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+            model_path = os.path.join(models_dir, selected_model)
+            
+            # モデルが存在するか確認
+            if not os.path.exists(model_path):
+                QMessageBox.warning(self, "警告", f"選択されたモデルが見つかりません: {selected_model}")
+                return
+        
+        # モデル変更を検出するための状態を保持
+        current_model_info = (model_type, model_path)
+        force_reload = False
+        
+        # モデルが変更された場合のみ強制再読み込み
+        if not hasattr(self, '_last_model_info') or self._last_model_info != current_model_info:
+            force_reload = True
+            self._last_model_info = current_model_info
+        
+        try:
+            # ステータスバーにメッセージ表示
+            model_desc = os.path.basename(model_path) if model_path else '事前学習済み'
+            self.statusBar().showMessage(f"推論処理中... モデル: {model_type} ({model_desc})")
+            QApplication.processEvents()
+
+            # 推論を実行
+            if model_type in list_available_models():
+                # モデルを使用した推論 - force_reloadはモデル変更時のみTrue
+                inference_results = batch_inference(
+                    target_images, 
+                    method="model", 
+                    model_type=model_type,
+                    model_path=model_path,
+                    force_reload=force_reload
+                )
+            else:
+                QMessageBox.warning(self, "警告", "サポートされていない推論方法です。")
+                return
+            
+            # 推論結果を保存（インデックスベースに変換）
+            old_count = len(self.inference_results)
+            
+            # 画像パスからインデックスに変換して保存
+            for img_path, result in inference_results.items():
+                # 画像パスから対応するインデックスを取得
+                try:
+                    img_index = self.images.index(img_path)
+                    self.inference_results[img_index] = result
+                    print(f"推論結果保存: インデックス{img_index} <- {os.path.basename(img_path)}")
+                except ValueError:
+                    print(f"警告: 画像パス {img_path} がself.imagesに見つかりません")
+                    # パスでも保存（後方互換性のため）
+                    self.inference_results[img_path] = result
+            
+            new_count = len(self.inference_results)
+            
+            # 推論表示チェックボックスを自動的にオンにする
+            was_checked = self.inference_checkbox.isChecked()
+            self.inference_checkbox.setChecked(True)
+            
+            # 表示を更新
+            self.update_inference_display()
+            self.main_image_view.update()
+            self.update_gallery()
+
+            # ステータスバーのメッセージをクリア
+            self.statusBar().clearMessage()
+
+            # 全画像の推論の場合はメッセージ表示
+            if all_images:
+                added_results = new_count - old_count
+                updated_results = len(target_images) - added_results
+                
+                check_message = ""
+                if not was_checked:
+                    check_message = "\n\n推論結果表示が自動的にオンになりました。"
+                    
+                QMessageBox.information(
+                    self, 
+                    "推論完了", 
+                    f"{len(target_images)}枚の画像に対する推論を完了しました。\n"
+                    f"{added_results}個の新しい結果が追加され、{updated_results}個の結果が更新されました。\n\n"
+                    f"使用モデル: {model_type} ({model_desc}){check_message}"
+                )
+            
+        except Exception as e:
+            self.statusBar().clearMessage()
+            import traceback
+            traceback.print_exc()  # エラーの詳細を表示
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"推論中にエラーが発生しました: {str(e)}"
+            )
+
+    def run_batch_inference(self):
+        """全ての画像に対して推論を実行する"""
+        if not self.images:
+            QMessageBox.warning(self, "警告", "画像が読み込まれていません。")
+            return
+        
+        # 現在のモデル情報を取得
+        model_type = self.auto_method_combo.currentText()
+        selected_model = self.model_combo.currentText()
+        
+        # モデルのパスを取得
+        model_path = None
+        if selected_model not in ["モデルが見つかりません", "フォルダを選択してください"] and "が見つかりません" not in selected_model:
+            model_path = os.path.join(models_dir, selected_model)
+            
+            # モデルが存在するか確認
+            if not os.path.exists(model_path):
+                QMessageBox.warning(self, "警告", f"選択されたモデルが見つかりません: {selected_model}")
+                return
+        
+        # 確認ダイアログ
+        reply = QMessageBox.question(
+            self, 
+            "一括推論実行確認", 
+            f"全{len(self.images)}枚の画像に対して推論を実行します。\n"
+            f"現在のモデル: {model_type}" + (f" ({os.path.basename(model_path)})" if model_path else " (事前学習済み)") + "\n\n"
+            "進行中は操作ができなくなります。続行しますか？",
+            QMessageBox.Yes | QMessageBox.No, 
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.No:
+            return
+        
+        # 既存の推論結果がある場合の確認
+        if hasattr(self, 'inference_results') and self.inference_results:
+            clear_reply = QMessageBox.question(
+                self, 
+                "既存の推論結果", 
+                f"現在、{len(self.inference_results)}個の推論結果が保存されています。これらを上書きしますか？\n\n"
+                "「はい」: 全ての推論結果を新しいモデルで上書きします。\n"
+                "「いいえ」: 推論結果がない画像のみ処理します。",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            clear_existing = (clear_reply == QMessageBox.Yes)
+        else:
+            clear_existing = True
+            
+        # 進捗ダイアログ
+        progress = QProgressDialog(
+            "推論処理の準備中...", 
+            "キャンセル", 0, len(self.images), self
+        )
+        progress.setWindowTitle("一括推論実行中")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+        QApplication.processEvents()
+        
+        try:
+            # バッチサイズを設定
+            batch_size = 50
+            total_batches = (len(self.images) + batch_size - 1) // batch_size
+            
+            # 初期化
+            if clear_existing or not hasattr(self, 'inference_results'):
+                self.inference_results = {}
+            
+            processed_count = 0
+            success_count = 0
+            skipped_count = 0
+            
+            # バッチ処理
+            for batch_idx in range(total_batches):
+                if progress.wasCanceled():
+                    break
+                    
+                # 現在のバッチの画像取得
+                start_idx = batch_idx * batch_size
+                end_idx = min((batch_idx + 1) * batch_size, len(self.images))
+                current_batch = self.images[start_idx:end_idx]
+                
+                # スキップすべき画像をフィルタリング
+                if not clear_existing:
+                    # インデックスベースでチェック
+                    batch_to_process = []
+                    for img_path in current_batch:
+                        try:
+                            img_index = self.images.index(img_path)
+                            if img_index not in self.inference_results:
+                                batch_to_process.append(img_path)
+                            else:
+                                skipped_count += 1
+                        except ValueError:
+                            # インデックスが見つからない場合は処理対象に含める
+                            batch_to_process.append(img_path)
+                else:
+                    batch_to_process = current_batch
+                
+                if not batch_to_process:  # 処理すべき画像がない場合はスキップ
+                    processed_count += len(current_batch)
+                    progress.setValue(processed_count)
+                    continue
+                
+                progress.setLabelText(
+                    f"バッチ {batch_idx+1}/{total_batches} 処理中...\n"
+                    f"画像 {start_idx+1}-{end_idx}/{len(self.images)}"
+                )
+                progress.setValue(processed_count)
+                QApplication.processEvents()
+                
+                # 推論を実行
+                try:
+                    batch_results = batch_inference(
+                        batch_to_process, 
+                        method="model", 
+                        model_type=model_type,
+                        model_path=model_path,
+                        force_reload=(batch_idx == 0)  # 最初のバッチのみ強制再読込
+                    )
+                    
+                    # 結果をインデックスベースで保存（ここが重要な修正点）
+                    for img_path, result in batch_results.items():
+                        # 画像パスから対応するインデックスを取得
+                        try:
+                            img_index = self.images.index(img_path)
+                            self.inference_results[img_index] = result
+                            success_count += 1
+                            print(f"推論結果保存: インデックス{img_index} <- {os.path.basename(img_path)}")
+                        except ValueError:
+                            print(f"警告: 画像パス {img_path} がself.imagesに見つかりません")
+                            # パスでも保存（後方互換性のため）
+                            self.inference_results[img_path] = result
+                            success_count += 1
+                    
+                except Exception as e:
+                    print(f"バッチ {batch_idx+1} 処理中にエラー: {e}")
+                
+                processed_count += len(current_batch)
+                progress.setValue(processed_count)
+                QApplication.processEvents()
+            
+            # 推論表示を自動的にONにする
+            self.inference_checkbox.setChecked(True)
+            
+            # 現在の画像の表示を更新
+            self.update_inference_display()
+            self.main_image_view.update()
+            self.update_gallery()  # ギャラリー表示も更新
+            
+            # 処理完了メッセージ
+            if progress.wasCanceled():
+                QMessageBox.information(
+                    self, 
+                    "キャンセル", 
+                    f"一括推論がキャンセルされました。\n"
+                    f"処理済み: {processed_count}/{len(self.images)}枚\n"
+                    f"成功: {success_count}枚, スキップ: {skipped_count}枚"
+                )
+            else:
+                QMessageBox.information(
+                    self, 
+                    "完了", 
+                    f"全画像の推論が完了しました。\n"
+                    f"処理済み: {len(self.images)}枚\n"
+                    f"成功: {success_count}枚, スキップ: {skipped_count}枚\n\n"
+                    f"推論結果表示がONになりました。"
+                )
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"一括推論実行中にエラーが発生しました: {str(e)}"
+            )
+        finally:
+            progress.close()
+
+    def run_location_inference_check(self, all_images=False):
+        """位置推論を実行するメソッド"""
+        if not self.images:
+            return
+        
+        # 現在のモデル情報を取得
+        model_type = self.auto_method_combo.currentText()
+        selected_model = self.model_combo.currentText()
+        
+        # 推論対象の画像を決定
+        if all_images:
+            target_images = self.images
+            progress_title = "全画像の位置推論を実行中..."
+        else:
+            target_images = [self.images[self.current_index]]
+            progress_title = "位置推論実行中..."
+        
+        # モデルのパスを取得
+        model_path = None
+        if hasattr(self, 'model_combo') and self.model_combo.currentText() not in ["モデルが見つかりません", "フォルダを選択してください"] and "が見つかりません" not in self.model_combo.currentText():
+            # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+            model_path = os.path.join(models_dir, selected_model)
+            
+            if not os.path.exists(model_path):
+                QMessageBox.warning(self, "警告", f"選択されたモデルが見つかりません: {selected_model}")
+                return
+        
+        # モデル変更を検出するための状態を保持
+        current_model_info = (model_type, model_path)
+        force_reload = False
+        
+        # モデルが変更された場合のみ強制再読み込み
+        if not hasattr(self, '_last_location_model_info') or self._last_location_model_info != current_model_info:
+            force_reload = True
+            self._last_location_model_info = current_model_info
+        
+        try:
+            # ステータスバーにメッセージ表示
+            model_desc = os.path.basename(model_path) if model_path else '事前学習済み'
+            self.statusBar().showMessage(f"位置推論処理中... モデル: {model_type} ({model_desc})")
+            QApplication.processEvents()
+
+            # 推論を実行
+            if model_type in list_available_models():
+                # モデルを使用した推論
+                inference_results = batch_inference(
+                    target_images, 
+                    method="model", 
+                    model_type=model_type,
+                    model_path=model_path,
+                    force_reload=force_reload
+                )
+            else:
+                QMessageBox.warning(self, "警告", "サポートされていない推論方法です。")
+                return
+            
+            # 推論結果を保存
+            old_count = len(self.location_inference_results)
+            for img_path, result in inference_results.items():
+                # 結果から位置情報を抽出
+                if "pilot/loc" in result:
+                    location = result["pilot/loc"]
+                elif "loc" in result:
+                    location = result["loc"]
+                else:
+                    # 位置情報がない場合、何らかのロジックで判断（例：角度から推定）
+                    location = estimate_location_from_angle(result.get("angle", 0))
+                
+                # 位置情報付きの結果を保存
+                self.location_inference_results[img_path] = {
+                    "loc": location,
+                    "x": result.get("x", 0),
+                    "y": result.get("y", 0)
+                }
+            
+            new_count = len(self.location_inference_results)
+            
+            # 位置推論表示チェックボックスを自動的にオンにする
+            was_checked = self.location_inference_checkbox.isChecked()
+            self.location_inference_checkbox.setChecked(True)
+            
+            # 表示を更新
+            self.update_ui()
+
+            # ステータスバーのメッセージをクリア
+            self.statusBar().clearMessage()
+
+            # 全画像の推論の場合はメッセージ表示
+            if all_images:
+                added_results = new_count - old_count
+                updated_results = len(target_images) - added_results
+                
+                check_message = ""
+                if not was_checked:
+                    check_message = "\n\n位置推論結果表示が自動的にオンになりました。"
+                    
+                QMessageBox.information(
+                    self, 
+                    "位置推論完了", 
+                    f"{len(target_images)}枚の画像に対する位置推論を完了しました。\n"
+                    f"{added_results}個の新しい結果が追加され、{updated_results}個の結果が更新されました。\n\n"
+                    f"使用モデル: {model_type} ({model_desc}){check_message}"
+                )
+            
+        except Exception as e:
+            self.statusBar().clearMessage()
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"位置推論中にエラーが発生しました: {str(e)}"
+            )
+    
+    def update_inference_display(self):
+        """推論結果の表示を更新する"""
+        if not self.images:
+            return
+                
+        current_index = self.current_index
+                
+        # 推論結果がある場合、表示を更新（インデックスベースで探す）
+        inference = None
+        if current_index in self.inference_results:
+            inference = self.inference_results[current_index]
+        
+        if inference:
+            # 新しいキー形式があればそれを使い、なければ古い形式を使う
+            if "pilot/angle" in inference and "pilot/throttle" in inference:
+                angle = inference["pilot/angle"]
+                throttle = inference["pilot/throttle"]
+            else:
+                angle = inference["angle"]
+                throttle = inference["throttle"]
+
+            # 推論情報のリッチテキスト
+            inference_text = f"<b>推論結果:</b><br>"
+            inference_text += f"angle = <span style='color: #6666FF;'>{angle:.4f}</span><br>"
+            inference_text += f"throttle = <span style='color: #6666FF;'>{throttle:.4f}</span>"
+
+
+            # 追加: 差分ベクトルの計算と表示
+            if current_index in self.annotations:
+                self.calculate_and_store_diff_vector(current_index)
+                
+                # 差分ベクトル情報を表示に追加
+                if current_index in self.inference_diff_vectors:
+                    diff_data = self.inference_diff_vectors[current_index]
+                    inference_text += f"<br><br><b>推論-操作値の差分ベクトル:</b><br>"
+                    inference_text += f"angle差分 = <span style='color: #228B22;'>{diff_data['angle_diff']:+.4f}</span><br>"
+                    inference_text += f"throttle差分 = <span style='color: #228B22;'>{diff_data['throttle_diff']:+.4f}</span><br>"
+                    inference_text += f"ベクトル長 = <span style='color: #228B22;'>{diff_data['vector_magnitude']:.4f}</span>"
+
+            # 位置情報を取得
+            location = None
+            if "pilot/loc" in inference:
+                location = inference["pilot/loc"]
+            elif "loc" in inference:
+                location = inference["loc"]
+
+            # 位置情報があれば色付きバッジとして表示（アノテーションと同じスタイル）
+            if location is not None:
+                loc_color = get_location_color(location)
+                
+                inference_text += f"<br><div style='margin-top: 10px;'>"
+                inference_text += f"<div style='display: inline-block; background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 5px; border-radius: 5px;'>"
+                inference_text += f"推論位置 {location}</div></div>"
+
+            # リッチテキストとして設定
+            self.inference_info_label.setText(inference_text)
+            self.inference_info_label.setTextFormat(Qt.RichText)
+
+            # ImageLabelに推論ポイントを設定
+            self.main_image_view.inference_point = QPoint(inference['x'], inference['y'])
+        else:
+            # 推論結果がない場合はクリア
+            self.inference_info_label.setText("")
+            self.main_image_view.inference_point = None
+        
+        # 推論表示のチェック状態を反映
+        self.main_image_view.show_inference = self.inference_checkbox.isChecked()
+
+    ### 読み込み関連         
+    def browse_folder(self):
+        """
+        画像フォルダを選択するダイアログを表示
+        選択されたフォルダの下のimagesフォルダを画像フォルダとして取り扱う
+        """        
+        # 複数フォルダ選択が可能なダイアログを表示
+        dialog = QFileDialog(self)
+        dialog.setFileMode(QFileDialog.DirectoryOnly)
+        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+        
+        # QFileDialogのリストビューを取得して複数選択を可能にする
+        listView = dialog.findChild(QListView, "listView")
+        if listView:
+            listView.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        
+        treeView = dialog.findChild(QTreeView)
+        if treeView:
+            treeView.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        
+        # 選択されたフォルダを取得
+        if dialog.exec_():
+            selected_folders = dialog.selectedFiles()
+            
+            # 複数のフォルダを選択した場合は、セミコロン区切りでテキストフィールドに表示
+            if selected_folders:
+                # 選択されたフォルダ内にimagesフォルダが存在するか確認
+                valid_folders = []
+                missing_images_folders = []
+                
+                for folder in selected_folders:
+                    images_path = os.path.join(folder, "images")
+                    if os.path.exists(images_path) and os.path.isdir(images_path):
+                        valid_folders.append(folder)
+                    else:
+                        missing_images_folders.append(folder)
+                
+                # imagesフォルダが見つからなかった場合は警告メッセージを表示
+                if missing_images_folders:
+                    missing_folders_str = "\n".join(missing_images_folders)
+                    QMessageBox.warning(
+                        self,
+                        "imagesフォルダ未検出",
+                        f"次のフォルダ内にimagesフォルダが見つかりませんでした：\n{missing_folders_str}\n\n有効なフォルダのみ処理を続行します。"
+                    )
+                
+                # 有効なフォルダをテキストフィールドに設定
+                if valid_folders:
+                    self.folder_input.setText(";".join(valid_folders))
+                else:
+                    self.folder_input.setText("")
+                    QMessageBox.critical(
+                        self,
+                        "エラー",
+                        "選択されたフォルダのいずれにもimagesフォルダが含まれていません。\n処理を中止します。"
+                    )
+                    return
+        
+        # 少し遅延させてから画像読み込みを実行（UIが更新される時間を確保）
+        QTimer.singleShot(100, self.load_images)
+
+    def load_images(self):
+        """
+        選択した各フォルダの下のimagesフォルダから画像を読み込む
+        アノテーションは自動では読み込まない
+        Jetracer形式のファイル名にも対応（修正版）
+        """
+        folder_paths_text = self.folder_input.text()
+        
+        # セミコロン区切りでフォルダパスを取得
+        folder_paths = folder_paths_text.split(";")
+        
+        # 有効なフォルダパスをチェック
+        valid_paths = []
+        image_folders = []  # 実際の画像フォルダ（各フォルダ下のimagesフォルダ）
+        
+        for folder_path in folder_paths:
+            folder_path = folder_path.strip()
+            if not os.path.exists(folder_path):
+                QMessageBox.warning(self, "エラー", f"フォルダが存在しません: {folder_path}")
+                continue
+                
+            # imagesフォルダのパスを取得
+            images_folder = os.path.join(folder_path, "images")
+            if os.path.exists(images_folder) and os.path.isdir(images_folder):
+                # imagesフォルダが存在する場合
+                valid_paths.append(folder_path)  # 親フォルダを有効パスとして記録
+                image_folders.append(images_folder)  # 実際の画像フォルダを記録
+            else:
+                QMessageBox.warning(self, "エラー", f"フォルダの下にimagesフォルダが見つかりません: {folder_path}")
+        
+        if not valid_paths or not image_folders:
+            return
+        
+        # 全画像フォルダの画像を集める
+        all_images = []
+        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.gif']
+        
+        print(f"{len(image_folders)}個のimagesフォルダを検索中...")
+        
+        for img_folder in image_folders:
+            print(f"画像フォルダを検索中: {img_folder}")
+            
+            # imagesフォルダ内の画像を検索
+            try:
+                for file in os.listdir(img_folder):
+                    if any(file.lower().endswith(ext) for ext in image_extensions):
+                        all_images.append(os.path.join(img_folder, file))
+            except Exception as e:
+                print(f"画像フォルダ {img_folder} の読み込みエラー: {e}")
+        
+        if not all_images:
+            QMessageBox.warning(self, "エラー", "選択されたフォルダ内のimagesフォルダに画像ファイルがありません。")
+            return
+        
+        print(f"{len(all_images)}枚の画像が見つかりました")
+        
+        # ファイル名からインデックスを抽出してソート（修正版）
+        image_with_indices = []
+        for img_path in all_images:
+            basename = os.path.basename(img_path)
+            # ファイル名からインデックスを抽出
+            try:
+                # Jetracer形式を優先的にチェック: x_y_index_cam_image_array_.jpg -> index
+                # 例: 200_100_2_cam_image_array_.jpg -> 2
+                jetracer_match = re.match(r'^\d+_\d+_(\d+)_', basename)
+                if jetracer_match:
+                    index = int(jetracer_match.group(1))
+                    image_with_indices.append((img_path, index))
+                    print(f"Jetracer形式検出: {basename} -> インデックス {index}")
+                else:
+                    # 通常形式: 10900_cam_image_array_.jpg -> 10900
+                    normal_match = re.match(r'^(\d+)_', basename)
+                    if normal_match:
+                        index = int(normal_match.group(1))
+                        image_with_indices.append((img_path, index))
+                        print(f"通常形式検出: {basename} -> インデックス {index}")
+                    else:
+                        # インデックスが抽出できない場合は、高い値（後ろに配置）
+                        image_with_indices.append((img_path, float('inf')))
+                        print(f"インデックス抽出失敗: {basename} -> 末尾に配置")
+            except Exception as e:
+                print(f"ファイル名からインデックス抽出エラー: {basename} - {e}")
+                # エラーの場合も高い値で後ろに配置
+                image_with_indices.append((img_path, float('inf')))
+        
+        # インデックスでソート
+        image_with_indices.sort(key=lambda x: x[1])
+        
+        # ソート後の画像パスリストを作成
+        images = [img_path for img_path, _ in image_with_indices]
+
+        # --- 画像グルーピング（インデックス＆キー単位） ---
+        self.image_groups = {}  # { index: { variant: path, ... } }
+        self.variant_images = {}  # 各キーの画像リスト
+
+        for img_path in images:
+            basename = os.path.basename(img_path)
+            
+            # Jetracer形式を優先的にチェック: 200_100_2_cam_image_array_.jpg
+            jetracer_match = re.match(r'^\d+_\d+_(\d+)_([A-Za-z0-9]+)_image_array', basename)
+            if jetracer_match:
+                # Jetracer形式の場合
+                idx = int(jetracer_match.group(1))
+                variant = jetracer_match.group(2)
+                print(f"Jetracer形式グルーピング: {basename} -> インデックス {idx}, バリアント {variant}")
+            else:
+                # 通常形式: 10900_cam_image_array_.jpg
+                normal_match = re.match(r'^(\d+)_([A-Za-z0-9]+)_image_array', basename)
+                if normal_match:
+                    # 通常形式の場合
+                    idx = int(normal_match.group(1))
+                    variant = normal_match.group(2)
+                    print(f"通常形式グルーピング: {basename} -> インデックス {idx}, バリアント {variant}")
+                else:
+                    # どちらにもマッチしない場合はスキップまたはデフォルト値を使用
+                    print(f"警告: ファイル名パターンにマッチしません: {basename}")
+                    continue
+            
+            # 画像グループに追加
+            self.image_groups.setdefault(idx, {})[variant] = img_path
+        
+            # キー別に画像リストを作成
+            if variant not in self.variant_images:
+                self.variant_images[variant] = []
+            self.variant_images[variant].append(img_path)
+        
+        self.sorted_indices = sorted(self.image_groups.keys())
+
+        # キー一覧を更新
+        self.available_variants = sorted(self.variant_images.keys())
+        
+        # available_variantsが空の場合のエラーハンドリングを追加
+        if not self.available_variants:
+            # バリアントが見つからない場合、全画像を'unknown'キーとして処理
+            print("警告: 有効なバリアントが見つかりません。全画像を'unknown'キーとして処理します。")
+            self.available_variants = ['unknown']
+            self.variant_images = {'unknown': images}
+            self.current_variant = 'unknown'
+        else:
+            # デフォルトキーを設定
+            if hasattr(self, 'current_variant') and self.current_variant in self.available_variants:
+                # 既に選択されているキーがある場合は保持
+                pass
+            elif 'cam' in self.available_variants:
+                # デフォルトはcam
+                self.current_variant = 'cam'
+            else:
+                # camがなければ最初のキー
+                self.current_variant = self.available_variants[0]
+
+        # 現在のキーの画像を選択
+        images = self.variant_images[self.current_variant]
+        print(f"画像データのキー: {self.available_variants}")
+        print(f"現在のキー '{self.current_variant}' の画像数: {len(images)}")
+
+        # キーボタン群を更新
+        self.update_variant_buttons()
+
+        # 画像ファイルのリストを取得後、最初の画像サイズを取得
+        if images:
+            try:
+                first_image = Image.open(images[0])
+                self.original_image_width, self.original_image_height = first_image.size
+                self.original_image_size = max(self.original_image_width, self.original_image_height)
+                print(f"元の画像サイズ: {self.original_image_width}x{self.original_image_height}")
+            except Exception as e:
+                print(f"画像サイズの取得エラー: {e}")        
+                
+        # Reset state
+        self.folder_path = valid_paths[0]  # 最初の親フォルダをメインフォルダとして設定
+        self.folder_paths = valid_paths    # すべての有効な親フォルダパスを保存
+        self.image_folders = image_folders # すべての画像フォルダパス（imagesフォルダ）を保存
+        self.images = images
+        self.current_index = 0
+        self.annotations = {}
+        self.annotation_history = []
+        self.annotated_count = 0
+        self.annotation_timestamps = {}
+        self.inference_results = {}
+        self.location_annotations = {}
+        
+        if hasattr(self, 'deleted_indexes'):
+            self.deleted_indexes = []
+
+        # スライダーの設定を更新
+        if images:
+            self.image_slider.setMaximum(len(images) - 1)
+            self.image_slider.setValue(0)
+            self.slider_value_label.setText(f"1/{len(images)}")
+        else:
+            self.image_slider.setMaximum(0)
+            self.image_slider.setValue(0)
+            self.slider_value_label.setText("0/0")
+        
+        # Update UI
+        self.display_current_image()
+        self.update_gallery()
+        self.update_slider_deleted_indexes()
+        
+        # モデルリストを更新
+        self.refresh_model_list()
+        #self.refresh_yolo_model_list()
+        self.refresh_yolo_unified_model_list()  # 追加
+
+        # 位置ボタンのカウント表示を更新
+        self.update_location_button_counts()
+        
+        # アノテーション関連ボタンをアクティブ化
+        self.set_annotation_buttons_enabled(True)
+        
+        QMessageBox.information(
+            self, 
+            "読み込み完了", 
+            f"{len(valid_paths)}個のフォルダから合計{len(all_images)}枚の画像を読み込みました。\n"
+            f"画像データのキー: {self.available_variants}\n"
+            f"現在のキー '{self.current_variant}' の画像数: {len(self.images)}\n"
+            f"元の画像サイズ: {self.original_image_width}x{self.original_image_height}\n"
+            "\nアノテーションデータは読み込まれていません。"
+        )
+        
+        # 自動的にアノテーションデータ読み込みを促す確認ダイアログ
+        reply = QMessageBox.question(
+            self, 
+            "アノテーションデータ読み込み", 
+            "画像読み込みが完了しました。\n"
+            "続けてアノテーションデータを読み込みますか？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+        
+        if reply == QMessageBox.Yes:
+            # アノテーションデータ読み込みメソッドを呼び出す
+            self.load_annotations()
+
+    def load_annotations(self):
+        """
+        アノテーションデータを読み込む
+        画像フォルダ（imagesフォルダ）と同じ階層にあるアノテーションデータだけを読み込む
+        """
+        if not hasattr(self, 'folder_paths') or not self.folder_paths or not self.images:
+            QMessageBox.warning(self, "警告", "先に画像フォルダを選択して画像を読み込んでください。")
+            return
+        
+        # 既存のアノテーションがある場合は確認
+        if self.annotations:
+            reply = QMessageBox.question(
+                self, 
+                "既存のアノテーションをクリア", 
+                f"現在、{len(self.annotations)}個のアノテーションが読み込まれています。\n"
+                "新しいアノテーションデータを読み込む前に、既存のデータをクリアしますか？",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Yes
+            )
+            
+            if reply == QMessageBox.Cancel:
+                return
+            elif reply == QMessageBox.Yes:
+                self.clear_annotations()
+        
+        # 進捗ダイアログを表示
+        progress = QProgressDialog(
+            f"{len(self.folder_paths)}個のフォルダからアノテーションを検索中...", 
+            "キャンセル", 0, len(self.folder_paths), self
+        )
+        progress.setWindowTitle("アノテーション読み込み")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QApplication.processEvents()
+        
+        # アノテーションデータの検索と読み込みを実行
+        annotations_loaded = False
+        loaded_count = 0
+        annotations_by_dir = {} 
+        
+        try:
+            for idx, parent_dir in enumerate(self.folder_paths):
+                progress.setValue(idx)
+                progress.setLabelText(f"フォルダ {idx+1}/{len(self.folder_paths)} を処理中...\n{parent_dir}")
+                QApplication.processEvents()
+                
+                if progress.wasCanceled():
+                    break
+                
+                # parent_dir直下のみ検索する
+                annotations_before = len(self.annotations)
+                
+                # manifest.jsonを確認（parent_dir直下のみ）
+                manifest_path = os.path.join(parent_dir, "manifest.json")
+                if os.path.exists(manifest_path):
+                    # マニフェストベースの読み込み
+                    if self.load_catalog_annotations(parent_dir):
+                        annotations_loaded = True
+                        loaded_in_dir = len(self.annotations) - annotations_before
+                        annotations_by_dir[parent_dir] = loaded_in_dir
+                        loaded_count += loaded_in_dir
+                        print(f"親ディレクトリ {parent_dir} から {loaded_in_dir} 個のアノテーションを読み込みました")
+                else:
+                    # カタログファイルの確認（parent_dir直下のみ）
+                    try:
+                        catalog_files = [f for f in os.listdir(parent_dir) if f.endswith('.catalog')]
+                        if catalog_files:
+                            catalog_path = os.path.join(parent_dir, catalog_files[0])
+                            if self.load_catalog_annotations(os.path.dirname(catalog_path)):
+                                annotations_loaded = True
+                                loaded_in_dir = len(self.annotations) - annotations_before
+                                annotations_by_dir[parent_dir] = loaded_in_dir
+                                loaded_count += loaded_in_dir
+                                print(f"親ディレクトリ {parent_dir} から {loaded_in_dir} 個のアノテーションを読み込みました")
+                    except Exception as e:
+                        print(f"カタログファイル検索エラー {parent_dir}: {e}")
+                            
+            progress.setValue(len(self.folder_paths))
+            progress.close()
+            
+            if annotations_loaded:
+                # Update UI
+                self.display_current_image()
+                self.update_gallery()
+                self.update_distribution_graph()  # 追加：分布グラフを更新
+                self.update_slider_deleted_indexes()
+                
+                # 位置ボタンのカウント表示を更新
+                self.update_location_button_counts()
+                
+                # 詳細情報を生成
+                details = ""
+                if len(annotations_by_dir) > 0:
+                    details = "\n\n詳細:\n"
+                    for dir_path, count in annotations_by_dir.items():
+                        if count > 0:
+                            dir_name = os.path.basename(dir_path)
+                            details += f"• {dir_name}: {count}個\n"
+                
+                QMessageBox.information(
+                    self, 
+                    "読み込み成功", 
+                    f"{len(self.folder_paths)}個のフォルダから合計{loaded_count}個のアノテーションを読み込みました。{details}"
+                )
+            else:
+                QMessageBox.warning(
+                    self, 
+                    "警告", 
+                    "選択したフォルダからアノテーションデータが見つかりませんでした。"
+                )
+                return
+                
+            print(f"複数フォルダからのアノテーション読み込み完了: {loaded_count}個のアノテーション")
+            
+        except Exception as e:
+            if 'progress' in locals():
+                progress.close()
+            traceback.print_exc()
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"アノテーションの読み込み中にエラーが発生しました: {str(e)}"
+            )
+
+    def load_subfolder_annotations(self):
+        """現在のフォルダの下の階層からアノテーションデータを読み込む"""
+        if not self.folder_path or not self.images:
+            QMessageBox.warning(self, "警告", "先に画像フォルダを選択して画像を読み込んでください。")
+            return
+        
+        # 現在のフォルダ内のサブフォルダを探す
+        sub_dirs = []
+        for item in os.listdir(self.folder_path):
+            full_path = os.path.join(self.folder_path, item)
+            if os.path.isdir(full_path):
+                sub_dirs.append(full_path)
+        
+        if not sub_dirs:
+            QMessageBox.warning(self, "警告", "現在のフォルダ内にサブフォルダが見つかりません。")
+            return
+        
+        # ユーザーに選択させるダイアログを表示
+        selected_dir, ok = QInputDialog.getItem(
+            self, 
+            "サブフォルダの選択", 
+            "アノテーションを読み込むサブフォルダを選択してください:",
+            [os.path.basename(dir_path) for dir_path in sub_dirs], 
+            0, 
+            False
+        )
+        
+        if not ok or not selected_dir:
+            return
+        
+        # 選択されたフォルダのフルパスを取得
+        selected_path = os.path.join(self.folder_path, selected_dir)
+        
+        # アノテーションデータの検索と読み込みを実行
+        annotations_loaded = False
+        
+        try:
+            # 読み込み前に既存のデータをクリア（安全のため）
+            if self.annotations:
+                self.clear_annotations()
+                
+            # 最初に選択されたフォルダ自体がDonkeycar形式かどうか確認する
+            # マニフェストファイルを確認
+            manifest_path = os.path.join(selected_path, "manifest.json")
+            if os.path.exists(manifest_path):
+                # マニフェストベースの読み込み（複数カタログ対応）
+                if self.load_catalog_annotations(selected_path):
+                    annotations_loaded = True
+                    QMessageBox.information(
+                        self, 
+                        "読み込み成功", 
+                        f"サブフォルダ「{selected_dir}」から{len(self.annotations)}個のアノテーションを読み込みました。"
+                    )
+            else:
+                # 単一カタログファイルの確認
+                catalog_files = [f for f in os.listdir(selected_path) if f.endswith('.catalog')]
+                if catalog_files:
+                    catalog_path = os.path.join(selected_path, catalog_files[0])
+                    if self.load_catalog_annotations(os.path.dirname(catalog_path)):
+                        annotations_loaded = True
+                        QMessageBox.information(
+                            self, 
+                            "読み込み成功", 
+                            f"サブフォルダ「{selected_dir}」から{len(self.annotations)}個のアノテーションを読み込みました。"
+                        )
+            
+            # 選択されたフォルダ内のdata_donkeyフォルダも確認する
+            if not annotations_loaded:
+                donkey_folder = os.path.join(selected_path, DATA_DONKEY_DIR_NAME)
+                if os.path.exists(donkey_folder):
+                    # マニフェストファイルを確認
+                    manifest_path = os.path.join(donkey_folder, "manifest.json")
+                    if os.path.exists(manifest_path):
+                        # マニフェストベースの読み込み（複数カタログ対応）
+                        if self.load_catalog_annotations(donkey_folder):
+                            annotations_loaded = True
+                            QMessageBox.information(
+                                self, 
+                                "読み込み成功", 
+                                f"サブフォルダ「{selected_dir}/data_donkey」から{len(self.annotations)}個のアノテーションを読み込みました。"
+                            )
+                    else:
+                        # 従来の単一カタログファイルの確認
+                        catalog_files = [f for f in os.listdir(donkey_folder) if f.endswith('.catalog')]
+                        if catalog_files:
+                            catalog_path = os.path.join(donkey_folder, catalog_files[0])
+                            if self.load_catalog_annotations(os.path.dirname(catalog_path)):
+                                annotations_loaded = True
+                                QMessageBox.information(
+                                    self, 
+                                    "読み込み成功", 
+                                    f"サブフォルダ「{selected_dir}/data_donkey」から{len(self.annotations)}個のアノテーションを読み込みました。"
+                                )
+            
+            # 選択されたフォルダ内のannotationフォルダも確認する
+            if not annotations_loaded:
+                annotation_folder = os.path.join(selected_path, "annotation")
+                if os.path.exists(annotation_folder):
+                    # Donkeycar形式のデータを確認
+                    donkey_folder = os.path.join(annotation_folder, DATA_DONKEY_DIR_NAME)
+                    if os.path.exists(donkey_folder):
+                        # マニフェストファイルを確認
+                        manifest_path = os.path.join(donkey_folder, "manifest.json")
+                        if os.path.exists(manifest_path):
+                            # マニフェストベースの読み込み（複数カタログ対応）
+                            if self.load_catalog_annotations(donkey_folder):
+                                annotations_loaded = True
+                                QMessageBox.information(
+                                    self, 
+                                    "読み込み成功", 
+                                    f"サブフォルダ「{selected_dir}/annotation/data_donkey」から{len(self.annotations)}個のアノテーションを読み込みました。"
+                                )
+                        else:
+                            # 従来の単一カタログファイルの確認
+                            catalog_files = [f for f in os.listdir(donkey_folder) if f.endswith('.catalog')]
+                            if catalog_files:
+                                catalog_path = os.path.join(donkey_folder, catalog_files[0])
+                                if self.load_catalog_annotations(os.path.dirname(catalog_path)):
+                                    annotations_loaded = True
+                                    QMessageBox.information(
+                                        self, 
+                                        "読み込み成功", 
+                                        f"サブフォルダ「{selected_dir}/annotation/data_donkey」から{len(self.annotations)}個のアノテーションを読み込みました。"
+                                    )
+            
+            if not annotations_loaded:
+                QMessageBox.warning(
+                    self, 
+                    "警告", 
+                    f"選択されたサブフォルダ「{selected_dir}」から読み込めるアノテーションデータがありませんでした。"
+                )
+                return
+            
+            # Update UI
+            self.display_current_image()
+            self.update_gallery()
+            self.update_slider_deleted_indexes()
+            
+            # 位置ボタンのカウント表示を更新
+            self.update_location_button_counts()
+            
+            print(f"サブフォルダアノテーション読み込み完了: {len(self.annotations)}個のアノテーション")
+            
+        except Exception as e:
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"サブフォルダアノテーションの読み込み中にエラーが発生しました: {str(e)}"
+            )
+
+    def load_selected_model(self):
+        """選択されたモデルを明示的に読み込む - 詳細な進捗メッセージ付き"""
+        if not self.images:
+            QMessageBox.warning(self, "警告", "画像が読み込まれていません。")
+            return
+        
+        # モデル情報を取得
+        model_type = self.auto_method_combo.currentText()
+        selected_model = self.model_combo.currentText()
+        
+        if selected_model == "モデルが見つかりません" or selected_model == "フォルダを選択してください" or "が見つかりません" in selected_model:
+            QMessageBox.warning(self, "警告", "有効なモデルが選択されていません。")
+            return
+        
+        # モデルのパスを取得
+        # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+        model_path = os.path.join(models_dir, selected_model)
+        
+        # モデルが存在するか確認
+        if not os.path.exists(model_path):
+            QMessageBox.warning(self, "警告", f"選択されたモデルが見つかりません: {selected_model}")
+            return
+        
+        # 進捗ダイアログを表示
+        progress = QProgressDialog(
+            f"モデル '{model_type} ({selected_model})' を読み込み中...", 
+            "キャンセル", 0, 100, self
+        )
+        progress.setWindowTitle("モデル読み込み")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)  # すぐに表示
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+        
+        # 既存の推論結果がある場合は確認ダイアログを表示
+        clear_inference = False
+        if self.inference_results:
+            progress.setLabelText(f"既存の推論結果: {len(self.inference_results)}個\n確認ダイアログを表示します...")
+            progress.setValue(5)
+            QApplication.processEvents()
+            
+            # 進捗ダイアログを一時的に非表示
+            progress.hide()
+            
+            reply = QMessageBox.question(
+                self, 
+                "推論結果のクリア確認", 
+                f"現在、{len(self.inference_results)}個の推論結果が保存されています。\n"
+                f"モデルを変更すると古い推論結果が新しいモデルと不整合を起こす可能性があります。\n\n"
+                f"既存の推論結果をクリアしますか？",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Yes
+            )
+            
+            if reply == QMessageBox.Cancel:
+                progress.cancel()
+                return  # 操作をキャンセル
+            
+            clear_inference = (reply == QMessageBox.Yes)
+            
+            # 進捗ダイアログを再表示
+            progress.show()
+        
+        try:
+            # 推論結果をクリアする場合
+            if clear_inference:
+                progress.setLabelText("既存の推論結果をクリア中...")
+                progress.setValue(10)
+                QApplication.processEvents()
+                
+                old_count = len(self.inference_results)
+                self.inference_results = {}
+                self.statusBar().showMessage(f"{old_count}個の古い推論結果をクリアしました", 2000)
+            
+            # モデルの初期化
+            progress.setLabelText("モデルアーキテクチャの初期化中...")
+            progress.setValue(20)
+            QApplication.processEvents()
+            
+            # PyTorchモデルの読み込み
+            progress.setLabelText(f"モデルファイルを読み込み中: {os.path.basename(model_path)}")
+            progress.setValue(40)
+            QApplication.processEvents()
+            
+            # モデルをメモリに読み込む
+            progress.setLabelText("モデルを初期化中...")
+            progress.setValue(50)
+            QApplication.processEvents()
+            
+            # GPU/CPUへの転送
+            device_type = "GPU" if torch.cuda.is_available() else "CPU"
+            progress.setLabelText(f"モデルを{device_type}に転送中...")
+            progress.setValue(60)
+            QApplication.processEvents()
+            
+            # 現在の画像に対する推論を実行
+            current_img_path = self.images[self.current_index]
+            progress.setLabelText(f"推論実行中: {os.path.basename(current_img_path)}")
+            progress.setValue(70)
+            QApplication.processEvents()
+            
+            # モデルを強制的に再読み込み（現在表示中の画像だけ推論）
+            inference_results = batch_inference(
+                [current_img_path],
+                method="model", 
+                model_type=model_type,
+                model_path=model_path,
+                force_reload=True  # 強制再読み込み
+            )
+            
+            progress.setLabelText("推論結果を保存中...")
+            progress.setValue(80)
+            QApplication.processEvents()
+            
+            # 推論結果を保存
+            self.inference_results.update(inference_results)
+            
+            # モデル変更を検出するための状態を保持
+            self._last_model_info = (model_type, model_path)
+            
+            # 推論表示チェックボックスを自動的にオンにする
+            progress.setLabelText("推論表示を更新中...")
+            progress.setValue(90)
+            QApplication.processEvents()
+            
+            self.inference_checkbox.setChecked(True)
+            
+            # 推論表示を更新
+            self.update_inference_display()
+            self.update_ui()
+
+            progress.setValue(100)
+            QApplication.processEvents()
+            
+            # 成功メッセージ
+            message_suffix = ""
+            if clear_inference:
+                message_suffix = " (古い推論結果はクリアされました)"
+            self.statusBar().showMessage(f"モデル '{model_type} ({selected_model})' を読み込みました{message_suffix}", 3000)
+            
+            # 確認ダイアログ
+            confirm_message = f"モデル '{model_type} ({selected_model})' を読み込みました。"
+            if clear_inference:
+                confirm_message += f"\n\n{len(self.inference_results)}個の新しい推論結果が利用可能です。"
+            else:
+                confirm_message += f"\n\n既存の推論結果は保持されています。必要に応じて「一括推論実行」ボタンで更新してください。"
+            
+            confirm_message += "\n\n推論結果表示が自動的にオンになりました。"
+            
+            # 進捗ダイアログを閉じる
+            progress.close()
+            
+            QMessageBox.information(
+                self, 
+                "モデル読み込み完了", 
+                confirm_message
+            )
+            
+        except Exception as e:
+            # エラー発生時も進捗ダイアログを閉じる
+            progress.close()
+            
+            self.statusBar().clearMessage()
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"モデル読み込み中にエラーが発生しました: {str(e)}"
+            )
+
+    def load_catalog_annotations(self, catalog_folder):
+        """カタログファイルからアノテーションを読み込む - 進捗表示付き"""
+        if not os.path.exists(catalog_folder):
+            return False
+        
+        # 進捗ダイアログを表示
+        progress = QProgressDialog(
+            f"アノテーションデータ読み込み準備中...", 
+            "キャンセル", 0, 100, self
+        )
+        progress.setWindowTitle("アノテーション読み込み")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)  # すぐに表示
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+        
+        # 問題を診断するためのデバッグ情報
+        print(f"カタログフォルダを読み込み中: {catalog_folder}")
+        
+        try:
+            # manifest.jsonの確認
+            progress.setLabelText("マニフェストファイルを確認中...")
+            progress.setValue(5)
+            QApplication.processEvents()
+            
+            manifest_path = os.path.join(catalog_folder, "manifest.json")
+            if not os.path.exists(manifest_path):
+                print(f"manifest.jsonが見つかりません: {manifest_path}")
+                progress.close()
+                return False
+            
+            # manifest.jsonからカタログファイルのリストを取得
+            progress.setLabelText("マニフェストファイルを解析中...")
+            progress.setValue(10)
+            QApplication.processEvents()
+            
+            catalog_files = []
+            deleted_indexes = []  # 削除されたインデックスを保存するリスト
+            
+            with open(manifest_path, 'r') as mf:
+                manifest_lines = mf.readlines()
+                if len(manifest_lines) >= 5:  # マニフェストには少なくとも5行必要
+                    # 5行目にカタログファイル情報がある
+                    catalog_info = json.loads(manifest_lines[4])
+                    if "paths" in catalog_info:
+                        catalog_files = catalog_info["paths"]
+                    
+                    # deleted_indexesも取得
+                    if "deleted_indexes" in catalog_info:
+                        deleted_indexes = catalog_info["deleted_indexes"]
+                        print(f"manifest.jsonから{len(deleted_indexes)}個の削除済みインデックスを読み込みました")
+                        
+                        # クラスの削除済みインデックスリストを更新
+                        if hasattr(self, 'deleted_indexes'):
+                            self.deleted_indexes = deleted_indexes.copy()
+            
+            if not catalog_files:
+                print("manifest.jsonからカタログファイルを取得できませんでした")
+                progress.close()
+                return False
+            
+            progress.setLabelText(f"{len(catalog_files)}個のカタログファイルを検出しました")
+            progress.setValue(15)
+            QApplication.processEvents()
+            
+            # 画像フォルダの特定（通常はcatalogと同じフォルダか、その下のimagesフォルダ）
+            progress.setLabelText("画像フォルダを検索中...")
+            progress.setValue(20)
+            QApplication.processEvents()
+            
+            images_folder = os.path.join(catalog_folder, "images")
+            if not os.path.exists(images_folder):
+                images_folder = catalog_folder  # imagesフォルダがなければカタログと同じフォルダを使用
+            
+            print(f"画像フォルダ: {images_folder}")
+            
+            # 画像のインデックスとファイル名のマッピングを作成
+            progress.setLabelText("画像ファイルのインデックスを解析中...")
+            progress.setValue(25)
+            QApplication.processEvents()
+            
+            image_index_map = {}
+            for img_path in self.images:
+                basename = os.path.basename(img_path)
+                # ファイル名からインデックスを抽出 (10900_cam_image_array_.jpg から 10900 を取得)
+                try:
+                    # 数字部分を抽出するための正規表現
+                    match = re.match(r'^(\d+)_', basename)
+                    if match:
+                        index = int(match.group(1))
+                        image_index_map[basename] = index
+                except Exception as e:
+                    print(f"ファイル名からインデックスを抽出できません: {basename} - {e}")
+            
+            # 全カタログファイルを処理
+            loaded_count = 0
+            total_entries = 0
+            progress_step = 50 / len(catalog_files)  # カタログファイル処理に50%の進捗割り当て
+            
+            for i, catalog_file in enumerate(catalog_files):
+                if progress.wasCanceled():
+                    progress.close()
+                    return False
+                    
+                progress.setLabelText(f"カタログファイル処理中: {catalog_file} ({i+1}/{len(catalog_files)})")
+                progress.setValue(30 + int(i * progress_step))
+                QApplication.processEvents()
+                
+                catalog_path = os.path.join(catalog_folder, catalog_file)
+                if not os.path.exists(catalog_path):
+                    print(f"カタログファイルが見つかりません: {catalog_path}")
+                    continue
+                
+                print(f"カタログファイルを処理中: {catalog_file}")
+                
+                # カタログファイルの行数をカウント
+                with open(catalog_path, 'r') as f:
+                    lines = f.readlines()
+                    total_entries += len(lines)
+                
+                # 処理開始
+                entry_count = 0
+                with open(catalog_path, 'r') as f:
+                    for line in f:
+                        if progress.wasCanceled():
+                            progress.close()
+                            return False
+                        
+                        entry_count += 1
+                        if entry_count % 100 == 0 or entry_count == total_entries:
+                            progress.setLabelText(f"カタログエントリ処理中: {entry_count}/{total_entries} エントリ")
+                            sub_progress = 30 + int(i * progress_step) + int((entry_count / total_entries) * progress_step)
+                            progress.setValue(min(80, sub_progress))
+                            QApplication.processEvents()
+                        
+                        entry = json.loads(line)
+                        
+                        # エントリのインデックスを取得
+                        entry_index = entry.get('_index', None)
+                        
+                        # 削除されたインデックスの場合はスキップ
+                        if entry_index in deleted_indexes:
+                            continue
+                        
+                        # 画像ファイル名を取得
+                        img_name = entry.get('cam/image_array', '')
+                        if not img_name:
+                            continue
+                        
+                        # 画像パスの処理 - 複数のパターンを試す
+                        img_path = None
+                        
+                        # 様々なパターンで画像を検索
+                        path_patterns = [
+                            os.path.join(images_folder, img_name),
+                            os.path.join(catalog_folder, img_name),
+                            os.path.join(os.path.dirname(catalog_path), img_name),
+                            os.path.join(self.folder_path, img_name)
+                        ]
+                        
+                        for path in path_patterns:
+                            if os.path.exists(path) and path in self.images:
+                                img_path = path
+                                break
+                        
+                        # 画像が見つからない場合、ファイル名のみで探す
+                        if img_path is None:
+                            basename = os.path.basename(img_name)
+                            for path in self.images:
+                                if os.path.basename(path) == basename:
+                                    img_path = path
+                                    break
+                        
+                        # 画像が見つからない場合はスキップ
+                        if img_path is None:
+                            continue
+                        
+                        try:
+                            # 画像寸法の取得とアノテーション座標の計算
+                            img = Image.open(img_path)
+                            img_width, img_height = img.size
+                            
+                            # ユーザーのアノテーション（または自動アノテーション）を取得
+                            angle = entry.get('user/angle', entry.get('pilot/angle', 0))
+                            throttle = entry.get('user/throttle', entry.get('pilot/throttle', 0))
+
+                            # 位置情報を取得
+                            location = entry.get('user/loc', entry.get('pilot/loc', None))
+                                
+                            # 座標に変換
+                            x = int((angle + 1) / 2 * img_width)
+                            y = int((1 - throttle) / 2 * img_height)
+                            
+                            # 範囲内に収める
+                            x = max(0, min(x, img_width - 1))
+                            y = max(0, min(y, img_height - 1))
+                            
+                            # アノテーションを保存
+                            self.annotations[entry_index] = {
+                                "angle": angle,
+                                "throttle": throttle,
+                                "x": x,
+                                "y": y,
+                                "original_index": entry_index  # 元のインデックスを保存
+                            }
+
+                            # 位置情報があれば追加
+                            if location is not None:
+                                self.annotations[entry_index]["loc"] = location
+                                self.location_annotations[entry_index] = location
+                                
+                                # 位置情報ボタンがまだなければ追加
+                                self.ensure_location_button_exists(location)
+
+                            # タイムスタンプを保存
+                            self.annotation_timestamps[entry_index] = entry.get('_timestamp_ms', int(time.time() * 1000))
+                            
+                            loaded_count += 1
+                            
+                            # 推論結果があれば保存（ユーザーアノテーションと異なる場合）
+                            if "pilot/angle" in entry and "pilot/throttle" in entry and \
+                            (entry.get("user/angle") != entry.get("pilot/angle") or 
+                                entry.get("user/throttle") != entry.get("pilot/throttle")):
+                                
+                                pilot_angle = entry.get("pilot/angle", 0)
+                                pilot_throttle = entry.get("pilot/throttle", 0)
+                                
+                                # 推論座標を計算
+                                pilot_x = int((pilot_angle + 1) / 2 * img_width)
+                                pilot_y = int((1 - pilot_throttle) / 2 * img_height)
+                                
+                                # 範囲内に収める
+                                pilot_x = max(0, min(pilot_x, img_width - 1))
+                                pilot_y = max(0, min(pilot_y, img_height - 1))
+                                
+                                # 推論結果を保存
+                                self.inference_results[entry_index] = {
+                                    "angle": pilot_angle,
+                                    "throttle": pilot_throttle,
+                                    "pilot/angle": pilot_angle,
+                                    "pilot/throttle": pilot_throttle,
+                                    "x": pilot_x,
+                                    "y": pilot_y
+                                }
+                                
+                                # 推論結果に位置情報があれば追加
+                                if "pilot/loc" in entry:
+                                    self.inference_results[entry_index]["pilot/loc"] = entry["pilot/loc"]
+                                    self.inference_results[entry_index]["loc"] = entry["pilot/loc"]
+                                    
+                        except Exception as e:
+                            print(f"画像 {img_path} の処理中にエラー: {e}")
+                            continue
+            
+            # 位置情報の更新処理
+            progress.setLabelText("位置情報ボタンを更新中...")
+            progress.setValue(85)
+            QApplication.processEvents()
+            
+            # 読み込んだmanifest.jsonのパスを保存
+            self.last_manifest_path = manifest_path
+            
+            # ギャラリー更新
+            progress.setLabelText("ギャラリー表示を更新中...")
+            progress.setValue(90)
+            QApplication.processEvents()
+            
+            # アノテーション数を更新
+            self.annotated_count = len(self.annotations)
+            progress.setLabelText(f"{loaded_count}個のアノテーションを読み込みました")
+            progress.setValue(95)
+            QApplication.processEvents()
+            
+            # 進捗ダイアログを閉じる
+            progress.setValue(100)
+            QApplication.processEvents()
+            progress.close()
+
+            # 分布グラフを更新
+            if self.annotated_count > 0:
+                try:
+                    self.update_distribution_graph()
+                except Exception as graph_error:
+                    print(f"分布グラフ更新時にエラー: {graph_error}")
+            
+            print(f"読み込み完了: {loaded_count}個のアノテーションを読み込みました")
+            print(f"削除済みインデックス数: {len(deleted_indexes)}")
+            return self.annotated_count > 0
+                
+        except Exception as e:
+            # エラー発生時も進捗ダイアログを閉じる
+            if 'progress' in locals():
+                progress.close()
+                
+            print(f"カタログフォルダ {catalog_folder} の読み込み中にエラー: {str(e)}")
+            traceback.print_exc()
+            return False
+
+
+    def clear_annotations(self):
+        """既存のアノテーションデータをクリアする"""
+        self.annotations = {}
+        self.annotation_history = []
+        self.annotated_count = 0
+        self.annotation_timestamps = {}
+        self.inference_results = {}
+        self.location_annotations = {}
+        
+        if hasattr(self, 'deleted_indexes'):
+            self.deleted_indexes = []
+        
+        # UI更新
+        self.display_current_image()
+        self.update_gallery()
+        self.update_slider_deleted_indexes()
+        
+        # 位置ボタンのカウント表示を更新
+        self.update_location_button_counts()
+        
+        # 分布グラフを更新
+        if hasattr(self, 'distribution_label'):
+            self.distribution_label.clear()
+            self.distribution_label.setText("アノテーションがありません")
+
+        print("アノテーションデータをクリアしました")
+
+
+
+    def ensure_location_button_exists(self, location_value):
+        """指定した位置情報のボタンが存在することを確認し、なければ作成する"""
+        # 既存のボタンをチェック
+        for button in self.location_buttons:
+            if button.property("location_value") == location_value:
+                return True
+        
+        # ボタンが存在しない場合は新規作成
+        self.new_location_input.setValue(location_value)
+        self.add_location_button()
+        return True
+    
+    def display_current_image(self):
+        pass
+
+    def update_gallery(self):
+        """ギャラリー表示を更新する - 位置情報の問題を根本的に修正"""
+        # Clear current gallery
+        for i in reversed(range(self.gallery_layout.count())): 
+            self.gallery_layout.itemAt(i).widget().deleteLater()
+        
+        if not self.images:
+            return
+        
+        # スキップ枚数を取得
+        skip_count = self.skip_count_spin.value()
+        
+        # 現在の位置とインデックス情報
+        current_idx = self.current_index
+        total_images = len(self.images)
+        
+        # 前に表示する2枚の画像インデックスを計算
+        prev_indices = []
+        for i in range(1, 3):
+            idx = current_idx - i * skip_count
+            if idx >= 0:
+                prev_indices.append(idx)
+        prev_indices.reverse()  # 近い順に並べる
+        
+        # 次に表示する2枚の画像インデックスを計算
+        next_indices = []
+        for i in range(1, 3):
+            idx = current_idx + i * skip_count
+            if idx < total_images:
+                next_indices.append(idx)
+        
+        # 表示する画像インデックスを組み合わせる
+        display_indices = prev_indices + [current_idx] + next_indices
+        
+        # ギャラリーのグリッドレイアウトを調整
+        col_count = GALLERY_COL_COUNT 
+        
+        # ギャラリーにサムネイルを追加
+        for i, idx in enumerate(display_indices):
+            if 0 <= idx < total_images:
+                img_path = self.images[idx]
+                
+                # 削除されたインデックスの場合、削除済みフラグをセット
+                is_deleted = hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes
+                
+                # アノテーション情報を取得
+                annotation = None
+                location_value = None  # Initialize here to prevent the error
+                
+                if  img_path in self.annotations:
+                    annotation = self.annotations[img_path]
+                
+                    # 位置情報を事前に特定
+                    if annotation and 'loc' in annotation:
+                        location_value = annotation['loc']
+                    # あるいは位置情報専用の辞書を確認 (uncomment this)
+                    elif img_path in self.location_annotations:
+                        location_value = self.location_annotations[img_path]
+                
+                # サムネイルウィジェットを作成
+                thumb = ThumbnailWidget(
+                    img_path=img_path,
+                    index=idx,
+                    is_selected=(idx == current_idx),
+                    annotation=annotation,
+                    on_click=self.select_image,
+                    location_value=location_value,
+                    is_deleted=is_deleted
+                )
+                
+                # col_count列のグリッドで配置
+                row = i // col_count
+                col = i % col_count
+                
+                self.gallery_layout.addWidget(thumb, row, col)
+
+    def select_image(self, index):
+        if 0 <= index < len(self.images):
+            # インデックスが変わらない場合は何もしない
+            if index == self.current_index:
+                return
+            
+            # 現在の画像に変更
+            self.current_index = index
+            
+            # スライダーの値を更新
+            self.image_slider.setValue(index)
+            self.slider_value_label.setText(f"{index + 1}/{len(self.images)}")
+            
+            # 画像表示を更新
+            self.display_current_image()
+            
+            # 推論表示チェックボックスがONの場合、推論結果を表示
+            if self.inference_checkbox.isChecked():
+                current_img_path = self.images[self.current_index]
+                # 推論結果がまだない場合のみ推論を実行
+                if current_img_path not in self.inference_results:
+                    self.run_inference_check(False)
+            
+            # ギャラリー更新
+            self.update_gallery()
+            
+            # スキップ枚数分だけ自動的に次に進める（選択したのが現在の画像より前の場合は戻る）
+            if self.skip_images_on_click.isChecked():  # チェックボックスで制御
+                skip_count = self.skip_count_spin.value()
+                QTimer.singleShot(300, lambda: self.skip_images(skip_count))
+
+    def skip_images(self, count):
+        """指定した数だけ画像をスキップする - 位置推論の自動実行も追加"""
+        new_index = self.current_index + count
+        
+        # Ensure the new index is within bounds
+        if new_index < 0:
+            new_index = 0
+        elif new_index >= len(self.images):
+            new_index = len(self.images) - 1
+        
+        # インデックスが変わらない場合は何もしない
+        if new_index == self.current_index:
+            return
+        
+        # スキップ前に現在の画像のバウンディングボックス情報を確認し、すべてのボックスを記録
+        if hasattr(self, 'bbox_annotations') and len(self.images) > 0:
+            # インデックスベースに変更
+            current_index = self.current_index
+            if (current_index is not None and 
+                isinstance(current_index, int) and 
+                current_index in self.bbox_annotations and 
+                self.bbox_annotations[current_index]):
+                # すべてのバウンディングボックスをリストとして保存
+                self.last_bboxes = [bbox.copy() for bbox in self.bbox_annotations[current_index]]
+                
+                # 互換性のため、最後のボックスも個別に保存
+                if self.last_bboxes:
+                    self.last_bbox = self.last_bboxes[-1].copy()
+
+        # スキップ前に現在の画像のセグメンテーション情報を確認し、すべてのセグメンテーションを記録
+        if hasattr(self, 'segmentation_annotations') and len(self.images) > 0:
+            # インデックスベースに変更
+            current_index = self.current_index
+            if (current_index is not None and 
+                isinstance(current_index, int) and 
+                current_index in self.segmentation_annotations and 
+                self.segmentation_annotations[current_index]):
+                # すべてのセグメンテーションをリストとして保存
+                self.last_segmentations = [seg.copy() for seg in self.segmentation_annotations[current_index]]
+                print(f"スキップ時にセグメンテーション情報を更新: {len(self.last_segmentations)}個のセグメンテーション")
+                
+                # 互換性のため、最後のセグメンテーションも個別に保存
+                if self.last_segmentations:
+                    self.last_segmentation = self.last_segmentations[-1].copy()
+
+        # 自動位置設定をする前の現在の位置情報を保存
+        old_current_location = self.current_location
+        
+        # 現在のインデックスを更新
+        self.current_index = new_index
+
+        # 新しい画像パスを取得（後で複数回使うので変数に格納）
+        new_img_path = self.images[self.current_index]
+
+        # スライダーの値を更新（valueChangedシグナルが発生し、slider_changedが呼ばれる）
+        self.image_slider.setValue(new_index)
+        self.slider_value_label.setText(f"{new_index + 1}/{len(self.images)}")
+                
+        # 自動チェックオン
+        if self.auto_apply_location:
+            # 前の値がある場合は上書き
+            if old_current_location is not None:
+                self.current_location = old_current_location
+                # インデックスとパスの両方に対応するため、必要に応じて初期化
+                if new_index not in self.annotations:
+                    self.annotations[new_index] = {}
+                self.annotations[new_index]['loc'] = self.current_location
+                self.location_annotations[new_index] = self.current_location
+        else:
+            if self.current_index in self.location_annotations:
+                self.current_location = self.location_annotations[self.current_index]
+            else:
+                self.current_location = None
+
+        # 前回のバウンディングボックスを適用（画像表示の前に先に処理）
+        if hasattr(self, 'auto_apply_last_bbox') and self.auto_apply_last_bbox:
+            # インデックスベースに変更: 現在の画像にボックスがない場合に適用
+            if (new_index not in self.bbox_annotations or 
+                not self.bbox_annotations[new_index]):
+                # last_bboxesが存在すればそれを使用、なければlast_bboxを使用
+                if hasattr(self, 'last_bboxes') and self.last_bboxes:
+                    # すべてのボックスを適用
+                    for bbox in self.last_bboxes:
+                        self.add_bbox_annotation(bbox.copy())
+                    
+                    # ステータスバーに表示
+                    self.statusBar().showMessage(f"前回の {len(self.last_bboxes)}個のバウンディングボックスを適用しました", 3000)
+                
+                elif hasattr(self, 'last_bbox') and self.last_bbox is not None:
+                    # 後方互換性のため、単一ボックスの場合も処理
+                    self.add_bbox_annotation(self.last_bbox.copy())
+                    self.statusBar().showMessage(f"前回の '{self.last_bbox['class']}' バウンディングボックスを適用しました", 3000)
+
+        # 前回のセグメンテーションを自動適用（最後に追加）
+        if hasattr(self, 'auto_apply_last_segmentation') and self.auto_apply_last_segmentation:
+            # インデックスベースに変更: 現在の画像にセグメンテーションがない場合に適用
+            if (new_index not in self.segmentation_annotations or 
+                not self.segmentation_annotations[new_index]):
+                # last_segmentationsが存在すればそれを使用、なければlast_segmentationを使用
+                if hasattr(self, 'last_segmentations') and self.last_segmentations:
+                    # すべてのセグメンテーションを適用
+                    for seg in self.last_segmentations:
+                        self.add_segmentation_annotation(seg.copy())
+                    
+                    # ステータスバーに表示
+                    self.statusBar().showMessage(f"前回の {len(self.last_segmentations)}個のセグメンテーションを適用しました", 3000)
+                
+                elif hasattr(self, 'last_segmentation') and self.last_segmentation:
+                    # 後方互換性のため、単一セグメンテーションの場合も処理
+                    self.add_segmentation_annotation(self.last_segmentation.copy())
+                    self.statusBar().showMessage(f"前回の '{self.last_segmentation['class']}' セグメンテーションを適用しました", 3000)
+
+        # 画像表示を更新
+        self.display_current_image()
+        
+        # ここから追加: 位置推論表示チェックボックスがONの場合、自動的に推論実行
+        if hasattr(self, 'location_inference_checkbox') and self.location_inference_checkbox.isChecked():
+            # 推論結果がまだない場合のみ推論を実行
+            if new_img_path not in self.location_inference_results:
+                self.run_location_inference()
+            # 表示を更新
+            self.update_location_inference_display()
+        
+        # 推論表示チェックボックスがONの場合、推論結果がなければ実行
+        if self.inference_checkbox.isChecked():
+            if new_img_path not in self.inference_results:
+                self.run_inference_check(False)
+
+        # 物体検知推論表示の更新
+        self.update_detection_info_panel()
+
+        # 画面を更新
+        self.update_gallery()
+        self.update_inference_display()
+
+    def handle_annotation(self, x, y):
+        """画像のアノテーションを処理する - 削除済み画像への再アノテーションをサポート"""
+        if not self.images:
+            return
+        
+        current_img_path = self.images[self.current_index]
+        
+        # Get image dimensions
+        img = Image.open(current_img_path)
+        width, height = img.size
+        
+        # Get normalized coordinates
+        angle, throttle = normalize_coordinates(x, y, width, height)
+        
+        # Store current state in history before changing
+        if current_img_path in self.annotations:
+            previous = self.annotations.copy()
+            self.annotation_history.append(previous)
+        
+        # 削除済みインデックスの場合、削除リストから削除
+        if hasattr(self, 'deleted_indexes') and self.current_index in self.deleted_indexes:
+            # 現在のインデックスを削除済みリストから除外
+            self.deleted_indexes.remove(self.current_index)
+        
+        # Update annotation for this image
+        if self.current_index not in self.annotations:
+            self.annotated_count += 1
+        
+        # アノテーション時のタイムスタンプを保存（ミリ秒）
+        current_timestamp = int(time.time() * 1000)
+        self.annotation_timestamps[self.current_index] = current_timestamp
+        
+        self.annotations[self.current_index] = {
+            "angle": angle,
+            "throttle": throttle,
+            "x": x,
+            "y": y
+        }
+
+        # 位置情報があれば追加
+        if self.current_location is not None:
+            self.annotations[self.current_index]["loc"] = self.current_location
+            # 位置情報アノテーションも更新
+            self.location_annotations[current_img_path] = self.current_location 
+
+        # 位置ボタンのカウント表示を更新
+        self.update_location_button_counts()
+
+        # Update UI
+        ###
+        self.update_ui()
+        self.display_current_image()
+        self.update_gallery()
+        self.update_distribution_graph()
+        self.update_slider_deleted_indexes()
+
+    def restore_deleted_annotation(self):
+        """現在表示中の削除済みの画像を復元する（削除状態を解除する）"""
+        if not self.images or not hasattr(self, 'deleted_indexes'):
+            return
+                
+        # 削除済みリストから削除
+        self.deleted_indexes.remove(self.current_index)
+        
+        # UI更新
+        self.display_current_image()
+        self.update_gallery()
+        self.update_distribution_graph()
+
+    def restore_all_deleted_annotations(self):
+        """全ての削除済みアノテーションの状態を復元する"""
+        if not self.images or not hasattr(self, 'deleted_indexes') or not self.deleted_indexes:
+            QMessageBox.information(
+                self, 
+                "情報", 
+                "復元する削除済みのアノテーションがありません。"
+            )
+            return
+                        
+        # 削除済みリストをクリア
+        self.deleted_indexes = []
+        
+        # UI更新
+        self.display_current_image()
+        self.update_gallery()
+        self.update_distribution_graph()
+        self.update_slider_deleted_indexes()
+    
+
+    ### エクスポート関連
+    def export_to_donkey(self):
+        """Donkeycar形式でエクスポートする - 共通ダイアログを使用"""
+        if not self.annotations:
+            QMessageBox.information(self, "情報", "エクスポートするアノテーションがありません。")
+            return
+        
+        # 共通ダイアログを表示
+        export_config = self.show_unified_export_dialog("donkey")
+        if not export_config:
+            return  # キャンセルされた場合
+        
+        try:
+            # エクスポート実行
+            catalog_path = export_to_donkey(
+                export_config['output_folder'], 
+                self.annotations, 
+                inference_results=self.inference_results,
+                deleted_indexes=self.deleted_indexes if hasattr(self, 'deleted_indexes') else [],
+                image_map=export_config['image_map'],
+                variant_keys=export_config['variant_keys'],
+                diff_vectors=self.inference_diff_vectors if hasattr(self, 'inference_diff_vectors') else None
+            )
+            
+            if not catalog_path:
+                QMessageBox.warning(
+                    self,
+                    "エクスポート警告",
+                    "エクスポート可能なエントリがありませんでした。"
+                )
+                return
+                    
+            QMessageBox.information(
+                self, 
+                "完了", 
+                f"アノテーションをDonkeycar形式でエクスポートしました。\n"
+                f"選択画像ソース: {', '.join(export_config['selected_variants'])}\n"
+                f"保存先: {export_config['output_folder']}\n"
+                f"エクスポート数: {len(self.annotations)}個"
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"Donkeycarエクスポート中にエラーが発生しました: {str(e)}\n\n"
+                f"詳細: {traceback.format_exc()}"
+            )
+
+    def export_to_jetracer(self):
+        """Jetracer形式でエクスポートする - 共通ダイアログを使用"""
+        if not self.annotations:
+            QMessageBox.information(self, "情報", "エクスポートするアノテーションがありません。")
+            return
+        
+        # 共通ダイアログを表示
+        export_config = self.show_unified_export_dialog("jetracer")
+        if not export_config:
+            return  # キャンセルされた場合
+        
+        try:
+            # Jetracer形式でエクスポート
+            # インデックスベースのアノテーションを画像パスベースに変換
+            path_based_annotations = {}
+            for idx, annotation in self.annotations.items():
+                if isinstance(idx, int) and 0 <= idx < len(self.images):
+                    img_path = self.images[idx]
+                    path_based_annotations[img_path] = annotation
+                elif isinstance(idx, str):
+                    path_based_annotations[idx] = annotation
+            
+            # 推論結果も同様に変換
+            path_based_inference = {}
+            if hasattr(self, 'inference_results') and self.inference_results:
+                for idx, inference in self.inference_results.items():
+                    if isinstance(idx, int) and 0 <= idx < len(self.images):
+                        img_path = self.images[idx]
+                        path_based_inference[img_path] = inference
+                    elif isinstance(idx, str):
+                        path_based_inference[idx] = inference
+            
+            catalog_path = export_to_jetracer(
+                export_config['output_folder'], 
+                path_based_annotations,
+                inference_results=path_based_inference
+            )
+            
+            QMessageBox.information(
+                self, 
+                "完了", 
+                f"アノテーションをJetracer形式でエクスポートしました。\n"
+                f"保存先: {export_config['output_folder']}\n"
+                f"エクスポート数: {len(path_based_annotations)}個"
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"Jetracerエクスポート中にエラーが発生しました: {str(e)}\n\n"
+                f"詳細: {traceback.format_exc()}"
+            )
+
+    def export_annotations_to_yolo(self, train_dir, val_dir, classes):
+        """バウンディングボックスアノテーションをYOLO形式でエクスポート - インデックスベース対応"""
+        
+        if not self.bbox_annotations:
+            print("バウンディングボックスアノテーションがありません")
+            return
+        
+        print(f"バウンディングボックスアノテーションエクスポート開始")
+        print(f"アノテーション数: {len(self.bbox_annotations)}")
+        
+        # クラス名からインデックスへのマッピングを作成
+        class_to_index = {cls: idx for idx, cls in enumerate(classes)}
+        print(f"クラス-インデックスマッピング: {class_to_index}")
+        
+        # アノテーションをランダムに学習用と検証用に分割
+        annotation_indices = list(self.bbox_annotations.keys())
+        random.shuffle(annotation_indices)
+        
+        split_point = int(len(annotation_indices) * 0.7)  # 70%を学習用
+        train_indices = annotation_indices[:split_point]
+        val_indices = annotation_indices[split_point:]
+        
+        print(f"学習用: {len(train_indices)}枚, 検証用: {len(val_indices)}枚")
+        
+        # 学習用データのエクスポート
+        train_success = 0
+        for index in train_indices:
+            try:
+                # インデックスから画像パスを取得
+                if index >= len(self.images):
+                    print(f"警告: インデックス {index} が画像リストの範囲外です")
+                    continue
+                    
+                img_path = self.images[index]
+                success = self._export_single_bbox_annotation(
+                    index, img_path, train_dir, class_to_index
+                )
+                if success:
+                    train_success += 1
+            except Exception as e:
+                print(f"アノテーション処理エラー {index}: {str(e)}")
+        
+        print(f"処理成功: {train_success}/{len(train_indices)}")
+        
+        # 検証用データのエクスポート
+        val_success = 0
+        for index in val_indices:
+            try:
+                # インデックスから画像パスを取得
+                if index >= len(self.images):
+                    print(f"警告: インデックス {index} が画像リストの範囲外です")
+                    continue
+                    
+                img_path = self.images[index]
+                success = self._export_single_bbox_annotation(
+                    index, img_path, val_dir, class_to_index
+                )
+                if success:
+                    val_success += 1
+            except Exception as e:
+                print(f"アノテーション処理エラー {index}: {str(e)}")
+        
+        print(f"処理成功: {val_success}/{len(val_indices)}")
+        print(f"バウンディングボックスアノテーションエクスポート完了")
+
+    # def _export_single_bbox_annotation(self, index, img_path, output_dir, class_to_index):
+    #     """単一のバウンディングボックスアノテーションをエクスポート"""
+        
+    #     # 画像ファイルの存在確認
+    #     if not os.path.exists(img_path):
+    #         print(f"画像ファイルが見つかりません: {img_path}")
+    #         return False
+        
+    #     # バウンディングボックスデータを取得
+    #     bboxes = self.bbox_annotations.get(index, [])
+    #     if not bboxes:
+    #         print(f"インデックス {index} にバウンディングボックスデータがありません")
+    #         return False
+        
+    #     # 画像ファイルをコピー
+    #     img_filename = os.path.basename(img_path)
+    #     dest_img_path = os.path.join(output_dir, "images", img_filename)
+        
+    #     try:
+    #         import shutil
+    #         shutil.copy2(img_path, dest_img_path)
+    #     except Exception as e:
+    #         print(f"画像コピーエラー {img_path}: {str(e)}")
+    #         return False
+        
+    #     # ラベルファイルの作成
+    #     label_filename = os.path.splitext(img_filename)[0] + ".txt"
+    #     label_path = os.path.join(output_dir, "labels", label_filename)
+        
+    #     try:
+    #         with open(label_path, 'w') as f:
+    #             for bbox in bboxes:
+    #                 class_name = bbox.get('class', 'unknown')
+                    
+    #                 # クラスインデックスを取得
+    #                 if class_name not in class_to_index:
+    #                     print(f"警告: 未知のクラス '{class_name}' をスキップします")
+    #                     continue
+                    
+    #                 class_idx = class_to_index[class_name]
+                    
+    #                 # バウンディングボックス座標（既に正規化済み）
+    #                 x1, y1, x2, y2 = bbox['x1'], bbox['y1'], bbox['x2'], bbox['y2']
+                    
+    #                 print("exp: ",bbox)
+
+    #                 # YOLO形式に変換: center_x, center_y, width, height
+    #                 center_x = (x1 + x2) / 2
+    #                 center_y = (y1 + y2) / 2
+    #                 width = x2 - x1
+    #                 height = y2 - y1
+                    
+    #                 # YOLO形式で書き込み
+    #                 f.write(f"{class_idx} {center_x:.6f} {center_y:.6f} {width:.6f} {height:.6f}\n")
+            
+    #         return True
+            
+    #     except Exception as e:
+    #         print(f"ラベルファイル作成エラー {label_path}: {str(e)}")
+    #         return False
+
+    def _export_single_bbox_annotation(self, index, img_path, output_dir, class_to_index):
+        """単一のバウンディングボックスアノテーションをエクスポート（修正版）"""
+        
+        # 画像ファイルの存在確認
+        if not os.path.exists(img_path):
+            print(f"画像ファイルが見つかりません: {img_path}")
+            return False
+        
+        # バウンディングボックスデータを取得
+        bboxes = self.bbox_annotations.get(index, [])
+        if not bboxes:
+            print(f"インデックス {index} にバウンディングボックスデータがありません")
+            return False
+        
+        # 画像ファイルをコピー
+        img_filename = os.path.basename(img_path)
+        dest_img_path = os.path.join(output_dir, "images", img_filename)
+        
+        try:
+            import shutil
+            shutil.copy2(img_path, dest_img_path)
+        except Exception as e:
+            print(f"画像コピーエラー {img_path}: {str(e)}")
+            return False
+        
+        # ラベルファイルの作成
+        label_filename = os.path.splitext(img_filename)[0] + ".txt"
+        label_path = os.path.join(output_dir, "labels", label_filename)
+        
+        try:
+            with open(label_path, 'w') as f:
+                for bbox in bboxes:
+                    # クラス名の取得（複数の形式に対応）
+                    class_name = None
+                    if isinstance(bbox, dict):
+                        class_name = bbox.get('class') or bbox.get('class_name')
+                    else:
+                        class_name = getattr(bbox, 'class', None) or getattr(bbox, 'class_name', None)
+                    
+                    # クラスインデックスを取得
+                    if not class_name or class_name not in class_to_index:
+                        print(f"警告: 未知のクラス '{class_name}' をスキップします")
+                        continue
+                    
+                    class_idx = class_to_index[class_name]
+                    
+                    # バウンディングボックス座標を取得（既に正規化済み）
+                    if isinstance(bbox, dict):
+                        # 現在の辞書形式（正規化済み）
+                        x1, y1, x2, y2 = bbox['x1'], bbox['y1'], bbox['x2'], bbox['y2']
+                    else:
+                        # 古いオブジェクト形式（ピクセル座標の場合）
+                        from PIL import Image
+                        with Image.open(img_path) as img:
+                            img_width, img_height = img.size
+                        
+                        x1 = bbox.x / img_width
+                        y1 = bbox.y / img_height
+                        x2 = (bbox.x + bbox.width) / img_width
+                        y2 = (bbox.y + bbox.height) / img_height
+                        print(x1,x2,"old")
+                    # YOLO形式に変換: center_x, center_y, width, height
+                    center_x = (x1 + x2) / 2
+                    center_y = (y1 + y2) / 2
+                    width = x2 - x1
+                    height = y2 - y1
+                    
+                    # YOLO形式で書き込み
+                    f.write(f"{class_idx} {center_x:.6f} {center_y:.6f} {width:.6f} {height:.6f}\n")
+            
+            return True
+            
+        except Exception as e:
+            print(f"ラベルファイル作成エラー {label_path}: {str(e)}")
+            return False
+
+    def export_segmentation_annotations_to_yolo(self, train_dir, val_dir, classes):
+        """セグメンテーションアノテーションをYOLO形式でエクスポート - 正しいセグメンテーション形式"""
+        
+        if not self.segmentation_annotations:
+            print("セグメンテーションアノテーションがありません")
+            return
+        
+        print(f"セグメンテーションアノテーションエクスポート開始")
+        print(f"アノテーション数: {len(self.segmentation_annotations)}")
+        
+        # クラス名からインデックスへのマッピングを作成
+        class_to_index = {cls: idx for idx, cls in enumerate(classes)}
+        print(f"クラス-インデックスマッピング: {class_to_index}")
+        
+        # アノテーションをランダムに学習用と検証用に分割
+        annotation_indices = list(self.segmentation_annotations.keys())
+        import random
+        random.shuffle(annotation_indices)
+        
+        split_point = int(len(annotation_indices) * 0.7)  # 70%を学習用
+        train_indices = annotation_indices[:split_point]
+        val_indices = annotation_indices[split_point:]
+        
+        print(f"学習用: {len(train_indices)}枚, 検証用: {len(val_indices)}枚")
+        
+        # 学習用データのエクスポート
+        train_success = 0
+        for index in train_indices:
+            try:
+                # インデックスから画像パスを取得
+                if index >= len(self.images):
+                    print(f"警告: インデックス {index} が画像リストの範囲外です")
+                    continue
+                    
+                img_path = self.images[index]
+                success = self._export_single_segmentation_annotation(
+                    index, img_path, train_dir, class_to_index
+                )
+                if success:
+                    train_success += 1
+            except Exception as e:
+                print(f"アノテーション処理エラー {index}: {str(e)}")
+        
+        print(f"学習用処理成功: {train_success}/{len(train_indices)}")
+        
+        # 検証用データのエクスポート
+        val_success = 0
+        for index in val_indices:
+            try:
+                # インデックスから画像パスを取得
+                if index >= len(self.images):
+                    print(f"警告: インデックス {index} が画像リストの範囲外です")
+                    continue
+                    
+                img_path = self.images[index]
+                success = self._export_single_segmentation_annotation(
+                    index, img_path, val_dir, class_to_index
+                )
+                if success:
+                    val_success += 1
+            except Exception as e:
+                print(f"アノテーション処理エラー {index}: {str(e)}")
+        
+        print(f"検証用処理成功: {val_success}/{len(val_indices)}")
+        print(f"セグメンテーションアノテーションエクスポート完了")
+
+    def _export_single_segmentation_annotation(self, index, img_path, output_dir, class_to_index):
+        """単一のセグメンテーションアノテーションをYOLO形式でエクスポート"""
+        
+        # 画像ファイルの存在確認
+        if not os.path.exists(img_path):
+            print(f"画像ファイルが見つかりません: {img_path}")
+            return False
+        
+        # セグメンテーションデータを取得
+        segmentations = self.segmentation_annotations.get(index, [])
+        if not segmentations:
+            print(f"インデックス {index} にセグメンテーションデータがありません")
+            return False
+        
+        # 画像のサイズを取得
+        try:
+            from PIL import Image
+            with Image.open(img_path) as img:
+                img_width, img_height = img.size
+        except Exception as e:
+            print(f"画像サイズ取得エラー {img_path}: {str(e)}")
+            return False
+        
+        print(f"処理中: {os.path.basename(img_path)} ({img_width}x{img_height})")
+        
+        # 画像ファイルをコピー
+        img_filename = os.path.basename(img_path)
+        dest_img_path = os.path.join(output_dir, "images", img_filename)
+        
+        try:
+            import shutil
+            os.makedirs(os.path.dirname(dest_img_path), exist_ok=True)
+            shutil.copy2(img_path, dest_img_path)
+        except Exception as e:
+            print(f"画像コピーエラー {img_path}: {str(e)}")
+            return False
+        
+        # ラベルファイルの作成
+        label_filename = os.path.splitext(img_filename)[0] + ".txt"
+        label_path = os.path.join(output_dir, "labels", label_filename)
+        
+        try:
+            os.makedirs(os.path.dirname(label_path), exist_ok=True)
+            
+            valid_annotations = 0
+            with open(label_path, 'w') as f:
+                for seg_idx, seg_data in enumerate(segmentations):
+                    class_name = seg_data.get('class', 'unknown')
+                    points = seg_data.get('points', [])
+                    
+                    # クラスインデックスを取得
+                    if class_name not in class_to_index:
+                        print(f"警告: 未知のクラス '{class_name}' をスキップします")
+                        continue
+                    
+                    class_idx = class_to_index[class_name]
+                    
+                    # ポイント数の確認
+                    if len(points) < 3:
+                        print(f"警告: ポイント数が不足しています ({len(points)}点) - セグメンテーション {seg_idx}")
+                        continue
+                    
+                    print(f"  セグメンテーション {seg_idx}: クラス={class_name}({class_idx}), ポイント数={len(points)}")
+                    
+                    # YOLO セグメンテーション形式のコーディネートに変換
+                    normalized_coords = []
+                    for point_idx, (px, py) in enumerate(points):
+                        # 座標を正規化 (0-1の範囲)
+                        norm_x = float(px) / float(img_width)
+                        norm_y = float(py) / float(img_height)
+                        
+                        # 範囲チェック
+                        norm_x = max(0.0, min(1.0, norm_x))
+                        norm_y = max(0.0, min(1.0, norm_y))
+                        
+                        normalized_coords.extend([norm_x, norm_y])
+                        
+                        if point_idx < 3:  # 最初の3点だけログ出力
+                            print(f"    ポイント{point_idx}: ({px}, {py}) -> ({norm_x:.4f}, {norm_y:.4f})")
+                    
+                    # 最低6個の値（3点）が必要
+                    if len(normalized_coords) < 6:
+                        print(f"警告: 正規化座標が不足 ({len(normalized_coords)}個)")
+                        continue
+                    
+                    # YOLO セグメンテーション形式で書き込み
+                    # 形式: class_id x1 y1 x2 y2 x3 y3 ... (正規化座標)
+                    coords_str = ' '.join(f"{coord:.6f}" for coord in normalized_coords)
+                    line = f"{class_idx} {coords_str}\n"
+                    f.write(line)
+                    valid_annotations += 1
+                    
+                    print(f"    書き込み: クラス{class_idx} + {len(normalized_coords)}個の座標")
+            
+            print(f"  有効なアノテーション: {valid_annotations}個")
+            
+            # ファイルが空でないことを確認
+            if valid_annotations == 0:
+                print(f"警告: {label_filename} に有効なアノテーションがありません")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            print(f"ラベルファイル作成エラー {label_path}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return False
+        
+    def browse_output_folder(self, folder_input):
+        """出力フォルダを選択するダイアログを表示"""
+        current_path = folder_input.text().strip()
+        if not current_path:
+            current_path = annotation_folder
+        
+        selected_folder = QFileDialog.getExistingDirectory(
+            self, "エクスポート先フォルダを選択", 
+            current_path,
+            QFileDialog.ShowDirsOnly
+        )
+        
+        if selected_folder:
+            folder_input.setText(selected_folder)
+
+    def create_annotation_video(self):
+        """アノテーション動画を作成する - フレームレートと画像ソースを選択可能、複数ソースを横に並べる機能付き"""
+        if not self.annotations:
+            QMessageBox.information(self, "情報", "アノテーションがありません。")
+            return
+                            
+        # タイムスタンプを使用してファイル名を生成
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_filename = f"annotation_video_{timestamp}.mp4"
+        output_file = os.path.join(video_folder, default_filename)
+        
+        # 動画作成設定ダイアログを作成
+        settings_dialog = QDialog(self)
+        settings_dialog.setWindowTitle("動画作成設定")
+        settings_dialog.setMinimumWidth(500)
+        settings_dialog.setMinimumHeight(500)  # サイズを大きくして表示を見やすく
+        
+        dialog_layout = QVBoxLayout(settings_dialog)
+        
+        # フレームレート設定
+        fps_layout = QHBoxLayout()
+        fps_layout.addWidget(QLabel("フレームレート (fps):"))
+        fps_spin = QSpinBox()
+        fps_spin.setRange(1, 60)
+        fps_spin.setValue(30)  # デフォルト: 30fps
+        fps_layout.addWidget(fps_spin)
+        dialog_layout.addLayout(fps_layout)
+        
+        # スキップ設定
+        skip_layout = QHBoxLayout()
+        skip_layout.addWidget(QLabel("画像スキップ数:"))
+        skip_spin = QSpinBox()
+        skip_spin.setRange(1, 100)
+        skip_spin.setValue(self.skip_count_spin.value())  # UIのスキップ値を初期値に
+        skip_layout.addWidget(skip_spin)
+        dialog_layout.addLayout(skip_layout)
+        
+        # 推論結果表示設定
+        inference_check = QCheckBox("推論結果を表示する（青丸）")
+        inference_check.setChecked(self.inference_checkbox.isChecked())  # UIの設定を初期値に
+        dialog_layout.addWidget(inference_check)
+        
+        # 追加: 差分ベクトル表示設定
+        diff_vector_check = QCheckBox("差分ベクトル矢印を表示する（緑矢印）")
+        diff_vector_check.setChecked(self.diff_vector_checkbox.isChecked())  # UIの設定を初期値に
+        dialog_layout.addWidget(diff_vector_check)
+
+        # 出力モード設定のグループボックス
+        output_mode_group = QGroupBox("出力モード")
+        output_mode_layout = QVBoxLayout(output_mode_group)
+        
+        # 出力モードのラジオボタン
+        single_source_radio = QRadioButton("単一ソース出力（通常モード）")
+        single_source_radio.setChecked(True)  # デフォルトで選択
+        output_mode_layout.addWidget(single_source_radio)
+        
+        multi_source_radio = QRadioButton("複数ソース出力（横に並べる）")
+        output_mode_layout.addWidget(multi_source_radio)
+        
+        # 複数ソース選択時の説明
+        multi_source_info = QLabel("※複数ソース選択時は下記から複数の画像ソースを選択してください。\n"
+                                "選択した順に左から配置されます。")
+        multi_source_info.setStyleSheet("color: #666; font-style: italic;")
+        output_mode_layout.addWidget(multi_source_info)
+        
+        dialog_layout.addWidget(output_mode_group)
+        
+        # 画像ソース選択
+        sources_group = QGroupBox("画像ソース")
+        sources_layout = QVBoxLayout(sources_group)
+        
+        # 使用可能なバリアント一覧
+        available_variants = []
+        variant_images = {}
+        current_variant = None
+        
+        if hasattr(self, 'available_variants'):
+            available_variants = self.available_variants
+            current_variant = self.current_variant if hasattr(self, 'current_variant') else None
+            
+            if hasattr(self, 'variant_images'):
+                variant_images = self.variant_images
+        
+        # バリアントがない場合のバックアップ処理
+        if not available_variants:
+            available_variants = ["cam"]
+            current_variant = "cam"
+            variant_images = {"cam": self.images if hasattr(self, 'images') else []}
+        
+        # 単一ソース用ラジオボタングループ
+        single_source_buttons = QButtonGroup(settings_dialog)
+        single_source_buttons.setExclusive(True)
+        
+        # 複数ソース用チェックボックスのリスト
+        multi_source_checks = []
+        
+        # 各ソースのラジオボタン・チェックボックスを作成
+        source_widgets_layout = QGridLayout()
+        
+        for i, variant in enumerate(available_variants):
+            count = len(variant_images.get(variant, []))
+            
+            # 単一ソース用ラジオボタン（左列）
+            rb = QRadioButton(variant)
+            rb.setProperty("variant", variant)
+            single_source_buttons.addButton(rb)
+            
+            # 現在選択中のバリアントを初期選択に
+            if variant == current_variant:
+                rb.setChecked(True)
+            
+            # 複数ソース用チェックボックス（右列）
+            cb = QCheckBox(variant)
+            cb.setProperty("variant", variant)
+            cb.setEnabled(False)  # 初期状態では無効（モード選択に連動）
+            multi_source_checks.append(cb)
+            
+            # 利用可能な画像数表示（中央列）
+            count_label = QLabel(f"({count}枚)")
+            
+            # グリッドに追加（行、列）
+            source_widgets_layout.addWidget(rb, i, 0)
+            source_widgets_layout.addWidget(count_label, i, 1)
+            source_widgets_layout.addWidget(cb, i, 2)
+        
+        sources_layout.addLayout(source_widgets_layout)
+        dialog_layout.addWidget(sources_group)
+        
+        # モード選択によるUIの有効/無効を切り替える関数
+        def toggle_source_selection_mode():
+            is_multi_mode = multi_source_radio.isChecked()
+            # 単一ソース選択ラジオボタン
+            for button in single_source_buttons.buttons():
+                button.setEnabled(not is_multi_mode)
+            
+            # 複数ソース選択チェックボックス
+            for check in multi_source_checks:
+                check.setEnabled(is_multi_mode)
+                
+            # 出力モード切替時に選択状態をリセット
+            if is_multi_mode:
+                # 複数モードに切り替えた場合、現在のラジオボタン選択に基づいてチェックボックスを初期選択
+                selected_variant = None
+                for button in single_source_buttons.buttons():
+                    if button.isChecked():
+                        selected_variant = button.property("variant")
+                        break
+                
+                # そのバリアントのチェックボックスを選択
+                if selected_variant:
+                    for check in multi_source_checks:
+                        if check.property("variant") == selected_variant:
+                            check.setChecked(True)
+                            break
+        
+        # 出力モードラジオボタンの切り替えイベントを接続
+        single_source_radio.toggled.connect(toggle_source_selection_mode)
+        multi_source_radio.toggled.connect(toggle_source_selection_mode)
+        
+        # 初期状態の設定
+        toggle_source_selection_mode()
+        
+        # 合計フレーム数の表示
+        total_frames_label = QLabel("合計フレーム数: 計算中...")
+        dialog_layout.addWidget(total_frames_label)
+        
+        # フレーム数を計算して表示を更新する関数
+        def update_total_frames():
+            skip = skip_spin.value()
+            is_multi_mode = multi_source_radio.isChecked()
+            
+            if is_multi_mode:
+                # 複数ソースモードの場合、選択されたすべてのソースで最小の画像数を取得
+                selected_sources = []
+                for check in multi_source_checks:
+                    if check.isChecked():
+                        selected_sources.append(check.property("variant"))
+                
+                if not selected_sources:
+                    total_frames_label.setText("合計フレーム数: 画像ソースが選択されていません")
+                    return
+                    
+                # 各ソースの画像数を取得
+                source_counts = []
+                for source in selected_sources:
+                    if source in variant_images:
+                        source_counts.append(len(variant_images[source]))
+                
+                if not source_counts:
+                    total_frames_label.setText("合計フレーム数: 有効な画像ソースがありません")
+                    return
+                    
+                # 最小の画像数を使用（すべてのソースで揃えるため）
+                min_count = min(source_counts)
+                count = min_count
+            else:
+                # 単一ソースモードの場合、選択されたソースの画像数を取得
+                selected_source = None
+                for button in single_source_buttons.buttons():
+                    if button.isChecked():
+                        selected_source = button.property("variant")
+                        break
+                
+                if selected_source and selected_source in variant_images:
+                    count = len(variant_images[selected_source])
+                else:
+                    count = len(self.images) if hasattr(self, 'images') else 0
+            
+            # スキップを適用した合計フレーム数（端数は切り上げ）
+            total_frames = (count + skip - 1) // skip
+            
+            # 予測時間の計算
+            fps = fps_spin.value()
+            if fps > 0:
+                seconds = total_frames / fps
+                minutes = int(seconds // 60)
+                seconds = int(seconds % 60)
+                time_str = f"{minutes}分{seconds}秒" if minutes > 0 else f"{seconds}秒"
+                
+                # ソース情報を追加
+                if is_multi_mode:
+                    selected_sources_str = ", ".join(selected_sources)
+                    source_info = f"\n選択ソース: {selected_sources_str} (各{min_count}枚)"
+                else:
+                    source_info = ""
+                    
+                total_frames_label.setText(
+                    f"合計フレーム数: {total_frames}フレーム (約{time_str}){source_info}"
+                )
+            else:
+                total_frames_label.setText(f"合計フレーム数: {total_frames}フレーム")
+        
+        # 設定変更時にフレーム数更新
+        skip_spin.valueChanged.connect(update_total_frames)
+        fps_spin.valueChanged.connect(update_total_frames)
+        single_source_radio.toggled.connect(update_total_frames)
+        multi_source_radio.toggled.connect(update_total_frames)
+        
+        for button in single_source_buttons.buttons():
+            button.toggled.connect(update_total_frames)
+        
+        for check in multi_source_checks:
+            check.stateChanged.connect(update_total_frames)
+        
+        # 初期フレーム数計算
+        update_total_frames()
+        
+        # ボタンボックス
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(settings_dialog.accept)
+        button_box.rejected.connect(settings_dialog.reject)
+        dialog_layout.addWidget(button_box)
+        
+        # ダイアログを表示
+        if not settings_dialog.exec_():
+            return  # キャンセルされた場合
+        
+        # 設定値の取得
+        fps = fps_spin.value()
+        skip_count = skip_spin.value()
+        show_inference = inference_check.isChecked()
+        show_diff_vectors = diff_vector_check.isChecked()  # 追加
+        is_multi_mode = multi_source_radio.isChecked()
+
+        # 選択された画像ソースを取得
+        if is_multi_mode:
+            # 複数ソースモード
+            selected_variants = []
+            for check in multi_source_checks:
+                if check.isChecked():
+                    selected_variants.append(check.property("variant"))
+            
+            if not selected_variants:
+                QMessageBox.warning(settings_dialog, "警告", "画像ソースが選択されていません。")
+                return
+                
+            # 各ソースの画像リスト
+            multi_source_images = []
+            for variant in selected_variants:
+                if variant in variant_images:
+                    multi_source_images.append(variant_images[variant])
+                else:
+                    QMessageBox.warning(settings_dialog, "警告", f"ソース '{variant}' の画像が見つかりません。")
+                    return
+            
+            # 各ソースで利用可能な画像数の最小値を取得
+            min_images_count = min(len(images) for images in multi_source_images)
+            
+            if min_images_count == 0:
+                QMessageBox.warning(settings_dialog, "警告", "選択したソースのいずれかに画像がありません。")
+                return
+        else:
+            # 単一ソースモード
+            selected_variant = None
+            for button in single_source_buttons.buttons():
+                if button.isChecked():
+                    selected_variant = button.property("variant")
+                    break
+            
+            if not selected_variant:
+                QMessageBox.warning(settings_dialog, "警告", "画像ソースが選択されていません。")
+                return
+                
+            # 選択されたソースの画像を取得
+            if selected_variant in variant_images:
+                selected_images = variant_images[selected_variant]
+            else:
+                selected_images = self.images if hasattr(self, 'images') else []
+                
+            if not selected_images:
+                QMessageBox.warning(settings_dialog, "警告", f"選択したソース '{selected_variant}' に画像がありません。")
+                return
+        
+        # 動画保存先を選択（デフォルトパスを設定）
+        selected_file, _ = QFileDialog.getSaveFileName(
+            self, "動画の保存先を選択", 
+            output_file,
+            "MP4 Files (*.mp4)"
+        )
+        
+        if not selected_file:
+            return
+        
+        try:
+            # 進捗ダイアログを表示
+            progress = QProgressDialog("動画作成中...", "キャンセル", 0, 100, self)
+            progress.setWindowTitle("処理中")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+            
+            # プログレスコールバック関数
+            def update_progress(current, total, message=None):
+                if message:
+                    progress.setLabelText(message)
+                progress.setValue(current)
+                QApplication.processEvents()
+                return not progress.wasCanceled()
+            
+            # 動画エクスポート実行
+            if is_multi_mode:
+                # 複数ソースモードの場合は特別な処理
+                frames_count = export_to_video_multi_source(
+                    self.annotations,
+                    self.inference_results,
+                    selected_file,
+                    source_images_lists=multi_source_images,
+                    source_names=selected_variants,
+                    show_inference=show_inference,
+                    skip_count=skip_count,
+                    fps=fps,
+                    progress_callback=update_progress,
+                    diff_vectors=self.inference_diff_vectors if (hasattr(self, 'inference_diff_vectors') and show_diff_vectors) else None  # 修正
+                )
+            else:
+                # 単一ソースモードは従来通り
+                frames_count = export_to_video(
+                    self.annotations, 
+                    self.inference_results, 
+                    selected_file, 
+                    show_inference=show_inference, 
+                    skip_count=skip_count, 
+                    fps=fps,
+                    progress_callback=update_progress,
+                    images_list=selected_images,
+                    diff_vectors=self.inference_diff_vectors if (hasattr(self, 'inference_diff_vectors') and show_diff_vectors) else None  # 修正
+                )
+
+            progress.close()
+            
+            if frames_count > 0:
+                # 成功メッセージ
+                if is_multi_mode:
+                    source_info = f"複数ソース: {', '.join(selected_variants)}"
+                else:
+                    source_info = f"ソース: {selected_variant}"
+                    
+                QMessageBox.information(
+                    self, 
+                    "成功", 
+                    f"アノテーション動画を作成しました:\n"
+                    f"ファイル: {os.path.basename(selected_file)}\n"
+                    f"フレーム数: {frames_count}フレーム\n"
+                    f"{source_info}\n"
+                    f"設定: {fps}fps, {skip_count}枚ごと"
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "警告",
+                    "動画の作成に失敗しました。処理可能なアノテーションデータがありませんでした。"
+                )
+            
+        except Exception as e:
+            progress.close()
+            import traceback
+            traceback.print_exc()  # デバッグ用にスタックトレースを出力
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"動画作成中にエラーが発生しました: {str(e)}"
+            )
+
+    def create_video_progress_callback(self, progress_dialog):
+        """動画作成用の進捗コールバック関数を返す
+        
+        Args:
+            progress_dialog: 進捗表示用のQProgressDialogインスタンス
+            
+        Returns:
+            進捗更新用のコールバック関数
+        """
+        def update_progress(current, total, message=None):
+            if message:
+                progress_dialog.setLabelText(message)
+            progress_dialog.setValue(current)
+            QApplication.processEvents()
+            return not progress_dialog.wasCanceled()
+        
+        return update_progress
+
+
+    ### mlflow 修正版学習ロジック自動運転モデル
+    def train_and_save_model(self):
+        if not self.annotations:
+            QMessageBox.warning(self, "警告", "モデルを学習するにはアノテーションが必要です。")
+            return
+        
+        # 現在選択されているモデルを取得
+        model_type = self.auto_method_combo.currentText()
+        
+        # 学習設定ダイアログを表示
+        training_settings = QDialog(self)
+        training_settings.setWindowTitle("学習設定")
+        training_settings.setMinimumWidth(550)
+        training_settings.setMinimumHeight(600)  # ダイアログサイズを大きくする
+        
+        settings_layout = QVBoxLayout(training_settings)
+        
+        # タブウィジェットを作成
+        tabs = QTabWidget()
+        
+        # 基本設定タブ
+        basic_tab = QWidget()
+        basic_layout = QVBoxLayout(basic_tab)
+        
+        # エポック数設定
+        epoch_layout = QHBoxLayout()
+        epoch_layout.addWidget(QLabel("学習エポック数:"))
+        epoch_spin = QSpinBox()
+        epoch_spin.setRange(1, 1000)
+        epoch_spin.setValue(30)  # デフォルト: 30エポック
+        epoch_layout.addWidget(epoch_spin)
+        basic_layout.addLayout(epoch_layout)
+        
+        # Early Stopping設定
+        early_stopping_check = QCheckBox("Early Stopping を有効にする")
+        early_stopping_check.setChecked(True)
+        basic_layout.addWidget(early_stopping_check)
+
+        # 学習対象データ選択グループボックス
+        data_selection_group = QGroupBox("学習データ選択")
+        data_selection_layout = QVBoxLayout()
+
+        # データ選択オプション
+        data_radio_all = QRadioButton("すべてのアノテーションデータを使用")
+        data_radio_all.setChecked(True)  # デフォルトですべて使用
+        data_selection_layout.addWidget(data_radio_all)
+
+        data_radio_skip = QRadioButton("スキップ設定でデータを間引く")
+        data_selection_layout.addWidget(data_radio_skip)
+
+        data_radio_range = QRadioButton("インデックス範囲を指定")
+        data_selection_layout.addWidget(data_radio_range)
+
+        # スキップ設定（オプション）
+        skip_layout = QHBoxLayout()
+        skip_layout.addWidget(QLabel("       "))  # インデント用スペース
+        skip_layout.addWidget(QLabel("スキップ枚数:"))
+        custom_skip_spin = QSpinBox()
+        custom_skip_spin.setRange(2, 100)
+        custom_skip_spin.setValue(5)  # デフォルト: 5枚
+        custom_skip_spin.setEnabled(False)  # 初期状態では無効
+        skip_layout.addWidget(custom_skip_spin)
+        data_selection_layout.addLayout(skip_layout)
+
+        # インデックス範囲指定（新機能）
+        range_layout = QHBoxLayout()
+        range_layout.addWidget(QLabel("       "))  # インデント用スペース
+        range_layout.addWidget(QLabel("インデックス範囲:"))
+
+        # インデックス範囲の入力フィールド
+        range_start_spin = QSpinBox()
+        range_start_spin.setRange(0, 99999)
+        range_start_spin.setValue(0)
+        range_start_spin.setEnabled(False)  # 初期状態では無効
+
+        range_end_spin = QSpinBox()
+        range_end_spin.setRange(0, 99999)
+        # 画像の最大インデックスを設定
+        max_index = len(self.images) - 1 if hasattr(self, 'images') and self.images else 0
+        range_end_spin.setValue(max_index)
+        range_end_spin.setEnabled(False)  # 初期状態では無効
+
+        range_layout.addWidget(range_start_spin)
+        range_layout.addWidget(QLabel("から"))
+        range_layout.addWidget(range_end_spin)
+        data_selection_layout.addLayout(range_layout)
+
+        # 範囲の現在値ボタン
+        range_current_layout = QHBoxLayout()
+        range_current_layout.addWidget(QLabel("       "))  # インデント用スペース
+
+        # 現在の位置を開始インデックスにするボタン
+        set_start_button = QPushButton("現在の位置を開始に設定")
+        set_start_button.clicked.connect(lambda: range_start_spin.setValue(self.current_index))
+        set_start_button.setEnabled(False)  # 初期状態では無効
+        range_current_layout.addWidget(set_start_button)
+
+        # 現在の位置を終了インデックスにするボタン
+        set_end_button = QPushButton("現在の位置を終了に設定")
+        set_end_button.clicked.connect(lambda: range_end_spin.setValue(self.current_index))
+        set_end_button.setEnabled(False)  # 初期状態では無効
+        range_current_layout.addWidget(set_end_button)
+
+        data_selection_layout.addLayout(range_current_layout)
+
+        # データサンプル数の表示ラベル
+        data_sample_label = QLabel("")
+        data_selection_layout.addWidget(data_sample_label)
+
+        # ラジオボタンの状態に応じて各設定欄の有効/無効を切り替える
+        def update_data_selection_ui():
+            # スキップ設定の有効/無効
+            custom_skip_spin.setEnabled(data_radio_skip.isChecked())
+            
+            # インデックス範囲設定の有効/無効
+            range_start_spin.setEnabled(data_radio_range.isChecked())
+            range_end_spin.setEnabled(data_radio_range.isChecked())
+            set_start_button.setEnabled(data_radio_range.isChecked())
+            set_end_button.setEnabled(data_radio_range.isChecked())
+            
+            # サンプル数の計算と表示
+            if data_radio_all.isChecked():
+                sample_count = len(self.annotations)
+                data_sample_label.setText(f"使用データ数: {sample_count}枚 (全データ)")
+            elif data_radio_skip.isChecked():
+                skip = custom_skip_spin.value()
+                sample_count = len(self.annotations) // skip + (1 if len(self.annotations) % skip > 0 else 0)
+                data_sample_label.setText(f"使用データ数: {sample_count}枚 ({skip}枚ごとに1枚)")
+            elif data_radio_range.isChecked():
+                start = range_start_spin.value()
+                end = range_end_spin.value()
+                # インデックス範囲内のアノテーションをカウント
+                sample_count = sum(1 for idx in self.annotations if start <= idx <= end)
+                data_sample_label.setText(f"使用データ数: {sample_count}枚 (インデックス {start} から {end})")
+
+        # ラジオボタンの状態変更イベントを接続
+        data_radio_all.toggled.connect(update_data_selection_ui)
+        data_radio_skip.toggled.connect(update_data_selection_ui)
+        data_radio_range.toggled.connect(update_data_selection_ui)
+
+        # スピンボックスの値変更イベントを接続
+        custom_skip_spin.valueChanged.connect(update_data_selection_ui)
+        range_start_spin.valueChanged.connect(update_data_selection_ui)
+        range_end_spin.valueChanged.connect(update_data_selection_ui)
+
+        # 初期表示を設定
+        update_data_selection_ui()
+
+        data_selection_group.setLayout(data_selection_layout)
+        basic_layout.addWidget(data_selection_group)
+
+        patience_layout = QHBoxLayout()
+        patience_layout.addWidget(QLabel("忍耐エポック数:"))
+        patience_spin = QSpinBox()
+        patience_spin.setRange(1, 20)
+        patience_spin.setValue(5)
+        patience_spin.setEnabled(True)
+        patience_layout.addWidget(patience_spin)
+        basic_layout.addLayout(patience_layout)
+        
+        # 学習率設定
+        lr_layout = QHBoxLayout()
+        lr_layout.addWidget(QLabel("学習率:"))
+        
+        lr_combo = QComboBox()
+        learning_rates = ["0.001", "0.0005", "0.0001", "0.00005", "0.00001"]
+        lr_combo.addItems(learning_rates)
+        lr_combo.setCurrentIndex(0)  # デフォルト: 0.001
+        lr_layout.addWidget(lr_combo)
+        basic_layout.addLayout(lr_layout)
+        
+        # タブに追加
+        tabs.addTab(basic_tab, "基本設定")
+        
+        # データオーグメンテーションタブ
+        aug_tab = QWidget()
+        aug_layout = QVBoxLayout(aug_tab)
+        
+        # データオーグメンテーション有効化チェックボックス
+        aug_enable_check = QCheckBox("データオーグメンテーションを有効にする")
+        aug_enable_check.setChecked(True)
+        aug_layout.addWidget(aug_enable_check)
+        
+        # オーグメンテーション設定のスクロールエリア
+        aug_scroll = QScrollArea()
+        aug_scroll.setWidgetResizable(True)
+        aug_scroll.setFrameShape(QFrame.NoFrame)
+        
+        aug_scroll_content = QWidget()
+        aug_options_layout = QVBoxLayout(aug_scroll_content)
+        
+        # 水平反転
+        flip_layout = QHBoxLayout()
+        aug_flip_checkbox = QCheckBox("水平反転")
+        aug_flip_checkbox.setChecked(False)
+        aug_flip_proba_label = QLabel("確率:")
+        aug_flip_proba = QDoubleSpinBox()
+        aug_flip_proba.setRange(0.0, 1.0)
+        aug_flip_proba.setSingleStep(0.1)
+        aug_flip_proba.setValue(0.5)
+        flip_layout.addWidget(aug_flip_checkbox)
+        flip_layout.addWidget(aug_flip_proba_label)
+        flip_layout.addWidget(aug_flip_proba)
+        flip_layout.addStretch()
+        aug_options_layout.addLayout(flip_layout)
+        
+        # 色調整
+        color_layout = QHBoxLayout()
+        aug_color_checkbox = QCheckBox("色調整")
+        aug_color_checkbox.setChecked(True)
+        color_layout.addWidget(aug_color_checkbox)
+        color_layout.addStretch()
+        aug_options_layout.addLayout(color_layout)
+        
+        # 色調整の詳細設定
+        color_details_layout = QGridLayout()
+        color_details_layout.setContentsMargins(20, 0, 0, 0)
+        
+        # 明るさ
+        color_details_layout.addWidget(QLabel("明るさ:"), 0, 0)
+        aug_brightness = QDoubleSpinBox()
+        aug_brightness.setRange(0.0, 1.0)
+        aug_brightness.setSingleStep(0.05)
+        aug_brightness.setValue(0.5)
+        color_details_layout.addWidget(aug_brightness, 0, 1)
+        
+        # コントラスト
+        color_details_layout.addWidget(QLabel("コントラスト:"), 1, 0)
+        aug_contrast = QDoubleSpinBox()
+        aug_contrast.setRange(0.0, 1.0)
+        aug_contrast.setSingleStep(0.05)
+        aug_contrast.setValue(0.5)
+        color_details_layout.addWidget(aug_contrast, 1, 1)
+        
+        # 彩度
+        color_details_layout.addWidget(QLabel("彩度:"), 2, 0)
+        aug_saturation = QDoubleSpinBox()
+        aug_saturation.setRange(0.0, 1.0)
+        aug_saturation.setSingleStep(0.05)
+        aug_saturation.setValue(0.5)
+        color_details_layout.addWidget(aug_saturation, 2, 1)
+        
+        aug_options_layout.addLayout(color_details_layout)
+        
+        # 幾何変換
+        geometry_layout = QHBoxLayout()
+        aug_geometry_checkbox = QCheckBox("幾何変換")
+        aug_geometry_checkbox.setChecked(False)
+        geometry_layout.addWidget(aug_geometry_checkbox)
+        geometry_layout.addStretch()
+        aug_options_layout.addLayout(geometry_layout)
+        
+        # 幾何変換の詳細設定
+        geometry_details_layout = QGridLayout()
+        geometry_details_layout.setContentsMargins(20, 0, 0, 0)
+        
+        # 回転角度
+        geometry_details_layout.addWidget(QLabel("回転角度 (±度):"), 0, 0)
+        aug_rotation = QSpinBox()
+        aug_rotation.setRange(0, 90)
+        aug_rotation.setValue(5)
+        geometry_details_layout.addWidget(aug_rotation, 0, 1)
+        
+        # 平行移動
+        geometry_details_layout.addWidget(QLabel("平行移動 (±比率):"), 1, 0)
+        aug_translate = QDoubleSpinBox()
+        aug_translate.setRange(0.0, 0.5)
+        aug_translate.setSingleStep(0.01)
+        aug_translate.setValue(0.1)
+        geometry_details_layout.addWidget(aug_translate, 1, 1)
+        
+        aug_options_layout.addLayout(geometry_details_layout)
+        
+        # ランダムイレース
+        erase_layout = QHBoxLayout()
+        aug_erase_checkbox = QCheckBox("ランダムイレース")
+        aug_erase_checkbox.setChecked(True)
+        aug_erase_proba_label = QLabel("確率:")
+        aug_erase_proba = QDoubleSpinBox()
+        aug_erase_proba.setRange(0.0, 1.0)
+        aug_erase_proba.setSingleStep(0.1)
+        aug_erase_proba.setValue(0.2)
+        erase_layout.addWidget(aug_erase_checkbox)
+        erase_layout.addWidget(aug_erase_proba_label)
+        erase_layout.addWidget(aug_erase_proba)
+        erase_layout.addStretch()
+        aug_options_layout.addLayout(erase_layout)
+        
+        # イレースの詳細設定
+        erase_details_layout = QHBoxLayout()
+        erase_details_layout.setContentsMargins(20, 0, 0, 0)
+        
+        # 最小比率
+        erase_details_layout.addWidget(QLabel("最小比率:"))
+        aug_erase_min_ratio = QDoubleSpinBox()
+        aug_erase_min_ratio.setRange(0.02, 0.4)
+        aug_erase_min_ratio.setSingleStep(0.01)
+        aug_erase_min_ratio.setValue(0.02)
+        erase_details_layout.addWidget(aug_erase_min_ratio)
+        
+        # スペーサーを追加して間隔を確保
+        erase_details_layout.addSpacing(10)
+        
+        # 最大比率
+        erase_details_layout.addWidget(QLabel("最大比率:"))
+        aug_erase_max_ratio = QDoubleSpinBox()
+        aug_erase_max_ratio.setRange(0.05, 0.5)
+        aug_erase_max_ratio.setSingleStep(0.01)
+        aug_erase_max_ratio.setValue(0.2)
+        erase_details_layout.addWidget(aug_erase_max_ratio)
+        
+        # レイアウトの右側に伸縮スペースを追加
+        erase_details_layout.addStretch()
+        
+        aug_options_layout.addLayout(erase_details_layout)
+        
+        # プレビューボタン
+        preview_layout = QHBoxLayout()
+        preview_button = QPushButton("オーグメンテーションプレビュー")
+        preview_button.clicked.connect(lambda: self.show_augmentation_preview_dialog({
+            'enabled': aug_enable_check.isChecked(),
+            'use_flip': aug_flip_checkbox.isChecked(),
+            'flip_prob': aug_flip_proba.value(),
+            'use_color': aug_color_checkbox.isChecked(),
+            'brightness': aug_brightness.value(),
+            'contrast': aug_contrast.value(),
+            'saturation': aug_saturation.value(),
+            'use_geometry': aug_geometry_checkbox.isChecked(),
+            'rotation_degrees': aug_rotation.value(),
+            'translate_ratio': aug_translate.value(),
+            'use_erase': aug_erase_checkbox.isChecked(),
+            'erase_prob': aug_erase_proba.value(),
+            'erase_min_ratio': aug_erase_min_ratio.value(),
+            'erase_max_ratio': aug_erase_max_ratio.value()
+        }))
+        preview_layout.addStretch()
+        preview_layout.addWidget(preview_button)
+        aug_options_layout.addLayout(preview_layout)
+        
+        # オプションの有効/無効を連動させる
+        def toggle_aug_options(checked):
+            for w in aug_scroll_content.findChildren(QWidget):
+                if w != aug_enable_check:
+                    w.setEnabled(checked)
+        
+        aug_enable_check.toggled.connect(toggle_aug_options)
+        
+        # スクロールエリアに設定
+        aug_scroll.setWidget(aug_scroll_content)
+        aug_layout.addWidget(aug_scroll)
+        
+        # タブに追加
+        tabs.addTab(aug_tab, "データオーグメンテーション")
+        
+        # タブをレイアウトに追加
+        settings_layout.addWidget(tabs)
+        
+        # ボタンの配置
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(training_settings.accept)
+        button_box.rejected.connect(training_settings.reject)
+        settings_layout.addWidget(button_box)
+        
+        # ダイアログを表示
+        if not training_settings.exec_():
+            return
+        
+        # 設定値の取得
+        num_epochs = epoch_spin.value()
+        use_early_stopping = early_stopping_check.isChecked()
+        patience = patience_spin.value() if use_early_stopping else 0
+        learning_rate = float(lr_combo.currentText())
+        
+        # データ選択設定の取得
+        use_all = data_radio_all.isChecked()
+        use_skip = data_radio_skip.isChecked()
+        use_range = data_radio_range.isChecked()
+
+        skip_count = custom_skip_spin.value() if use_skip else 1
+        range_start = range_start_spin.value() if use_range else 0
+        range_end = range_end_spin.value() if use_range else (len(self.images) - 1)
+
+        # オーグメンテーション設定の取得
+        augmentation_params = {
+            'enabled': aug_enable_check.isChecked(),
+            'use_flip': aug_flip_checkbox.isChecked(),
+            'flip_prob': aug_flip_proba.value(),
+            'use_color': aug_color_checkbox.isChecked(),
+            'brightness': aug_brightness.value(),
+            'contrast': aug_contrast.value(),
+            'saturation': aug_saturation.value(),
+            'use_geometry': aug_geometry_checkbox.isChecked(),
+            'rotation_degrees': aug_rotation.value(),
+            'translate_ratio': aug_translate.value(),
+            'use_erase': aug_erase_checkbox.isChecked(),
+            'erase_prob': aug_erase_proba.value(),
+            'erase_min_ratio': aug_erase_min_ratio.value(),
+            'erase_max_ratio': aug_erase_max_ratio.value()
+        }
+        
+        # モデルトレーニングの続きの確認
+        sampling_info = ""
+        if use_all:
+            total_annotations = len(self.annotations)
+            excluded_count = sum(1 for idx in self.annotations if idx in self.deleted_indexes)
+            used_count = total_annotations - excluded_count
+            sampling_info = f"データサンプリング: すべて使用 ({used_count}/{total_annotations}枚使用, 削除済み{excluded_count}枚を除外)"
+        elif use_skip:
+            total_annotations = len(self.annotations)
+            valid_indices = [idx for idx in self.annotations if idx not in self.deleted_indexes]
+            sampled_count = len([idx for idx in valid_indices if idx % skip_count == 0])
+            excluded_count = sum(1 for idx in self.annotations if idx in self.deleted_indexes)
+            sampling_info = f"データサンプリング: {skip_count}枚ごとに1枚 ({sampled_count}/{total_annotations}枚使用, 削除済み{excluded_count}枚を除外)"
+        elif use_range:
+            start = range_start
+            end = range_end
+            # インデックス範囲内のアノテーションをカウント（削除済みを除く）
+            in_range_count = sum(1 for idx in self.annotations if start <= idx <= end)
+            excluded_count = sum(1 for idx in self.annotations if start <= idx <= end and idx in self.deleted_indexes)
+            sample_count = in_range_count - excluded_count
+            total_count = len(self.annotations)
+            sampling_info = f"データサンプリング: インデックス範囲 {start}～{end} ({sample_count}/{total_count}枚使用, 削除済み{excluded_count}枚を除外)"
+
+        # オーグメンテーション情報を生成
+        aug_info = "データオーグメンテーション: "
+        if augmentation_params['enabled']:
+            aug_info += "有効\n"
+            if augmentation_params['use_flip']:
+                aug_info += f"・水平反転 (確率: {augmentation_params['flip_prob']})\n"
+            if augmentation_params['use_color']:
+                aug_info += f"・色調整 (明るさ: {augmentation_params['brightness']}, "
+                aug_info += f"コントラスト: {augmentation_params['contrast']}, "
+                aug_info += f"彩度: {augmentation_params['saturation']})\n"
+            if augmentation_params['use_geometry']:
+                aug_info += f"・幾何変換 (回転: ±{augmentation_params['rotation_degrees']}度, "
+                aug_info += f"平行移動: ±{augmentation_params['translate_ratio']})\n"
+            if augmentation_params['use_erase']:
+                aug_info += f"・ランダムイレース (確率: {augmentation_params['erase_prob']}, "
+                aug_info += f"範囲: {augmentation_params['erase_min_ratio']}～{augmentation_params['erase_max_ratio']})\n"
+        else:
+            aug_info += "無効\n"
+
+        reply = QMessageBox.question(
+            self, 
+            "モデル学習確認", 
+            f"選択されたモデル '{model_type}' を以下の設定で学習しますか？\n\n"
+            f"エポック数: {num_epochs}\n"
+            f"学習率: {learning_rate}\n"
+            f"{sampling_info}\n"
+            f"Early Stopping: {'有効（忍耐値: ' + str(patience) + '）' if use_early_stopping else '無効'}\n\n"
+            f"{aug_info}",
+            QMessageBox.Yes | QMessageBox.No, 
+            QMessageBox.Yes
+        )
+
+        if reply == QMessageBox.No:
+            return
+        
+        # 既存のモデル重みをロードするかの確認
+        load_weights = False
+        model_path = None
+        selected_model = self.model_combo.currentText()
+        
+        if selected_model and selected_model not in ["モデルが見つかりません", "フォルダを選択してください"] and "が見つかりません" not in selected_model:
+            # アノテーションフォルダ内のモデルのフルパスを作成
+            annotation_folder = os.path.join(self.folder_path, ANNOTATION_DIR_NAME)
+            # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+            model_path = os.path.join(models_dir, selected_model)
+            
+            # モデルが存在するか確認
+            if os.path.exists(model_path):
+                weights_reply = QMessageBox.question(
+                    self, 
+                    "モデル重みの読み込み", 
+                    f"現在選択されているモデル '{selected_model}' の重みを使って学習を始めますか？\n\n"
+                    f"「はい」: 選択したモデルの重みからファインチューニングします。\n"
+                    f"「いいえ」: 新しくモデルをトレーニングします。",
+                    QMessageBox.Yes | QMessageBox.No, 
+                    QMessageBox.Yes
+                )
+                
+                load_weights = (weights_reply == QMessageBox.Yes)
+        
+        try:
+            # 学習データの準備（データ選択設定を適用）
+            image_paths = []
+            for idx in self.annotations.keys():
+                # 削除済みインデックスをスキップ
+                if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
+                    continue
+
+                if isinstance(idx, int) and 0 <= idx < len(self.images):
+                    # データ選択条件に基づいてフィルタリング
+                    if use_all:
+                        # 全データ使用
+                        image_paths.append(self.images[idx])
+                    elif use_skip:
+                        # スキップ設定による間引き
+                        if idx % skip_count == 0:
+                            image_paths.append(self.images[idx])
+                    elif use_range:
+                        # インデックス範囲フィルタリング
+                        if range_start <= idx <= range_end:
+                            image_paths.append(self.images[idx]) 
+                                            
+            if not image_paths:
+                QMessageBox.warning(self, "警告", "学習データがありません。")
+                return
+            
+            # 対応するアノテーション値を取得
+            annotation_values = []
+            for img_path in image_paths:
+                # パスからインデックスを逆引き
+                idx = self.images.index(img_path)
+                if idx in self.annotations:
+            
+                    annotation_values.append(self.annotations[idx])
+
+            # データ数の確認と最小バッチサイズの調整
+            batch_size = min(32, len(image_paths))  # バッチサイズを調整
+            if batch_size < 2:
+                QMessageBox.warning(self, "警告", "データ数が不足しています。最低2枚の画像が必要です。")
+                return
+                        
+            # 進捗ダイアログ
+            progress = QProgressDialog(
+                f"モデル '{model_type}' の学習中...", 
+                "キャンセル", 0, 100, self
+            )
+            progress.setWindowTitle("モデル学習")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+            
+            # 進捗コールバック
+            def update_progress(current, total, message=None):
+                value = int(current * 100 / total)
+                progress.setValue(value)
+                if message:
+                    progress.setLabelText(message)
+                QApplication.processEvents()
+                return not progress.wasCanceled()
+                        
+            # データセットの作成（バッチサイズと詳細オーグメンテーション設定を明示的に指定）
+            train_loader, val_loader, dataset_info = create_datasets(
+                image_paths=image_paths,
+                annotations=annotation_values,
+                model_name=model_type,
+                use_augmentation=augmentation_params if augmentation_params['enabled'] else False,
+                batch_size=batch_size  # バッチサイズを追加
+            )
+
+            # 最初の画像から実際のサイズを取得
+            sample_img_path = image_paths[0]
+            sample_img = Image.open(sample_img_path)
+            input_size = (sample_img.height, sample_img.width)  # 高さ、幅の順
+
+            progress.setLabelText(f"入力サイズ: {input_size} で学習準備中...")
+            progress.setValue(10)
+            QApplication.processEvents()
+
+            # モデルの学習 - 事前学習済み重みをロードするかどうかのフラグを追加
+            training_results = train_model(
+                model_name=model_type,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                save_dir=models_dir,
+                progress_callback=update_progress,
+                pretrained=not load_weights,  # 既存モデルを使う場合はTrueにしない
+                model_path=model_path if load_weights else None,  # ロードする場合はパスを指定
+                num_epochs=num_epochs,  # 指定されたエポック数
+                learning_rate=learning_rate,  # 指定された学習率
+                use_early_stopping=use_early_stopping,  # Early Stoppingの有効/無効
+                patience=patience  # 忍耐値
+            )
+            
+            progress.close()
+
+            # MLflowに結果を記録 - 統合版
+            mlflow_info = self._log_autonomous_driving_training(
+                model_type=model_type,
+                training_results=training_results,
+                training_params={
+                    "num_epochs": num_epochs,
+                    "completed_epochs": training_results.get('completed_epochs', num_epochs),
+                    "learning_rate": learning_rate,
+                    "batch_size": batch_size,
+                    "use_early_stopping": use_early_stopping,
+                    "patience": patience if use_early_stopping else 0,
+                    "early_stopped": training_results.get('early_stopped', False),
+                    "initial_weights": "fine-tuned" if load_weights else "pretrained",
+                    "augmentation_enabled": augmentation_params['enabled'],
+                    "sampling_strategy": self._get_sampling_strategy_name(use_all, use_skip, use_range, skip_count),
+                    "augmentation_params": augmentation_params
+                },
+                dataset_info={
+                    "total_annotations": len(self.annotations),
+                    "used_samples": len(image_paths),
+                    "train_samples": len(train_loader.dataset),
+                    "val_samples": len(val_loader.dataset),
+                    "input_shape": input_size,
+                    "deleted_samples": len(getattr(self, 'deleted_indexes', []))
+                },
+                image_paths=image_paths
+            )
+            
+            # 成功メッセージを表示
+            self._show_training_success_message(
+                model_type=model_type,
+                training_results=training_results,
+                training_params={
+                    "num_epochs": num_epochs,
+                    "learning_rate": learning_rate,
+                    "batch_size": batch_size,
+                    "use_early_stopping": use_early_stopping,
+                    "patience": patience,
+                    "load_weights": load_weights,
+                    "selected_model": selected_model if load_weights else None
+                },
+                dataset_info={
+                    "image_paths_count": len(image_paths),
+                    "input_size": input_size,
+                    "sampling_info": self._get_sampling_info(use_all, use_skip, use_range, skip_count, range_start, range_end)
+                },
+                augmentation_params=augmentation_params,
+                mlflow_info=mlflow_info
+            )
+            
+            # モデルリストを更新
+            self.refresh_model_list()
+            
+        except Exception as e:
+            if 'progress' in locals():
+                progress.close()
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"モデル学習中にエラーが発生しました: {str(e)}"
+            )
+
+    def _log_autonomous_driving_training(self, model_type, training_results, training_params, dataset_info, image_paths):
+        """自動運転モデルの学習結果をMLflowに記録"""
+        
+        try:
+            # MLflowManagerが初期化されていない場合は初期化
+            if not hasattr(self, 'mlflow_manager'):
+                self.mlflow_manager = MLflowManager(self.folder_path)
+            
+            # メトリクスを準備
+            metrics = {
+                "best_val_loss": training_results.get('best_val_loss', 0.0),
+                "final_train_loss": training_results['train_losses'][-1] if 'train_losses' in training_results else 0.0,
+                "final_val_loss": training_results['val_losses'][-1] if 'val_losses' in training_results else 0.0,
+                "train_losses": training_results.get('train_losses', []),
+                "val_losses": training_results.get('val_losses', []),
+                "status": "early_stopped" if training_results.get('early_stopped', False) else "completed"
+            }
+            
+            # 自動運転特有のメトリクスを追加（可能であれば）
+            if 'steering_accuracy' in training_results:
+                metrics["steering_accuracy"] = training_results['steering_accuracy']
+            if 'throttle_accuracy' in training_results:
+                metrics["throttle_accuracy"] = training_results['throttle_accuracy']
+            if 'steering_mae' in training_results:
+                metrics["steering_mae"] = training_results['steering_mae']
+            if 'throttle_mae' in training_results:
+                metrics["throttle_mae"] = training_results['throttle_mae']
+            
+            # MLflowに記録
+            success = self.mlflow_manager.log_autonomous_driving_model(
+                model_path=training_results['best_model_path'],
+                training_params=training_params,
+                metrics=metrics,
+                dataset_info=dataset_info
+            )
+            
+            if success:
+                return "MLflowに学習履歴を記録しました。\n「MLflow比較」ボタンで結果を確認できます。"
+            else:
+                return "MLflowへの記録中にエラーが発生しました。"
+                
+        except ImportError:
+            return "MLflowがインストールされていないため、学習履歴は記録されませんでした。\npip install mlflow でインストールできます。"
+        except Exception as e:
+            print(f"MLflow記録エラー: {e}")
+            return f"MLflowへの記録中にエラーが発生しました: {str(e)}"
+
+    def _get_sampling_strategy_name(self, use_all, use_skip, use_range, skip_count):
+        """サンプリング戦略の名前を取得"""
+        if use_all:
+            return "all"
+        elif use_skip:
+            return f"skip_{skip_count}"
+        elif use_range:
+            return "range"
+        return "unknown"
+
+    def _get_sampling_info(self, use_all, use_skip, use_range, skip_count, range_start, range_end):
+        """サンプリング情報の文字列を取得"""
+        if use_all:
+            total_annotations = len(self.annotations)
+            excluded_count = sum(1 for idx in self.annotations if idx in getattr(self, 'deleted_indexes', []))
+            used_count = total_annotations - excluded_count
+            return f"すべて使用 ({used_count}/{total_annotations}枚使用, 削除済み{excluded_count}枚を除外)"
+        elif use_skip:
+            total_annotations = len(self.annotations)
+            valid_indices = [idx for idx in self.annotations if idx not in getattr(self, 'deleted_indexes', [])]
+            sampled_count = len([idx for idx in valid_indices if idx % skip_count == 0])
+            excluded_count = sum(1 for idx in self.annotations if idx in getattr(self, 'deleted_indexes', []))
+            return f"{skip_count}枚ごとに1枚 ({sampled_count}/{total_annotations}枚使用, 削除済み{excluded_count}枚を除外)"
+        elif use_range:
+            in_range_count = sum(1 for idx in self.annotations if range_start <= idx <= range_end)
+            excluded_count = sum(1 for idx in self.annotations if range_start <= idx <= range_end and idx in getattr(self, 'deleted_indexes', []))
+            sample_count = in_range_count - excluded_count
+            total_count = len(self.annotations)
+            return f"インデックス範囲 {range_start}～{range_end} ({sample_count}/{total_count}枚使用, 削除済み{excluded_count}枚を除外)"
+        return "不明"
+
+    def _show_training_success_message(self, model_type, training_results, training_params, dataset_info, augmentation_params, mlflow_info):
+        """学習成功メッセージを表示"""
+        
+        # オーグメンテーション情報を生成
+        aug_details = ""
+        if augmentation_params['enabled']:
+            aug_details = "データオーグメンテーション: 有効\n"
+            if augmentation_params['use_flip']:
+                aug_details += f"  - 水平反転 (確率: {augmentation_params['flip_prob']})\n"
+            if augmentation_params['use_color']:
+                aug_details += f"  - 色調整 (明るさ: ±{augmentation_params['brightness']}, "
+                aug_details += f"コントラスト: ±{augmentation_params['contrast']}, "
+                aug_details += f"彩度: ±{augmentation_params['saturation']})\n"
+            if augmentation_params['use_geometry']:
+                aug_details += f"  - 幾何変換 (回転: ±{augmentation_params['rotation_degrees']}度, "
+                aug_details += f"平行移動: ±{augmentation_params['translate_ratio']})\n"
+            if augmentation_params['use_erase']:
+                aug_details += f"  - ランダムイレース (確率: {augmentation_params['erase_prob']}, "
+                aug_details += f"範囲: {augmentation_params['erase_min_ratio']}～{augmentation_params['erase_max_ratio']})\n"
+        else:
+            aug_details = "データオーグメンテーション: 無効\n"
+        
+        # 初期重みの情報
+        weights_info = ""
+        if training_params['load_weights']:
+            weights_info = f"初期重み: {training_params['selected_model']} から読み込み\n"
+        else:
+            weights_info = "初期重み: 事前学習済みモデル\n"
+        
+        # Early Stopping情報
+        early_stopping_info = ""
+        if training_params['use_early_stopping']:
+            if training_results.get('early_stopped', False):
+                early_stopping_info = f"Early Stopping: {training_results.get('stopped_epoch', 0)}エポックで停止\n"
+            else:
+                early_stopping_info = f"Early Stopping: 発動せず (忍耐値: {training_params['patience']})\n"
+        
+        # 入力サイズ情報
+        input_size = dataset_info['input_size']
+        input_size_info = f"入力サイズ: {input_size[0]}x{input_size[1]} (H x W)\n"
+        
+        # 成功メッセージを表示
+        QMessageBox.information(
+            self, 
+            "学習完了", 
+            f"{model_type} モデルを学習し保存しました: {os.path.basename(training_results['model_path'])}\n" +
+            f"最良検証損失: {training_results['best_val_loss']:.6f}\n" +
+            f"実施エポック数: {training_results.get('completed_epochs', training_params['num_epochs'])}/{training_params['num_epochs']}\n" +
+            early_stopping_info +
+            f"学習データ数: {dataset_info['image_paths_count']}枚 {dataset_info['sampling_info']}\n" +
+            input_size_info + 
+            weights_info +
+            f"学習率: {training_params['learning_rate']}\n" +
+            f"バッチサイズ: {training_params['batch_size']}\n" +
+            aug_details +
+            f"\n{mlflow_info}"
+        )
+
+    ###
+
+    #TODO:annotationsのpathからindexへ変更
+    def auto_annotate(self):
+        """オートアノテーションを実行する - 詳細な進捗表示付き"""
+        if not self.annotations:
+            QMessageBox.warning(self, "警告", "オートアノテーションを実行するには、まず数枚の画像に手動でアノテーションを行ってください。")
+            return
+        
+        # アノテーションされていない画像を取得
+        unannotated_images = [img for img in self.images if img not in self.annotations]
+        
+        if not unannotated_images:
+            QMessageBox.information(self, "情報", "すべての画像がすでにアノテーションされています。")
+            return
+        
+        # 選択された学習方法（モデル）を取得
+        model_type = self.auto_method_combo.currentText()
+        selected_model = self.model_combo.currentText()
+        
+        # モデルのパスを取得
+        model_path = None
+        if hasattr(self, 'model_combo') and selected_model not in ["モデルが見つかりません", "フォルダを選択してください"] and "が見つかりません" not in selected_model:
+            # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+            model_path = os.path.join(models_dir, selected_model)
+            
+            # モデルが存在するか確認
+            if not os.path.exists(model_path):
+                model_path = None
+        
+        # 進捗ダイアログを表示
+        progress = QProgressDialog(
+            f"オートアノテーション準備中... ({len(unannotated_images)}枚の画像)", 
+            "キャンセル", 0, 100, self
+        )
+        progress.setWindowTitle("オートアノテーション実行中")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)  # すぐに表示
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+        
+        # 処理前の確認
+        progress.setLabelText(f"モデル '{model_type}' を使用した処理を準備中...")
+        progress.setValue(5)
+        QApplication.processEvents()
+        
+        # バッチサイズ - 大量の画像を一度に処理するとメモリ不足になる可能性があるため
+        batch_size = 50
+        total_batches = (len(unannotated_images) + batch_size - 1) // batch_size
+        
+        try:
+            # モデル初期化
+            progress.setLabelText(f"モデル '{model_type}' を初期化中...")
+            progress.setValue(10)
+            QApplication.processEvents()
+            
+            # 既存モデルの読み込み
+            device_type = "GPU" if torch.cuda.is_available() else "CPU"
+            
+            if model_path:
+                progress.setLabelText(f"モデル '{os.path.basename(model_path)}' を読み込み中...")
+            else:
+                progress.setLabelText(f"事前学習済みモデル '{model_type}' を準備中...")
+            
+            progress.setValue(15)
+            QApplication.processEvents()
+            
+            # バッチ処理での進捗管理
+            processed_count = 0
+            success_count = 0
+            
+            # 実行中のモデル情報を保存
+            self._last_model_info = (model_type, model_path)
+            
+            # バッチ処理
+            for batch_idx in range(total_batches):
+                if progress.wasCanceled():
+                    break
+                    
+                # 現在のバッチの画像取得
+                start_idx = batch_idx * batch_size
+                end_idx = min((batch_idx + 1) * batch_size, len(unannotated_images))
+                current_batch = unannotated_images[start_idx:end_idx]
+                
+                progress.setLabelText(
+                    f"バッチ {batch_idx+1}/{total_batches} 処理中...\n"
+                    f"画像 {start_idx+1}-{end_idx}/{len(unannotated_images)}"
+                )
+                
+                # 進捗値計算 - バッチ処理に80%の進捗を割り当て (15-95%)
+                batch_progress = 15 + int((batch_idx / total_batches) * 80)
+                progress.setValue(batch_progress)
+                QApplication.processEvents()
+                
+                # 推論を実行
+                try:
+                    inference_results = batch_inference(
+                        current_batch, 
+                        method="model", 
+                        model_type=model_type,
+                        model_path=model_path,
+                        force_reload=(batch_idx == 0)  # 最初のバッチのみ強制再読込
+                    )
+                    
+                    # サブ進捗表示
+                    batch_size = len(current_batch)
+                    for i, (img_path, result) in enumerate(inference_results.items()):
+                        if progress.wasCanceled():
+                            break
+                            
+                        # 10画像ごとに進捗更新
+                        if i % 10 == 0 or i == batch_size - 1:
+                            sub_progress = batch_progress + int((i / batch_size) * (80 / total_batches))
+                            progress.setValue(min(95, sub_progress))
+                            progress.setLabelText(
+                                f"バッチ {batch_idx+1}/{total_batches} 処理中...\n"
+                                f"画像 {start_idx+i+1}/{len(unannotated_images)} を処理中"
+                            )
+                            QApplication.processEvents()
+                        
+                        # アノテーションを保存
+                        self.annotations[img_path] = {
+                            "angle": result.get("angle", 0),
+                            "throttle": result.get("throttle", 0),
+                            "x": result.get("x", 0),
+                            "y": result.get("y", 0)
+                        }
+
+                        # 位置情報があれば追加
+                        if "loc" in result or "pilot/loc" in result:
+                            loc_value = result.get("pilot/loc", result.get("loc", 0))
+                            self.annotations[self.current_index]["loc"] = loc_value
+                            self.location_annotations[img_path] = loc_value
+                            
+                            # 位置情報ボタンがまだなimg_pathければ追加
+                            self.ensure_location_button_exists(loc_value)
+
+                        # タイムスタンプを記録
+                        self.annotation_timestamps[img_path] = int(time.time() * 1000)
+                        
+                        # 推論結果も保存
+                        self.inference_results[img_path] = result
+                        
+                        # カウント更新
+                        processed_count += 1
+                        success_count += 1
+                    
+                except Exception as e:
+                    print(f"バッチ {batch_idx+1} 処理中にエラー: {e}")
+                    # エラーがあっても次のバッチを処理する
+                    processed_count += len(current_batch)
+            
+            # 最終処理
+            if not progress.wasCanceled():
+                # アノテーションカウントを更新
+                self.annotated_count = len(self.annotations)
+                
+                # 位置ボタンのカウント表示を更新
+                progress.setLabelText("位置情報ボタンを更新中...")
+                progress.setValue(96)
+                QApplication.processEvents()
+                self.update_location_button_counts()
+                
+                # UI更新
+                progress.setLabelText("UI表示を更新中...")
+                progress.setValue(98)
+                QApplication.processEvents()
+                self.display_current_image()
+                self.update_gallery()
+                self.update_distribution_graph()
+
+                # 分布グラフを更新
+                progress.setLabelText("分布グラフを更新中...")
+                progress.setValue(99)
+                QApplication.processEvents()
+                self.update_distribution_graph()
+
+                # 完了表示
+                progress.setLabelText(f"完了: {success_count}枚の画像にオートアノテーションを適用しました")
+                progress.setValue(100)
+                QApplication.processEvents()
+            
+            # 処理完了
+            progress.close()
+            
+            if not progress.wasCanceled():
+                QMessageBox.information(
+                    self, 
+                    "完了", 
+                    f"{success_count}枚の画像にオートアノテーションを適用しました。\n"
+                    f"使用モデル: {model_type}" + 
+                    (f" ({os.path.basename(model_path)})" if model_path else " (事前学習済み)")
+                )
+            else:
+                QMessageBox.information(
+                    self, 
+                    "キャンセル", 
+                    f"オートアノテーションがキャンセルされました。\n"
+                    f"{success_count}枚の画像が処理されました。"
+                )
+                
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"オートアノテーション中にエラーが発生しました: {str(e)}"
+            )
+
+    def show_augmentation_preview_dialog(self, aug_params):        
+        if not self.images:
+            QMessageBox.warning(self, "警告", "プレビュー対象の画像がありません。")
+            return
+        
+        # オーグメンテーションが無効の場合
+        if not aug_params['enabled']:
+            QMessageBox.information(self, "情報", "データオーグメンテーションが無効になっています。")
+            return
+        
+        # 現在表示中の画像を取得
+        current_img_path = self.images[self.current_index]
+        
+        try:
+            # モジュールのインポートをここで行う
+            print("model_training モジュールをインポート中...")
+            
+            print(f"現在の画像パス: {current_img_path}")
+            
+            # オーグメンテーションサンプルを生成
+            print("サンプル生成開始...")
+            samples = generate_augmentation_samples(
+                current_img_path,
+                num_samples=5,  # オリジナル含め5枚表示
+                use_flip=aug_params['use_flip'],
+                flip_prob=aug_params['flip_prob'],
+                use_color=aug_params['use_color'],
+                brightness=aug_params['brightness'],
+                contrast=aug_params['contrast'],
+                saturation=aug_params['saturation'],
+                use_geometry=aug_params['use_geometry'],
+                rotation_degrees=aug_params['rotation_degrees'],
+                translate_ratio=aug_params['translate_ratio'],
+                use_erase=aug_params['use_erase'],
+                erase_prob=aug_params['erase_prob'],
+                erase_min_ratio=aug_params['erase_min_ratio'],
+                erase_max_ratio=aug_params['erase_max_ratio']
+            )
+            print(f"サンプル生成完了: {len(samples)}枚")
+            
+            # プレビューダイアログを作成
+            preview_dialog = QDialog(self)
+            preview_dialog.setWindowTitle("オーグメンテーションプレビュー")
+            preview_dialog.setMinimumWidth(800)
+            preview_dialog.setMinimumHeight(500)
+            
+            preview_layout = QVBoxLayout(preview_dialog)
+            
+            # タイトルラベル
+            title_label = QLabel("オーグメンテーションプレビュー")
+            title_label.setStyleSheet("font-size: 16px; font-weight: bold;")
+            title_label.setAlignment(Qt.AlignCenter)
+            preview_layout.addWidget(title_label)
+            
+            # 適用中の設定を表示
+            settings_text = "適用中の設定:\n"
+            if aug_params['use_flip']:
+                settings_text += f"・水平反転 (確率: {aug_params['flip_prob']})\n"
+            if aug_params['use_color']:
+                settings_text += f"・色調整 (明るさ: ±{aug_params['brightness']}, "
+                settings_text += f"コントラスト: ±{aug_params['contrast']}, "
+                settings_text += f"彩度: ±{aug_params['saturation']})\n"
+            if aug_params['use_geometry']:
+                settings_text += f"・幾何変換 (回転: ±{aug_params['rotation_degrees']}度, "
+                settings_text += f"平行移動: ±{aug_params['translate_ratio']})\n"
+            if aug_params['use_erase']:
+                settings_text += f"・ランダムイレース (確率: {aug_params['erase_prob']}, "
+                settings_text += f"範囲: {aug_params['erase_min_ratio']}～{aug_params['erase_max_ratio']})\n"
+                
+            settings_label = QLabel(settings_text)
+            settings_label.setStyleSheet("font-size: 12px;")
+            preview_layout.addWidget(settings_label)
+            
+            # 画像表示用のグリッドレイアウト
+            images_widget = QWidget()
+            images_layout = QGridLayout(images_widget)
+            images_layout.setContentsMargins(10, 10, 10, 10)
+            images_layout.setSpacing(10)
+            
+            # 画像を配置（最初はオリジナル）
+            original_img = samples[0]
+            original_label = QLabel()
+            original_pixmap = QPixmap.fromImage(pil_to_qimage(original_img))
+            original_label.setPixmap(original_pixmap.scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            original_label.setAlignment(Qt.AlignCenter)
+            
+            label_text = QLabel("オリジナル画像")
+            label_text.setAlignment(Qt.AlignCenter)
+            
+            # オリジナルを配置
+            images_layout.addWidget(original_label, 0, 0)
+            images_layout.addWidget(label_text, 1, 0)
+            
+            # オーグメンテーションサンプルを配置
+            for i, sample in enumerate(samples[1:], 1):
+                img, description = sample
+                sample_label = QLabel()
+                sample_pixmap = QPixmap.fromImage(pil_to_qimage(img))
+                sample_label.setPixmap(sample_pixmap.scaled(300, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                sample_label.setAlignment(Qt.AlignCenter)
+                
+                # 説明ラベル（適用された変換）
+                desc_label = QLabel(description)
+                desc_label.setAlignment(Qt.AlignCenter)
+                desc_label.setWordWrap(True)
+                
+                col = i % 2
+                row = (i // 2) * 2
+                
+                images_layout.addWidget(sample_label, row, col)
+                images_layout.addWidget(desc_label, row + 1, col)
+            
+            # スクロールエリアに配置
+            scroll_area = QScrollArea()
+            scroll_area.setWidgetResizable(True)
+            scroll_area.setWidget(images_widget)
+            preview_layout.addWidget(scroll_area)
+            
+            # 閉じるボタン
+            close_button = QPushButton("閉じる")
+            close_button.clicked.connect(preview_dialog.accept)
+            preview_layout.addWidget(close_button)
+            
+            # ダイアログを表示
+            preview_dialog.exec_()
+        
+        except Exception as e:
+            print(f"プレビュー生成中にエラー: {str(e)}")
+            traceback.print_exc()  # スタックトレースを出力
+            QMessageBox.critical(self, "エラー", f"プレビュー生成中にエラーが発生しました: {str(e)}")
+
+    def update_detection_info_panel(self):
+        """物体検知推論結果の情報パネルを更新する"""
+        if not self.images:
+            return
+            
+        current_img_path = self.images[self.current_index]
+        
+        if hasattr(self, 'detection_inference_checkbox') and self.detection_inference_checkbox.isChecked():
+            if current_img_path in self.detection_inference_results:
+                # クラスごとのカウント辞書を作成
+                class_counts = {}
+                inference_bboxes = self.detection_inference_results[current_img_path]
+                
+                for bbox in inference_bboxes:
+                    class_name = bbox.get('class', 'unknown')
+                    class_counts[class_name] = class_counts.get(class_name, 0) + 1
+                
+                # 情報テキストを構築
+                inference_text = "<b>物体検知推論結果:</b><br>"
+                inference_text += "検出オブジェクト:<br>"
+                
+                for class_name, count in class_counts.items():
+                    # クラスに応じた色を設定
+                    class_colors = DETECTION_INFERENCE_TEXT_COLORS
+                    color = class_colors.get(class_name, "#FF0000")
+                    
+                    inference_text += f"<span style='color: {color}; font-weight: bold;'>● {class_name}</span>: {count}個<br>"
+                
+                inference_text += f"合計: {len(inference_bboxes)}個のオブジェクト<br>"
+                
+                # テキストをラベルに直接設定
+                if hasattr(self, 'detection_inference_info_label'):
+                    self.detection_inference_info_label.setText(inference_text)
+                    self.detection_inference_info_label.setTextFormat(Qt.RichText)
+                    # 更新を強制
+                    self.detection_inference_info_label.repaint()
+                
+                return True
+                
+            elif hasattr(self, 'run_single_yolo_inference') and hasattr(self, 'yolo_model'):
+                # 推論結果がない場合は実行
+                return self.run_single_yolo_inference()
+        else:
+            # 表示がオフの場合はラベルをクリア
+            if hasattr(self, 'detection_inference_info_label'):
+                self.detection_inference_info_label.setText("")
+        
+        return False
+
+
+    ### 位置モデル関連
+    def init_location_buttons(self):
+        """初期位置情報ボタンを設定する"""
+        # 位置ボタン数
+        num_buttons = 8
+        
+        # 既存のボタンをクリア
+        for button in self.location_buttons:
+            if button.parent():
+                button.setParent(None)
+        self.location_buttons.clear()
+        
+        # 8つの位置情報ボタンを作成
+        for i in range(num_buttons):
+            button = QPushButton(f"0 | 位置 {i}")  # カウント0で初期化
+            button.setProperty("location_value", i)
+            button.setCheckable(True)  # チェック可能に設定
+            button.clicked.connect(lambda checked, value=i: self.set_location(value))
+            
+            # 対応する色を取得
+            color = get_location_color(i)
+            
+            # ボタンのスタイルを設定
+            button.setStyleSheet(f"""
+                QPushButton {{
+                    padding: 8px;
+                    border: 1px solid #cccccc;
+                    border-radius: 4px;
+                    background-color: #f0f0f0;
+                    color: #888888;
+                }}
+                QPushButton:checked {{
+                    background-color: {color.name()};
+                    color: white;
+                    font-weight: bold;
+                }}
+            """)
+            
+            # レイアウトに追加
+            self.location_buttons_layout.addWidget(button)
+            self.location_buttons.append(button)
+
+    def add_location_model_section(self):
+        """位置推論モデルのセクションを追加する"""
+        # 位置モデルマネージャーの初期化
+        self.location_model_manager = LocationModelManager(APP_DIR_PATH, MODELS_DIR_NAME)
+
+        # YOLOモデル領域の上に位置推論モデルセクションを配置するため、
+        # オリジナルのレイアウトを取得
+        left_layout = self.findChild(QVBoxLayout, "left_layout")
+        if not left_layout:
+            # レイアウトが見つからない場合、centralWidgetを取得して探す
+            left_layout = self.centralWidget().layout().itemAt(0).widget().layout()
+        
+        object_detection_index = left_layout.count()
+        
+        # 位置推論モデルコンテナを作成
+        self.location_model_container = QWidget()
+        location_model_layout = QVBoxLayout(self.location_model_container)
+        
+        # ヘッダータイトル
+        location_model_label = QLabel("位置推論モデル:")
+        location_model_label.setStyleSheet("font-weight: bold")
+        location_model_layout.addWidget(location_model_label)
+        
+        # モデル選択
+        model_type_layout = QHBoxLayout()
+        model_type_layout.addWidget(QLabel("モデルタイプ:"))
+        self.location_model_combo = QComboBox()
+        self.location_model_combo.addItems(["donkey_location", "resnet18_location"])
+        # イベントハンドラを接続（追加）
+        self.location_model_combo.currentIndexChanged.connect(self.on_location_model_type_changed)
+        model_type_layout.addWidget(self.location_model_combo)
+        location_model_layout.addLayout(model_type_layout)
+        
+        # 事前学習済みモデル選択
+        self.location_saved_model_combo = QComboBox()
+        self.location_saved_model_combo.setMinimumWidth(180)
+        self.location_saved_model_combo.setStyleSheet("combobox-popup: 0;")
+        location_model_layout.addWidget(self.location_saved_model_combo)
+        
+        # モデル操作ボタン
+        location_model_buttons_layout = QHBoxLayout()
+        
+        # 位置モデル学習ボタン
+        train_location_button = QPushButton("モデル学習・保存")
+        train_location_button.clicked.connect(self.train_and_save_location_model)
+        apply_style(train_location_button, 'training')
+        location_model_buttons_layout.addWidget(train_location_button)
+
+        # モデル読み込みボタン
+        self.location_load_button = QPushButton("モデル読込")
+        self.location_load_button.setToolTip("modelsフォルダのモデルを読込む")
+        self.location_load_button.clicked.connect(self.load_location_model)
+        apply_style(self.location_load_button, 'model')
+        location_model_buttons_layout.addWidget(self.location_load_button)
+        
+        location_model_layout.addLayout(location_model_buttons_layout)
+                
+        # 位置推論表示チェックボックス
+        location_inference_layout = QHBoxLayout()
+        self.location_inference_checkbox = QCheckBox("位置推論結果表示")
+        self.location_inference_checkbox.setChecked(False)
+        self.location_inference_checkbox.stateChanged.connect(self.toggle_location_inference_display)
+        location_inference_layout.addWidget(self.location_inference_checkbox)
+        location_model_layout.addLayout(location_inference_layout)
+        
+        # YOLOコンテナの前に位置モデルコンテナを挿入
+        left_layout.insertWidget(object_detection_index, self.location_model_container)
+        
+        # 推論結果格納用の辞書を初期化
+        self.location_inference_results = {}
+        
+        # モデルリストの取得は新しいマネージャーを使用
+        self.refresh_location_model_list()
+        
+        # 推論結果格納用の辞書を初期化
+        self.location_inference_results = {}
+
+    def refresh_location_model_list(self):
+        """保存されている位置モデルのリストを更新 - 選択したタイプでフィルタリング"""
+        self.location_saved_model_combo.clear()
+        
+        # 更新開始のメッセージを表示
+        self.statusBar().showMessage("位置モデルリストを更新中...")
+        
+        # 現在選択されているモデルタイプを取得
+        selected_model_type = self.location_model_combo.currentText()
+        
+        # モデルマネージャーからモデルリストを取得 - タイプ指定
+        model_files = self.location_model_manager.get_model_list(model_type=selected_model_type)
+        
+        if not model_files:
+            # フィルタリングした結果がなければ、その旨を表示
+            self.location_saved_model_combo.addItem(f"{selected_model_type}の位置モデルが見つかりません")
+            self.statusBar().showMessage(f"{selected_model_type}の位置モデルが見つかりません。モデルを学習してください", 3000)
+            return
+        
+        # コンボボックスに追加
+        for model_file in model_files:
+            self.location_saved_model_combo.addItem(model_file)
+        
+        # 更新完了メッセージ
+        self.statusBar().showMessage(f"{len(model_files)}個の{selected_model_type}位置モデルを読み込みました", 3000)
+
+    def load_location_model(self):
+        """選択された位置モデルを読み込む"""
+        if not self.images:
+            QMessageBox.warning(self, "警告", "画像が読み込まれていません。")
+            return
+        
+        # モデル情報を取得
+        model_type = self.location_model_combo.currentText()
+        selected_model = self.location_saved_model_combo.currentText()
+        
+        if selected_model == "位置モデルが見つかりません" or selected_model == "フォルダを選択してください":
+            QMessageBox.warning(self, "警告", "有効な位置モデルが選択されていません。")
+            return
+        
+        # モデルのパスを取得
+        model_path = os.path.join(models_dir, selected_model)
+        
+        # モデルが存在するか確認
+        if not os.path.exists(model_path):
+            QMessageBox.warning(self, "警告", f"選択されたモデルが見つかりません: {selected_model}")
+            return
+        
+        # 進捗ダイアログを表示
+        progress = QProgressDialog(
+            f"位置モデル '{model_type} ({selected_model})' を読み込み中...", 
+            "キャンセル", 0, 100, self
+        )
+        progress.setWindowTitle("モデル読み込み")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+        
+        # 進捗コールバック関数
+        def update_progress(value, message=None):
+            if message:
+                progress.setLabelText(message)
+            progress.setValue(value)
+            QApplication.processEvents()
+            return not progress.wasCanceled()
+        
+        try:
+            # マネージャーを使用してモデルをロード
+            success, result = self.location_model_manager.load_model(
+                model_type, model_path, update_progress
+            )
+            
+            if not success:
+                progress.close()
+                QMessageBox.critical(
+                    self, 
+                    "エラー", 
+                    f"位置モデルの読み込み中にエラーが発生しました: {result}"
+                )
+                return
+            
+            num_classes = result
+            
+            update_progress(80, "初期推論を実行中...")
+            
+            # 現在の画像に対して推論を実行
+            self.run_location_inference()
+            
+            update_progress(90, "推論表示を更新中...")
+            
+            # 推論表示チェックボックスを自動的にオンにする
+            self.location_inference_checkbox.setChecked(True)
+            
+            update_progress(100)
+            progress.close()
+            
+            # 成功メッセージ
+            self.statusBar().showMessage(f"位置モデル '{model_type} ({selected_model})' を読み込みました (クラス数: {num_classes})", 5000)
+            
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"位置モデルの読み込み中にエラーが発生しました: {str(e)}"
+            )
+    
+    def on_location_model_type_changed(self, index):
+        """位置モデルタイプが変更されたときの処理"""
+        # 現在選択されているモデルタイプを取得
+        selected_model_type = self.location_model_combo.currentText()
+        self.statusBar().showMessage(f"位置モデルタイプを「{selected_model_type}」に変更しました。モデルリストを更新します...")
+        
+        # モデルリストを更新
+        self.refresh_location_model_list()
+
+    def run_location_inference(self):
+        """現在の画像に対して位置推論を実行"""
+        if not self.images or not hasattr(self, 'location_model_manager'):
+            return
+        
+        current_img_path = self.images[self.current_index]
+        
+        # マネージャーを使用して推論を実行
+        result = self.location_model_manager.run_inference(current_img_path)
+        
+        if result:
+            # 推論結果を保存
+            self.location_inference_results[current_img_path] = result
+            
+            # 表示を更新
+            self.update_location_inference_display()
+            
+            return True
+        
+        return False
+
+    def train_and_save_location_model(self):
+        """位置推論モデルの学習"""
+        
+        if not self.images or not self.location_annotations:
+            QMessageBox.warning(self, "警告", "位置モデルを学習するには位置アノテーションが必要です。")
+            return
+        
+        # 使用可能な位置情報のユニークなリストを取得
+        unique_locations = sorted(list(set(self.location_annotations.values())))
+        actual_classes = len(unique_locations)
+        
+        if actual_classes < 2:
+            QMessageBox.warning(self, "警告", f"位置モデルを学習するには少なくとも2つの異なる位置ラベルが必要です。現在: {actual_classes}種類")
+            return
+        
+        # 常に8クラスを使用（実際のクラス数に関わらず）
+        num_classes = LOCATION_DEFAULT_NUM_CLASSES
+        
+        # 選択されたモデル
+        model_type = self.location_model_combo.currentText()
+        
+        # 学習設定ダイアログを表示
+        training_settings = self._create_location_training_dialog(actual_classes, unique_locations, num_classes)
+        
+        if not training_settings.exec_():
+            return
+        
+        # 設定値の取得
+        training_config = self._get_location_training_config(training_settings)
+        
+        try:
+            # データの準備（インデックスベース修正版）
+            image_data = self._prepare_location_training_data(unique_locations)
+            
+            if not image_data['image_paths']:
+                QMessageBox.warning(self, "警告", "有効な位置アノテーションがありません。")
+                return
+            
+            # 進捗ダイアログを表示
+            progress = QProgressDialog(
+                f"位置モデル '{model_type}' の学習データを準備中...", 
+                "キャンセル", 0, 100, self
+            )
+            progress.setWindowTitle("位置モデル学習")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+            QApplication.processEvents()
+            
+            # データセット作成
+            train_loader, val_loader, dataset_info = create_location_datasets(
+                image_paths=image_data['image_paths'],
+                location_labels=image_data['location_indices'],
+                val_split=0.2,
+                model_name=model_type,
+                batch_size=training_config['batch_size'],
+                use_augmentation=training_config['use_augmentation']
+            )
+            
+            progress.setValue(20)
+            progress.setLabelText(f"モデル '{model_type}' を初期化中... (固定{num_classes}クラス)")
+            QApplication.processEvents()
+            
+            # 進捗コールバック関数
+            def update_progress(current, total, message=None):
+                if message:
+                    progress.setLabelText(message)
+                progress.setValue(20 + int(current * 70 / total))
+                QApplication.processEvents()
+                return not progress.wasCanceled()
+            
+            # モデル学習（統合版）
+            training_results = self._train_location_model_internal(
+                model_type=model_type,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                num_classes=num_classes,
+                training_config=training_config,
+                progress_callback=update_progress
+            )
+            
+            # モデルのメタデータ保存
+            self._save_location_model_metadata(
+                training_results['best_model_path'],
+                num_classes,
+                actual_classes,
+                image_data['location_to_index']
+            )
+            
+            progress.setValue(95)
+            progress.setLabelText("MLflowに学習結果を記録中...")
+            QApplication.processEvents()
+            
+            # MLflowに結果を記録
+            mlflow_info = self._log_location_training(
+                model_type=model_type,
+                training_results=training_results,
+                training_config=training_config,
+                dataset_info={
+                    "total_annotations": len(self.location_annotations),
+                    "used_samples": len(image_data['image_paths']),
+                    "train_samples": dataset_info['train_samples'],
+                    "val_samples": dataset_info['val_samples'],
+                    "input_shape": dataset_info['actual_image_size'],
+                    "num_classes": num_classes,
+                    "actual_classes": actual_classes,
+                    "unique_locations": unique_locations,
+                    "location_mapping": image_data['location_to_index']
+                }
+            )
+            
+            # モデルリストを更新
+            self.refresh_location_model_list()
+            
+            progress.setValue(100)
+            progress.close()
+            
+            # 学習完了メッセージ
+            self._show_location_training_success(
+                model_type=model_type,
+                training_results=training_results,
+                training_config=training_config,
+                dataset_info={
+                    "image_paths_count": len(image_data['image_paths']),
+                    "num_classes": num_classes,
+                    "actual_classes": actual_classes
+                },
+                mlflow_info=mlflow_info
+            )
+            
+        except Exception as e:
+            if 'progress' in locals():
+                progress.close()
+            traceback.print_exc()
+            QMessageBox.critical(
+                self, 
+                "エラー", 
+                f"位置モデル学習中にエラーが発生しました: {str(e)}"
+            )
+
+    def _create_location_training_dialog(self, actual_classes, unique_locations, num_classes):
+        """位置モデル学習設定ダイアログを作成"""
+        
+        training_settings = QDialog(self)
+        training_settings.setWindowTitle("位置モデル学習設定")
+        training_settings.setMinimumWidth(500)
+        
+        settings_layout = QVBoxLayout(training_settings)
+        
+        # 現在の位置情報の概要を表示
+        info_label = QLabel(f"検出された位置ラベル: {actual_classes}種類 ({', '.join(map(str, unique_locations))})")
+        settings_layout.addWidget(info_label)
+        
+        # 固定クラス数の情報表示
+        fixed_class_label = QLabel(f"※ 位置モデルは常に{num_classes}クラス出力で作成されます。")
+        fixed_class_label.setStyleSheet("color: #666666; font-style: italic;")
+        settings_layout.addWidget(fixed_class_label)
+        
+        # エポック数設定
+        epoch_layout = QHBoxLayout()
+        epoch_layout.addWidget(QLabel("学習エポック数:"))
+        training_settings.epoch_spin = QSpinBox()
+        training_settings.epoch_spin.setRange(1, 1000)
+        training_settings.epoch_spin.setValue(30)
+        epoch_layout.addWidget(training_settings.epoch_spin)
+        settings_layout.addLayout(epoch_layout)
+        
+        # バッチサイズ設定
+        batch_layout = QHBoxLayout()
+        batch_layout.addWidget(QLabel("バッチサイズ:"))
+        training_settings.batch_spin = QSpinBox()
+        training_settings.batch_spin.setRange(1, 128)
+        training_settings.batch_spin.setValue(16)
+        batch_layout.addWidget(training_settings.batch_spin)
+        settings_layout.addLayout(batch_layout)
+        
+        # データオーグメンテーション設定
+        training_settings.aug_check = QCheckBox("データオーグメンテーションを有効にする")
+        training_settings.aug_check.setChecked(True)
+        settings_layout.addWidget(training_settings.aug_check)
+        
+        # Early Stopping設定
+        training_settings.early_stopping_check = QCheckBox("Early Stopping を有効にする")
+        training_settings.early_stopping_check.setChecked(True)
+        settings_layout.addWidget(training_settings.early_stopping_check)
+        
+        patience_layout = QHBoxLayout()
+        patience_layout.addWidget(QLabel("忍耐エポック数:"))
+        training_settings.patience_spin = QSpinBox()
+        training_settings.patience_spin.setRange(1, 20)
+        training_settings.patience_spin.setValue(5)
+        patience_layout.addWidget(training_settings.patience_spin)
+        settings_layout.addLayout(patience_layout)
+        
+        # 学習率設定
+        lr_layout = QHBoxLayout()
+        lr_layout.addWidget(QLabel("学習率:"))
+        training_settings.lr_combo = QComboBox()
+        learning_rates = ["0.001", "0.0005", "0.0001", "0.00005", "0.00001"]
+        training_settings.lr_combo.addItems(learning_rates)
+        training_settings.lr_combo.setCurrentIndex(0)
+        lr_layout.addWidget(training_settings.lr_combo)
+        settings_layout.addLayout(lr_layout)
+        
+        # ボタンの配置
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(training_settings.accept)
+        button_box.rejected.connect(training_settings.reject)
+        settings_layout.addWidget(button_box)
+        
+        return training_settings
+
+    def _get_location_training_config(self, dialog):
+        """学習設定ダイアログから設定値を取得"""
+        
+        return {
+            'num_epochs': dialog.epoch_spin.value(),
+            'batch_size': dialog.batch_spin.value(),
+            'use_augmentation': dialog.aug_check.isChecked(),
+            'use_early_stopping': dialog.early_stopping_check.isChecked(),
+            'patience': dialog.patience_spin.value() if dialog.early_stopping_check.isChecked() else 0,
+            'learning_rate': float(dialog.lr_combo.currentText())
+        }
+
+    def _prepare_location_training_data(self, unique_locations):
+        """位置学習データの準備（インデックスベース修正版）"""
+        
+        # 位置ラベルのマッピングを作成（実際の位置値をインデックスに変換）
+        location_to_index = {loc: i for i, loc in enumerate(unique_locations)}
+        
+        # データを準備（インデックスベースに修正）
+        image_paths = []
+        location_labels = []
+        
+        for idx, location in self.location_annotations.items():
+            # インデックスが有効範囲内かチェック
+            if isinstance(idx, int) and 0 <= idx < len(self.images):
+                # インデックスから画像パスを取得
+                img_path = self.images[idx]
+                image_paths.append(img_path)
+                location_labels.append(location)
+        
+        # ラベルをインデックスに変換
+        location_indices = [location_to_index[label] for label in location_labels]
+        
+        return {
+            'image_paths': image_paths,
+            'location_labels': location_labels,
+            'location_indices': location_indices,
+            'location_to_index': location_to_index
+        }
+
+    def _train_location_model_internal(self, model_type, train_loader, val_loader, num_classes, training_config, progress_callback):
+        """位置モデル学習の内部実装（外部依存を排除）"""
+        
+        # デバイスの設定
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # モデルのロード（get_model関数を使用）
+        if progress_callback:
+            progress_callback(0, training_config['num_epochs'], "モデルをロード中...")
+        
+        model = self._initialize_location_model(model_type, num_classes, device)
+        
+        # 損失関数と最適化アルゴリズム
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(model.parameters(), lr=training_config['learning_rate'], weight_decay=1e-4)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
+        
+        # トレーニングループ
+        train_losses = []
+        val_losses = []
+        train_accuracies = []
+        val_accuracies = []
+        best_val_loss = float('inf')
+        best_val_acc = 0.0
+        
+        # Early Stopping用の変数
+        early_stopping_counter = 0
+        early_stopped = False
+        stopped_epoch = 0
+        
+        # 保存ディレクトリとファイル名
+        os.makedirs(models_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_path = os.path.join(models_dir, f'{model_type}_model_{timestamp}.pth')
+        best_model_path = os.path.join(models_dir, f'{model_type}_best_{timestamp}.pth')
+        
+        completed_epochs = 0
+        for epoch in range(training_config['num_epochs']):
+            # 進捗コールバック - エポック開始
+            if progress_callback:
+                message = f"エポック {epoch+1}/{training_config['num_epochs']} 開始"
+                should_continue = progress_callback(epoch, training_config['num_epochs'], message)
+                if not should_continue:
+                    break
+            
+            # トレーニングフェーズ
+            model.train()
+            epoch_loss = 0.0
+            correct = 0
+            total = 0
+            
+            for i, (inputs, targets) in enumerate(train_loader):
+                inputs, targets = inputs.to(device), targets.to(device)
+                
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                loss.backward()
+                optimizer.step()
+                
+                # 統計情報を更新
+                epoch_loss += loss.item() * inputs.size(0)
+                _, predicted = torch.max(outputs, 1)
+                total += targets.size(0)
+                correct += (predicted == targets).sum().item()
+            
+            # エポック損失と精度の計算
+            epoch_loss /= len(train_loader.dataset)
+            epoch_accuracy = 100 * correct / total
+            train_losses.append(epoch_loss)
+            train_accuracies.append(epoch_accuracy)
+            
+            # 検証フェーズ
+            model.eval()
+            val_loss = 0.0
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                for inputs, targets in val_loader:
+                    inputs, targets = inputs.to(device), targets.to(device)
+                    
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
+                    
+                    val_loss += loss.item() * inputs.size(0)
+                    _, predicted = torch.max(outputs, 1)
+                    total += targets.size(0)
+                    correct += (predicted == targets).sum().item()
+            
+            val_loss /= len(val_loader.dataset)
+            val_accuracy = 100 * correct / total
+            val_losses.append(val_loss)
+            val_accuracies.append(val_accuracy)
+            
+            # 学習率の調整
+            scheduler.step(val_loss)
+            
+            completed_epochs = epoch + 1
+            
+            # 進捗コールバック - エポック終了
+            if progress_callback:
+                message = f"エポック {epoch+1}/{training_config['num_epochs']}, 学習損失: {epoch_loss:.4f}, 検証損失: {val_loss:.4f}, "
+                message += f"学習精度: {epoch_accuracy:.2f}%, 検証精度: {val_accuracy:.2f}%"
+                should_continue = progress_callback(epoch + 1, training_config['num_epochs'], message)
+                if not should_continue:
+                    break
+            
+            # 最良モデルの保存
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                early_stopping_counter = 0
+                
+                if val_accuracy > best_val_acc:
+                    best_val_acc = val_accuracy
+                
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': best_val_loss,
+                    'accuracy': best_val_acc,
+                    'num_classes': num_classes
+                }, best_model_path)
+                
+            elif val_accuracy > best_val_acc:
+                best_val_acc = val_accuracy
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': val_loss,
+                    'accuracy': best_val_acc,
+                    'num_classes': num_classes
+                }, best_model_path)
+            else:
+                # Early Stopping判定
+                if training_config['use_early_stopping']:
+                    early_stopping_counter += 1
+                    if early_stopping_counter >= training_config['patience']:
+                        early_stopped = True
+                        stopped_epoch = epoch + 1
+                        break
+        
+        # 最終モデルの保存
+        torch.save({
+            'epoch': completed_epochs,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'train_accuracies': train_accuracies,
+            'val_accuracies': val_accuracies,
+            'best_val_loss': best_val_loss,
+            'best_val_acc': best_val_acc,
+            'early_stopped': early_stopped,
+            'stopped_epoch': stopped_epoch if early_stopped else completed_epochs,
+            'num_classes': num_classes
+        }, model_path)
+        
+        return {
+            'model_name': model_type,
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'train_accuracies': train_accuracies,
+            'val_accuracies': val_accuracies,
+            'best_val_loss': best_val_loss,
+            'best_val_acc': best_val_acc,
+            'model_path': model_path,
+            'best_model_path': best_model_path,
+            'completed_epochs': completed_epochs,
+            'early_stopped': early_stopped,
+            'stopped_epoch': stopped_epoch if early_stopped else completed_epochs
+        }
+
+    def _initialize_location_model(self, model_type, num_classes, device):
+        """位置モデルの初期化"""
+        
+        # モデルを初期化（既存のget_model関数を使用）
+        if 'donkey_location' in model_type:
+            model = get_model(model_type, pretrained=True)
+            model.classifier = nn.Linear(50, num_classes)  # 出力層を置き換え
+        elif 'resnet18_location' in model_type:
+            model = get_model(model_type, pretrained=True)
+            if hasattr(model, 'regressor'):
+                in_features = model.regressor.in_features if hasattr(model.regressor, 'in_features') else model.regressor[0].in_features
+                model.regressor = nn.Linear(in_features, num_classes)
+        else:
+            model = get_model(model_type, pretrained=True)
+        
+        return model.to(device)
+
+    def _save_location_model_metadata(self, model_path, num_classes, actual_classes, location_mapping):
+        """位置モデルのメタデータを保存"""
+        
+        checkpoint = torch.load(model_path, map_location='cpu')
+        checkpoint['num_classes'] = num_classes
+        checkpoint['actual_classes'] = actual_classes
+        checkpoint['location_mapping'] = location_mapping
+        torch.save(checkpoint, model_path)
+
+    def _log_location_training(self, model_type, training_results, training_config, dataset_info):
+        """位置推論モデルの学習結果をMLflowに記録"""
+        
+        try:
+            # MLflowManagerが初期化されていない場合は初期化
+            if not hasattr(self, 'mlflow_manager'):
+                self.mlflow_manager = MLflowManager(self.folder_path)
+            
+            # メトリクスを準備
+            metrics = {
+                "best_val_loss": training_results.get('best_val_loss', 0.0),
+                "best_val_acc": training_results.get('best_val_acc', 0.0),
+                "final_train_loss": training_results['train_losses'][-1] if 'train_losses' in training_results else 0.0,
+                "final_val_loss": training_results['val_losses'][-1] if 'val_losses' in training_results else 0.0,
+                "final_train_acc": training_results['train_accuracies'][-1] if 'train_accuracies' in training_results else 0.0,
+                "final_val_acc": training_results['val_accuracies'][-1] if 'val_accuracies' in training_results else 0.0,
+                "train_losses": training_results.get('train_losses', []),
+                "val_losses": training_results.get('val_losses', []),
+                "train_accuracies": training_results.get('train_accuracies', []),
+                "val_accuracies": training_results.get('val_accuracies', []),
+                "status": "early_stopped" if training_results.get('early_stopped', False) else "completed"
+            }
+            
+            # 学習パラメータを準備
+            training_params = {
+                "model_type": model_type,
+                "num_epochs": training_config['num_epochs'],
+                "completed_epochs": training_results.get('completed_epochs', training_config['num_epochs']),
+                "learning_rate": training_config['learning_rate'],
+                "batch_size": training_config['batch_size'],
+                "use_early_stopping": training_config['use_early_stopping'],
+                "patience": training_config['patience'],
+                "early_stopped": training_results.get('early_stopped', False),
+                "augmentation_enabled": training_config['use_augmentation'],
+                "coordinate_system": "classification",  # 位置推論特有
+                "estimation_method": "cnn_classification",  # 位置推論特有
+                "fixed_classes": dataset_info['num_classes'],
+                "actual_classes": dataset_info['actual_classes']
+            }
+            
+            # MLflowに記録
+            success = self.mlflow_manager.log_position_estimation_model(
+                model_path=training_results['best_model_path'],
+                training_params=training_params,
+                metrics=metrics,
+                dataset_info=dataset_info
+            )
+            
+            if success:
+                return "MLflowに学習履歴を記録しました。\n「MLflow比較」ボタンで結果を確認できます。"
+            else:
+                return "MLflowへの記録中にエラーが発生しました。"
+                
+        except ImportError:
+            return "MLflowがインストールされていないため、学習履歴は記録されませんでした。\npip install mlflow でインストールできます。"
+        except Exception as e:
+            print(f"MLflow記録エラー: {e}")
+            return f"MLflowへの記録中にエラーが発生しました: {str(e)}"
+
+    def _show_location_training_success(self, model_type, training_results, training_config, dataset_info, mlflow_info):
+        """位置モデル学習成功メッセージを表示"""
+        
+        # Early Stopping情報
+        early_stopping_info = ""
+        if training_config['use_early_stopping']:
+            if training_results.get('early_stopped', False):
+                early_stopping_info = f"Early Stopping: {training_results.get('stopped_epoch', 0)}エポックで停止\n"
+            else:
+                early_stopping_info = f"Early Stopping: 発動せず (忍耐値: {training_config['patience']})\n"
+        
+        # 学習完了メッセージ
+        QMessageBox.information(
+            self, 
+            "学習完了", 
+            f"{model_type} 位置モデルを学習し保存しました: {os.path.basename(training_results['best_model_path'])}\n" +
+            f"最良検証損失: {training_results['best_val_loss']:.6f}\n" +
+            f"最良検証精度: {training_results['best_val_acc']:.2f}%\n" +
+            f"実施エポック数: {training_results['completed_epochs']}/{training_config['num_epochs']}\n" +
+            early_stopping_info +
+            f"出力クラス数: {dataset_info['num_classes']} (実際の位置クラス数: {dataset_info['actual_classes']})\n" +
+            f"学習データ数: {dataset_info['image_paths_count']}枚\n" +
+            f"学習率: {training_config['learning_rate']}\n" +
+            f"バッチサイズ: {training_config['batch_size']}\n" +
+            f"データオーグメンテーション: {'有効' if training_config['use_augmentation'] else '無効'}\n\n" +
+            f"{mlflow_info}"
+        )
+
+    def update_location_inference_display(self):
+        """位置推論表示を更新する - 上位3クラスのみ表示"""
+        if not self.images:
+            return
+        
+        current_img_path = self.images[self.current_index]
+    
+        if hasattr(self, 'location_inference_checkbox') and self.location_inference_checkbox.isChecked():
+            if current_img_path in self.location_inference_results:
+                # 推論結果を取得
+                result = self.location_inference_results[current_img_path]
+                pred_class = result['pred_class']
+                confidence = result['confidence']
+                all_probs = result.get('all_probs', [])
+                
+                # 情報テキストを構築
+                inference_text = "<b>位置推論結果:</b><br>"
+                
+                # 一番高いクラスは背景色付きで表示
+                loc_color = get_location_color(pred_class)
+                
+                # 予測クラスを背景色付きで表示
+                inference_text += f"<div style='background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 5px; border-radius: 5px; margin: 5px 0;'>"
+                inference_text += f"予測位置: {pred_class} (確信度: {confidence:.4f})</div>"
+                
+                # 上位3クラスの予測結果を表示（すでに確率でソートされている前提）
+                if all_probs:
+                    # 確率が高い順にインデックスをソート
+                    sorted_indices = sorted(range(len(all_probs)), key=lambda i: all_probs[i], reverse=True)
+                    
+                    # 上位3つ（または全部、少ない方）を取得
+                    top_k = min(3, len(sorted_indices))
+                    top_indices = sorted_indices[:top_k]
+                    
+                    inference_text += "<br>上位クラス:<br>"
+                    
+                    for i, idx in enumerate(top_indices):
+                        # すでに表示したクラスは飛ばす
+                        if idx == pred_class and i > 0:
+                            continue
+                        
+                        # 位置によって色を変える
+                        color = get_location_color(idx).name()
+                        
+                        # 各クラスの予測確率
+                        inference_text += f"{i+1}. 位置 {idx}: <span style='color: {color}; font-weight: bold;'>{all_probs[idx]:.4f}</span><br>"
+                
+                # テキストをラベルに設定
+                if hasattr(self, 'location_inference_info_label'):
+                    self.location_inference_info_label.setText(inference_text)
+                    self.location_inference_info_label.setTextFormat(Qt.RichText)
+                else:
+                    # ラベルがない場合は新規作成
+                    self.location_inference_info_label = QLabel(inference_text)
+                    self.location_inference_info_label.setWordWrap(True)
+                    self.location_inference_info_label.setStyleSheet("color: purple;")
+                    
+                    # レイアウトに追加（推論結果表示の下）
+                    if hasattr(self, 'detection_inference_info_label') and self.detection_inference_info_label.parent():
+                        parent_layout = self.detection_inference_info_label.parent().layout()
+                        if parent_layout:
+                            parent_layout.addWidget(self.location_inference_info_label)
+                    elif hasattr(self, 'inference_info_label') and self.inference_info_label.parent():
+                        parent_layout = self.inference_info_label.parent().layout()
+                        if parent_layout:
+                            parent_layout.addWidget(self.location_inference_info_label)
+                
+                return True
+                    
+            # モデルがロードされていて推論結果がない場合は実行
+            elif hasattr(self, 'location_model_manager') and self.location_model_manager.is_model_loaded():
+                self.run_location_inference()
+                # 再帰的に呼び出して表示を更新
+                return self.update_location_inference_display()
+        else:
+            # 表示がオフの場合はラベルをクリア
+            if hasattr(self, 'location_inference_info_label'):
+                self.location_inference_info_label.setText("")
+        
+        return False
+    
+    ###
+
+    def update_slider_deleted_indexes(self):
+        """スライダーの削除済みインデックス表示を更新"""
+        if hasattr(self, 'image_slider') and isinstance(self.image_slider, DeletedIndexesSlider):
+            self.image_slider.setDeletedIndexes(self.deleted_indexes, len(self.images))
+
+    ###
+    def _export_segmentation_subset(self, indices, output_dir, class_to_index):
+        """セグメンテーションサブセットのエクスポート - クラス名修正版"""
+        
+        success_count = 0
+        
+        for idx in indices:
+            if idx in self.segmentation_annotations:
+                try:
+                    # 画像をコピー
+                    source_image_path = self.images[idx]
+                    image_filename = os.path.basename(source_image_path)
+                    dest_image_path = os.path.join(output_dir, "images", image_filename)
+                    
+                    import shutil
+                    shutil.copy2(source_image_path, dest_image_path)
+                    
+                    # セグメンテーションアノテーションを処理
+                    label_filename = os.path.splitext(image_filename)[0] + ".txt"
+                    label_path = os.path.join(output_dir, "labels", label_filename)
+                    
+                    # 画像サイズを取得
+                    from PIL import Image
+                    with Image.open(source_image_path) as img:
+                        img_width, img_height = img.size
+                    
+                    print(f"処理中: {image_filename} (サイズ: {img_width}x{img_height})")
+                    
+                    # ラベルファイルを作成（セグメンテーション形式）
+                    label_lines = []
+                    valid_segments = 0
+                    
+                    for seg_idx, seg in enumerate(self.segmentation_annotations[idx]):
+                        # クラス名を取得 - 複数のキーを試す
+                        class_name = None
+                        points = []
+                        
+                        if isinstance(seg, dict):
+                            # 複数のキー名で試行
+                            class_name = seg.get('class_name') or seg.get('class') or seg.get('label')
+                            points = seg.get('points', [])
+                            
+                            print(f"  セグメント {seg_idx}: 辞書キー={list(seg.keys())}")
+                            print(f"    class_name={seg.get('class_name')}, class={seg.get('class')}")
+                            
+                        else:
+                            # オブジェクト形式の場合
+                            class_name = (getattr(seg, 'class_name', None) or 
+                                        getattr(seg, 'class', None) or 
+                                        getattr(seg, 'label', None))
+                            points = getattr(seg, 'points', [])
+                        
+                        print(f"  セグメント {seg_idx}: 最終クラス名={class_name}, ポイント数={len(points)}")
+                        
+                        # クラス名が有効で、期待されるクラスリストに含まれているかチェック
+                        if class_name and class_name in class_to_index and points and len(points) >= 3:
+                            class_id = class_to_index[class_name]
+                            
+                            # ポイントを正規化座標に変換
+                            normalized_points = []
+                            valid_points = 0
+                            
+                            for point_idx, point in enumerate(points):
+                                try:
+                                    # タプル形式の座標を処理
+                                    if isinstance(point, tuple) and len(point) >= 2:
+                                        x = float(point[0])
+                                        y = float(point[1])
+                                    elif isinstance(point, dict):
+                                        x = float(point.get('x', 0))
+                                        y = float(point.get('y', 0))
+                                    elif hasattr(point, 'x') and hasattr(point, 'y'):
+                                        x = float(point.x)
+                                        y = float(point.y)
+                                    else:
+                                        print(f"    警告: ポイント {point_idx} の形式が不正: {type(point)}, 値: {point}")
+                                        continue
+                                    
+                                    # 正規化（0-1の範囲）
+                                    x_norm = x / img_width
+                                    y_norm = y / img_height
+                                    
+                                    # 座標を0-1の範囲にクランプ
+                                    x_norm = max(0.0, min(1.0, x_norm))
+                                    y_norm = max(0.0, min(1.0, y_norm))
+                                    
+                                    normalized_points.extend([x_norm, y_norm])
+                                    valid_points += 1
+                                    
+                                except (ValueError, TypeError) as e:
+                                    print(f"    エラー: ポイント {point_idx} の変換失敗: {e}")
+                                    continue
+                            
+                            print(f"    有効ポイント数: {valid_points}")
+                            
+                            # YOLO セグメンテーション形式で書き込み
+                            if len(normalized_points) >= 6:  # 最低3点 (6座標)
+                                points_str = ' '.join([f"{coord:.6f}" for coord in normalized_points])
+                                label_line = f"{class_id} {points_str}"
+                                label_lines.append(label_line)
+                                valid_segments += 1
+                                print(f"    ✓ ラベル行作成: クラス{class_id} ({class_name}), {valid_points}点")
+                            else:
+                                print(f"    警告: 有効ポイント不足 ({len(normalized_points)//2}点)")
+                        else:
+                            print(f"    スキップ: クラス名='{class_name}', 有効クラス={class_name in class_to_index if class_name else False}, ポイント数={len(points)}")
+                    
+                    # ラベルファイルに書き込み
+                    if label_lines:
+                        with open(label_path, 'w') as f:
+                            for line in label_lines:
+                                f.write(line + '\n')
+                        print(f"  ✓ ラベルファイル作成成功: {len(label_lines)}行")
+                    else:
+                        # 空のラベルファイルを作成
+                        with open(label_path, 'w') as f:
+                            pass
+                        print(f"  ❌ 警告: 有効なセグメンテーションなし、空ファイル作成")
+                    
+                    success_count += 1
+                    
+                except Exception as e:
+                    print(f"セグメンテーション インデックス {idx} の処理中にエラー: {e}")
+                    import traceback
+                    traceback.print_exc()
+        
+        return success_count
+
+    def debug_segmentation_data(self):
+        """セグメンテーションデータのデバッグ用メソッド - 強化版"""
+        
+        print("\n=== セグメンテーションデータ詳細確認 ===")
+        
+        for idx, segments in list(self.segmentation_annotations.items())[:3]:
+            print(f"\nインデックス {idx}:")
+            print(f"  セグメント数: {len(segments) if segments else 0}")
+            
+            if segments:
+                for seg_idx, seg in enumerate(segments):
+                    print(f"  セグメント {seg_idx}:")
+                    print(f"    タイプ: {type(seg)}")
+                    
+                    if isinstance(seg, dict):
+                        print(f"    全キー: {list(seg.keys())}")
+                        # 複数のクラス名キーを確認
+                        for key in ['class_name', 'class', 'label', 'category']:
+                            if key in seg:
+                                print(f"    {key}: {seg[key]}")
+                        
+                        points = seg.get('points', [])
+                        print(f"    ポイント数: {len(points)}")
+                        if points and len(points) > 0:
+                            print(f"    最初のポイント: {points[0]} (タイプ: {type(points[0])})")
+                            if isinstance(points[0], tuple):
+                                print(f"      タプル座標: x={points[0][0]}, y={points[0][1]}")
+                            elif isinstance(points[0], dict):
+                                print(f"      辞書座標: x={points[0].get('x')}, y={points[0].get('y')}")
+                    else:
+                        # オブジェクト属性を確認
+                        attrs = [attr for attr in dir(seg) if not attr.startswith('_')]
+                        print(f"    利用可能な属性: {attrs}")
+                        
+                        for attr in ['class_name', 'class', 'label']:
+                            if hasattr(seg, attr):
+                                print(f"    {attr}: {getattr(seg, attr)}")
+                        
+                        points = getattr(seg, 'points', [])
+                        print(f"    ポイント数: {len(points)}")
+
+    # アノテーション検証の改善
+    def _validate_yolo_annotations(self, task_type):
+        """YOLOアノテーションの検証 - クラス名確認強化版"""
+        
+        if task_type == "segment":
+            if not self.segmentation_annotations:
+                QMessageBox.warning(self, "警告", "セグメンテーションアノテーションがありません。")
+                return None, None
+            
+            annotations = self.segmentation_annotations
+            
+            # セグメンテーションデータの詳細検証
+            total_segments = 0
+            valid_segments = 0
+            valid_images = 0
+            class_names_found = set()
+            
+            for index, segments in annotations.items():
+                image_has_valid_segments = False
+                if segments and len(segments) > 0:
+                    total_segments += len(segments)
+                    for seg in segments:
+                        # クラス名を取得
+                        class_name = None
+                        if isinstance(seg, dict):
+                            class_name = seg.get('class_name') or seg.get('class') or seg.get('label')
+                        else:
+                            class_name = (getattr(seg, 'class_name', None) or 
+                                        getattr(seg, 'class', None) or 
+                                        getattr(seg, 'label', None))
+                        
+                        if class_name:
+                            class_names_found.add(class_name)
+                        
+                        # ポイント数チェック
+                        points = None
+                        if isinstance(seg, dict):
+                            points = seg.get('points', [])
+                        else:
+                            points = getattr(seg, 'points', [])
+                        
+                        if class_name and points and len(points) >= 3:
+                            valid_segments += 1
+                            image_has_valid_segments = True
+                
+                if image_has_valid_segments:
+                    valid_images += 1
+            
+            print(f"\n=== セグメンテーションアノテーション確認 ===")
+            print(f"アノテーション辞書数: {len(annotations)}")
+            print(f"総セグメンテーション数: {total_segments}")
+            print(f"有効なセグメンテーション数: {valid_segments}")
+            print(f"有効なセグメンテーションがある画像数: {valid_images}")
+            print(f"発見されたクラス名: {sorted(class_names_found)}")
+            print("=" * 50)
+            
+            # クラス名の不一致チェック
+            expected_classes = set(self.get_current_classes())
+            missing_classes = expected_classes - class_names_found
+            extra_classes = class_names_found - expected_classes
+            
+            if missing_classes:
+                print(f"警告: 期待されるクラスが見つからない: {missing_classes}")
+            if extra_classes:
+                print(f"警告: 予期しないクラスが見つかった: {extra_classes}")
+            
+            if valid_segments == 0:
+                QMessageBox.critical(
+                    self,
+                    "セグメンテーションデータなし",
+                    f"有効なセグメンテーションアノテーションが見つかりません。\n\n"
+                    f"発見されたクラス名: {sorted(class_names_found)}\n"
+                    f"期待されるクラス名: {sorted(expected_classes)}\n\n"
+                    f"クラス名が一致していることを確認してください。"
+                )
+                return None, None
+            
+            return annotations, {"total_count": valid_segments, "image_count": valid_images}
+        
+        # ... 検出タスクの処理は既存と同じ ...
+        
+        return None, None
+
+# 追加機能切り出し　削除表示
+class DeletedIndexesSlider(QSlider):
+    """削除済みインデックスを視覚的に表示するカスタムスライダー"""
+    
+    def __init__(self, parent=None):
+        super().__init__(Qt.Horizontal, parent)
+        self.deleted_indexes = []  # 削除済みインデックスのリスト
+        self.total_count = 0       # 総インデックス数
+    
+    def setDeletedIndexes(self, deleted_indexes, total_count):
+        """削除済みインデックスを設定"""
+        self.deleted_indexes = deleted_indexes
+        self.total_count = total_count
+        self.update()  # スライダーを再描画
+   
+    def paintEvent(self, event):
+        """削除インデックス表示を上に描くスライダー"""
+        # 最初にスライダー全体を通常通り描画（ハンドルも含む）
+        super().paintEvent(event)
+
+        # カスタム描画開始（赤マークを重ねる）
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        try:
+            # スタイルオプション初期化
+            option = QStyleOptionSlider()
+            self.initStyleOption(option)
+
+            # トラックの矩形を取得
+            groove_rect = self.style().subControlRect(
+                QStyle.CC_Slider, option, QStyle.SC_SliderGroove, self
+            )
+
+            track_length = groove_rect.width()
+            track_start = groove_rect.x()
+            track_height = groove_rect.height()
+
+            # 削除インデックス描画（赤マーク）
+            if self.deleted_indexes and self.total_count > 0:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(QColor(255, 50, 50, 180)))
+
+                for idx in self.deleted_indexes:
+                    if 0 <= idx < self.total_count:
+                        position = track_start + (idx / (self.total_count - 1)) * track_length
+                        mark_width = max(3, track_length / self.total_count)
+                        mark_height = track_height + 6
+
+                    painter.drawRect(
+                        int(position - mark_width / 2),
+                        int(groove_rect.center().y()),          
+                        int(mark_width),
+                        int(mark_height / 2)                    
+                    )
+
+        finally:
+            painter.end()
+
+
+# メインプログラムのセクション
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = ImageAnnotationTool()
+    window.show()
+    
+    try:
+        sys.exit(app.exec_())
+    except Exception as e:
+        print(f"アプリケーション実行中にエラーが発生: {e}")
+        # 例外発生時のみセッション情報を保存（closeEventが呼ばれない場合の保険）
+        if 'window' in locals() and hasattr(window, 'save_session_info'):
+            window.save_session_info()

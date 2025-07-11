@@ -15,6 +15,8 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from typing import Dict, List, Any, Optional, Tuple, Callable
 from datetime import datetime
+import traceback
+
 
 from model_catalog import get_model, AnnotationDataset
 
@@ -363,359 +365,6 @@ def train_model(
     weight_decay: float = 1e-4,
     save_dir: str = './saved_models',
     device: Optional[torch.device] = None,
-    progress_callback: Optional[Callable[[int, int, str], bool]] = None
-) -> Dict[str, Any]:
-    """モデルをトレーニングする
-
-    Args:
-        model_name: トレーニングするモデル名
-        train_loader: トレーニングデータローダー
-        val_loader: 検証用データローダー
-        num_epochs: エポック数
-        learning_rate: 学習率
-        weight_decay: 重み減衰
-        save_dir: モデル保存ディレクトリ
-        device: 使用するデバイス (Noneの場合は自動選択)
-        progress_callback: 進捗コールバック関数 (current, total, message) -> continue
-
-    Returns:
-        トレーニング結果の辞書
-    """
-    # デバイスの設定
-    if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # モデルのロード
-    model = get_model(model_name, pretrained=True)
-    model = model.to(device)
-    
-    # 損失関数と最適化アルゴリズム
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
-    
-    # トレーニングループ
-    train_losses = []
-    val_losses = []
-    best_val_loss = float('inf')
-    
-    # 保存ディレクトリの作成
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # タイムスタンプを使用してファイル名を生成
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_path = os.path.join(save_dir, f'{model_name}_model_{timestamp}.pth')
-    best_model_path = os.path.join(save_dir, f'{model_name}_best_{timestamp}.pth')
-    
-    for epoch in range(num_epochs):
-        # 進捗コールバック - エポック開始
-        if progress_callback:
-            message = f"エポック {epoch+1}/{num_epochs} 開始"
-            should_continue = progress_callback(epoch, num_epochs, message)
-            if not should_continue:
-                break
-        
-        model.train()
-        epoch_loss = 0.0
-        
-        # トレーニングステップ
-        for i, (inputs, targets) in enumerate(train_loader):
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-            
-            # 勾配のリセット
-            optimizer.zero_grad()
-            
-            # 順伝播
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            
-            # 逆伝播と最適化
-            loss.backward()
-            optimizer.step()
-            
-            # 損失の記録
-            epoch_loss += loss.item() * inputs.size(0)
-            
-            # バッチごとの進捗コールバック（10%ごと）
-            if progress_callback and (i % max(1, len(train_loader) // 10) == 0):
-                batch_progress = i / len(train_loader)
-                total_progress = (epoch + batch_progress) / num_epochs
-                message = f"エポック {epoch+1}/{num_epochs}, バッチ {i}/{len(train_loader)}, 損失: {loss.item():.4f}"
-                should_continue = progress_callback(int(total_progress * num_epochs), num_epochs, message)
-                if not should_continue:
-                    break
-        
-        # エポック損失の計算
-        epoch_loss /= len(train_loader.dataset)
-        train_losses.append(epoch_loss)
-        
-        # 検証
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for inputs, targets in val_loader:
-                inputs = inputs.to(device)
-                targets = targets.to(device)
-                
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                
-                val_loss += loss.item() * inputs.size(0)
-        
-        val_loss /= len(val_loader.dataset)
-        val_losses.append(val_loss)
-        
-        # 学習率の調整
-        scheduler.step(val_loss)
-        
-        # 進捗コールバック - エポック終了
-        if progress_callback:
-            message = f"エポック {epoch+1}/{num_epochs}, 学習損失: {epoch_loss:.4f}, 検証損失: {val_loss:.4f}"
-            should_continue = progress_callback(epoch + 1, num_epochs, message)
-            if not should_continue:
-                break
-        
-        # 最良モデルの保存
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': best_val_loss,
-            }, best_model_path)
-    
-    # 最終モデルの保存
-    torch.save({
-        'epoch': num_epochs,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'best_val_loss': best_val_loss,
-    }, model_path)
-    
-    # トレーニング結果
-    training_results = {
-        'model_name': model_name,
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'best_val_loss': best_val_loss,
-        'model_path': model_path,
-        'best_model_path': best_model_path,
-        'num_epochs': num_epochs,
-        'learning_rate': learning_rate,
-        'weight_decay': weight_decay
-    }
-    
-    # トレーニング結果の可視化
-    plot_training_results(training_results, save_dir,timestamp)
-    
-    return training_results
-#m
-def train_model(
-    model_name: str,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    num_epochs: int = 30,
-    learning_rate: float = 0.001,
-    weight_decay: float = 1e-4,
-    save_dir: str = './saved_models',
-    device: Optional[torch.device] = None,
-    progress_callback: Optional[Callable[[int, int, str], bool]] = None,
-    pretrained: bool = True,
-    model_path: Optional[str] = None
-) -> Dict[str, Any]:
-    """モデルをトレーニングする
-
-    Args:
-        model_name: トレーニングするモデル名
-        train_loader: トレーニングデータローダー
-        val_loader: 検証用データローダー
-        num_epochs: エポック数
-        learning_rate: 学習率
-        weight_decay: 重み減衰
-        save_dir: モデル保存ディレクトリ
-        device: 使用するデバイス (Noneの場合は自動選択)
-        progress_callback: 進捗コールバック関数 (current, total, message) -> continue
-        pretrained: 事前学習済みの重みを使用するかどうか
-        model_path: 特定のモデルファイルから重みをロードする場合のパス
-
-    Returns:
-        トレーニング結果の辞書
-    """
-    # デバイスの設定
-    if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # モデルのロード
-    if progress_callback:
-        progress_callback(0, num_epochs, "モデルをロード中...")
-    
-    # まず事前学習済みの重みでモデルを初期化（またはランダム初期化）
-    model = get_model(model_name, pretrained=pretrained)
-    
-    # 特定のモデルファイルから重みをロードする場合
-    if model_path and os.path.exists(model_path):
-        if progress_callback:
-            progress_callback(0, num_epochs, f"保存済みモデル '{os.path.basename(model_path)}' から重みをロード中...")
-        
-        try:
-            # モデルチェックポイントをロード
-            checkpoint = torch.load(model_path, map_location=device)
-            
-            # state_dictがあるかチェック
-            if 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
-                print(f"モデル重みを '{model_path}' からロードしました")
-            else:
-                # 直接state_dictが保存されている場合
-                model.load_state_dict(checkpoint)
-                print(f"モデル重みを '{model_path}' からロードしました")
-                
-        except Exception as e:
-            print(f"モデル重みのロードに失敗しました: {e}")
-            print("事前学習済みモデルまたはランダム初期化を使用します")
-    
-    model = model.to(device)
-    
-    # 損失関数と最適化アルゴリズム
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
-    
-    # トレーニングループ
-    train_losses = []
-    val_losses = []
-    best_val_loss = float('inf')
-    
-    # 保存ディレクトリの作成
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # タイムスタンプを使用してファイル名を生成
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_path = os.path.join(save_dir, f'{model_name}_model_{timestamp}.pth')
-    best_model_path = os.path.join(save_dir, f'{model_name}_best_{timestamp}.pth')
-    
-    for epoch in range(num_epochs):
-        # 進捗コールバック - エポック開始
-        if progress_callback:
-            message = f"エポック {epoch+1}/{num_epochs} 開始"
-            should_continue = progress_callback(epoch, num_epochs, message)
-            if not should_continue:
-                break
-        
-        model.train()
-        epoch_loss = 0.0
-        
-        # トレーニングステップ
-        for i, (inputs, targets) in enumerate(train_loader):
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-            
-            # 勾配のリセット
-            optimizer.zero_grad()
-            
-            # 順伝播
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            
-            # 逆伝播と最適化
-            loss.backward()
-            optimizer.step()
-            
-            # 損失の記録
-            epoch_loss += loss.item() * inputs.size(0)
-            
-            # バッチごとの進捗コールバック（10%ごと）
-            if progress_callback and (i % max(1, len(train_loader) // 10) == 0):
-                batch_progress = i / len(train_loader)
-                total_progress = (epoch + batch_progress) / num_epochs
-                message = f"エポック {epoch+1}/{num_epochs}, バッチ {i}/{len(train_loader)}, 損失: {loss.item():.4f}"
-                should_continue = progress_callback(int(total_progress * num_epochs), num_epochs, message)
-                if not should_continue:
-                    break
-        
-        # エポック損失の計算
-        epoch_loss /= len(train_loader.dataset)
-        train_losses.append(epoch_loss)
-        
-        # 検証
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for inputs, targets in val_loader:
-                inputs = inputs.to(device)
-                targets = targets.to(device)
-                
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                
-                val_loss += loss.item() * inputs.size(0)
-        
-        val_loss /= len(val_loader.dataset)
-        val_losses.append(val_loss)
-        
-        # 学習率の調整
-        scheduler.step(val_loss)
-        
-        # 進捗コールバック - エポック終了
-        if progress_callback:
-            message = f"エポック {epoch+1}/{num_epochs}, 学習損失: {epoch_loss:.4f}, 検証損失: {val_loss:.4f}"
-            should_continue = progress_callback(epoch + 1, num_epochs, message)
-            if not should_continue:
-                break
-        
-        # 最良モデルの保存
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': best_val_loss,
-            }, best_model_path)
-    
-    # 最終モデルの保存
-    torch.save({
-        'epoch': num_epochs,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'best_val_loss': best_val_loss,
-    }, model_path)
-    
-    # トレーニング結果
-    training_results = {
-        'model_name': model_name,
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'best_val_loss': best_val_loss,
-        'model_path': model_path,
-        'best_model_path': best_model_path,
-        'num_epochs': num_epochs,
-        'learning_rate': learning_rate,
-        'weight_decay': weight_decay,
-        'pretrained': pretrained,
-        'loaded_weights': model_path is not None and os.path.exists(model_path)
-    }
-    
-    # トレーニング結果の可視化
-    plot_training_results(training_results, save_dir, timestamp)
-    
-    return training_results
-#m
-def train_model(
-    model_name: str,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    num_epochs: int = 30,
-    learning_rate: float = 0.001,
-    weight_decay: float = 1e-4,
-    save_dir: str = './saved_models',
-    device: Optional[torch.device] = None,
     progress_callback: Optional[Callable[[int, int, str], bool]] = None,
     pretrained: bool = True,
     model_path: Optional[str] = None,
@@ -940,7 +589,6 @@ def train_model(
     plot_training_results(training_results, save_dir, timestamp)
     
     return training_results
-
 
 def validate_model(model, dataloader, criterion, device):
     """モデルの検証を行う"""
@@ -1222,337 +870,631 @@ def plot_model_comparison(results):
     plt.savefig('model_efficiency_comparison.png')
     plt.close()
 
-def visualize_predictions(
-    model_name: str,
-    test_loader: DataLoader,
-    model_path: Optional[str] = None,
-    num_samples: int = 5,
-    device: Optional[torch.device] = None
-):
-    """モデルの予測を視覚化する
+class LocationModelManager:
+    def __init__(self, app_dir_path, models_dir_name):
+        self.APP_DIR_PATH = app_dir_path
+        self.MODELS_DIR_NAME = models_dir_name
+        self.model = None
+        self.model_type = None
+        self.model_path = None
+        self.num_classes = 8  # 固定で8クラス
+        
+    def get_model_list(self, model_type=None):
+        """利用可能な位置モデルのリストを取得 - モデルタイプでフィルタリング
+
+        Args:
+            model_type (str, optional): フィルタリングするモデルタイプ。指定しない場合はすべての位置モデルを返す。
+
+        Returns:
+            list: 位置モデルのファイル名リスト（モデルタイプでフィルタリング済み）
+        """
+        models_dir = os.path.join(self.APP_DIR_PATH, self.MODELS_DIR_NAME)
+        os.makedirs(models_dir, exist_ok=True)
+        
+        # モデルファイルを検索
+        all_model_files = [f for f in os.listdir(models_dir) if f.endswith('.pth')]
+        
+        # 位置モデルでフィルタリング
+        model_files = []
+        for model_file in all_model_files:
+            # まず位置モデルかどうかをチェック
+            if any(keyword in model_file.lower() for keyword in ['location', 'loc_model']):
+                # モデルタイプが指定されている場合はさらにフィルタリング
+                if model_type:
+                    # モデルタイプがファイル名に含まれているか確認
+                    if model_type.lower() in model_file.lower():
+                        model_files.append(model_file)
+                else:
+                    # モデルタイプが指定されていない場合はすべての位置モデルを追加
+                    model_files.append(model_file)
+        
+        # モデルファイルを日付順にソート（新しいものが上）
+        model_files.sort(reverse=True)
+        
+        return model_files
+
+    def load_model(self, model_type, model_path, progress_callback=None):
+        """位置モデルを読み込む"""
+        try:
+            # 進捗表示コールバック
+            if progress_callback:
+                progress_callback(30, "モデルチェックポイントを読み込み中...")
+            
+            # モデルチェックポイントをロード
+            checkpoint = torch.load(model_path, map_location='cpu')
+            
+            # クラス数を取得（チェックポイントから）
+            num_classes = None
+            if 'model_state_dict' in checkpoint:
+                # classifierの重みを確認
+                for key, value in checkpoint['model_state_dict'].items():
+                    if 'classifier.weight' in key:
+                        num_classes = value.shape[0]  # 出力層の最初の次元がクラス数
+                        break
+                    if 'regressor.weight' in key:
+                        num_classes = value.shape[0]
+                        break
+            else:
+                # 直接state_dictの場合
+                for key, value in checkpoint.items():
+                    if 'classifier.weight' in key:
+                        num_classes = value.shape[0]
+                        break
+                    if 'regressor.weight' in key:
+                        num_classes = value.shape[0]
+                        break
+            
+            # クラス数がまだ特定できない場合はデフォルト値
+            if num_classes is None:
+                num_classes = checkpoint.get('num_classes', 8)  # デフォルト8
+            
+            self.num_classes = num_classes
+            
+            if progress_callback:
+                progress_callback(50, f"モデル '{model_type}' をロード中... (クラス数: {num_classes})")
+            
+            # モデルを初期化
+            if model_type == 'donkey_location':
+                from model_catalog import DonkeyLocationModel
+                self.model = DonkeyLocationModel(num_classes=num_classes)
+            elif model_type == 'resnet18_location':
+                from model_catalog import ResNet18LocationModel
+                self.model = ResNet18LocationModel(num_classes=num_classes)
+            else:
+                # その他のモデル対応
+                from model_catalog import get_model
+                self.model = get_model(model_type, num_classes=num_classes)
+            
+            if progress_callback:
+                progress_callback(70, "モデルの重みをロード中...")
+            
+            # モデルの重みをロード
+            if 'model_state_dict' in checkpoint:
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                self.model.load_state_dict(checkpoint)
+            
+            # デバイスを設定
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            self.model.to(device)
+            self.model.eval()
+            
+            # モデル情報を保存
+            self.model_path = model_path
+            self.model_type = model_type
+            
+            return True, num_classes
+            
+        except Exception as e:
+            traceback.print_exc()
+            return False, str(e)
+    
+    def run_inference(self, img_path):
+        """指定された画像に対して位置推論を実行"""
+        if self.model is None:
+            return None
+        
+        try:
+            # 画像を読み込む
+            img = Image.open(img_path).convert('RGB')
+            
+            # モデルの前処理を取得
+            if not hasattr(self.model, '_preprocess') or self.model._preprocess is None:
+                self.model._preprocess = self.model.get_preprocess()
+            
+            # 前処理を適用
+            tensor_image = self.model._preprocess(img)
+            tensor_image = tensor_image.unsqueeze(0)
+            
+            # デバイスを取得
+            device = next(self.model.parameters()).device
+            tensor_image = tensor_image.to(device)
+            
+            # 推論実行
+            with torch.no_grad():
+                logits = self.model(tensor_image)
+                probs = torch.softmax(logits, dim=1)
+                
+                # クラスインデックスと確率を取得
+                max_prob, pred_class = torch.max(probs, dim=1)
+                
+                # 全クラスの確率をリストとして取得
+                all_probs = probs[0].cpu().numpy().tolist()
+            
+            # 推論結果を返す
+            return {
+                'pred_class': pred_class.item(),
+                'confidence': max_prob.item(),
+                'all_probs': all_probs
+            }
+            
+        except Exception as e:
+            print(f"位置推論実行エラー: {e}")
+            traceback.print_exc()
+            return None
+    
+    def batch_inference(self, img_paths, progress_callback=None):
+        """複数の画像に対してバッチ推論を実行"""
+        results = {}
+        total = len(img_paths)
+        
+        for i, img_path in enumerate(img_paths):
+            if progress_callback:
+                progress_callback(i, total, f"画像 {i+1}/{total} を処理中...")
+            
+            result = self.run_inference(img_path)
+            if result:
+                results[img_path] = result
+        
+        return results
+    
+    def is_model_loaded(self):
+        """位置モデルが読み込まれているかチェック"""
+        return hasattr(self, 'model') and self.model is not None
+
+class LocationClassificationDataset(torch.utils.data.Dataset):
+    """位置分類用のカスタムデータセット"""
+    def __init__(self, image_paths, location_labels, transform=None):
+        self.image_paths = image_paths
+        self.location_labels = location_labels
+        self.transform = transform
+        
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        
+        # PILで画像を読み込む
+        img = Image.open(img_path).convert('RGB')
+        
+        # 変換を適用
+        if self.transform:
+            try:
+                img = self.transform(img)
+            except Exception as e:
+                img_np = np.array(img)
+                img = self.transform(img_np)
+        
+        # 位置ラベルをターゲットとして使用
+        target = torch.tensor(self.location_labels[idx], dtype=torch.long)
+        
+        return img, target
+
+def create_location_datasets(
+    image_paths: List[str] = None,
+    location_labels: List[int] = None,
+    val_split: float = 0.2, 
+    model_name: str = 'resnet18_location',
+    batch_size: int = 32,
+    num_workers: int = 4,
+    use_augmentation: bool = False
+) -> Tuple[DataLoader, DataLoader, Dict[str, Any]]:
+    """位置分類用のデータセットを作成する
 
     Args:
-        model_name: 評価するモデル名
-        test_loader: テストデータローダー
-        model_path: 評価するモデルのパス (Noneの場合は新しくロード)
-        num_samples: 視覚化するサンプル数
+        image_paths: 画像パスのリスト
+        location_labels: 位置ラベルのリスト
+        val_split: 検証用データの割合
+        model_name: モデル名
+        batch_size: バッチサイズ
+        num_workers: ワーカー数
+        use_augmentation: データ拡張を使用するかどうか
+
+    Returns:
+        トレーニング用DataLoader, 検証用DataLoader, データセット情報
+    """
+    if image_paths is None or location_labels is None or len(image_paths) == 0 or len(location_labels) == 0:
+        raise ValueError("有効な画像パスと位置ラベルが必要です。")
+
+    # 入力サイズを取得
+    sample_img = Image.open(image_paths[0]).convert('RGB')
+    actual_size = (sample_img.height, sample_img.width)
+    print(f"実際の画像サイズ: {actual_size}")
+
+    # モデルから前処理を取得
+    model = get_model(model_name, pretrained=False, input_size=actual_size)
+    base_transform = model.get_preprocess()
+
+    # データ拡張
+    if use_augmentation:
+        transform = transforms.Compose([
+            transforms.Resize(actual_size),
+            transforms.ToTensor(),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            transforms.RandomAffine(degrees=5, translate=(0.1, 0.1)),
+            transforms.RandomErasing(p=0.5, scale=(0.02, 0.2)),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                std=[0.229, 0.224, 0.225])
+        ])
+    else:
+        transform = transforms.Compose([
+            transforms.Resize(actual_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                std=[0.229, 0.224, 0.225])
+        ])
+
+    # データセット作成
+    dataset = LocationClassificationDataset(image_paths, location_labels, transform=transform)
+
+    # データ分割
+    val_size = int(len(dataset) * val_split)
+    train_size = len(dataset) - val_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+
+    # DataLoader作成
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+    # ユニークなクラス数を取得
+    num_classes = len(set(location_labels))
+
+    dataset_info = {
+        'total_samples': len(dataset),
+        'train_samples': len(train_dataset),
+        'val_samples': len(val_dataset),
+        'batch_size': batch_size,
+        'num_classes': num_classes,
+        'use_augmentation': use_augmentation,
+        'actual_image_size': actual_size
+    }
+
+    return train_loader, val_loader, dataset_info
+
+def train_location_model(
+    model_name: str,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    num_classes: int = 8,
+    num_epochs: int = 30,
+    learning_rate: float = 0.001,
+    weight_decay: float = 1e-4,
+    save_dir: str = './saved_models',
+    device: Optional[torch.device] = None,
+    progress_callback: Optional[Callable[[int, int, str], bool]] = None,
+    pretrained: bool = True,
+    model_path: Optional[str] = None,
+    use_early_stopping: bool = False,
+    patience: int = 5
+) -> Dict[str, Any]:
+    """位置分類モデルをトレーニングする
+
+    Args:
+        model_name: トレーニングするモデル名
+        train_loader: トレーニングデータローダー
+        val_loader: 検証用データローダー
+        num_classes: クラス数
+        num_epochs: エポック数
+        learning_rate: 学習率
+        weight_decay: 重み減衰
+        save_dir: モデル保存ディレクトリ
         device: 使用するデバイス (Noneの場合は自動選択)
+        progress_callback: 進捗コールバック関数 (current, total, message) -> continue
+        pretrained: 事前学習済みの重みを使用するかどうか
+        model_path: 特定のモデルファイルから重みをロードする場合のパス
+        use_early_stopping: Early Stoppingを使用するかどうか
+        patience: Early Stoppingの忍耐値
+
+    Returns:
+        トレーニング結果の辞書
     """
     # デバイスの設定
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # モデルのロード
-    model = get_model(model_name, pretrained=False)
+    if progress_callback:
+        progress_callback(0, num_epochs, "モデルをロード中...")
     
+    # モデルを初期化（クラス数を引数に追加）
+    if 'donkey_location' in model_name:
+        model = get_model(model_name, pretrained=pretrained)
+        model.classifier = nn.Linear(50, num_classes)  # 出力層を置き換え
+    elif 'resnet18_location' in model_name:
+        model = get_model(model_name, pretrained=pretrained)
+        # TIMMベースモデルは初期化時にnum_outputsを設定するので
+        # コンストラクタで置き換える必要はないが、確認のため
+        if hasattr(model, 'regressor'):
+            in_features = model.regressor.in_features if hasattr(model.regressor, 'in_features') else model.regressor[0].in_features
+            model.regressor = nn.Linear(in_features, num_classes)
+    else:
+        # その他のモデル対応
+        model = get_model(model_name, pretrained=pretrained)
+    
+    # 特定のモデルファイルから重みをロードする場合
     if model_path and os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        print(f'Model loaded from: {model_path}')
+        if progress_callback:
+            progress_callback(0, num_epochs, f"保存済みモデル '{os.path.basename(model_path)}' から重みをロード中...")
+        
+        try:
+            # モデルチェックポイントをロード
+            checkpoint = torch.load(model_path, map_location=device)
+            
+            # state_dictがあるかチェック
+            if 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+                print(f"モデル重みを '{model_path}' からロードしました")
+            else:
+                # 直接state_dictが保存されている場合
+                model.load_state_dict(checkpoint)
+                print(f"モデル重みを '{model_path}' からロードしました")
+                
+        except Exception as e:
+            print(f"モデル重みのロードに失敗しました: {e}")
+            print("事前学習済みモデルまたはランダム初期化を使用します")
     
     model = model.to(device)
-    model.eval()
     
-    # データの取得
-    data_iter = iter(test_loader)
-    inputs, targets = next(data_iter)
+    # 損失関数と最適化アルゴリズム
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
     
-    # サンプル数の調整
-    num_samples = min(num_samples, inputs.size(0))
+    # トレーニングループ
+    train_losses = []
+    val_losses = []
+    train_accuracies = []
+    val_accuracies = []
+    best_val_loss = float('inf')
+    best_val_acc = 0.0
     
-    # 予測
-    with torch.no_grad():
-        inputs_device = inputs[:num_samples].to(device)
-        outputs = model(inputs_device).cpu().numpy()
+    # Early Stopping用の変数
+    early_stopping_counter = 0
+    early_stopped = False
+    stopped_epoch = 0
     
-    # ターゲットをNumPy配列に変換
-    targets = targets[:num_samples].numpy()
+    # 保存ディレクトリの作成
+    os.makedirs(save_dir, exist_ok=True)
     
-    # 予測の視覚化
-    fig, axs = plt.subplots(num_samples, 2, figsize=(12, 3*num_samples))
+    # タイムスタンプを使用してファイル名を生成
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_path = os.path.join(save_dir, f'{model_name}_model_{timestamp}.pth')
+    best_model_path = os.path.join(save_dir, f'{model_name}_best_{timestamp}.pth')
     
-    for i in range(num_samples):
-        # 画像の表示
-        img = inputs[i].numpy().transpose(1, 2, 0)
-        mean = np.array([0.485, 0.456, 0.406])
-        std = np.array([0.229, 0.224, 0.225])
-        img = std * img + mean
-        img = np.clip(img, 0, 1)
+    completed_epochs = 0
+    for epoch in range(num_epochs):
+        # 進捗コールバック - エポック開始
+        if progress_callback:
+            message = f"エポック {epoch+1}/{num_epochs} 開始"
+            should_continue = progress_callback(epoch, num_epochs, message)
+            if not should_continue:
+                break
         
-        axs[i, 0].imshow(img)
-        axs[i, 0].set_title(f'Sample {i+1}')
-        axs[i, 0].axis('off')
+        model.train()
+        epoch_loss = 0.0
+        correct = 0
+        total = 0
         
-        # ステアリングホイールの描画
-        axs[i, 1].set_xlim(-1.2, 1.2)
-        axs[i, 1].set_ylim(-1.2, 1.2)
+        # トレーニングステップ
+        for i, (inputs, targets) in enumerate(train_loader):
+            inputs, targets = inputs.to(device), targets.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            
+            # 統計情報を更新
+            epoch_loss += loss.item() * inputs.size(0)
+            _, predicted = torch.max(outputs, 1)
+            total += targets.size(0)
+            correct += (predicted == targets).sum().item()
+            
+            # バッチごとの進捗コールバック（10%ごと）
+            if progress_callback and (i % max(1, len(train_loader) // 10) == 0):
+                batch_progress = i / len(train_loader)
+                total_progress = (epoch + batch_progress) / num_epochs
+                message = f"エポック {epoch+1}/{num_epochs}, バッチ {i}/{len(train_loader)}, 損失: {loss.item():.4f}"
+                should_continue = progress_callback(int(total_progress * num_epochs), num_epochs, message)
+                if not should_continue:
+                    break
         
-        # 円の描画
-        circle = plt.Circle((0, 0), 1, fill=False, color='black', linewidth=2)
-        axs[i, 1].add_patch(circle)
+        # エポック損失と精度の計算
+        epoch_loss /= len(train_loader.dataset)
+        epoch_accuracy = 100 * correct / total
+        train_losses.append(epoch_loss)
+        train_accuracies.append(epoch_accuracy)
         
-        # 予測角度の描画（-1から1の範囲を-π/4からπ/4に変換）
-        pred_angle = outputs[i, 0] * np.pi/4
-        target_angle = targets[i, 0] * np.pi/4
+        # 検証
+        model.eval()
+        val_loss = 0.0
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for inputs, targets in val_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                
+                # 統計情報を更新
+                val_loss += loss.item() * inputs.size(0)
+                _, predicted = torch.max(outputs, 1)
+                total += targets.size(0)
+                correct += (predicted == targets).sum().item()
         
-        # 予測角度の矢印
-        axs[i, 1].arrow(0, 0, np.cos(pred_angle), np.sin(pred_angle), 
-                       head_width=0.1, head_length=0.1, fc='red', ec='red', label='Predicted')
+        # 検証損失と精度の計算
+        val_loss /= len(val_loader.dataset)
+        val_accuracy = 100 * correct / total
+        val_losses.append(val_loss)
+        val_accuracies.append(val_accuracy)
         
-        # ターゲット角度の矢印
-        axs[i, 1].arrow(0, 0, np.cos(target_angle), np.sin(target_angle), 
-                       head_width=0.1, head_length=0.1, fc='blue', ec='blue', label='Target')
+        # 学習率の調整
+        scheduler.step(val_loss)
         
-        # スロットル情報をテキストで表示
-        pred_throttle = outputs[i, 1]
-        target_throttle = targets[i, 1]
-        axs[i, 1].text(-1.1, -1.1, f'Pred Throttle: {pred_throttle:.2f}', color='red')
-        axs[i, 1].text(-1.1, -1.0, f'Target Throttle: {target_throttle:.2f}', color='blue')
+        # エポックの完了をカウント
+        completed_epochs = epoch + 1
         
-        # 凡例を表示
-        if i == 0:
-            axs[i, 1].legend()
+        # 進捗コールバック - エポック終了
+        if progress_callback:
+            message = f"エポック {epoch+1}/{num_epochs}, 学習損失: {epoch_loss:.4f}, 検証損失: {val_loss:.4f}, "
+            message += f"学習精度: {epoch_accuracy:.2f}%, 検証精度: {val_accuracy:.2f}%"
+            should_continue = progress_callback(epoch + 1, num_epochs, message)
+            if not should_continue:
+                break
         
-        axs[i, 1].set_title(f'Steering Prediction')
-        axs[i, 1].axis('equal')
+        # 最良モデルの保存（検証損失の改善）
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            early_stopping_counter = 0  # カウンタをリセット
+            
+            # 最良精度も更新
+            if val_accuracy > best_val_acc:
+                best_val_acc = val_accuracy
+            
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': best_val_loss,
+                'accuracy': best_val_acc,
+                'num_classes': num_classes
+            }, best_model_path)
+            
+            if progress_callback:
+                progress_callback(epoch + 1, num_epochs, 
+                                f"エポック {epoch+1}/{num_epochs}: 新しい最良モデルを保存しました"
+                                f"（損失: {best_val_loss:.6f}, 精度: {best_val_acc:.2f}%）")
+        # 検証精度のみ改善した場合
+        elif val_accuracy > best_val_acc:
+            best_val_acc = val_accuracy
+            
+            # 精度が改善した場合も保存
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': val_loss,
+                'accuracy': best_val_acc,
+                'num_classes': num_classes
+            }, best_model_path)
+            
+            if progress_callback:
+                progress_callback(epoch + 1, num_epochs, 
+                                f"エポック {epoch+1}/{num_epochs}: 新しい最良精度を保存しました"
+                                f"（精度: {best_val_acc:.2f}%, 損失: {val_loss:.6f}）")
+        else:
+            # 検証損失が改善しなかった場合
+            if use_early_stopping:
+                early_stopping_counter += 1
+                if progress_callback:
+                    progress_callback(epoch + 1, num_epochs, 
+                                    f"エポック {epoch+1}/{num_epochs}: 検証損失が改善しませんでした"
+                                    f"（カウンタ: {early_stopping_counter}/{patience}）")
+                
+                # Early Stoppingの判定
+                if early_stopping_counter >= patience:
+                    if progress_callback:
+                        progress_callback(epoch + 1, num_epochs, 
+                                        f"エポック {epoch+1}/{num_epochs}: Early Stoppingにより"
+                                        f"トレーニングを終了します")
+                    early_stopped = True
+                    stopped_epoch = epoch + 1
+                    break
     
+    # 最終モデルの保存
+    torch.save({
+        'epoch': completed_epochs,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'train_accuracies': train_accuracies,
+        'val_accuracies': val_accuracies,
+        'best_val_loss': best_val_loss,
+        'best_val_acc': best_val_acc,
+        'early_stopped': early_stopped,
+        'stopped_epoch': stopped_epoch if early_stopped else completed_epochs,
+        'num_classes': num_classes
+    }, model_path)
+    
+    # トレーニング結果
+    training_results = {
+        'model_name': model_name,
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'train_accuracies': train_accuracies,
+        'val_accuracies': val_accuracies,
+        'best_val_loss': best_val_loss,
+        'best_val_acc': best_val_acc,
+        'model_path': model_path,
+        'best_model_path': best_model_path,
+        'num_epochs': num_epochs,
+        'completed_epochs': completed_epochs,
+        'learning_rate': learning_rate,
+        'weight_decay': weight_decay,
+        'pretrained': pretrained,
+        'loaded_weights': model_path is not None and os.path.exists(model_path),
+        'early_stopped': early_stopped,
+        'stopped_epoch': stopped_epoch if early_stopped else completed_epochs,
+        'patience': patience if use_early_stopping else 0,
+        'num_classes': num_classes
+    }
+    
+    # トレーニング結果の可視化
+    plot_location_training_results(training_results, save_dir, timestamp)
+    
+    return training_results
+
+def plot_location_training_results(results, save_dir, timestamp):
+    """位置分類モデルのトレーニング結果をプロットする
+
+    Args:
+        results: トレーニング結果の辞書
+        save_dir: プロット保存ディレクトリ
+        timestamp: タイムスタンプ
+    """
+    # 2x1のサブプロットを作成（損失と精度）
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
+    
+    # 損失のプロット
+    ax1.plot(results['train_losses'], label='Training Loss')
+    ax1.plot(results['val_losses'], label='Validation Loss')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.set_title(f"Training Losses: {results['model_name']}")
+    ax1.legend()
+    ax1.grid(True)
+    
+    # 精度のプロット
+    ax2.plot(results['train_accuracies'], label='Training Accuracy')
+    ax2.plot(results['val_accuracies'], label='Validation Accuracy')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Accuracy (%)')
+    ax2.set_title(f"Training Accuracies: {results['model_name']}")
+    ax2.legend()
+    ax2.grid(True)
+    
+    # プロットの保存
     plt.tight_layout()
-    plt.savefig(f'{model_name}_predictions.png')
+    plot_path = os.path.join(save_dir, f"{results['model_name']}_{timestamp}_training_plot.png")
+    plt.savefig(plot_path)
     plt.close()
-    print(f'Predictions visualization saved: {model_name}_predictions.png')
-
-# #def export_model_to_h5(model_path, output_path, model_type):
-#     """PyTorchモデルをDonkeycar用のH5形式に変換する
     
-#     Args:
-#         model_path: 変換するPyTorchモデルのパス
-#         output_path: 出力するH5ファイルのパス
-#         model_type: モデルの種類
-        
-#     Returns:
-#         出力されたH5ファイルのパス
-#     """
-#     import torch
-#     import numpy as np
-#     import h5py
-#     import os
-#     from datetime import datetime
-    
-#     from model_catalog import get_model
-    
-#     try:
-#         # PyTorchモデルを読み込む
-#         device = torch.device('cpu')  # CPU上で変換
-#         model = get_model(model_type, pretrained=False)
-        
-#         # 保存されたモデルの状態を読み込む
-#         checkpoint = torch.load(model_path, map_location=device)
-        
-#         # state_dictを取得
-#         if 'model_state_dict' in checkpoint:
-#             model.load_state_dict(checkpoint['model_state_dict'])
-#         else:
-#             # 直接state_dictが保存されている場合
-#             model.load_state_dict(checkpoint)
-        
-#         # 評価モードに設定
-#         model.eval()
-        
-#         # モデルの構造を取得（レイヤー名と重み）
-#         layers = []
-        
-#         # モデルの構造をトラバースして重みを抽出
-#         for name, param in model.named_parameters():
-#             # 名前をDonkeycar互換の形式に変換
-#             # 例: "features.0.weight" → "features_0_weight"
-#             h5_name = name.replace('.', '_')
-            
-#             # パラメータをNumPy配列に変換
-#             weight_np = param.data.cpu().numpy()
-            
-#             # レイヤー情報を記録
-#             layers.append({
-#                 'name': h5_name,
-#                 'weight': weight_np,
-#                 'shape': weight_np.shape
-#             })
-        
-#         # H5ファイルに保存
-#         with h5py.File(output_path, 'w') as f:
-#             # メタデータを保存
-#             f.attrs['model_type'] = model_type
-#             f.attrs['created_date'] = np.string_(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-#             f.attrs['pytorch_model'] = np.string_(os.path.basename(model_path))
-            
-#             # モデルのアーキテクチャ情報を保存
-#             arch_group = f.create_group('architecture')
-#             arch_group.attrs['name'] = model_type
-            
-#             # レイヤーごとの重みを保存
-#             weights_group = f.create_group('weights')
-#             for layer in layers:
-#                 # レイヤーのデータセットを作成
-#                 dataset = weights_group.create_dataset(
-#                     layer['name'], 
-#                     data=layer['weight'],
-#                     compression="gzip", 
-#                     compression_opts=9
-#                 )
-#                 # 形状情報も属性として保存
-#                 dataset.attrs['shape'] = layer['shape']
-            
-#             # Donkeycar互換のモデル構成情報を追加
-#             config_group = f.create_group('model_config')
-#             #config_group.attrs['input_shape'] = np.array([120, 160, 3])  # 一般的なDonkeycarの入力サイズ
-#             config_group.attrs['input_shape'] = np.array([224, 224, 3])  # 一般的なDonkeycarの入力サイズ
-#             config_group.attrs['output_shape'] = np.array([2])  # angle, throttle
-#             config_group.attrs['type'] = 'pytorch_linear'
-            
-#             print(f"モデルを.h5形式に変換し、{output_path}に保存しました")
-#             return output_path
-            
-#     except Exception as e:
-#         print(f"H5変換エラー: {str(e)}")
-#         raise e
-
-# def export_model_to_h5(model_path, output_path, model_type='linear'):
-#     """PyTorchモデルをDonkeycar互換のh5形式に変換する"""
-#     try:
-#         import tensorflow as tf
-#         from tensorflow import keras
-#         import numpy as np
-        
-#         # Donkeycarの標準入力サイズ
-#         input_shape = (224, 224, 3)
-#         #input_shape = (120, 160, 3)
-        
-#         # Donkeycar互換のモデルを直接作成
-#         img_in = keras.layers.Input(shape=input_shape, name='img_in')
-        
-#         # モデルタイプに基づいて適切なCNNレイヤーを構築
-#         drop = 0.2
-#         x = img_in
-#         x = keras.layers.Conv2D(24, (5, 5), strides=(2, 2), activation='relu', name='conv2d_1')(x)
-#         x = keras.layers.Dropout(drop)(x)
-#         x = keras.layers.Conv2D(32, (5, 5), strides=(2, 2), activation='relu', name='conv2d_2')(x)
-#         x = keras.layers.Dropout(drop)(x)
-#         x = keras.layers.Conv2D(64, (5, 5), strides=(2, 2), activation='relu', name='conv2d_3')(x)
-#         x = keras.layers.Dropout(drop)(x)
-#         x = keras.layers.Conv2D(64, (3, 3), strides=(1, 1), activation='relu', name='conv2d_4')(x)
-#         x = keras.layers.Dropout(drop)(x)
-#         x = keras.layers.Conv2D(64, (3, 3), strides=(1, 1), activation='relu', name='conv2d_5')(x)
-#         x = keras.layers.Dropout(drop)(x)
-#         x = keras.layers.Flatten(name='flattened')(x)
-#         x = keras.layers.Dense(100, activation='relu', name='dense_1')(x)
-#         x = keras.layers.Dropout(drop)(x)
-#         x = keras.layers.Dense(50, activation='relu', name='dense_2')(x)
-#         x = keras.layers.Dropout(drop)(x)
-        
-#         # リニアモデルの場合は2つの出力（角度とスロットル）
-#         outputs = []
-#         outputs.append(keras.layers.Dense(1, activation='linear', name='n_outputs0')(x))
-#         outputs.append(keras.layers.Dense(1, activation='linear', name='n_outputs1')(x))
-        
-#         # Kerasモデルを作成
-#         model = keras.Model(inputs=[img_in], outputs=outputs, name='linear')
-        
-#         # モデルをコンパイル - Donkeycarと互換性のある設定
-#         model.compile(optimizer='adam', loss='mse')
-        
-#         # モデルの構造と重みを保存
-#         model.save(output_path, include_optimizer=True)
-        
-#         print(f"Donkeycar互換のモデルを保存しました: {output_path}")
-#         return True
-        
-#     except Exception as e:
-#         print(f"モデル変換中にエラーが発生しました: {e}")
-#         import traceback
-#         traceback.print_exc()
-#         return False
-
-def export_model_to_h5(model_path, output_path, model_type='linear'):
-    """PyTorchモデルをDonkeycar互換のh5形式に変換する"""
-    try:
-        import tensorflow as tf
-        from tensorflow import keras
-        import numpy as np
-        
-        # TensorFlow/Kerasのバージョンを確認
-        tf_version = tf.__version__
-        keras_version = keras.__version__
-        print(f"TensorFlow version: {tf_version}")
-        print(f"Keras version: {keras_version}")
-        
-        # Donkeycarの標準入力サイズ
-        input_shape = (120, 160, 3)
-        
-        # Donkeycar互換のモデルを直接作成
-        img_in = keras.layers.Input(shape=input_shape, name='img_in')
-        
-        # モデルタイプに基づいて適切なCNNレイヤーを構築
-        drop = 0.2
-        x = img_in
-        x = keras.layers.Conv2D(24, (5, 5), strides=(2, 2), activation='relu', name='conv2d_1')(x)
-        x = keras.layers.Dropout(drop)(x)
-        x = keras.layers.Conv2D(32, (5, 5), strides=(2, 2), activation='relu', name='conv2d_2')(x)
-        x = keras.layers.Dropout(drop)(x)
-        x = keras.layers.Conv2D(64, (5, 5), strides=(2, 2), activation='relu', name='conv2d_3')(x)
-        x = keras.layers.Dropout(drop)(x)
-        x = keras.layers.Conv2D(64, (3, 3), strides=(1, 1), activation='relu', name='conv2d_4')(x)
-        x = keras.layers.Dropout(drop)(x)
-        x = keras.layers.Conv2D(64, (3, 3), strides=(1, 1), activation='relu', name='conv2d_5')(x)
-        x = keras.layers.Dropout(drop)(x)
-        x = keras.layers.Flatten(name='flattened')(x)
-        x = keras.layers.Dense(100, activation='relu', name='dense_1')(x)
-        x = keras.layers.Dropout(drop)(x)
-        x = keras.layers.Dense(50, activation='relu', name='dense_2')(x)
-        x = keras.layers.Dropout(drop)(x)
-        
-        # リニアモデルの場合は2つの出力（角度とスロットル）
-        outputs = []
-        outputs.append(keras.layers.Dense(1, activation='linear', name='n_outputs0')(x))
-        outputs.append(keras.layers.Dense(1, activation='linear', name='n_outputs1')(x))
-        
-        # Kerasモデルを作成
-        model = keras.Model(inputs=[img_in], outputs=outputs, name='linear')
-        
-        # モデルをコンパイル - Donkeycarと互換性のある設定
-        # 古いKerasバージョンに対応するためにlrパラメータを使用
-        try:
-            model.compile(optimizer=keras.optimizers.Adam(learning_rate=0.001), loss='mse')
-        except:
-            # 古いKerasバージョンでは'lr'を使用
-            model.compile(optimizer=keras.optimizers.Adam(lr=0.001), loss='mse')
-        
-        # モデルの保存 - バージョン互換性のために基本的なオプションを使用
-        try:
-            # 新しい方法での保存を試みる
-            model.save(output_path, include_optimizer=True, save_format='h5')
-        except:
-            try:
-                # 古い方法での保存を試みる
-                model.save(output_path, include_optimizer=True)
-            except:
-                # さらに古い方法
-                model.save(output_path)
-        
-        print(f"Donkeycar互換のモデルを保存しました: {output_path}")
-        
-        # モデルの読み込みテスト
-        try:
-            test_model = keras.models.load_model(output_path)
-            print("保存したモデルを正常に読み込めることを確認しました。")
-        except Exception as test_error:
-            print(f"保存したモデルの読み込みテスト中にエラーが発生しました: {test_error}")
-            print("モデルは保存されましたが、Donkeycarで読み込めない可能性があります。")
-        
-        return True
-        
-    except Exception as e:
-        print(f"モデル変換中にエラーが発生しました: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+    print(f'Training plot saved: {plot_path}')
 
 # モジュールが直接実行された場合のサンプル処理（オプション）
 if __name__ == "__main__":
@@ -1600,14 +1542,6 @@ if __name__ == "__main__":
         )
         
         print(f"評価結果: {eval_results}")
-        
-        # 予測の可視化
-        visualize_predictions(
-            model_name=args.model,
-            test_loader=test_loader,
-            model_path=training_results['best_model_path'],
-            num_samples=5
-        )
-        
+                
     except Exception as e:
         print(f"エラー: {str(e)}")
