@@ -120,10 +120,13 @@ python annotation_bbox.py
 - 再現手順
 - オペレーティングシステムとPythonバージョン
 
-## ライセンス
+## ライセンス（License）
+This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
 
-[MITライセンス](LICENSE)
+## Third-party Libraries
+- PyQt5: Licensed under GPL v3
+
 
 ## 謝辞
 
-このツールは、DonkeycarやJetracerなどのAIミニカープロジェクトをサポートするために開発されました。
+このツールは、Togikaidrive、DonkeycarやJetracerなどのAIミニカープロジェクトをサポートするために開発されました。
