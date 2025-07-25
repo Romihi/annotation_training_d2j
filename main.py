@@ -2545,6 +2545,10 @@ class ImageAnnotationTool(QMainWindow):
             if hasattr(self, 'display_current_image'):
                 self.display_current_image()
             
+            # 統計情報を更新
+            if hasattr(self, 'update_driving_annotation_stats'):
+                self.update_driving_annotation_stats()
+            
             # 推論情報パネルを更新（推論表示がONの場合のみ）
             if (hasattr(self, 'inference_checkbox') and 
                 hasattr(self, 'update_inference_display') and 
@@ -2739,11 +2743,34 @@ class ImageAnnotationTool(QMainWindow):
         """セグメンテーションアノテーションの統計情報を更新"""
         seg_count = len(self.segmentation_annotations) if hasattr(self, 'segmentation_annotations') else 0
         
-        # 統計ラベルの更新（既存のstats_labelを拡張）
-        if hasattr(self, 'stats_label'):
-            current_text = self.stats_label.text()
-            if "Segmentations:" not in current_text:
-                self.stats_label.setText(f"{current_text} | Segmentations: {seg_count}")
+        # Update the stats through the comprehensive update method
+        if hasattr(self, 'update_driving_annotation_stats'):
+            self.update_driving_annotation_stats()
+    
+    def update_driving_annotation_stats(self):
+        """運転アノテーションの統計情報を更新"""
+        if not hasattr(self, 'stats_label'):
+            return
+            
+        # アノテーション数の更新
+        self.annotated_count = len(self.annotations)
+        total_images = len(self.images) if self.images else 0
+        
+        # 統計ラベルのテキストを構築
+        stats_text = f"アノテーション済み: {self.annotated_count} / {total_images}"
+        
+        # バウンディングボックスの統計情報を追加
+        if hasattr(self, 'bbox_annotations') and self.bbox_annotations:
+            bbox_count = len(self.bbox_annotations)
+            stats_text += f" | Bounding Boxes: {bbox_count}"
+        
+        # セグメンテーションの統計情報を追加
+        if hasattr(self, 'segmentation_annotations') and self.segmentation_annotations:
+            seg_count = len(self.segmentation_annotations)
+            stats_text += f" | Segmentations: {seg_count}"
+        
+        # ラベルを更新
+        self.stats_label.setText(stats_text)
 
     def eventFilter(self, obj, event):
         # キーイベントを処理
@@ -2961,9 +2988,9 @@ class ImageAnnotationTool(QMainWindow):
         # Count the number of bounding box annotations
         bbox_count = len(self.bbox_annotations) if hasattr(self, 'bbox_annotations') else 0
         
-        # Update the stats label to show bounding box count
-        if hasattr(self, 'stats_label'):
-            self.stats_label.setText(f"Bounding Boxes: {bbox_count} / {len(self.images)}")
+        # Update the stats through the comprehensive update method
+        if hasattr(self, 'update_driving_annotation_stats'):
+            self.update_driving_annotation_stats()
             
     def add_detection_inference_controls(self):
         """物体検知推論表示コントロールを追加"""
@@ -7146,9 +7173,9 @@ class ImageAnnotationTool(QMainWindow):
 
     def _finalize_yolo_annotation_loading(self, stats, classes):
         """YOLOアノテーション読み込み完了後の処理"""
-        # 統計情報を更新
-        if hasattr(self, 'update_bbox_stats'):
-            self.update_bbox_stats()
+        # 統計情報を更新 - 全体の統計情報を更新
+        if hasattr(self, 'update_driving_annotation_stats'):
+            self.update_driving_annotation_stats()
         
         # 表示を更新
         if hasattr(self, 'display_current_image'):
@@ -9189,6 +9216,9 @@ class ImageAnnotationTool(QMainWindow):
         # 位置ボタンのカウント表示を更新
         self.update_location_button_counts()
         
+        # 統計情報を更新（画像読み込み時）
+        self.update_driving_annotation_stats()
+        
         # アノテーション関連ボタンをアクティブ化
         self.set_annotation_buttons_enabled(True)
         
@@ -9306,6 +9336,9 @@ class ImageAnnotationTool(QMainWindow):
                 
                 # 位置ボタンのカウント表示を更新
                 self.update_location_button_counts()
+                
+                # 運転アノテーションの統計情報を更新
+                self.update_driving_annotation_stats()
                 
                 # 詳細情報を生成
                 details = ""
@@ -9946,6 +9979,9 @@ class ImageAnnotationTool(QMainWindow):
                     self.update_distribution_graph()
                 except Exception as graph_error:
                     print(f"分布グラフ更新時にエラー: {graph_error}")
+            
+            # 運転アノテーションの統計情報を更新
+            self.update_driving_annotation_stats()
             
             print(f"読み込み完了: {loaded_count}個のアノテーションを読み込みました")
             print(f"削除済みインデックス数: {len(deleted_indexes)}")
