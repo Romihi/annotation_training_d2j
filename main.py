@@ -2545,6 +2545,10 @@ class ImageAnnotationTool(QMainWindow):
             if hasattr(self, 'display_current_image'):
                 self.display_current_image()
             
+            # 統計情報を更新
+            if hasattr(self, 'update_driving_annotation_stats'):
+                self.update_driving_annotation_stats()
+            
             # 推論情報パネルを更新（推論表示がONの場合のみ）
             if (hasattr(self, 'inference_checkbox') and 
                 hasattr(self, 'update_inference_display') and 
@@ -2739,11 +2743,34 @@ class ImageAnnotationTool(QMainWindow):
         """セグメンテーションアノテーションの統計情報を更新"""
         seg_count = len(self.segmentation_annotations) if hasattr(self, 'segmentation_annotations') else 0
         
-        # 統計ラベルの更新（既存のstats_labelを拡張）
-        if hasattr(self, 'stats_label'):
-            current_text = self.stats_label.text()
-            if "Segmentations:" not in current_text:
-                self.stats_label.setText(f"{current_text} | Segmentations: {seg_count}")
+        # Update the stats through the comprehensive update method
+        if hasattr(self, 'update_driving_annotation_stats'):
+            self.update_driving_annotation_stats()
+    
+    def update_driving_annotation_stats(self):
+        """運転アノテーションの統計情報を更新"""
+        if not hasattr(self, 'stats_label'):
+            return
+            
+        # アノテーション数の更新
+        self.annotated_count = len(self.annotations)
+        total_images = len(self.images) if self.images else 0
+        
+        # 統計ラベルのテキストを構築
+        stats_text = f"アノテーション済み: {self.annotated_count} / {total_images}"
+        
+        # バウンディングボックスの統計情報を追加
+        if hasattr(self, 'bbox_annotations') and self.bbox_annotations:
+            bbox_count = len(self.bbox_annotations)
+            stats_text += f" | Bounding Boxes: {bbox_count}"
+        
+        # セグメンテーションの統計情報を追加
+        if hasattr(self, 'segmentation_annotations') and self.segmentation_annotations:
+            seg_count = len(self.segmentation_annotations)
+            stats_text += f" | Segmentations: {seg_count}"
+        
+        # ラベルを更新
+        self.stats_label.setText(stats_text)
 
     def eventFilter(self, obj, event):
         # キーイベントを処理
@@ -2961,9 +2988,9 @@ class ImageAnnotationTool(QMainWindow):
         # Count the number of bounding box annotations
         bbox_count = len(self.bbox_annotations) if hasattr(self, 'bbox_annotations') else 0
         
-        # Update the stats label to show bounding box count
-        if hasattr(self, 'stats_label'):
-            self.stats_label.setText(f"Bounding Boxes: {bbox_count} / {len(self.images)}")
+        # Update the stats through the comprehensive update method
+        if hasattr(self, 'update_driving_annotation_stats'):
+            self.update_driving_annotation_stats()
             
     def add_detection_inference_controls(self):
         """物体検知推論表示コントロールを追加"""
@@ -7146,9 +7173,9 @@ class ImageAnnotationTool(QMainWindow):
 
     def _finalize_yolo_annotation_loading(self, stats, classes):
         """YOLOアノテーション読み込み完了後の処理"""
-        # 統計情報を更新
-        if hasattr(self, 'update_bbox_stats'):
-            self.update_bbox_stats()
+        # 統計情報を更新 - 全体の統計情報を更新
+        if hasattr(self, 'update_driving_annotation_stats'):
+            self.update_driving_annotation_stats()
         
         # 表示を更新
         if hasattr(self, 'display_current_image'):
@@ -9189,6 +9216,9 @@ class ImageAnnotationTool(QMainWindow):
         # 位置ボタンのカウント表示を更新
         self.update_location_button_counts()
         
+        # 統計情報を更新（画像読み込み時）
+        self.update_driving_annotation_stats()
+        
         # アノテーション関連ボタンをアクティブ化
         self.set_annotation_buttons_enabled(True)
         
@@ -9279,6 +9309,7 @@ class ImageAnnotationTool(QMainWindow):
                         annotations_by_dir[parent_dir] = loaded_in_dir
                         loaded_count += loaded_in_dir
                         print(f"親ディレクトリ {parent_dir} から {loaded_in_dir} 個のアノテーションを読み込みました")
+                        print(f"  現在の合計アノテーション数: {len(self.annotations)}")
                 else:
                     # カタログファイルの確認（parent_dir直下のみ）
                     try:
@@ -9291,6 +9322,7 @@ class ImageAnnotationTool(QMainWindow):
                                 annotations_by_dir[parent_dir] = loaded_in_dir
                                 loaded_count += loaded_in_dir
                                 print(f"親ディレクトリ {parent_dir} から {loaded_in_dir} 個のアノテーションを読み込みました")
+                        print(f"  現在の合計アノテーション数: {len(self.annotations)}")
                     except Exception as e:
                         print(f"カタログファイル検索エラー {parent_dir}: {e}")
                             
@@ -9307,6 +9339,9 @@ class ImageAnnotationTool(QMainWindow):
                 # 位置ボタンのカウント表示を更新
                 self.update_location_button_counts()
                 
+                # 運転アノテーションの統計情報を更新
+                self.update_driving_annotation_stats()
+                
                 # 詳細情報を生成
                 details = ""
                 if len(annotations_by_dir) > 0:
@@ -9315,6 +9350,14 @@ class ImageAnnotationTool(QMainWindow):
                         if count > 0:
                             dir_name = os.path.basename(dir_path)
                             details += f"• {dir_name}: {count}個\n"
+                
+                # デバッグ情報をコンソールに出力
+                print("\n=== アノテーション読み込み完了 ===")
+                print(f"読み込みフォルダ数: {len(self.folder_paths)}")
+                print(f"総画像数: {len(self.images)}")
+                print(f"総アノテーション数: {len(self.annotations)}")
+                for dir_path, count in annotations_by_dir.items():
+                    print(f"  {dir_path}: {count}個のアノテーション")
                 
                 QMessageBox.information(
                     self, 
@@ -9714,9 +9757,9 @@ class ImageAnnotationTool(QMainWindow):
                         deleted_indexes = catalog_info["deleted_indexes"]
                         print(f"manifest.jsonから{len(deleted_indexes)}個の削除済みインデックスを読み込みました")
                         
-                        # クラスの削除済みインデックスリストを更新
-                        if hasattr(self, 'deleted_indexes'):
-                            self.deleted_indexes = deleted_indexes.copy()
+                        # 削除済みインデックスは各フォルダのローカルなインデックスなので、
+                        # グローバルなdeleted_indexesには追加しない（後で別途処理が必要な場合は要検討）
+                        # ここではローカル変数として保持するのみ
             
             if not catalog_files:
                 print("manifest.jsonからカタログファイルを取得できませんでした")
@@ -9819,7 +9862,10 @@ class ImageAnnotationTool(QMainWindow):
                             os.path.join(images_folder, img_name),
                             os.path.join(catalog_folder, img_name),
                             os.path.join(os.path.dirname(catalog_path), img_name),
-                            os.path.join(self.folder_path, img_name)
+                            os.path.join(catalog_folder, "images", img_name),
+                            # catalog_folderの親ディレクトリも検索
+                            os.path.join(os.path.dirname(catalog_folder), img_name),
+                            os.path.join(os.path.dirname(catalog_folder), "images", img_name)
                         ]
                         
                         for path in path_patterns:
@@ -9837,6 +9883,14 @@ class ImageAnnotationTool(QMainWindow):
                         
                         # 画像が見つからない場合はスキップ
                         if img_path is None:
+                            continue
+                        
+                        # 画像のインデックスを self.images リストから取得
+                        actual_index = None
+                        try:
+                            actual_index = self.images.index(img_path)
+                        except ValueError:
+                            print(f"警告: 画像 {img_path} が self.images に見つかりません")
                             continue
                         
                         try:
@@ -9859,8 +9913,8 @@ class ImageAnnotationTool(QMainWindow):
                             x = max(0, min(x, img_width - 1))
                             y = max(0, min(y, img_height - 1))
                             
-                            # アノテーションを保存
-                            self.annotations[entry_index] = {
+                            # アノテーションを保存 - actual_indexを使用
+                            self.annotations[actual_index] = {
                                 "angle": angle,
                                 "throttle": throttle,
                                 "x": x,
@@ -9870,16 +9924,17 @@ class ImageAnnotationTool(QMainWindow):
 
                             # 位置情報があれば追加
                             if location is not None:
-                                self.annotations[entry_index]["loc"] = location
-                                self.location_annotations[entry_index] = location
+                                self.annotations[actual_index]["loc"] = location
+                                self.location_annotations[actual_index] = location
                                 
                                 # 位置情報ボタンがまだなければ追加
                                 self.ensure_location_button_exists(location)
 
                             # タイムスタンプを保存
-                            self.annotation_timestamps[entry_index] = entry.get('_timestamp_ms', int(time.time() * 1000))
+                            self.annotation_timestamps[actual_index] = entry.get('_timestamp_ms', int(time.time() * 1000))
                             
                             loaded_count += 1
+                            print(f"  アノテーション追加: 画像インデックス {actual_index}, 元のエントリインデックス {entry_index}")
                             
                             # 推論結果があれば保存（ユーザーアノテーションと異なる場合）
                             if "pilot/angle" in entry and "pilot/throttle" in entry and \
@@ -9898,7 +9953,7 @@ class ImageAnnotationTool(QMainWindow):
                                 pilot_y = max(0, min(pilot_y, img_height - 1))
                                 
                                 # 推論結果を保存
-                                self.inference_results[entry_index] = {
+                                self.inference_results[actual_index] = {
                                     "angle": pilot_angle,
                                     "throttle": pilot_throttle,
                                     "pilot/angle": pilot_angle,
@@ -9909,8 +9964,8 @@ class ImageAnnotationTool(QMainWindow):
                                 
                                 # 推論結果に位置情報があれば追加
                                 if "pilot/loc" in entry:
-                                    self.inference_results[entry_index]["pilot/loc"] = entry["pilot/loc"]
-                                    self.inference_results[entry_index]["loc"] = entry["pilot/loc"]
+                                    self.inference_results[actual_index]["pilot/loc"] = entry["pilot/loc"]
+                                    self.inference_results[actual_index]["loc"] = entry["pilot/loc"]
                                     
                         except Exception as e:
                             print(f"画像 {img_path} の処理中にエラー: {e}")
@@ -9946,6 +10001,9 @@ class ImageAnnotationTool(QMainWindow):
                     self.update_distribution_graph()
                 except Exception as graph_error:
                     print(f"分布グラフ更新時にエラー: {graph_error}")
+            
+            # 運転アノテーションの統計情報を更新
+            self.update_driving_annotation_stats()
             
             print(f"読み込み完了: {loaded_count}個のアノテーションを読み込みました")
             print(f"削除済みインデックス数: {len(deleted_indexes)}")
