@@ -4,9 +4,7 @@ annotation/
 sessions/
 models/
 mlruns/
-utils/
 tmp/
-tools/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
