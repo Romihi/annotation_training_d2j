@@ -538,7 +538,7 @@ def train_multi_image_model(
     
     # タイムスタンプを使用してファイル名を生成
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_path = os.path.join(save_dir, f'{model_name}_model_{timestamp}.pth')
+    model_path = os.path.join(save_dir, f'{model_name}_{timestamp}.pth')
     best_model_path = os.path.join(save_dir, f'{model_name}_best_{timestamp}.pth')
     
     completed_epochs = 0

@@ -984,9 +984,12 @@ def get_model(model_type, pretrained=False, input_size=None):
     
     model_class = MODEL_REGISTRY[model_type]
     
-    # DonkeyModelの場合、入力サイズを渡す
-    if model_type == "donkey" and input_size is not None:
+    # DonkeyModel系の場合、入力サイズを渡す
+    if model_type in ["donkey", "donkey_fcn"] and input_size is not None:
         return model_class(pretrained=pretrained, input_size=input_size)
+    elif model_type == "donkey_location" and input_size is not None:
+        # DonkeyLocationModelの場合、num_classesも必要（デフォルト8）
+        return model_class(num_classes=8, pretrained=pretrained, input_size=input_size)
     
     # その他のモデルの場合は通常通り初期化
     return model_class(pretrained=pretrained)

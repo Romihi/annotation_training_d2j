@@ -47,13 +47,14 @@ os.makedirs(session_dir, exist_ok=True)
 # UI関連設定
 # ===========================================
 # メインウィンドウ
-MAIN_WINDOW_WIDTH = 1600
+MAIN_WINDOW_WIDTH = 1700  # 左パネル拡張に合わせて調整
 MAIN_WINDOW_HEIGHT = 900
 MAIN_WINDOW_X = 100
 MAIN_WINDOW_Y = 100
 
 # 左パネル
-LEFT_PANEL_MAX_WIDTH = 300
+LEFT_PANEL_MAX_WIDTH = 400
+LEFT_PANEL_MIN_WIDTH = 350
 
 # 画像表示
 DEFAULT_ZOOM_FACTOR = 2.5
