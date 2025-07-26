@@ -1833,6 +1833,9 @@ class ImageAnnotationTool(QMainWindow):
 
         # Setup UI
         self.init_ui()
+        
+        # Load saved display settings
+        self.load_display_settings()
 
         # Update UI
         self.display_current_image()
@@ -2169,6 +2172,20 @@ class ImageAnnotationTool(QMainWindow):
         mlflow_layout.addWidget(mlflow_compare_button)
 
         left_layout.addLayout(mlflow_layout)
+
+        # --- 表示設定ボタンを追加 ---
+        settings_layout = QVBoxLayout()
+        
+        settings_label = QLabel("表示設定:")
+        settings_label.setStyleSheet("font-weight: bold;")
+        settings_layout.addWidget(settings_label)
+        
+        settings_button = QPushButton("ウィンドウ・フォントサイズ設定")
+        settings_button.clicked.connect(self.show_display_settings)
+        apply_style(settings_button, 'primary')
+        settings_layout.addWidget(settings_button)
+        
+        left_layout.addLayout(settings_layout)
 
         self.on_method_changed(self.auto_method_combo.currentIndex())
 
@@ -8043,6 +8060,210 @@ class ImageAnnotationTool(QMainWindow):
                 self.last_selected_bbox_class = class_name
                 return class_name
             return None
+
+    def show_display_settings(self):
+        """ウィンドウサイズとフォントサイズの設定ダイアログを表示"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("表示設定")
+        dialog.setMinimumWidth(450)
+        dialog.setMinimumHeight(400)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # ウィンドウサイズ設定
+        window_group = QGroupBox("ウィンドウサイズ")
+        window_layout = QVBoxLayout(window_group)
+        
+        # 現在のウィンドウサイズを表示
+        current_size_label = QLabel(f"現在のサイズ: {self.width()} x {self.height()}")
+        window_layout.addWidget(current_size_label)
+        
+        # 幅設定
+        width_layout = QHBoxLayout()
+        width_layout.addWidget(QLabel("幅:"))
+        self.width_spin = QSpinBox()
+        self.width_spin.setRange(800, 3840)
+        self.width_spin.setValue(self.width())
+        self.width_spin.setSuffix(" px")
+        width_layout.addWidget(self.width_spin)
+        window_layout.addLayout(width_layout)
+        
+        # 高さ設定
+        height_layout = QHBoxLayout()
+        height_layout.addWidget(QLabel("高さ:"))
+        self.height_spin = QSpinBox()
+        self.height_spin.setRange(600, 2160)
+        self.height_spin.setValue(self.height())
+        self.height_spin.setSuffix(" px")
+        height_layout.addWidget(self.height_spin)
+        window_layout.addLayout(height_layout)
+        
+        # プリセットボタン
+        preset_layout = QHBoxLayout()
+        preset_layout.addWidget(QLabel("プリセット:"))
+        
+        preset_buttons = [
+            ("1280x720", 1280, 720),
+            ("1600x900", 1600, 900),
+            ("1920x1080", 1920, 1080),
+            ("2560x1440", 2560, 1440)
+        ]
+        
+        for text, w, h in preset_buttons:
+            btn = QPushButton(text)
+            # Lambda関数内でwidth, heightを正しくキャプチャするための修正
+            btn.clicked.connect(lambda checked=False, width=w, height=h: self.set_window_size_preset(width, height))
+            preset_layout.addWidget(btn)
+        
+        window_layout.addLayout(preset_layout)
+        layout.addWidget(window_group)
+        
+        # フォントサイズ設定
+        font_group = QGroupBox("フォントサイズ")
+        font_layout = QVBoxLayout(font_group)
+        
+        # 現在のフォントサイズ
+        current_font = self.font()
+        current_font_label = QLabel(f"現在のフォントサイズ: {current_font.pointSize()}pt")
+        font_layout.addWidget(current_font_label)
+        
+        # フォントサイズスライダー
+        font_size_layout = QHBoxLayout()
+        font_size_layout.addWidget(QLabel("サイズ:"))
+        
+        self.font_size_slider = QSlider(Qt.Horizontal)
+        self.font_size_slider.setRange(8, 20)
+        self.font_size_slider.setValue(current_font.pointSize())
+        self.font_size_slider.setTickPosition(QSlider.TicksBelow)
+        self.font_size_slider.setTickInterval(2)
+        
+        self.font_size_label = QLabel(f"{current_font.pointSize()}pt")
+        self.font_size_slider.valueChanged.connect(lambda v: self.font_size_label.setText(f"{v}pt"))
+        
+        font_size_layout.addWidget(self.font_size_slider)
+        font_size_layout.addWidget(self.font_size_label)
+        font_layout.addLayout(font_size_layout)
+        
+        # プレビューテキスト
+        preview_label = QLabel("プレビュー: アノテーションツール")
+        preview_label.setFrameStyle(QFrame.Box)
+        preview_label.setAlignment(Qt.AlignCenter)
+        self.font_size_slider.valueChanged.connect(
+            lambda v: preview_label.setFont(QFont(preview_label.font().family(), v))
+        )
+        font_layout.addWidget(preview_label)
+        
+        layout.addWidget(font_group)
+        
+        # 設定の保存オプション
+        save_group = QGroupBox("設定の保存")
+        save_layout = QVBoxLayout(save_group)
+        
+        self.save_settings_check = QCheckBox("次回起動時にこの設定を適用する")
+        self.save_settings_check.setChecked(True)
+        save_layout.addWidget(self.save_settings_check)
+        
+        layout.addWidget(save_group)
+        
+        # ボタン
+        button_layout = QHBoxLayout()
+        
+        apply_button = QPushButton("適用")
+        apply_button.clicked.connect(lambda: self.apply_display_settings(dialog, False))
+        button_layout.addWidget(apply_button)
+        
+        ok_button = QPushButton("OK")
+        ok_button.clicked.connect(lambda: self.apply_display_settings(dialog, True))
+        button_layout.addWidget(ok_button)
+        
+        cancel_button = QPushButton("キャンセル")
+        cancel_button.clicked.connect(dialog.reject)
+        button_layout.addWidget(cancel_button)
+        
+        layout.addLayout(button_layout)
+        
+        dialog.exec_()
+    
+    def set_window_size_preset(self, width, height):
+        """ウィンドウサイズのプリセットを設定"""
+        self.width_spin.setValue(width)
+        self.height_spin.setValue(height)
+    
+    def apply_display_settings(self, dialog, close_dialog):
+        """表示設定を適用"""
+        # ウィンドウサイズを変更
+        new_width = self.width_spin.value()
+        new_height = self.height_spin.value()
+        self.resize(new_width, new_height)
+        
+        # フォントサイズを変更
+        new_font_size = self.font_size_slider.value()
+        font = self.font()
+        font.setPointSize(new_font_size)
+        self.setFont(font)
+        
+        # すべての子ウィジェットにフォントを適用
+        self.apply_font_to_children(self, font)
+        
+        # 設定を保存
+        if self.save_settings_check.isChecked():
+            self.save_display_settings(new_width, new_height, new_font_size)
+        
+        # ステータスバーに通知
+        self.statusBar().showMessage(
+            f"表示設定を適用しました - ウィンドウ: {new_width}x{new_height}, フォント: {new_font_size}pt", 
+            3000
+        )
+        
+        if close_dialog:
+            dialog.accept()
+    
+    def apply_font_to_children(self, widget, font):
+        """すべての子ウィジェットにフォントを適用"""
+        for child in widget.findChildren(QWidget):
+            if hasattr(child, 'setFont'):
+                # 特定のウィジェットタイプごとにフォントサイズを調整
+                if isinstance(child, (QPushButton, QLabel, QLineEdit, QComboBox)):
+                    child_font = QFont(font)
+                    child.setFont(child_font)
+    
+    def save_display_settings(self, width, height, font_size):
+        """表示設定をファイルに保存"""
+        settings_path = os.path.join(session_dir, "display_settings.json")
+        settings = {
+            "window_width": width,
+            "window_height": height,
+            "font_size": font_size
+        }
+        
+        try:
+            with open(settings_path, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=2)
+        except Exception as e:
+            print(f"表示設定の保存エラー: {e}")
+    
+    def load_display_settings(self):
+        """保存された表示設定を読み込んで適用"""
+        settings_path = os.path.join(session_dir, "display_settings.json")
+        
+        if os.path.exists(settings_path):
+            try:
+                with open(settings_path, 'r', encoding='utf-8') as f:
+                    settings = json.load(f)
+                
+                # ウィンドウサイズを適用
+                if "window_width" in settings and "window_height" in settings:
+                    self.resize(settings["window_width"], settings["window_height"])
+                
+                # フォントサイズを適用
+                if "font_size" in settings:
+                    font = self.font()
+                    font.setPointSize(settings["font_size"])
+                    self.setFont(font)
+                    self.apply_font_to_children(self, font)
+                    
+            except Exception as e:
+                print(f"表示設定の読み込みエラー: {e}")
 
     def add_bbox_annotation(self, bbox):
         """バウンディングボックスアノテーションを追加"""
