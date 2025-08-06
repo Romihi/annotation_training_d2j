@@ -2010,15 +2010,6 @@ class ImageAnnotationTool(QMainWindow):
 
         pilot_layout.addLayout(model_buttons_layout)
         
-        # ONNX変換ボタン（モデル操作の下に配置）
-        onnx_button_layout = QHBoxLayout()
-        self.onnx_convert_button = QPushButton("ONNX変換")
-        self.onnx_convert_button.setToolTip("選択中のモデルをONNX形式に変換")
-        self.onnx_convert_button.clicked.connect(self.convert_selected_model_to_onnx)
-        self.onnx_convert_button.setEnabled(False)  # 初期状態では無効
-        apply_style(self.onnx_convert_button, 'special')
-        onnx_button_layout.addWidget(self.onnx_convert_button)
-        pilot_layout.addLayout(onnx_button_layout)
 
         # 推論結果表示オプション
         inference_layout = QHBoxLayout()
@@ -3310,9 +3301,6 @@ class ImageAnnotationTool(QMainWindow):
         if not model_files:
             # フィルタリングした結果がなければ、その旨を表示
             self.model_combo.addItem(f"{current_arch}のモデルが見つかりません")
-            # ONNX変換ボタンを無効化
-            if hasattr(self, 'onnx_convert_button'):
-                self.onnx_convert_button.setEnabled(False)
             self.statusBar().showMessage(f"{current_arch}のモデルが見つかりません。他のアーキを選択するか、モデルを学習してください", 3000)
             return
         
@@ -3322,11 +3310,7 @@ class ImageAnnotationTool(QMainWindow):
         # コンボボックスに追加
         for model_file in model_files:
             self.model_combo.addItem(model_file)
-        
-        # ONNX変換ボタンを有効化
-        if hasattr(self, 'onnx_convert_button'):
-            self.onnx_convert_button.setEnabled(len(model_files) > 0)
-        
+                
         # 更新完了メッセージ
         self.statusBar().showMessage(f"{len(model_files)}個の{current_arch}モデルを読み込みました", 3000)
 
@@ -10120,6 +10104,9 @@ class ImageAnnotationTool(QMainWindow):
         # 画面を更新
         self.update_gallery()
         self.update_inference_display()
+        
+        # 位置アノテーション数の表示を更新
+        self.update_location_button_counts()
 
     def handle_annotation(self, x, y):
         """画像のアノテーションを処理する - 削除済み画像への再アノテーションをサポート"""
@@ -11899,8 +11886,6 @@ class ImageAnnotationTool(QMainWindow):
             f"\n{mlflow_info}"
         )
         
-        # ONNX変換の確認
-        self._ask_onnx_conversion(model_type, training_results['best_model_path'], dataset_info['input_size'])
 
     ###
 
@@ -12574,8 +12559,12 @@ class ImageAnnotationTool(QMainWindow):
         # 選択されたモデル
         model_type = self.location_model_combo.currentText()
         
+        # アノテーション統計情報を収集
+        total_images = len(self.images)
+        annotated_images = len(self.location_annotations)
+        
         # 学習設定ダイアログを表示
-        training_settings = self._create_location_training_dialog(actual_classes, unique_locations, num_classes)
+        training_settings = self._create_location_training_dialog(actual_classes, unique_locations, num_classes, total_images, annotated_images)
         
         if not training_settings.exec_():
             return
@@ -12692,7 +12681,7 @@ class ImageAnnotationTool(QMainWindow):
                 f"位置モデル学習中にエラーが発生しました: {str(e)}"
             )
 
-    def _create_location_training_dialog(self, actual_classes, unique_locations, num_classes):
+    def _create_location_training_dialog(self, actual_classes, unique_locations, num_classes, total_images, annotated_images):
         """位置モデル学習設定ダイアログを作成"""
         
         training_settings = QDialog(self)
@@ -12700,6 +12689,16 @@ class ImageAnnotationTool(QMainWindow):
         training_settings.setMinimumWidth(500)
         
         settings_layout = QVBoxLayout(training_settings)
+        
+        # アノテーション統計情報を表示
+        stats_label = QLabel(f"<b>学習データ統計:</b><br>"
+                           f"総読み込み画像数: {total_images}枚<br>"
+                           f"位置アノテーション済み画像数: {annotated_images}枚<br>"
+                           f"<span style='color: #FF6600;'>※ 位置アノテーションがされている画像のみが学習に使用されます</span>")
+        stats_label.setStyleSheet("padding: 10px; background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 5px;")
+        settings_layout.addWidget(stats_label)
+        
+        settings_layout.addWidget(QLabel(""))  # スペース追加
         
         # 現在の位置情報の概要を表示
         info_label = QLabel(f"検出された位置ラベル: {actual_classes}種類 ({', '.join(map(str, unique_locations))})")
@@ -13091,185 +13090,8 @@ class ImageAnnotationTool(QMainWindow):
             f"{mlflow_info}"
         )
         
-        # ONNX変換の確認
-        input_size = dataset_info.get('actual_image_size', (120, 160))
-        self._ask_onnx_conversion(model_type, training_results['best_model_path'], input_size)
 
-    def _ask_onnx_conversion(self, model_type, model_path, input_size):
-        """ONNX変換を確認するダイアログを表示"""
-        reply = QMessageBox.question(
-            self,
-            "ONNX変換の確認",
-            f"学習したモデルをONNX形式に変換しますか？\n\n"
-            f"ONNX形式に変換すると、以下のメリットがあります：\n"
-            f"・より高速な推論が可能\n"
-            f"・他のフレームワークでも使用可能\n"
-            f"・モバイルデバイスへの展開が容易\n\n"
-            f"変換を実行しますか？",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes
-        )
-        
-        if reply == QMessageBox.Yes:
-            self._convert_to_onnx(model_type, model_path, input_size)
     
-    def _convert_to_onnx(self, model_type, model_path, input_size):
-        """モデルをONNX形式に変換"""
-        try:
-            # 進捗ダイアログを表示
-            progress = QProgressDialog("ONNX変換を準備中...", "キャンセル", 0, 100, self)
-            progress.setWindowTitle("ONNX変換中")
-            progress.setWindowModality(Qt.WindowModal)
-            progress.setMinimumDuration(0)
-            progress.setValue(0)
-            progress.show()
-            QApplication.processEvents()
-            
-            # 変換スクリプトのパスを取得
-            converter_path = os.path.join(os.path.dirname(__file__), "tools", "pytorch_to_onnx.py")
-            
-            if not os.path.exists(converter_path):
-                progress.close()
-                QMessageBox.warning(
-                    self,
-                    "警告",
-                    "ONNX変換スクリプトが見つかりません。\n"
-                    f"期待されるパス: {converter_path}"
-                )
-                return
-            
-            # 出力パスを生成（同じディレクトリに.onnx拡張子で保存）
-            output_path = os.path.splitext(model_path)[0] + ".onnx"
-            
-            progress.setLabelText("ONNXライブラリをインポート中...")
-            progress.setValue(10)
-            QApplication.processEvents()
-            
-            # toolsディレクトリをシステムパスに追加
-            tools_dir = os.path.dirname(converter_path)
-            if tools_dir not in sys.path:
-                sys.path.insert(0, tools_dir)
-            
-            try:
-                # pytorch_to_onnx モジュールをインポート
-                from pytorch_to_onnx import convert_pytorch_to_onnx
-                
-                progress.setLabelText(f"モデル '{os.path.basename(model_path)}' を変換中...")
-                progress.setValue(30)
-                QApplication.processEvents()
-                
-                # 変換を実行
-                result_path = convert_pytorch_to_onnx(
-                    model_path=model_path,
-                    model_type=model_type,
-                    output_path=output_path,
-                    input_size=input_size,
-                    dynamic_axes=True,
-                    simplify=True,
-                    opset_version=12
-                )
-                
-                progress.setValue(90)
-                QApplication.processEvents()
-                
-                if result_path and os.path.exists(result_path):
-                    # ファイルサイズを取得
-                    original_size = os.path.getsize(model_path) / 1024 / 1024  # MB
-                    onnx_size = os.path.getsize(result_path) / 1024 / 1024  # MB
-                    
-                    progress.setValue(100)
-                    progress.close()
-                    
-                    # 成功メッセージ
-                    QMessageBox.information(
-                        self,
-                        "変換完了",
-                        f"ONNX形式への変換が完了しました！\n\n"
-                        f"元のモデル: {os.path.basename(model_path)} ({original_size:.1f} MB)\n"
-                        f"ONNXモデル: {os.path.basename(result_path)} ({onnx_size:.1f} MB)\n"
-                        f"サイズ削減: {(1 - onnx_size/original_size)*100:.1f}%\n\n"
-                        f"保存先: {result_path}"
-                    )
-                else:
-                    progress.close()
-                    QMessageBox.warning(
-                        self,
-                        "変換失敗",
-                        "ONNX変換が失敗しました。\n"
-                        "詳細はコンソールログを確認してください。"
-                    )
-                    
-            except ImportError as e:
-                progress.close()
-                QMessageBox.warning(
-                    self,
-                    "インポートエラー",
-                    f"ONNX変換に必要なライブラリがインストールされていません。\n\n"
-                    f"以下のコマンドでインストールしてください：\n"
-                    f"pip install onnx onnxruntime onnx-simplifier\n\n"
-                    f"エラー詳細: {str(e)}"
-                )
-            except Exception as e:
-                progress.close()
-                QMessageBox.critical(
-                    self,
-                    "エラー",
-                    f"ONNX変換中にエラーが発生しました：\n{str(e)}"
-                )
-            finally:
-                # システムパスから削除
-                if tools_dir in sys.path:
-                    sys.path.remove(tools_dir)
-                    
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "エラー",
-                f"ONNX変換の準備中にエラーが発生しました：\n{str(e)}"
-            )
-
-    def convert_selected_model_to_onnx(self):
-        """選択中のモデルをONNX形式に変換"""
-        if not hasattr(self, 'model_combo') or not self.model_combo.currentText():
-            QMessageBox.warning(self, "警告", "変換するモデルが選択されていません。")
-            return
-        
-        selected_model = self.model_combo.currentText()
-        model_type = self.auto_method_combo.currentText()
-        
-        # モデルパスを構築
-        model_path = os.path.join(models_dir, selected_model)
-        
-        if not os.path.exists(model_path):
-            QMessageBox.warning(
-                self, 
-                "警告", 
-                f"選択されたモデルファイルが見つかりません：\n{model_path}"
-            )
-            return
-        
-        # 現在の画像データから入力サイズを取得
-        current_input_size = (120, 160)  # デフォルトサイズ
-        
-        # 現在読み込まれている画像がある場合、そのサイズを使用
-        if hasattr(self, 'images') and self.images and self.current_index < len(self.images):
-            try:
-                from PIL import Image
-                current_img = Image.open(self.images[self.current_index])
-                current_input_size = (current_img.height, current_img.width)
-                print(f"現在の画像サイズを検出: {current_input_size}")
-            except Exception as e:
-                print(f"画像サイズの検出に失敗（デフォルト値を使用）: {e}")
-        
-        # モデルタイプから適切な入力サイズを推定（現在のデータサイズと比較用）
-        expected_input_size = current_input_size
-        if "resnet" in model_type.lower() or "mobilenet" in model_type.lower():
-            expected_input_size = (224, 224)
-        elif "vit" in model_type.lower():
-            expected_input_size = (224, 224)
-        
-        # ONNX変換を実行（現在の画像サイズを渡す）
-        self._convert_to_onnx(model_type, model_path, current_input_size)
 
     def update_location_inference_display(self):
         """位置推論表示を更新する - 上位3クラスのみ表示"""
