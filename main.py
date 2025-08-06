@@ -2123,7 +2123,7 @@ class ImageAnnotationTool(QMainWindow):
         model_type_layout = QHBoxLayout()
         model_type_layout.addWidget(QLabel("YOLOモデル:"))
         self.yolo_model_combo = QComboBox()
-        self.yolo_model_combo.addItems(["yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x"])
+        self.yolo_model_combo.addItems(["yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x", "yolo11n", "yolo11s", "yolo11m", "yolo11l", "yolo11x"])
         self.yolo_model_combo.currentIndexChanged.connect(self.on_yolo_model_type_changed)
         model_type_layout.addWidget(self.yolo_model_combo)
         obj_detection_layout.addLayout(model_type_layout)
@@ -4069,7 +4069,14 @@ class ImageAnnotationTool(QMainWindow):
     def _validate_yolo_annotations(self, task_type):
         """YOLOアノテーションの検証"""
         
+        print(f"DEBUG: Validating YOLO annotations for task: {task_type}")
+        
         if task_type == "detect":
+            print(f"DEBUG: Checking bbox_annotations exist: {hasattr(self, 'bbox_annotations')}")
+            if hasattr(self, 'bbox_annotations'):
+                print(f"DEBUG: bbox_annotations content: {bool(self.bbox_annotations)}")
+                if self.bbox_annotations:
+                    print(f"DEBUG: Number of bbox annotations: {len(self.bbox_annotations)}")
             if not self.bbox_annotations:
                 QMessageBox.warning(self, "警告", "物体検知アノテーションがありません。")
                 return None, None
@@ -4470,7 +4477,7 @@ class ImageAnnotationTool(QMainWindow):
                     
                     # バウンディングボックスアノテーションを処理
                     label_filename = os.path.splitext(image_filename)[0] + ".txt"
-                    label_path = os.path.join(output_dir, "labels", label_path)
+                    label_path = os.path.join(output_dir, "labels", label_filename)
                     
                     # ラベルファイルを作成（バウンディングボックス形式のみ）
                     with open(label_path, 'w') as f:
@@ -5057,7 +5064,7 @@ class ImageAnnotationTool(QMainWindow):
             return None
         
         # 設定値の取得
-        return {
+        config = {
             'use_pretrained': training_settings.weights_radio_pretrained.isChecked(),
             'num_epochs': training_settings.epoch_spin.value(),
             'batch_size': training_settings.batch_spin.value(),
@@ -5075,6 +5082,8 @@ class ImageAnnotationTool(QMainWindow):
             'scale': training_settings.aug_scale.value() if training_settings.aug_geometry_checkbox.isChecked() and training_settings.aug_enable_check.isChecked() else 0.0,
             'erasing': training_settings.aug_erase_proba.value() if training_settings.aug_erase_checkbox.isChecked() and training_settings.aug_enable_check.isChecked() else 0.0
         }
+        
+        return config
     #
 
     def generate_segmentation_from_bbox(self):
@@ -6503,7 +6512,7 @@ class ImageAnnotationTool(QMainWindow):
 
     def download_pretrained_yolo_model(self, model_type):
         """事前学習済みのYOLOモデルをダウンロードしてmodelsフォルダに保存する"""
-        if not model_type or not model_type.startswith("yolov8"):
+        if not model_type or not (model_type.startswith("yolov8") or model_type.startswith("yolo11")):
             return None
         
         # モデルファイル名（例: yolov8n.pt）
@@ -6560,8 +6569,10 @@ class ImageAnnotationTool(QMainWindow):
             QMessageBox.critical(
                 self, 
                 "エラー", 
-                f"事前学習済みモデルのダウンロード中にエラーが発生しました: {str(e)}"
+                f"事前学習済みモデル {model_type} のダウンロード中にエラーが発生しました: {str(e)}\n\n"
+                f"モデル名 '{model_type}' がUltralyticsでサポートされていない可能性があります。"
             )
+            print(f"YOLO model download error for {model_type}: {e}")
             return None
 
     def load_yolo_model(self):
@@ -13353,6 +13364,15 @@ class ImageAnnotationTool(QMainWindow):
     # アノテーション検証の改善
     def _validate_yolo_annotations(self, task_type):
         """YOLOアノテーションの検証 - クラス名確認強化版"""
+        
+        if task_type == "detect":
+            if not hasattr(self, 'bbox_annotations') or not self.bbox_annotations:
+                QMessageBox.warning(self, "警告", "物体検知アノテーションがありません。")
+                return None, None
+            
+            annotations = self.bbox_annotations
+            total_boxes = sum(len(boxes) for boxes in annotations.values())
+            return annotations, {"total_count": total_boxes, "image_count": len(annotations)}
         
         if task_type == "segment":
             if not self.segmentation_annotations:
