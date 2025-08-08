@@ -402,6 +402,16 @@ def train_model(
     # まず事前学習済みの重みでモデルを初期化（またはランダム初期化）
     model = get_model(model_name, pretrained=pretrained)
     
+    # 入力サイズをモデルまたはデータローダーから取得
+    model_input_size = None
+    if hasattr(model, 'input_size'):
+        model_input_size = model.input_size
+    else:
+        # データローダーから推定
+        sample_batch = next(iter(train_loader))
+        model_input_size = (sample_batch[0].shape[2], sample_batch[0].shape[3])  # (H, W)
+    print(f"Model input size: {model_input_size}")
+    
     # 特定のモデルファイルから重みをロードする場合
     if model_path and os.path.exists(model_path):
         if progress_callback:
@@ -446,7 +456,7 @@ def train_model(
     
     # タイムスタンプを使用してファイル名を生成
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_path = os.path.join(save_dir, f'{model_name}_model_{timestamp}.pth')
+    model_path = os.path.join(save_dir, f'{model_name}_{timestamp}.pth')
     best_model_path = os.path.join(save_dir, f'{model_name}_best_{timestamp}.pth')
     
     completed_epochs = 0
@@ -532,6 +542,7 @@ def train_model(
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': best_val_loss,
+                'input_size': model_input_size,
             }, best_model_path)
             
             if progress_callback:
@@ -564,6 +575,7 @@ def train_model(
         'best_val_loss': best_val_loss,
         'early_stopped': early_stopped,
         'stopped_epoch': stopped_epoch if early_stopped else completed_epochs,
+        'input_size': model_input_size,
     }, model_path)
     
     # トレーニング結果
@@ -1270,7 +1282,7 @@ def train_location_model(
     
     # タイムスタンプを使用してファイル名を生成
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_path = os.path.join(save_dir, f'{model_name}_model_{timestamp}.pth')
+    model_path = os.path.join(save_dir, f'{model_name}_{timestamp}.pth')
     best_model_path = os.path.join(save_dir, f'{model_name}_best_{timestamp}.pth')
     
     completed_epochs = 0

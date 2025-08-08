@@ -1833,6 +1833,9 @@ class ImageAnnotationTool(QMainWindow):
 
         # Setup UI
         self.init_ui()
+        
+        # Load saved display settings
+        self.load_display_settings()
 
         # Update UI
         self.display_current_image()
@@ -1842,7 +1845,8 @@ class ImageAnnotationTool(QMainWindow):
         if hasattr(self, 'prev_multi_button') and hasattr(self, 'next_multi_button'):
             self.update_skip_button_labels(10)  # デフォルト値は10
 
-        self.add_session_check_to_init_ui()
+        # セッション復元チェックを遅延実行（UIが完全に表示された後）
+        QTimer.singleShot(500, self.add_session_check_to_init_ui)
 
         QApplication.instance().installEventFilter(self)
 
@@ -1855,11 +1859,20 @@ class ImageAnnotationTool(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
         
-        # Left panel for controls
+        # Left panel for controls with scroll area
+        left_scroll_area = QScrollArea()
+        left_scroll_area.setWidgetResizable(True)
+        left_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        left_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        left_scroll_area.setMaximumWidth(LEFT_PANEL_MAX_WIDTH + 20)  # スクロールバー分の余裕
+        left_scroll_area.setMinimumWidth(LEFT_PANEL_MIN_WIDTH)  # 最小幅を設定
+        
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
-        left_panel.setMaximumWidth(LEFT_PANEL_MAX_WIDTH)
-        main_layout.addWidget(left_panel)
+        left_panel.setMinimumWidth(LEFT_PANEL_MIN_WIDTH - 20)  # スクロールバー分を考慮した最小幅を確保
+        
+        left_scroll_area.setWidget(left_panel)
+        main_layout.addWidget(left_scroll_area)
 
         # Folder selection
         folder_label = QLabel("データ読込（imagesフォルダの親フォルダ:")
@@ -1996,6 +2009,7 @@ class ImageAnnotationTool(QMainWindow):
         model_buttons_layout.addWidget(self.model_load_button)
 
         pilot_layout.addLayout(model_buttons_layout)
+        
 
         # 推論結果表示オプション
         inference_layout = QHBoxLayout()
@@ -2051,9 +2065,6 @@ class ImageAnnotationTool(QMainWindow):
         self.object_detection_container = QWidget()
         obj_detection_layout = QVBoxLayout(self.object_detection_container)
 
-        # 位置推論モデル追加
-        self.add_location_model_section()
-
         # ラベル
         obj_detection_label = QLabel("物体検知・セグメンテーションモデル:")
         obj_detection_label.setStyleSheet("font-weight: bold")
@@ -2067,25 +2078,40 @@ class ImageAnnotationTool(QMainWindow):
 
         # クラス設定グループ（既存のコード）
         classes_group = QGroupBox("検知クラス設定")
+        classes_group.setMinimumWidth(320)  # 最小幅を設定（新しい左パネル幅に合わせて調整）
+        classes_group.setMaximumHeight(140)  # 最大高さを制限
+        classes_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)  # 横は拡張、縦は固定
         classes_group_layout = QVBoxLayout(classes_group)
+        classes_group_layout.setContentsMargins(8, 8, 8, 8)  # マージンを適切に設定
         
         # クラス入力フィールド
         classes_layout = QHBoxLayout()
-        classes_layout.addWidget(QLabel("検知クラス:"))
+        class_label = QLabel("検知クラス:")
+        class_label.setMinimumWidth(70)  # ラベルの最小幅を設定
+        classes_layout.addWidget(class_label)
+        
         self.classes_input = QLineEdit("car,person,sign,cone")
         self.classes_input.setPlaceholderText("カンマ区切りでクラス名を入力")
         self.classes_input.setToolTip("例: car,person,wall,crossroad,sign")
+        self.classes_input.setMinimumWidth(200)  # 入力フィールドの最小幅を設定（拡張）
+        self.classes_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)  # 横は拡張、縦は固定
         classes_layout.addWidget(self.classes_input)
         classes_group_layout.addLayout(classes_layout)
         
         # クラス操作ボタン
         class_buttons_layout = QHBoxLayout()
         preset_button = QPushButton("プリセット")
+        preset_button.setMinimumWidth(80)  # ボタンの最小幅を設定
         preset_button.clicked.connect(self.show_class_preset_dialog)
         class_buttons_layout.addWidget(preset_button)
+        
         validate_button = QPushButton("クラス確認")
+        validate_button.setMinimumWidth(80)  # ボタンの最小幅を設定
         validate_button.clicked.connect(self.validate_classes)
         class_buttons_layout.addWidget(validate_button)
+        
+        # ボタンレイアウトにストレッチを追加して均等配置
+        class_buttons_layout.addStretch()
         classes_group_layout.addLayout(class_buttons_layout)
         
         obj_detection_layout.addWidget(classes_group)
@@ -2097,7 +2123,7 @@ class ImageAnnotationTool(QMainWindow):
         model_type_layout = QHBoxLayout()
         model_type_layout.addWidget(QLabel("YOLOモデル:"))
         self.yolo_model_combo = QComboBox()
-        self.yolo_model_combo.addItems(["yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x"])
+        self.yolo_model_combo.addItems(["yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x", "yolo11n", "yolo11s", "yolo11m", "yolo11l", "yolo11x"])
         self.yolo_model_combo.currentIndexChanged.connect(self.on_yolo_model_type_changed)
         model_type_layout.addWidget(self.yolo_model_combo)
         obj_detection_layout.addLayout(model_type_layout)
@@ -2149,9 +2175,11 @@ class ImageAnnotationTool(QMainWindow):
         
         obj_detection_layout.addLayout(inference_layout)
         
+        # 位置推論モデル追加（left_layoutが確実に存在する段階で呼び出し）
+        self.add_location_model_section()
+        
         # 物体検知コンテナを追加
         left_layout.addWidget(self.object_detection_container)
-        
 
         # --- MLflow関連ボタンを追加 ---
         mlflow_layout = QVBoxLayout()
@@ -2169,6 +2197,20 @@ class ImageAnnotationTool(QMainWindow):
         mlflow_layout.addWidget(mlflow_compare_button)
 
         left_layout.addLayout(mlflow_layout)
+
+        # --- 表示設定ボタンを追加 ---
+        settings_layout = QVBoxLayout()
+        
+        settings_label = QLabel("表示設定:")
+        settings_label.setStyleSheet("font-weight: bold;")
+        settings_layout.addWidget(settings_label)
+        
+        settings_button = QPushButton("ウィンドウ・フォントサイズ設定")
+        settings_button.clicked.connect(self.show_display_settings)
+        apply_style(settings_button, 'primary')
+        settings_layout.addWidget(settings_button)
+        
+        left_layout.addLayout(settings_layout)
 
         self.on_method_changed(self.auto_method_combo.currentIndex())
 
@@ -3268,7 +3310,7 @@ class ImageAnnotationTool(QMainWindow):
         # コンボボックスに追加
         for model_file in model_files:
             self.model_combo.addItem(model_file)
-        
+                
         # 更新完了メッセージ
         self.statusBar().showMessage(f"{len(model_files)}個の{current_arch}モデルを読み込みました", 3000)
 
@@ -3394,18 +3436,47 @@ class ImageAnnotationTool(QMainWindow):
         # キーボタン群を更新
         self.update_variant_buttons()
 
+    def get_left_layout(self):
+        """左パネルのレイアウトを安全に取得するヘルパーメソッド"""
+        try:
+            central_widget = self.centralWidget()
+            if central_widget is None:
+                return None
+            main_layout = central_widget.layout()
+            if main_layout is None:
+                return None
+            left_scroll_area = main_layout.itemAt(0).widget()  # QScrollArea
+            if left_scroll_area is None:
+                return None
+            left_panel = left_scroll_area.widget()  # QWidget
+            if left_panel is None:
+                return None
+            return left_panel.layout()  # QVBoxLayout
+        except Exception as e:
+            print(f"エラー: left_layoutの取得に失敗しました: {e}")
+            return None
+
     def update_variant_buttons(self):
         """
         available_variantsの内容に基づいてキーボタン群を更新する
         """
         # GroupBoxを探す
         variant_box = None
-        left_panel = self.centralWidget().layout().itemAt(0).widget()
-        for i in range(left_panel.layout().count()):
-            item = left_panel.layout().itemAt(i).widget()
-            if isinstance(item, QGroupBox) and item.title() == "画像ソース":
-                variant_box = item
-                break
+        left_layout = self.get_left_layout()
+        
+        if left_layout is None:
+            print("警告: left_layoutが見つかりません")
+            return
+            
+        try:
+            for i in range(left_layout.count()):
+                item = left_layout.itemAt(i).widget()
+                if isinstance(item, QGroupBox) and item.title() == "画像ソース":
+                    variant_box = item
+                    break
+        except Exception as e:
+            print(f"エラー: GroupBox検索に失敗しました: {e}")
+            return
         
         if not variant_box:
             print("画像ソースのGroupBoxが見つかりませんでした")
@@ -3998,7 +4069,14 @@ class ImageAnnotationTool(QMainWindow):
     def _validate_yolo_annotations(self, task_type):
         """YOLOアノテーションの検証"""
         
+        print(f"DEBUG: Validating YOLO annotations for task: {task_type}")
+        
         if task_type == "detect":
+            print(f"DEBUG: Checking bbox_annotations exist: {hasattr(self, 'bbox_annotations')}")
+            if hasattr(self, 'bbox_annotations'):
+                print(f"DEBUG: bbox_annotations content: {bool(self.bbox_annotations)}")
+                if self.bbox_annotations:
+                    print(f"DEBUG: Number of bbox annotations: {len(self.bbox_annotations)}")
             if not self.bbox_annotations:
                 QMessageBox.warning(self, "警告", "物体検知アノテーションがありません。")
                 return None, None
@@ -4399,7 +4477,7 @@ class ImageAnnotationTool(QMainWindow):
                     
                     # バウンディングボックスアノテーションを処理
                     label_filename = os.path.splitext(image_filename)[0] + ".txt"
-                    label_path = os.path.join(output_dir, "labels", label_path)
+                    label_path = os.path.join(output_dir, "labels", label_filename)
                     
                     # ラベルファイルを作成（バウンディングボックス形式のみ）
                     with open(label_path, 'w') as f:
@@ -4986,7 +5064,7 @@ class ImageAnnotationTool(QMainWindow):
             return None
         
         # 設定値の取得
-        return {
+        config = {
             'use_pretrained': training_settings.weights_radio_pretrained.isChecked(),
             'num_epochs': training_settings.epoch_spin.value(),
             'batch_size': training_settings.batch_spin.value(),
@@ -5004,6 +5082,8 @@ class ImageAnnotationTool(QMainWindow):
             'scale': training_settings.aug_scale.value() if training_settings.aug_geometry_checkbox.isChecked() and training_settings.aug_enable_check.isChecked() else 0.0,
             'erasing': training_settings.aug_erase_proba.value() if training_settings.aug_erase_checkbox.isChecked() and training_settings.aug_enable_check.isChecked() else 0.0
         }
+        
+        return config
     #
 
     def generate_segmentation_from_bbox(self):
@@ -6432,7 +6512,7 @@ class ImageAnnotationTool(QMainWindow):
 
     def download_pretrained_yolo_model(self, model_type):
         """事前学習済みのYOLOモデルをダウンロードしてmodelsフォルダに保存する"""
-        if not model_type or not model_type.startswith("yolov8"):
+        if not model_type or not (model_type.startswith("yolov8") or model_type.startswith("yolo11")):
             return None
         
         # モデルファイル名（例: yolov8n.pt）
@@ -6489,8 +6569,10 @@ class ImageAnnotationTool(QMainWindow):
             QMessageBox.critical(
                 self, 
                 "エラー", 
-                f"事前学習済みモデルのダウンロード中にエラーが発生しました: {str(e)}"
+                f"事前学習済みモデル {model_type} のダウンロード中にエラーが発生しました: {str(e)}\n\n"
+                f"モデル名 '{model_type}' がUltralyticsでサポートされていない可能性があります。"
             )
+            print(f"YOLO model download error for {model_type}: {e}")
             return None
 
     def load_yolo_model(self):
@@ -7395,491 +7477,7 @@ class ImageAnnotationTool(QMainWindow):
             # 推論結果がない場合は表示をクリア
             if hasattr(self, 'detection_inference_info_label'):
                 self.detection_inference_info_label.setText("")
-    
-    # def train_and_save_yolo_model(self):
-    #     """Ultralytics YOLOモデルを学習し保存する - 事前学習済みモデルを自動ダウンロード"""        
-    #     if not self.bbox_annotations:
-    #         QMessageBox.warning(self, "警告", "物体検知アノテーションがありません。")
-    #         return
-        
-    #     # 動的にクラスを取得
-    #     classes = self.get_current_classes()
 
-    #     if not classes:
-    #         QMessageBox.warning(self, "警告", "検知クラスが設定されていません。\n先にクラス設定を行ってください。")
-    #         return
-        
-    #     # 学習設定ダイアログで現在のクラス設定を表示
-    #     model_type = self.yolo_model_combo.currentText()
-        
-    #     # 学習設定ダイアログを表示
-    #     training_settings = QDialog(self)
-    #     training_settings.setWindowTitle("YOLOモデル学習設定")
-    #     training_settings.setMinimumWidth(500)
-    #     training_settings.setMinimumHeight(600)
-        
-    #     settings_layout = QVBoxLayout(training_settings)
-        
-    #     # タブウィジェットを作成
-    #     tabs = QTabWidget()
-        
-    #     # 基本設定タブ
-    #     basic_tab = QWidget()
-    #     basic_layout = QVBoxLayout(basic_tab)
-        
-    #     # モデル初期化設定
-    #     init_group = QGroupBox("モデル初期化設定")
-    #     init_layout = QVBoxLayout(init_group)
-        
-    #     # 初期重みの選択
-    #     weights_radio_pretrained = QRadioButton("事前学習済みの重みを使用 (推奨)")
-    #     weights_radio_pretrained.setChecked(True)  # デフォルト選択
-    #     init_layout.addWidget(weights_radio_pretrained)
-        
-    #     # 現在のモデルを選択
-    #     weights_radio_current = QRadioButton("現在読み込まれているモデルの重みを使用")
-    #     init_layout.addWidget(weights_radio_current)
-        
-    #     # 現在読み込まれているモデルの情報を表示
-    #     current_model_info = QLabel("現在のモデル: なし")
-    #     if hasattr(self, 'yolo_model') and hasattr(self, 'yolo_model_file'):
-    #         model_name = os.path.basename(self.yolo_model_file) if hasattr(self, 'yolo_model_file') else "Unknown"
-    #         current_model_info.setText(f"現在のモデル: {model_name}")
-    #         weights_radio_current.setEnabled(True)
-    #     else:
-    #         weights_radio_current.setEnabled(False)
-    #         current_model_info.setText("現在のモデル: なし（先にモデルを読み込んでください）")
-        
-    #     init_layout.addWidget(current_model_info)
-    #     basic_layout.addWidget(init_group)
-        
-    #     # エポック数設定
-    #     epoch_layout = QHBoxLayout()
-    #     epoch_layout.addWidget(QLabel("学習エポック数:"))
-    #     epoch_spin = QSpinBox()
-    #     epoch_spin.setRange(1, 1000)
-    #     epoch_spin.setValue(30)  # デフォルト: 30エポック
-    #     epoch_layout.addWidget(epoch_spin)
-    #     basic_layout.addLayout(epoch_layout)
-        
-    #     # バッチサイズ設定
-    #     batch_layout = QHBoxLayout()
-    #     batch_layout.addWidget(QLabel("バッチサイズ:"))
-    #     batch_spin = QSpinBox()
-    #     batch_spin.setRange(1, 128)
-    #     batch_spin.setValue(16)  # デフォルト: 16
-    #     batch_layout.addWidget(batch_spin)
-    #     basic_layout.addLayout(batch_layout)
-        
-    #     # 入力サイズ設定
-    #     size_layout = QHBoxLayout()
-    #     size_layout.addWidget(QLabel("入力画像サイズ:"))
-    #     size_combo = QComboBox()
-    #     size_options = [str(self.original_image_size),"320", "416", "512", "640", "768", "896", "1024"]
-    #     default_index = 4  # デフォルトは640
-
-    #     # 説明ラベルを追加
-    #     size_layout.addWidget(QLabel(f"元画像: {self.original_image_width}×{self.original_image_height}"))
-
-    #     size_combo.addItems(size_options)
-    #     size_combo.setCurrentIndex(default_index)
-    #     size_layout.addWidget(size_combo)
-    #     basic_layout.addLayout(size_layout)
-
-    #     # 注意書き
-    #     size_note = QLabel("注: 640以外のサイズを選択すると精度や速度に影響します")
-    #     size_note.setStyleSheet("color: #888; font-style: italic;")
-    #     basic_layout.addWidget(size_note)
-
-    #     # Early Stopping設定
-    #     early_stopping_check = QCheckBox("Early Stopping を有効にする")
-    #     early_stopping_check.setChecked(True)
-    #     basic_layout.addWidget(early_stopping_check)
-        
-    #     patience_layout = QHBoxLayout()
-    #     patience_layout.addWidget(QLabel("忍耐エポック数:"))
-    #     patience_spin = QSpinBox()
-    #     patience_spin.setRange(1, 20)
-    #     patience_spin.setValue(10)
-    #     patience_spin.setEnabled(True)
-    #     patience_layout.addWidget(patience_spin)
-    #     basic_layout.addLayout(patience_layout)
-        
-    #     # 学習率設定
-    #     lr_layout = QHBoxLayout()
-    #     lr_layout.addWidget(QLabel("学習率:"))
-        
-    #     lr_combo = QComboBox()
-    #     learning_rates = ["0.01", "0.005", "0.001", "0.0005", "0.0001"]
-    #     lr_combo.addItems(learning_rates)
-    #     lr_combo.setCurrentIndex(2)  # デフォルト: 0.001
-    #     lr_layout.addWidget(lr_combo)
-    #     basic_layout.addLayout(lr_layout)
-        
-    #     # タブに追加
-    #     tabs.addTab(basic_tab, "基本設定")
-        
-    #     # データオーグメンテーションタブ
-    #     aug_tab = QWidget()
-    #     aug_layout = QVBoxLayout(aug_tab)
-        
-    #     # データオーグメンテーション有効化チェックボックス
-    #     aug_enable_check = QCheckBox("データオーグメンテーションを有効にする")
-    #     aug_enable_check.setChecked(True)
-    #     aug_layout.addWidget(aug_enable_check)
-        
-    #     # オーグメンテーション設定のスクロールエリア
-    #     aug_scroll = QScrollArea()
-    #     aug_scroll.setWidgetResizable(True)
-    #     aug_scroll.setFrameShape(QFrame.NoFrame)
-        
-    #     aug_scroll_content = QWidget()
-    #     aug_options_layout = QVBoxLayout(aug_scroll_content)
-        
-    #     # モザイク
-    #     mosaic_layout = QHBoxLayout()
-    #     aug_mosaic_checkbox = QCheckBox("モザイク")
-    #     aug_mosaic_checkbox.setChecked(True)
-    #     aug_mosaic_proba_label = QLabel("確率:")
-    #     aug_mosaic_proba = QDoubleSpinBox()
-    #     aug_mosaic_proba.setRange(0.0, 1.0)
-    #     aug_mosaic_proba.setSingleStep(0.1)
-    #     aug_mosaic_proba.setValue(1.0)
-    #     mosaic_layout.addWidget(aug_mosaic_checkbox)
-    #     mosaic_layout.addWidget(aug_mosaic_proba_label)
-    #     mosaic_layout.addWidget(aug_mosaic_proba)
-    #     mosaic_layout.addStretch()
-    #     aug_options_layout.addLayout(mosaic_layout)
-        
-    #     # 水平反転
-    #     flip_layout = QHBoxLayout()
-    #     aug_flip_checkbox = QCheckBox("水平反転")
-    #     aug_flip_checkbox.setChecked(True)
-    #     aug_flip_proba_label = QLabel("確率:")
-    #     aug_flip_proba = QDoubleSpinBox()
-    #     aug_flip_proba.setRange(0.0, 1.0)
-    #     aug_flip_proba.setSingleStep(0.1)
-    #     aug_flip_proba.setValue(0.5)
-    #     flip_layout.addWidget(aug_flip_checkbox)
-    #     flip_layout.addWidget(aug_flip_proba_label)
-    #     flip_layout.addWidget(aug_flip_proba)
-    #     flip_layout.addStretch()
-    #     aug_options_layout.addLayout(flip_layout)
-        
-    #     # HSV調整
-    #     hsv_layout = QHBoxLayout()
-    #     aug_hsv_checkbox = QCheckBox("HSV調整")
-    #     aug_hsv_checkbox.setChecked(True)
-    #     hsv_layout.addWidget(aug_hsv_checkbox)
-    #     hsv_layout.addStretch()
-    #     aug_options_layout.addLayout(hsv_layout)
-        
-    #     # HSVの詳細設定
-    #     hsv_details_layout = QGridLayout()
-    #     hsv_details_layout.setContentsMargins(20, 0, 0, 0)
-        
-    #     hsv_details_layout.addWidget(QLabel("色相 (H):"), 0, 0)
-    #     aug_hsv_h = QDoubleSpinBox()
-    #     aug_hsv_h.setRange(0.0, 0.1)
-    #     aug_hsv_h.setSingleStep(0.005)
-    #     aug_hsv_h.setValue(0.015)
-    #     hsv_details_layout.addWidget(aug_hsv_h, 0, 1)
-        
-    #     hsv_details_layout.addWidget(QLabel("彩度 (S):"), 1, 0)
-    #     aug_hsv_s = QDoubleSpinBox()
-    #     aug_hsv_s.setRange(0.0, 1.0)
-    #     aug_hsv_s.setSingleStep(0.1)
-    #     aug_hsv_s.setValue(0.7)
-    #     hsv_details_layout.addWidget(aug_hsv_s, 1, 1)
-        
-    #     hsv_details_layout.addWidget(QLabel("明度 (V):"), 2, 0)
-    #     aug_hsv_v = QDoubleSpinBox()
-    #     aug_hsv_v.setRange(0.0, 1.0)
-    #     aug_hsv_v.setSingleStep(0.1)
-    #     aug_hsv_v.setValue(0.4)
-    #     hsv_details_layout.addWidget(aug_hsv_v, 2, 1)
-        
-    #     aug_options_layout.addLayout(hsv_details_layout)
-        
-    #     # 幾何変換
-    #     geometry_layout = QHBoxLayout()
-    #     aug_geometry_checkbox = QCheckBox("幾何変換")
-    #     aug_geometry_checkbox.setChecked(True)
-    #     geometry_layout.addWidget(aug_geometry_checkbox)
-    #     geometry_layout.addStretch()
-    #     aug_options_layout.addLayout(geometry_layout)
-        
-    #     # 幾何変換の詳細設定
-    #     geometry_details_layout = QGridLayout()
-    #     geometry_details_layout.setContentsMargins(20, 0, 0, 0)
-        
-    #     geometry_details_layout.addWidget(QLabel("平行移動:"), 0, 0)
-    #     aug_translate = QDoubleSpinBox()
-    #     aug_translate.setRange(0.0, 0.5)
-    #     aug_translate.setSingleStep(0.05)
-    #     aug_translate.setValue(0.1)
-    #     geometry_details_layout.addWidget(aug_translate, 0, 1)
-        
-    #     geometry_details_layout.addWidget(QLabel("スケール:"), 1, 0)
-    #     aug_scale = QDoubleSpinBox()
-    #     aug_scale.setRange(0.0, 1.0)
-    #     aug_scale.setSingleStep(0.05)
-    #     aug_scale.setValue(0.5)
-    #     geometry_details_layout.addWidget(aug_scale, 1, 1)
-        
-    #     aug_options_layout.addLayout(geometry_details_layout)
-        
-    #     # RandomErase
-    #     erase_layout = QHBoxLayout()
-    #     aug_erase_checkbox = QCheckBox("ランダムイレース")
-    #     aug_erase_checkbox.setChecked(True)
-    #     aug_erase_proba_label = QLabel("確率:")
-    #     aug_erase_proba = QDoubleSpinBox()
-    #     aug_erase_proba.setRange(0.0, 1.0)
-    #     aug_erase_proba.setSingleStep(0.1)
-    #     aug_erase_proba.setValue(0.4)
-    #     erase_layout.addWidget(aug_erase_checkbox)
-    #     erase_layout.addWidget(aug_erase_proba_label)
-    #     erase_layout.addWidget(aug_erase_proba)
-    #     erase_layout.addStretch()
-    #     aug_options_layout.addLayout(erase_layout)
-        
-    #     # オプションの有効/無効を連動させる
-    #     def toggle_aug_options(checked):
-    #         for w in aug_scroll_content.findChildren(QWidget):
-    #             if w != aug_enable_check:
-    #                 w.setEnabled(checked)
-        
-    #     aug_enable_check.toggled.connect(toggle_aug_options)
-        
-    #     # スクロールエリアに設定
-    #     aug_scroll.setWidget(aug_scroll_content)
-    #     aug_layout.addWidget(aug_scroll)
-        
-    #     # タブに追加
-    #     tabs.addTab(aug_tab, "データオーグメンテーション")
-        
-    #     # タブをレイアウトに追加
-    #     settings_layout.addWidget(tabs)
-        
-    #     # ボタンの配置
-    #     button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-    #     button_box.accepted.connect(training_settings.accept)
-    #     button_box.rejected.connect(training_settings.reject)
-    #     settings_layout.addWidget(button_box)
-        
-    #     # ダイアログを表示
-    #     if not training_settings.exec_():
-    #         return
-        
-    #     # 設定値の取得
-    #     use_pretrained = weights_radio_pretrained.isChecked()
-    #     num_epochs = epoch_spin.value()
-    #     batch_size = batch_spin.value()
-    #     img_size = int(size_combo.currentText())
-    #     use_early_stopping = early_stopping_check.isChecked()
-    #     patience = patience_spin.value() if use_early_stopping else 0
-    #     learning_rate = float(lr_combo.currentText())
-        
-    #     # オーグメンテーション設定の取得
-    #     augmentation_enabled = aug_enable_check.isChecked()
-    #     mosaic = aug_mosaic_proba.value() if aug_mosaic_checkbox.isChecked() and augmentation_enabled else 0.0
-    #     fliplr = aug_flip_proba.value() if aug_flip_checkbox.isChecked() and augmentation_enabled else 0.0
-    #     hsv_h = aug_hsv_h.value() if aug_hsv_checkbox.isChecked() and augmentation_enabled else 0.0
-    #     hsv_s = aug_hsv_s.value() if aug_hsv_checkbox.isChecked() and augmentation_enabled else 0.0
-    #     hsv_v = aug_hsv_v.value() if aug_hsv_checkbox.isChecked() and augmentation_enabled else 0.0
-    #     translate = aug_translate.value() if aug_geometry_checkbox.isChecked() and augmentation_enabled else 0.0
-    #     scale = aug_scale.value() if aug_geometry_checkbox.isChecked() and augmentation_enabled else 0.0
-    #     erasing = aug_erase_proba.value() if aug_erase_checkbox.isChecked() and augmentation_enabled else 0.0
-        
-    #     # YOLOフォーマット用のデータを生成（YOLO用ディレクトリ構造を作成）
-    #     try:            
-    #         # データディレクトリ構造の作成
-    #         train_dir = os.path.join(yolo_dataset_dir, "train")
-    #         val_dir = os.path.join(yolo_dataset_dir, "val")
-    #         os.makedirs(os.path.join(train_dir, "images"), exist_ok=True)
-    #         os.makedirs(os.path.join(train_dir, "labels"), exist_ok=True)
-    #         os.makedirs(os.path.join(val_dir, "images"), exist_ok=True)
-    #         os.makedirs(os.path.join(val_dir, "labels"), exist_ok=True)
-            
-    #         # クラス名ファイルの保存
-    #         with open(os.path.join(yolo_dataset_dir, "classes.txt"), 'w') as f:
-    #             for cls in classes:
-    #                 f.write(f"{cls}\n")
-            
-    #         # データセット設定YAMLファイルの作成
-    #         yaml_content = f"""
-    # path:
-    # train: train/images
-    # val: val/images
-    # test: test/images
-
-    # nc: {len(classes)}
-    # names: {classes}
-    #         """
-            
-    #         yaml_file = os.path.join(yolo_dataset_dir, "dataset.yaml")
-    #         with open(yaml_file, 'w') as f:
-    #             f.write(yaml_content)
-            
-    #         # アノテーションデータのエクスポート
-    #         self.export_annotations_to_yolo(train_dir, val_dir, classes)
-            
-    #         # Ultralytics YOLOモデルとMLflowのインポート
-    #         try:
-    #             settings.update({"mlflow": True})
-    #         except ImportError as e:
-    #             missing_package = "ultralytics" if "ultralytics" in str(e) else "mlflow" if "mlflow" in str(e) else "依存パッケージ"
-    #             QMessageBox.critical(self, "エラー", f"{missing_package}パッケージがインストールされていません。\npip install {missing_package} でインストールしてください。")
-    #             return
-            
-    #         # デバイスの選択
-    #         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    #         print(f"Using device for YOLO training: {device}")
-            
-    #         # 学習用の進捗ダイアログ
-    #         progress = QProgressDialog(
-    #             f"YOLOモデル '{model_type}' の学習準備中...", 
-    #             "キャンセル", 0, 100, self
-    #         )
-    #         progress.setWindowTitle("YOLOモデル学習")
-    #         progress.setWindowModality(Qt.WindowModal)
-    #         progress.show()
-            
-    #         # ここが新しい部分: 事前学習済みモデルを自動ダウンロード
-    #         pretrained_model_path = None
-    #         model_path = None
-            
-    #         if use_pretrained:
-    #             # 事前学習済みモデルをダウンロード
-    #             progress.setLabelText(f"事前学習済み {model_type} モデルをダウンロードしています...")
-    #             progress.setValue(5)
-    #             QApplication.processEvents()
-                
-    #             pretrained_model_path = self.download_pretrained_yolo_model(model_type)
-    #             if not pretrained_model_path:
-    #                 progress.close()
-    #                 QMessageBox.critical(self, "エラー", f"事前学習済み {model_type} モデルの準備に失敗しました。")
-    #                 return
-    #         else:
-    #             # 現在ロードされているモデルを使用
-    #             if hasattr(self, 'yolo_model_file') and os.path.exists(self.yolo_model_file):
-    #                 model_path = self.yolo_model_file
-    #             else:
-    #                 progress.close()
-    #                 QMessageBox.critical(self, "エラー", "現在のモデルが読み込まれていません。事前学習済みモデルを使用するか、モデルを読み込んでから再試行してください。")
-    #                 return
-                            
-            
-    #         # Windows環境での正しいURI形式を構築
-    #         if sys.platform.startswith('win'):
-    #             tracking_uri = f"file:///{normalized_path}"
-    #         else:
-    #             tracking_uri = f"file://{normalized_path}"
-            
-    #         print(f"YOLOトレーニング用MLflowトラッキングURI: {tracking_uri}")
-                                    
-    #         # 重要: 実験名を固定の文字列に設定
-    #         experiment_name = "yolo_training"
-            
-    #         # 実験が存在するか確認し、なければ作成
-    #         experiment = mlflow.get_experiment_by_name(experiment_name)
-    #         if experiment is None:
-    #             mlflow.create_experiment(experiment_name)
-            
-    #         # YOLOの設定は環境変数から読み込みになる
-    #         os.environ["MLFLOW_TRACKING_URI"] = tracking_uri
-    #         os.environ["MLFLOW_EXPERIMENT_NAME"] = experiment_name
-                        
-    #         # トレーニング設定のカスタマイズ
-    #         run_name = f"{model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            
-    #         progress.setLabelText("YOLOモデルを初期化中...")
-    #         progress.setValue(10)
-    #         QApplication.processEvents()
-                        
-    #         # 分離プロセスで学習を実行
-    #         try:
-    #             # モデルの読み込み - 選択に基づいて初期重みを設定
-    #             if use_pretrained:
-    #                 # ダウンロードした事前学習済みモデルを使用
-    #                 model = YOLO(pretrained_model_path)
-    #                 pretrained_info = f"事前学習済みの重み (ダウンロード済み: {os.path.basename(pretrained_model_path)})"
-    #             else:
-    #                 # 現在読み込まれているモデルを使用
-    #                 model = YOLO(model_path)
-    #                 pretrained_info = f"現在のモデル重み: {os.path.basename(model_path)}"
-                
-    #             progress.setLabelText("学習開始...")
-    #             progress.setValue(20)
-    #             QApplication.processEvents()
-                
-    #             # 学習設定
-    #             results = model.train(
-    #                 data=yaml_file,
-    #                 epochs=num_epochs,
-    #                 batch=batch_size,
-    #                 imgsz=img_size,
-    #                 project=models_dir,
-    #                 name=run_name,
-    #                 device=device.type,
-    #                 workers=0,
-    #                 close_mosaic=10 if mosaic > 0 else 0,
-    #                 patience=patience,
-    #                 exist_ok=True,
-    #                 lr0=learning_rate,
-    #                 lrf=learning_rate / 10,
-    #                 # オーグメンテーション設定
-    #                 mosaic=mosaic,
-    #                 fliplr=fliplr,
-    #                 hsv_h=hsv_h,
-    #                 hsv_s=hsv_s,
-    #                 hsv_v=hsv_v,
-    #                 translate=translate,
-    #                 scale=scale,
-    #                 erasing=erasing
-    #             )
-                
-    #             progress.setValue(95)
-    #             QApplication.processEvents()
-                
-    #             # モデルリストを更新 - 選択したタイプでフィルタリングするように変更
-    #             #self.refresh_yolo_model_list()
-    #             self.refresh_yolo_unified_model_list()                
-
-    #             progress.setValue(100)
-    #             progress.close()
-                
-    #             # 学習結果を表示
-    #             QMessageBox.information(
-    #                 self,
-    #                 "学習完了",
-    #                 f"YOLOモデルの学習が完了しました。\n"
-    #                 f"最終mAP: {results.maps}\n"
-    #                 f"使用デバイス: {device}\n"
-    #                 f"初期化: {pretrained_info}\n\n"
-    #                 f"モデル保存先: {os.path.join(models_dir, run_name, 'weights')}\n"
-    #                 f"MLflow実験名: {experiment_name}"
-    #             )
-            
-    #         except Exception as inner_e:
-    #             print(f"YOLO学習中の内部エラー: {str(inner_e)}")
-    #             progress.close()
-    #             QMessageBox.critical(
-    #                 self,
-    #                 "トレーニングエラー",
-    #                 f"YOLO学習プロセス中にエラーが発生しました: {str(inner_e)}"
-    #             )
-            
-    #     except Exception as e:
-    #         if 'progress' in locals():
-    #             progress.close()
-    #         traceback.print_exc()
-    #         QMessageBox.critical(
-    #             self,
-    #             "エラー",
-    #             f"YOLOモデル学習中にエラーが発生しました: {str(e)}"
-    #         )
 
     ###TODO:統合
     def on_classes_changed(self, text):
@@ -8044,6 +7642,210 @@ class ImageAnnotationTool(QMainWindow):
                 return class_name
             return None
 
+    def show_display_settings(self):
+        """ウィンドウサイズとフォントサイズの設定ダイアログを表示"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("表示設定")
+        dialog.setMinimumWidth(450)
+        dialog.setMinimumHeight(400)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # ウィンドウサイズ設定
+        window_group = QGroupBox("ウィンドウサイズ")
+        window_layout = QVBoxLayout(window_group)
+        
+        # 現在のウィンドウサイズを表示
+        current_size_label = QLabel(f"現在のサイズ: {self.width()} x {self.height()}")
+        window_layout.addWidget(current_size_label)
+        
+        # 幅設定
+        width_layout = QHBoxLayout()
+        width_layout.addWidget(QLabel("幅:"))
+        self.width_spin = QSpinBox()
+        self.width_spin.setRange(800, 3840)
+        self.width_spin.setValue(self.width())
+        self.width_spin.setSuffix(" px")
+        width_layout.addWidget(self.width_spin)
+        window_layout.addLayout(width_layout)
+        
+        # 高さ設定
+        height_layout = QHBoxLayout()
+        height_layout.addWidget(QLabel("高さ:"))
+        self.height_spin = QSpinBox()
+        self.height_spin.setRange(600, 2160)
+        self.height_spin.setValue(self.height())
+        self.height_spin.setSuffix(" px")
+        height_layout.addWidget(self.height_spin)
+        window_layout.addLayout(height_layout)
+        
+        # プリセットボタン
+        preset_layout = QHBoxLayout()
+        preset_layout.addWidget(QLabel("プリセット:"))
+        
+        preset_buttons = [
+            ("1280x720", 1280, 720),
+            ("1600x900", 1600, 900),
+            ("1920x1080", 1920, 1080),
+            ("2560x1440", 2560, 1440)
+        ]
+        
+        for text, w, h in preset_buttons:
+            btn = QPushButton(text)
+            # Lambda関数内でwidth, heightを正しくキャプチャするための修正
+            btn.clicked.connect(lambda checked=False, width=w, height=h: self.set_window_size_preset(width, height))
+            preset_layout.addWidget(btn)
+        
+        window_layout.addLayout(preset_layout)
+        layout.addWidget(window_group)
+        
+        # フォントサイズ設定
+        font_group = QGroupBox("フォントサイズ")
+        font_layout = QVBoxLayout(font_group)
+        
+        # 現在のフォントサイズ
+        current_font = self.font()
+        current_font_label = QLabel(f"現在のフォントサイズ: {current_font.pointSize()}pt")
+        font_layout.addWidget(current_font_label)
+        
+        # フォントサイズスライダー
+        font_size_layout = QHBoxLayout()
+        font_size_layout.addWidget(QLabel("サイズ:"))
+        
+        self.font_size_slider = QSlider(Qt.Horizontal)
+        self.font_size_slider.setRange(8, 20)
+        self.font_size_slider.setValue(current_font.pointSize())
+        self.font_size_slider.setTickPosition(QSlider.TicksBelow)
+        self.font_size_slider.setTickInterval(2)
+        
+        self.font_size_label = QLabel(f"{current_font.pointSize()}pt")
+        self.font_size_slider.valueChanged.connect(lambda v: self.font_size_label.setText(f"{v}pt"))
+        
+        font_size_layout.addWidget(self.font_size_slider)
+        font_size_layout.addWidget(self.font_size_label)
+        font_layout.addLayout(font_size_layout)
+        
+        # プレビューテキスト
+        preview_label = QLabel("プレビュー: アノテーションツール")
+        preview_label.setFrameStyle(QFrame.Box)
+        preview_label.setAlignment(Qt.AlignCenter)
+        self.font_size_slider.valueChanged.connect(
+            lambda v: preview_label.setFont(QFont(preview_label.font().family(), v))
+        )
+        font_layout.addWidget(preview_label)
+        
+        layout.addWidget(font_group)
+        
+        # 設定の保存オプション
+        save_group = QGroupBox("設定の保存")
+        save_layout = QVBoxLayout(save_group)
+        
+        self.save_settings_check = QCheckBox("次回起動時にこの設定を適用する")
+        self.save_settings_check.setChecked(True)
+        save_layout.addWidget(self.save_settings_check)
+        
+        layout.addWidget(save_group)
+        
+        # ボタン
+        button_layout = QHBoxLayout()
+        
+        apply_button = QPushButton("適用")
+        apply_button.clicked.connect(lambda: self.apply_display_settings(dialog, False))
+        button_layout.addWidget(apply_button)
+        
+        ok_button = QPushButton("OK")
+        ok_button.clicked.connect(lambda: self.apply_display_settings(dialog, True))
+        button_layout.addWidget(ok_button)
+        
+        cancel_button = QPushButton("キャンセル")
+        cancel_button.clicked.connect(dialog.reject)
+        button_layout.addWidget(cancel_button)
+        
+        layout.addLayout(button_layout)
+        
+        dialog.exec_()
+    
+    def set_window_size_preset(self, width, height):
+        """ウィンドウサイズのプリセットを設定"""
+        self.width_spin.setValue(width)
+        self.height_spin.setValue(height)
+    
+    def apply_display_settings(self, dialog, close_dialog):
+        """表示設定を適用"""
+        # ウィンドウサイズを変更
+        new_width = self.width_spin.value()
+        new_height = self.height_spin.value()
+        self.resize(new_width, new_height)
+        
+        # フォントサイズを変更
+        new_font_size = self.font_size_slider.value()
+        font = self.font()
+        font.setPointSize(new_font_size)
+        self.setFont(font)
+        
+        # すべての子ウィジェットにフォントを適用
+        self.apply_font_to_children(self, font)
+        
+        # 設定を保存
+        if self.save_settings_check.isChecked():
+            self.save_display_settings(new_width, new_height, new_font_size)
+        
+        # ステータスバーに通知
+        self.statusBar().showMessage(
+            f"表示設定を適用しました - ウィンドウ: {new_width}x{new_height}, フォント: {new_font_size}pt", 
+            3000
+        )
+        
+        if close_dialog:
+            dialog.accept()
+    
+    def apply_font_to_children(self, widget, font):
+        """すべての子ウィジェットにフォントを適用"""
+        for child in widget.findChildren(QWidget):
+            if hasattr(child, 'setFont'):
+                # 特定のウィジェットタイプごとにフォントサイズを調整
+                if isinstance(child, (QPushButton, QLabel, QLineEdit, QComboBox)):
+                    child_font = QFont(font)
+                    child.setFont(child_font)
+    
+    def save_display_settings(self, width, height, font_size):
+        """表示設定をファイルに保存"""
+        settings_path = os.path.join(session_dir, "display_settings.json")
+        settings = {
+            "window_width": width,
+            "window_height": height,
+            "font_size": font_size
+        }
+        
+        try:
+            with open(settings_path, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=2)
+        except Exception as e:
+            print(f"表示設定の保存エラー: {e}")
+    
+    def load_display_settings(self):
+        """保存された表示設定を読み込んで適用"""
+        settings_path = os.path.join(session_dir, "display_settings.json")
+        
+        if os.path.exists(settings_path):
+            try:
+                with open(settings_path, 'r', encoding='utf-8') as f:
+                    settings = json.load(f)
+                
+                # ウィンドウサイズを適用
+                if "window_width" in settings and "window_height" in settings:
+                    self.resize(settings["window_width"], settings["window_height"])
+                
+                # フォントサイズを適用
+                if "font_size" in settings:
+                    font = self.font()
+                    font.setPointSize(settings["font_size"])
+                    self.setFont(font)
+                    self.apply_font_to_children(self, font)
+                    
+            except Exception as e:
+                print(f"表示設定の読み込みエラー: {e}")
+
     def add_bbox_annotation(self, bbox):
         """バウンディングボックスアノテーションを追加"""
         if not self.images:
@@ -8075,6 +7877,11 @@ class ImageAnnotationTool(QMainWindow):
 
     def add_session_check_to_init_ui(self):
         """init_uiメソッドの最後に追加する初期セッション確認コード"""
+        # メインウィンドウを最前面にアクティブ化
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        
         # 保存されたセッション情報を読み込む
         session_info = self.load_session_info()
         
@@ -8089,16 +7896,18 @@ class ImageAnnotationTool(QMainWindow):
             valid_paths = [path for path in folder_paths if os.path.exists(path)]
             
             if valid_paths:
-                # 確認ダイアログを表示
-                reply = QMessageBox.question(
-                    self, 
-                    "前回のセッションを復元", 
-                    f"前回の作業フォルダ（{len(valid_paths)}個）を読み込みますか？\n\n"
-                    f"最初のフォルダ: {valid_paths[0]}\n" +
-                    (f"他 {len(valid_paths)-1} フォルダ" if len(valid_paths) > 1 else ""),
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.Yes
-                )
+                # 確認ダイアログを表示（最前面表示）
+                msg_box = QMessageBox(self)
+                msg_box.setWindowTitle("前回のセッションを復元")
+                msg_box.setText(f"前回の作業フォルダ（{len(valid_paths)}個）を読み込みますか？\n\n"
+                              f"最初のフォルダ: {valid_paths[0]}\n" +
+                              (f"他 {len(valid_paths)-1} フォルダ" if len(valid_paths) > 1 else ""))
+                msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+                msg_box.setDefaultButton(QMessageBox.Yes)
+                msg_box.setWindowFlags(msg_box.windowFlags() | Qt.WindowStaysOnTopHint)
+                msg_box.activateWindow()
+                msg_box.raise_()
+                reply = msg_box.exec_()
                 
                 if reply == QMessageBox.Yes:
                     # フォルダパスを設定し、画像を読み込む
@@ -8114,14 +7923,16 @@ class ImageAnnotationTool(QMainWindow):
             
             # フォルダが存在するか確認
             if os.path.exists(last_folder):
-                # 確認ダイアログを表示
-                reply = QMessageBox.question(
-                    self, 
-                    "前回のセッションを復元", 
-                    f"前回の作業フォルダを読み込みますか？\n\nフォルダ: {last_folder}",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.Yes
-                )
+                # 確認ダイアログを表示（最前面表示）
+                msg_box = QMessageBox(self)
+                msg_box.setWindowTitle("前回のセッションを復元")
+                msg_box.setText(f"前回の作業フォルダを読み込みますか？\n\nフォルダ: {last_folder}")
+                msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+                msg_box.setDefaultButton(QMessageBox.Yes)
+                msg_box.setWindowFlags(msg_box.windowFlags() | Qt.WindowStaysOnTopHint)
+                msg_box.activateWindow()
+                msg_box.raise_()
+                reply = msg_box.exec_()
                 
                 if reply == QMessageBox.Yes:
                     # フォルダパスを設定し、画像を読み込む
@@ -10304,6 +10115,9 @@ class ImageAnnotationTool(QMainWindow):
         # 画面を更新
         self.update_gallery()
         self.update_inference_display()
+        
+        # 位置アノテーション数の表示を更新
+        self.update_location_button_counts()
 
     def handle_annotation(self, x, y):
         """画像のアノテーションを処理する - 削除済み画像への再アノテーションをサポート"""
@@ -12082,6 +11896,7 @@ class ImageAnnotationTool(QMainWindow):
             aug_details +
             f"\n{mlflow_info}"
         )
+        
 
     ###
 
@@ -12523,12 +12338,14 @@ class ImageAnnotationTool(QMainWindow):
 
         # YOLOモデル領域の上に位置推論モデルセクションを配置するため、
         # オリジナルのレイアウトを取得
-        left_layout = self.findChild(QVBoxLayout, "left_layout")
-        if not left_layout:
-            # レイアウトが見つからない場合、centralWidgetを取得して探す
-            left_layout = self.centralWidget().layout().itemAt(0).widget().layout()
+        left_layout = self.get_left_layout()
+        if left_layout is None:
+            print("警告: left_layoutが見つかりません")
+            return
         
-        object_detection_index = left_layout.count()
+        # 位置推論モデルを現在のレイアウトの末尾に追加する
+        # （呼び出し順序を調整済みなので、物体検知コンテナより前に配置される）
+        insert_index = left_layout.count()
         
         # 位置推論モデルコンテナを作成
         self.location_model_container = QWidget()
@@ -12581,8 +12398,8 @@ class ImageAnnotationTool(QMainWindow):
         location_inference_layout.addWidget(self.location_inference_checkbox)
         location_model_layout.addLayout(location_inference_layout)
         
-        # YOLOコンテナの前に位置モデルコンテナを挿入
-        left_layout.insertWidget(object_detection_index, self.location_model_container)
+        # 位置モデルコンテナを追加（物体検知コンテナより前に配置される）
+        left_layout.addWidget(self.location_model_container)
         
         # 推論結果格納用の辞書を初期化
         self.location_inference_results = {}
@@ -12753,8 +12570,12 @@ class ImageAnnotationTool(QMainWindow):
         # 選択されたモデル
         model_type = self.location_model_combo.currentText()
         
+        # アノテーション統計情報を収集
+        total_images = len(self.images)
+        annotated_images = len(self.location_annotations)
+        
         # 学習設定ダイアログを表示
-        training_settings = self._create_location_training_dialog(actual_classes, unique_locations, num_classes)
+        training_settings = self._create_location_training_dialog(actual_classes, unique_locations, num_classes, total_images, annotated_images)
         
         if not training_settings.exec_():
             return
@@ -12871,7 +12692,7 @@ class ImageAnnotationTool(QMainWindow):
                 f"位置モデル学習中にエラーが発生しました: {str(e)}"
             )
 
-    def _create_location_training_dialog(self, actual_classes, unique_locations, num_classes):
+    def _create_location_training_dialog(self, actual_classes, unique_locations, num_classes, total_images, annotated_images):
         """位置モデル学習設定ダイアログを作成"""
         
         training_settings = QDialog(self)
@@ -12879,6 +12700,16 @@ class ImageAnnotationTool(QMainWindow):
         training_settings.setMinimumWidth(500)
         
         settings_layout = QVBoxLayout(training_settings)
+        
+        # アノテーション統計情報を表示
+        stats_label = QLabel(f"<b>学習データ統計:</b><br>"
+                           f"総読み込み画像数: {total_images}枚<br>"
+                           f"位置アノテーション済み画像数: {annotated_images}枚<br>"
+                           f"<span style='color: #FF6600;'>※ 位置アノテーションがされている画像のみが学習に使用されます</span>")
+        stats_label.setStyleSheet("padding: 10px; background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 5px;")
+        settings_layout.addWidget(stats_label)
+        
+        settings_layout.addWidget(QLabel(""))  # スペース追加
         
         # 現在の位置情報の概要を表示
         info_label = QLabel(f"検出された位置ラベル: {actual_classes}種類 ({', '.join(map(str, unique_locations))})")
@@ -13016,7 +12847,7 @@ class ImageAnnotationTool(QMainWindow):
         # 保存ディレクトリとファイル名
         os.makedirs(models_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_path = os.path.join(models_dir, f'{model_type}_model_{timestamp}.pth')
+        model_path = os.path.join(models_dir, f'{model_type}_{timestamp}.pth')
         best_model_path = os.path.join(models_dir, f'{model_type}_best_{timestamp}.pth')
         
         completed_epochs = 0
@@ -13269,6 +13100,9 @@ class ImageAnnotationTool(QMainWindow):
             f"データオーグメンテーション: {'有効' if training_config['use_augmentation'] else '無効'}\n\n" +
             f"{mlflow_info}"
         )
+        
+
+    
 
     def update_location_inference_display(self):
         """位置推論表示を更新する - 上位3クラスのみ表示"""
@@ -13530,6 +13364,15 @@ class ImageAnnotationTool(QMainWindow):
     # アノテーション検証の改善
     def _validate_yolo_annotations(self, task_type):
         """YOLOアノテーションの検証 - クラス名確認強化版"""
+        
+        if task_type == "detect":
+            if not hasattr(self, 'bbox_annotations') or not self.bbox_annotations:
+                QMessageBox.warning(self, "警告", "物体検知アノテーションがありません。")
+                return None, None
+            
+            annotations = self.bbox_annotations
+            total_boxes = sum(len(boxes) for boxes in annotations.values())
+            return annotations, {"total_count": total_boxes, "image_count": len(annotations)}
         
         if task_type == "segment":
             if not self.segmentation_annotations:

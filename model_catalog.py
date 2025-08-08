@@ -50,8 +50,8 @@ def load_model_weights(model, weights_path, device):
         print(f"Loading model weights from: {weights_path}")
         print(f"Target device: {device}")
         
-        # 重みを読み込み
-        checkpoint = torch.load(weights_path, map_location=device)
+        # 重みを読み込み（PyTorch 2.6+対応）
+        checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
         
         if isinstance(checkpoint, dict):
             if 'model_state_dict' in checkpoint:
@@ -84,8 +84,8 @@ def load_model_weights(model, weights_path, device):
         print(f"Attempting to load with alternative method...")
         
         try:
-            # 代替方法での読み込み
-            checkpoint = torch.load(weights_path, map_location='cpu')
+            # 代替方法での読み込み（PyTorch 2.6+対応）
+            checkpoint = torch.load(weights_path, map_location='cpu', weights_only=False)
             if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                 model.load_state_dict(checkpoint['model_state_dict'])
             else:
@@ -467,6 +467,56 @@ class EfficientFormerL1Model(TIMMBasedModel):
         super(EfficientFormerL1Model, self).__init__(
             name="efficientformer_l1",
             timm_model_name="efficientformer_l1",
+            pretrained=pretrained
+        )
+
+
+class YOLOv11nModel(TIMMBasedModel):
+    """YOLOv11 Nano モデル"""
+    def __init__(self, pretrained=True):
+        super(YOLOv11nModel, self).__init__(
+            name="yolo11n",
+            timm_model_name="yolo11n",
+            pretrained=pretrained
+        )
+
+
+class YOLOv11sModel(TIMMBasedModel):
+    """YOLOv11 Small モデル"""
+    def __init__(self, pretrained=True):
+        super(YOLOv11sModel, self).__init__(
+            name="yolo11s",
+            timm_model_name="yolo11s",
+            pretrained=pretrained
+        )
+
+
+class YOLOv11mModel(TIMMBasedModel):
+    """YOLOv11 Medium モデル"""
+    def __init__(self, pretrained=True):
+        super(YOLOv11mModel, self).__init__(
+            name="yolo11m",
+            timm_model_name="yolo11m",
+            pretrained=pretrained
+        )
+
+
+class YOLOv11lModel(TIMMBasedModel):
+    """YOLOv11 Large モデル"""
+    def __init__(self, pretrained=True):
+        super(YOLOv11lModel, self).__init__(
+            name="yolo11l",
+            timm_model_name="yolo11l",
+            pretrained=pretrained
+        )
+
+
+class YOLOv11xModel(TIMMBasedModel):
+    """YOLOv11 Extra Large モデル"""
+    def __init__(self, pretrained=True):
+        super(YOLOv11xModel, self).__init__(
+            name="yolo11x",
+            timm_model_name="yolo11x",
             pretrained=pretrained
         )
 
@@ -962,6 +1012,13 @@ MODEL_REGISTRY = {
     
     # EfficientFormer variants
     "efficientformer_l1": EfficientFormerL1Model,
+    
+    # YOLO variants
+    "yolo11n": YOLOv11nModel,
+    "yolo11s": YOLOv11sModel,
+    "yolo11m": YOLOv11mModel,
+    "yolo11l": YOLOv11lModel,
+    "yolo11x": YOLOv11xModel,
 
     # 位置推論モデル
     "donkey_location": DonkeyLocationModel,
@@ -984,9 +1041,12 @@ def get_model(model_type, pretrained=False, input_size=None):
     
     model_class = MODEL_REGISTRY[model_type]
     
-    # DonkeyModelの場合、入力サイズを渡す
-    if model_type == "donkey" and input_size is not None:
+    # DonkeyModel系の場合、入力サイズを渡す
+    if model_type in ["donkey", "donkey_fcn"] and input_size is not None:
         return model_class(pretrained=pretrained, input_size=input_size)
+    elif model_type == "donkey_location" and input_size is not None:
+        # DonkeyLocationModelの場合、num_classesも必要（デフォルト8）
+        return model_class(num_classes=8, pretrained=pretrained, input_size=input_size)
     
     # その他のモデルの場合は通常通り初期化
     return model_class(pretrained=pretrained)
