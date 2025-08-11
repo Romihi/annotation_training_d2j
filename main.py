@@ -100,7 +100,14 @@ class ImageLabel(QLabel):
         self.inference_point = None 
         self.show_inference = False 
         self.zoom_factor = DEFAULT_ZOOM_FACTOR  
-        self.is_deleted = False  
+        self.is_deleted = False
+        
+        # 画像描画とクリック制御関連
+        self.is_image_loading = False  # 画像読み込み中フラグ
+        self.click_disabled = False  # クリック無効化フラグ
+        self.last_click_time = 0  # 最後のクリック時間（デバウンス用）
+        self.debounce_delay = 100  # デバウンス時間（ミリ秒）
+        self.original_cursor = None  # 元のカーソルを保存  
 
         # バウンディングボックス関連
         self.bbox_start = None  
@@ -764,8 +771,22 @@ class ImageLabel(QLabel):
 
     def mousePressEvent(self, event):
         if self.pixmap() and self.main_window:
+            # デバウンス処理（連続クリック防止）
+            current_time = int(time.time() * 1000)  # ミリ秒に変換
+            if current_time - self.last_click_time < self.debounce_delay:
+                if hasattr(self.main_window, 'debug_mode') and self.main_window.debug_mode:
+                    print(f"デバウンス: クリック無視 (間隔: {current_time - self.last_click_time}ms)")
+                return  # デバウンス時間内のクリックは無視
+            
+            # クリック無効化チェック
+            if self.click_disabled or self.is_image_loading:
+                if hasattr(self.main_window, 'debug_mode') and self.main_window.debug_mode:
+                    print(f"クリック無効化: disabled={self.click_disabled}, loading={self.is_image_loading}")
+                return  # クリック処理を無視
+            
             # クリック位置を取得
             pos = event.pos()
+            self.last_click_time = current_time  # クリック時間を更新
                         
             # クリック位置が画像内かチェック
             if not self.target_rect.contains(pos):
@@ -2839,10 +2860,14 @@ class ImageAnnotationTool(QMainWindow):
 
             # 左右矢印キーでの画像移動
             elif key == Qt.Key_Left:
-                self.skip_images(-10)
+                # 自動スキップ設定に応じてスキップ枚数を決定
+                skip_count = self.skip_count_spin.value() if self.skip_images_on_click.isChecked() else 1
+                self.skip_images(-skip_count)
                 return True
             elif key == Qt.Key_Right:
-                self.skip_images(10)
+                # 自動スキップ設定に応じてスキップ枚数を決定
+                skip_count = self.skip_count_spin.value() if self.skip_images_on_click.isChecked() else 1
+                self.skip_images(skip_count)
                 return True
 
             # 削除キーが押された場合、選択されたバウンディングボックスを削除

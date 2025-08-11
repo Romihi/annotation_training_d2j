@@ -6,7 +6,7 @@ from PIL import Image, ImageDraw
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                             QFrame, QGraphicsOpacityEffect)
 from PyQt5.QtGui import QPixmap, QImage, QColor
-from PyQt5.QtCore import Qt, QPoint
+from PyQt5.QtCore import Qt, QPoint, QTimer
 
 # 1. アノテーション情報ラベルを更新する関数
 def update_annotation_info_label(self):
@@ -172,33 +172,67 @@ def enhanced_display_current_image(self):
         self.inference_info_label.setText("")
     
     # 画像を読み込んで表示
+    # 画像読み込み開始時にクリックを無効化
+    if hasattr(self.main_image_view, 'is_image_loading'):
+        self.main_image_view.is_image_loading = True
+        self.main_image_view.click_disabled = True
+        # カーソルを変更してクリック無効状態を視覚化
+        if hasattr(self.main_image_view, 'original_cursor'):
+            if not self.main_image_view.original_cursor:
+                self.main_image_view.original_cursor = self.main_image_view.cursor()
+            self.main_image_view.setCursor(Qt.ForbiddenCursor)
+        
     pixmap = QPixmap(current_img_path)
     if not pixmap.isNull():
         self.main_image_view.setPixmap(pixmap)
         
-        # アノテーションポイントの設定
-        if self.current_index in self.annotations :
-            anno = self.annotations[self.current_index]
-            self.main_image_view.annotation_point = QPoint(anno['x'], anno['y'])
-        else:
-            self.main_image_view.annotation_point = None
+        # 画像描画完了後にクリックを有効化（少し遅延を入れる）
+        def enable_clicks():
+            if hasattr(self.main_image_view, 'is_image_loading'):
+                self.main_image_view.is_image_loading = False
+                self.main_image_view.click_disabled = False
+                # カーソルを元に戻す
+                if hasattr(self.main_image_view, 'original_cursor') and self.main_image_view.original_cursor:
+                    self.main_image_view.setCursor(self.main_image_view.original_cursor)
+                else:
+                    self.main_image_view.setCursor(Qt.CrossCursor)  # デフォルトのカーソル
         
-        # 推論ポイントの設定
-        if self.inference_checkbox.isChecked() and self.current_index in self.inference_results:
-            inference = self.inference_results[self.current_index]
-            self.main_image_view.inference_point = QPoint(inference['x'], inference['y'])
-        else:
-            self.main_image_view.inference_point = None
+        # QTimerを使って少し遅延してからクリックを有効化
+        QTimer.singleShot(50, enable_clicks)  # 50ms後にクリックを有効化
+    else:
+        # 画像読み込みに失敗した場合もクリックを有効化
+        if hasattr(self.main_image_view, 'is_image_loading'):
+            self.main_image_view.is_image_loading = False
+            self.main_image_view.click_disabled = False
+            # カーソルを元に戻す
+            if hasattr(self.main_image_view, 'original_cursor') and self.main_image_view.original_cursor:
+                self.main_image_view.setCursor(self.main_image_view.original_cursor)
+            else:
+                self.main_image_view.setCursor(Qt.CrossCursor)
+    
+    # アノテーションポイントの設定（画像読み込みの成功/失敗に関係なく実行）
+    if self.current_index in self.annotations :
+        anno = self.annotations[self.current_index]
+        self.main_image_view.annotation_point = QPoint(anno['x'], anno['y'])
+    else:
+        self.main_image_view.annotation_point = None
+    
+    # 推論ポイントの設定（画像読み込みの成功/失敗に関係なく実行）
+    if self.inference_checkbox.isChecked() and self.current_index in self.inference_results:
+        inference = self.inference_results[self.current_index]
+        self.main_image_view.inference_point = QPoint(inference['x'], inference['y'])
+    else:
+        self.main_image_view.inference_point = None
+    
+    # 削除済みの場合（画像読み込みの成功/失敗に関係なく実行）
+    if is_deleted:
+        # 削除済みフラグを設定
+        self.main_image_view.is_deleted = True
+    else:
+        self.main_image_view.is_deleted = False
         
-        # 削除済みの場合
-        if is_deleted:
-            # 削除済みフラグを設定
-            self.main_image_view.is_deleted = True
-        else:
-            self.main_image_view.is_deleted = False
-            
-        # UIを更新
-        self.main_image_view.update()
+    # UIを更新（画像読み込みの成功/失敗に関係なく実行）
+    self.main_image_view.update()
 
 # 3. 強化されたサムネイルウィジェットクラス
 class EnhancedThumbnailWidget(QWidget):
