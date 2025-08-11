@@ -181,6 +181,8 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-#
+#DS
 .DS_Store
+
+#VSCode
 .vscode/
