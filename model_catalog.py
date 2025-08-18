@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
+import torch.fx
 import timm
 from PIL import Image
 from typing import Dict, Any, Optional, Tuple, List
