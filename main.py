@@ -135,11 +135,86 @@ class ImageLabel(QLabel):
         self.hovering_segmentation_index = None 
         self.close_threshold = SEGMENTATION_CLOSE_THRESHOLD
         self.selected_polygon_index = None    
-        self.selected_vertex_index = None     
-        self.is_moving_vertex = False         
-        self.hovering_polygon_index = None    
-        self.hovering_vertex_index = None     
+        self.selected_vertex_index = None
+        
+        # 頂点編集関連
+        self.is_moving_vertex = False
+        self.hovering_polygon_index = None
+        self.hovering_vertex_index = None
         self.vertex_radius = SEGMENTATION_VERTEX_RADIUS
+    
+    def add_point_to_polygon(self, polygon_index, x, y):
+        """指定されたポリゴンに新しい点を追加する"""
+        if not hasattr(self.main_window, 'segmentation_annotations'):
+            return
+            
+        current_index = self.main_window.current_index
+        if current_index not in self.main_window.segmentation_annotations:
+            return
+            
+        segmentations = self.main_window.segmentation_annotations[current_index]
+        if polygon_index >= len(segmentations):
+            return
+            
+        seg_data = segmentations[polygon_index]
+        points = seg_data['points']
+        
+        if len(points) < 3:
+            return
+            
+        # 新しい点を挿入する最適な位置を見つける
+        insert_index = self.find_best_insertion_point(points, x, y)
+        
+        # 新しい点を挿入
+        points.insert(insert_index, (x, y))
+        
+        # 画面を更新
+        self.update()
+        
+        # ステータスメッセージを表示
+        if hasattr(self.main_window, 'statusBar'):
+            self.main_window.statusBar().showMessage(f"ポリゴンに新しい点を追加しました (位置: {insert_index})", 3000)
+    
+    def find_best_insertion_point(self, points, x, y):
+        """新しい点を挿入する最適な位置を見つける"""
+        if len(points) < 2:
+            return len(points)
+            
+        min_distance = float('inf')
+        best_index = 1  # デフォルトで最初の辺の後に挿入
+        
+        # 各辺について、クリック位置との距離を計算
+        for i in range(len(points)):
+            p1 = points[i]
+            p2 = points[(i + 1) % len(points)]  # 次の点（最後の場合は最初の点）
+            
+            # 線分p1-p2とクリック位置(x,y)との距離を計算
+            distance = self.point_to_line_distance(x, y, p1[0], p1[1], p2[0], p2[1])
+            
+            if distance < min_distance:
+                min_distance = distance
+                best_index = i + 1  # p1の次に挿入
+                
+        return best_index
+    
+    def point_to_line_distance(self, px, py, x1, y1, x2, y2):
+        """点(px, py)から線分(x1,y1)-(x2,y2)までの距離を計算"""
+        # 線分の長さの二乗
+        line_length_sq = (x2 - x1) ** 2 + (y2 - y1) ** 2
+        
+        if line_length_sq == 0:
+            # 点と点の距離
+            return ((px - x1) ** 2 + (py - y1) ** 2) ** 0.5
+        
+        # 点から線分への垂線の足のパラメータt
+        t = max(0, min(1, ((px - x1) * (x2 - x1) + (py - y1) * (y2 - y1)) / line_length_sq))
+        
+        # 垂線の足の座標
+        projection_x = x1 + t * (x2 - x1)
+        projection_y = y1 + t * (y2 - y1)
+        
+        # 点と垂線の足の距離
+        return ((px - projection_x) ** 2 + (py - projection_y) ** 2) ** 0.5
 
     #　paintEventはリファクタリング済 ~
     def paintEvent(self, event):
@@ -1034,8 +1109,8 @@ class ImageLabel(QLabel):
                                 self.update()
                                 return
                             elif event.button() == Qt.RightButton and self.selected_segmentation_index == i:
-                                # 右クリックで選択中のセグメンテーションを削除
-                                self.main_window.delete_selected_segmentation(i)
+                                # 右クリックでポリゴンに新しい点を追加
+                                self.add_point_to_polygon(i, orig_x, orig_y)
                                 return
                 
                 # 新しいポリゴンの描画処理
@@ -2120,6 +2195,8 @@ class ImageAnnotationTool(QMainWindow):
         inference_layout = QHBoxLayout()
         self.inference_checkbox = QCheckBox("推論結果表示（青丸）")
         self.inference_checkbox.setChecked(False)
+        self.inference_checkbox.setEnabled(False)  # 初期状態は無効
+        self.inference_checkbox.setToolTip("自動運転モデルが読み込まれていません")
         self.inference_checkbox.stateChanged.connect(self.toggle_inference_display)
         inference_layout.addWidget(self.inference_checkbox)
 
@@ -2136,6 +2213,8 @@ class ImageAnnotationTool(QMainWindow):
         diff_vector_layout = QHBoxLayout()
         self.diff_vector_checkbox = QCheckBox("差分ベクトル矢印表示（緑矢印）")
         self.diff_vector_checkbox.setChecked(False)
+        self.diff_vector_checkbox.setEnabled(False)  # 初期状態は無効
+        self.diff_vector_checkbox.setToolTip("自動運転モデルが読み込まれていません")
         self.diff_vector_checkbox.stateChanged.connect(self.toggle_diff_vector_display)
         diff_vector_layout.addWidget(self.diff_vector_checkbox)
         
@@ -2216,10 +2295,10 @@ class ImageAnnotationTool(QMainWindow):
         preset_button.clicked.connect(self.show_class_preset_dialog)
         class_buttons_layout.addWidget(preset_button)
         
-        validate_button = QPushButton("クラス確認")
-        validate_button.setMinimumWidth(80)  # ボタンの最小幅を設定
-        validate_button.clicked.connect(self.validate_classes)
-        class_buttons_layout.addWidget(validate_button)
+        apply_button = QPushButton("反映")
+        apply_button.setMinimumWidth(80)  # ボタンの最小幅を設定
+        apply_button.clicked.connect(self.apply_classes)
+        class_buttons_layout.addWidget(apply_button)
         
         # ボタンレイアウトにストレッチを追加して均等配置
         class_buttons_layout.addStretch()
@@ -2275,12 +2354,16 @@ class ImageAnnotationTool(QMainWindow):
         # 物体検知推論結果表示チェックボックス
         self.detection_inference_checkbox = QCheckBox("物体検知推論結果表示")
         self.detection_inference_checkbox.setChecked(False)
+        self.detection_inference_checkbox.setEnabled(False)  # 初期状態は無効
+        self.detection_inference_checkbox.setToolTip("物体検知モデルが読み込まれていません")
         self.detection_inference_checkbox.stateChanged.connect(self.toggle_detection_inference_display)
         inference_layout.addWidget(self.detection_inference_checkbox)
         
         # セグメンテーション推論結果表示チェックボックス
         self.segmentation_inference_checkbox = QCheckBox("セグメンテーション推論結果表示")
         self.segmentation_inference_checkbox.setChecked(False)
+        self.segmentation_inference_checkbox.setEnabled(False)  # 初期状態は無効
+        self.segmentation_inference_checkbox.setToolTip("セグメンテーションモデルが読み込まれていません")
         self.segmentation_inference_checkbox.stateChanged.connect(self.toggle_segmentation_inference_display)
         inference_layout.addWidget(self.segmentation_inference_checkbox)
         
@@ -3879,6 +3962,9 @@ class ImageAnnotationTool(QMainWindow):
         # 既存のコードを修正して3つのモードに対応
         sender = self.sender()
         
+        # モード切り替え前に選択状態をクリア
+        self.clear_all_selections()
+        
         if sender == self.auto_mode_button:
             self.current_mode = 0
             self.auto_mode_button.setChecked(True)
@@ -3916,7 +4002,125 @@ class ImageAnnotationTool(QMainWindow):
                 self.segmentation_mode_button.setChecked(True)
                 self.statusBar().showMessage("セグメンテーションアノテーションモードに切り替えました。", 3000)
         
-        self.main_image_view.update()   
+        self.main_image_view.update()
+    
+    def clear_all_selections(self):
+        """全ての選択状態をクリア"""
+        # バウンディングボックスの選択をクリア
+        if hasattr(self.main_image_view, 'selected_bbox_index'):
+            self.main_image_view.selected_bbox_index = None
+        if hasattr(self.main_image_view, 'hovering_bbox_index'):
+            self.main_image_view.hovering_bbox_index = None
+            
+        # セグメンテーションの選択をクリア
+        if hasattr(self.main_image_view, 'selected_segmentation_index'):
+            self.main_image_view.selected_segmentation_index = None
+        if hasattr(self.main_image_view, 'selected_polygon_index'):
+            self.main_image_view.selected_polygon_index = None
+        if hasattr(self.main_image_view, 'hovering_polygon_index'):
+            self.main_image_view.hovering_polygon_index = None
+            
+        # セグメンテーション描画状態をクリア
+        if hasattr(self.main_image_view, 'current_polygon'):
+            self.main_image_view.current_polygon = []
+        if hasattr(self.main_image_view, 'is_drawing_polygon'):
+            self.main_image_view.is_drawing_polygon = False
+            
+        # 一時的なセグメンテーション描画状態をクリア（黄色い線を消去）
+        if hasattr(self.main_image_view, 'current_segmentation_polygon'):
+            self.main_image_view.current_segmentation_polygon = []
+        if hasattr(self.main_image_view, 'is_drawing_segmentation'):
+            self.main_image_view.is_drawing_segmentation = False
+            
+        # 移動・編集状態をクリア
+        if hasattr(self.main_image_view, 'is_moving_segmentation'):
+            self.main_image_view.is_moving_segmentation = False
+        if hasattr(self.main_image_view, 'is_moving_vertex'):
+            self.main_image_view.is_moving_vertex = False
+        if hasattr(self.main_image_view, 'selected_vertex_index'):
+            self.main_image_view.selected_vertex_index = None
+    
+    def update_inference_checkboxes_status(self):
+        """各モデルの読み込み状態に応じてチェックボックスの有効/無効を更新"""
+        # 自動運転モデル
+        if hasattr(self, 'model') and self.model is not None:
+            self.inference_checkbox.setEnabled(True)
+            self.inference_checkbox.setToolTip("自動運転モデルが読み込まれています")
+        else:
+            self.inference_checkbox.setEnabled(False)
+            self.inference_checkbox.setChecked(False)
+            self.inference_checkbox.setToolTip("自動運転モデルが読み込まれていません")
+        
+        # YOLOモデル（物体検知）
+        if hasattr(self, 'yolo_model') and self.yolo_model is not None:
+            self.detection_inference_checkbox.setEnabled(True)
+            self.detection_inference_checkbox.setToolTip("物体検知モデルが読み込まれています")
+        else:
+            self.detection_inference_checkbox.setEnabled(False)
+            self.detection_inference_checkbox.setChecked(False)
+            self.detection_inference_checkbox.setToolTip("物体検知モデルが読み込まれていません")
+        
+        # YOLOモデル（セグメンテーション）
+        if hasattr(self, 'yolo_seg_model') and self.yolo_seg_model is not None:
+            self.segmentation_inference_checkbox.setEnabled(True)
+            self.segmentation_inference_checkbox.setToolTip("セグメンテーションモデルが読み込まれています")
+        else:
+            self.segmentation_inference_checkbox.setEnabled(False)
+            self.segmentation_inference_checkbox.setChecked(False)
+            self.segmentation_inference_checkbox.setToolTip("セグメンテーションモデルが読み込まれていません")
+        
+        # 位置モデル
+        if hasattr(self, 'location_model') and self.location_model is not None:
+            self.location_inference_checkbox.setEnabled(True)
+            self.location_inference_checkbox.setToolTip("位置モデルが読み込まれています")
+        else:
+            self.location_inference_checkbox.setEnabled(False)
+            self.location_inference_checkbox.setChecked(False)
+            self.location_inference_checkbox.setToolTip("位置モデルが読み込まれていません")
+            
+        # 差分ベクトル表示（自動運転モデルに依存）
+        if hasattr(self, 'model') and self.model is not None:
+            self.diff_vector_checkbox.setEnabled(True)
+            self.diff_vector_checkbox.setToolTip("自動運転モデルが読み込まれています")
+        else:
+            self.diff_vector_checkbox.setEnabled(False)
+            self.diff_vector_checkbox.setChecked(False)
+            self.diff_vector_checkbox.setToolTip("自動運転モデルが読み込まれていません")
+    
+    def _disable_other_model_checkboxes(self, exclude_detection=False, exclude_segmentation=False, exclude_location=False, exclude_auto=False):
+        """指定したモデル以外のチェックボックスを無効にする"""
+        
+        # 自動運転モデル関連
+        if not exclude_auto:
+            if hasattr(self, 'inference_checkbox'):
+                self.inference_checkbox.setEnabled(False)
+                self.inference_checkbox.setChecked(False)
+                self.inference_checkbox.setToolTip("自動運転モデルが読み込まれていません")
+            if hasattr(self, 'diff_vector_checkbox'):
+                self.diff_vector_checkbox.setEnabled(False)
+                self.diff_vector_checkbox.setChecked(False)
+                self.diff_vector_checkbox.setToolTip("自動運転モデルが読み込まれていません")
+        
+        # 物体検知モデル
+        if not exclude_detection:
+            if hasattr(self, 'detection_inference_checkbox'):
+                self.detection_inference_checkbox.setEnabled(False)
+                self.detection_inference_checkbox.setChecked(False)
+                self.detection_inference_checkbox.setToolTip("物体検知モデルが読み込まれていません")
+        
+        # セグメンテーションモデル
+        if not exclude_segmentation:
+            if hasattr(self, 'segmentation_inference_checkbox'):
+                self.segmentation_inference_checkbox.setEnabled(False)
+                self.segmentation_inference_checkbox.setChecked(False)
+                self.segmentation_inference_checkbox.setToolTip("セグメンテーションモデルが読み込まれていません")
+        
+        # 位置モデル
+        if not exclude_location:
+            if hasattr(self, 'location_inference_checkbox'):
+                self.location_inference_checkbox.setEnabled(False)
+                self.location_inference_checkbox.setChecked(False)
+                self.location_inference_checkbox.setToolTip("位置モデルが読み込まれていません")   
 
     def add_segmentation_annotation(self, polygon_data):
         """セグメンテーションアノテーションを追加"""
@@ -5470,17 +5674,27 @@ class ImageAnnotationTool(QMainWindow):
                 self.yolo_seg_confidence_threshold = confidence
                 self.yolo_seg_model_file = model_path
                 
-                # セグメンテーション推論チェックボックスをオン
+                # セグメンテーション推論チェックボックスを有効にしてオン
                 if hasattr(self, 'segmentation_inference_checkbox'):
+                    self.segmentation_inference_checkbox.setEnabled(True)
+                    self.segmentation_inference_checkbox.setToolTip("セグメンテーションモデルが読み込まれています")
                     self.segmentation_inference_checkbox.setChecked(True)
+                
+                # 他のモデルのチェックボックスを無効にする
+                self._disable_other_model_checkboxes(exclude_segmentation=True)
             else:
                 self.yolo_model = yolo_model
                 self.yolo_confidence_threshold = confidence
                 self.yolo_model_file = model_path
                 
-                # 物体検知推論チェックボックスをオン
+                # 物体検知推論チェックボックスを有効にしてオン
                 if hasattr(self, 'detection_inference_checkbox'):
+                    self.detection_inference_checkbox.setEnabled(True)
+                    self.detection_inference_checkbox.setToolTip("物体検知モデルが読み込まれています")
                     self.detection_inference_checkbox.setChecked(True)
+                
+                # 他のモデルのチェックボックスを無効にする
+                self._disable_other_model_checkboxes(exclude_detection=True)
             
             progress.setValue(70)
             progress.setLabelText("推論テストを実行中...")
@@ -7995,11 +8209,8 @@ class ImageAnnotationTool(QMainWindow):
     ###TODO:統合
     def on_classes_changed(self, text):
         """クラス入力フィールドが変更された時の処理"""
-        classes = [cls.strip() for cls in text.split(',') if cls.strip()]
-        if classes:
-            self.classes_display_label.setText(f"現在のクラス: {', '.join(classes)}")
-        else:
-            self.classes_display_label.setText("クラスが入力されていません")
+        # テキスト変更時の処理は最小限に抑える
+        pass
 
     def show_class_preset_dialog(self):
         """クラスプリセット選択ダイアログを表示"""
@@ -8076,8 +8287,8 @@ class ImageAnnotationTool(QMainWindow):
                         self.classes_input.setText(preset_classes)
                     break
 
-    def validate_classes(self):
-        """入力されたクラス名をバリデート"""
+    def apply_classes(self):
+        """クラス設定を確認してから反映"""
         text = self.classes_input.text().strip()
         if not text:
             QMessageBox.warning(self, "警告", "クラス名が入力されていません。")
@@ -8113,13 +8324,70 @@ class ImageAnnotationTool(QMainWindow):
             )
             return
         
-        # 成功メッセージ
-        QMessageBox.information(
-            self, "確認完了",
-            f"有効なクラス設定です。\n"
+        # 確認メッセージ
+        reply = QMessageBox.question(
+            self, "クラス確認",
+            f"以下のクラス設定を反映しますか？\n\n"
             f"クラス数: {len(classes)}\n"
-            f"クラス: {', '.join(classes)}"
+            f"クラス: {', '.join(classes)}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
         )
+        
+        if reply == QMessageBox.Yes:
+            # クラスを反映
+            self._apply_class_changes(classes)
+            QMessageBox.information(self, "完了", "クラス設定が反映されました。")
+    
+    def _apply_class_changes(self, classes):
+        """クラス変更を実際に適用し、色を初期化"""
+        # グローバル色設定を更新
+        global CLASS_COLORS, SEGMENTATION_CLASS_COLORS, DETECTION_INFERENCE_TEXT_COLORS, DETECTION_INFERENCE_CLASS_COLORS
+        
+        # デフォルト色リスト
+        default_colors = [
+            (255, 0, 0, 180),    # 赤
+            (0, 255, 0, 180),    # 緑
+            (0, 0, 255, 180),    # 青
+            (255, 255, 0, 180),  # 黄
+            (255, 0, 255, 180),  # マゼンタ
+            (0, 255, 255, 180),  # シアン
+            (255, 128, 0, 180),  # オレンジ
+            (128, 0, 255, 180),  # 紫
+        ]
+        
+        default_seg_colors = [
+            (255, 0, 0, 120),    # 赤
+            (0, 255, 0, 120),    # 緑
+            (0, 0, 255, 120),    # 青
+            (255, 255, 0, 120),  # 黄
+            (255, 0, 255, 120),  # マゼンタ
+            (0, 255, 255, 120),  # シアン
+            (255, 128, 0, 120),  # オレンジ
+            (128, 0, 255, 120),  # 紫
+        ]
+        
+        default_text_colors = [
+            "#FF0000", "#00FF00", "#0000FF", "#FFFF00",
+            "#FF00FF", "#00FFFF", "#FF8000", "#8000FF"
+        ]
+        
+        # 色辞書を初期化
+        CLASS_COLORS = {}
+        SEGMENTATION_CLASS_COLORS = {}
+        DETECTION_INFERENCE_TEXT_COLORS = {}
+        DETECTION_INFERENCE_CLASS_COLORS = {}
+        
+        # 各クラスに色を割り当て
+        for i, class_name in enumerate(classes):
+            color_idx = i % len(default_colors)
+            CLASS_COLORS[class_name] = default_colors[color_idx]
+            SEGMENTATION_CLASS_COLORS[class_name] = default_seg_colors[color_idx]
+            DETECTION_INFERENCE_CLASS_COLORS[class_name] = default_seg_colors[color_idx]
+            DETECTION_INFERENCE_TEXT_COLORS[class_name] = default_text_colors[color_idx]
+        
+        # 画面を再描画
+        self.display_current_image()
 
     def get_current_classes(self):
         """現在設定されているクラスリストを取得"""
@@ -9376,32 +9644,79 @@ class ImageAnnotationTool(QMainWindow):
         if not valid_paths or not image_folders:
             return
         
+        # プログレスダイアログを作成
+        progress = QProgressDialog("フォルダを読み込み中...", "キャンセル", 0, 100, self)
+        progress.setWindowTitle("読み込み進捗")
+        progress.setModal(True)
+        progress.show()
+        
         # 全画像フォルダの画像を集める
         all_images = []
         image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.gif']
         
         print(f"{len(image_folders)}個のimagesフォルダを検索中...")
+        progress.setLabelText(f"{len(image_folders)}個のフォルダを検索中...")
+        progress.setValue(10)
+        QApplication.processEvents()
         
-        for img_folder in image_folders:
+        # 各フォルダを順次処理
+        for folder_idx, img_folder in enumerate(image_folders):
+            if progress.wasCanceled():
+                return
+                
+            folder_name = os.path.basename(os.path.dirname(img_folder))
+            progress.setLabelText(f"フォルダ '{folder_name}' を読み込み中... ({folder_idx + 1}/{len(image_folders)})")
+            progress.setValue(10 + (folder_idx * 60 // len(image_folders)))
+            QApplication.processEvents()
+            
             print(f"画像フォルダを検索中: {img_folder}")
             
             # imagesフォルダ内の画像を検索
             try:
-                for file in os.listdir(img_folder):
+                files = os.listdir(img_folder)
+                for file_idx, file in enumerate(files):
+                    if progress.wasCanceled():
+                        return
+                        
                     if any(file.lower().endswith(ext) for ext in image_extensions):
                         all_images.append(os.path.join(img_folder, file))
+                    
+                    # ファイル処理の進捗を細かく更新
+                    if file_idx % 10 == 0:  # 10ファイルごとに更新
+                        file_progress = 10 + (folder_idx * 60 // len(image_folders)) + (file_idx * 10 // len(files))
+                        progress.setValue(min(file_progress, 70))
+                        QApplication.processEvents()
+                        
             except Exception as e:
                 print(f"画像フォルダ {img_folder} の読み込みエラー: {e}")
         
+        if progress.wasCanceled():
+            return
+            
+        progress.setLabelText("画像ファイルを確認中...")
+        progress.setValue(70)
+        QApplication.processEvents()
+        
         if not all_images:
+            progress.close()
             QMessageBox.warning(self, "エラー", "選択されたフォルダ内のimagesフォルダに画像ファイルがありません。")
             return
         
         print(f"{len(all_images)}枚の画像が見つかりました")
+        progress.setLabelText(f"{len(all_images)}枚の画像を処理中...")
+        progress.setValue(75)
+        QApplication.processEvents()
         
         # ファイル名からインデックスを抽出してソート（修正版）
+        progress.setLabelText("画像ファイルをソート中...")
+        progress.setValue(80)
+        QApplication.processEvents()
+        
         image_with_indices = []
-        for img_path in all_images:
+        for img_idx, img_path in enumerate(all_images):
+            if progress.wasCanceled():
+                return
+                
             basename = os.path.basename(img_path)
             # ファイル名からインデックスを抽出
             try:
@@ -9427,18 +9742,37 @@ class ImageAnnotationTool(QMainWindow):
                 print(f"ファイル名からインデックス抽出エラー: {basename} - {e}")
                 # エラーの場合も高い値で後ろに配置
                 image_with_indices.append((img_path, float('inf')))
+            
+            # ソート進捗の更新（100ファイルごと）
+            if img_idx % 100 == 0:
+                sort_progress = 80 + (img_idx * 5 // len(all_images))
+                progress.setValue(min(sort_progress, 85))
+                QApplication.processEvents()
         
+        if progress.wasCanceled():
+            return
+            
         # インデックスでソート
+        progress.setLabelText("画像ファイルの並び替え中...")
+        progress.setValue(85)
+        QApplication.processEvents()
+        
         image_with_indices.sort(key=lambda x: x[1])
         
         # ソート後の画像パスリストを作成
         images = [img_path for img_path, _ in image_with_indices]
 
         # --- 画像グルーピング（インデックス＆キー単位） ---
+        progress.setLabelText("画像データを整理中...")
+        progress.setValue(90)
+        QApplication.processEvents()
+        
         self.image_groups = {}  # { index: { variant: path, ... } }
         self.variant_images = {}  # 各キーの画像リスト
 
-        for img_path in images:
+        for img_idx, img_path in enumerate(images):
+            if progress.wasCanceled():
+                return
             basename = os.path.basename(img_path)
             
             # Jetracer形式を優先的にチェック: 200_100_2_cam_image_array_.jpg
@@ -9537,6 +9871,11 @@ class ImageAnnotationTool(QMainWindow):
             self.image_slider.setValue(0)
             self.slider_value_label.setText("0/0")
         
+        # 最終的な処理
+        progress.setLabelText("画面を更新中...")
+        progress.setValue(95)
+        QApplication.processEvents()
+        
         # Update UI
         self.display_current_image()
         self.update_gallery()
@@ -9555,6 +9894,10 @@ class ImageAnnotationTool(QMainWindow):
         
         # アノテーション関連ボタンをアクティブ化
         self.set_annotation_buttons_enabled(True)
+        
+        # プログレスダイアログを閉じる
+        progress.setValue(100)
+        progress.close()
         
         QMessageBox.information(
             self, 
@@ -9992,12 +10335,21 @@ class ImageAnnotationTool(QMainWindow):
             # モデル変更を検出するための状態を保持
             self._last_model_info = (model_type, model_path)
             
-            # 推論表示チェックボックスを自動的にオンにする
+            # 推論表示チェックボックスを有効にして自動的にオンにする
             progress.setLabelText("推論表示を更新中...")
             progress.setValue(90)
             QApplication.processEvents()
             
+            self.inference_checkbox.setEnabled(True)
+            self.inference_checkbox.setToolTip("自動運転モデルが読み込まれています")
             self.inference_checkbox.setChecked(True)
+            
+            # 差分ベクトル表示チェックボックスも有効にする
+            self.diff_vector_checkbox.setEnabled(True)
+            self.diff_vector_checkbox.setToolTip("自動運転モデルが読み込まれています")
+            
+            # 他のモデルのチェックボックスを無効にする
+            self._disable_other_model_checkboxes(exclude_auto=True)
             
             # 推論表示を更新
             self.update_inference_display()
@@ -13418,6 +13770,8 @@ class ImageAnnotationTool(QMainWindow):
         location_inference_layout = QHBoxLayout()
         self.location_inference_checkbox = QCheckBox("位置推論結果表示")
         self.location_inference_checkbox.setChecked(False)
+        self.location_inference_checkbox.setEnabled(False)  # 初期状態は無効
+        self.location_inference_checkbox.setToolTip("位置モデルが読み込まれていません")
         self.location_inference_checkbox.stateChanged.connect(self.toggle_location_inference_display)
         location_inference_layout.addWidget(self.location_inference_checkbox)
         location_model_layout.addLayout(location_inference_layout)
@@ -13526,8 +13880,13 @@ class ImageAnnotationTool(QMainWindow):
             
             update_progress(90, "推論表示を更新中...")
             
-            # 推論表示チェックボックスを自動的にオンにする
+            # 推論表示チェックボックスを有効にして自動的にオンにする
+            self.location_inference_checkbox.setEnabled(True)
+            self.location_inference_checkbox.setToolTip("位置モデルが読み込まれています")
             self.location_inference_checkbox.setChecked(True)
+            
+            # 他のモデルのチェックボックスを無効にする
+            self._disable_other_model_checkboxes(exclude_location=True)
             
             update_progress(100)
             progress.close()
