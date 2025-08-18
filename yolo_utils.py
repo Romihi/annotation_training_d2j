@@ -123,9 +123,21 @@ def detect_objects_and_segments(image_path, model=None, conf_threshold=0.25):
                 x1, y1, x2, y2, conf, cls = det.tolist()
                 class_name = results.names[int(cls)]
                 
+                # ピクセル座標を正規化座標（0-1）に変換し、float型で統一
+                norm_x1 = float(x1) / float(img_width)
+                norm_y1 = float(y1) / float(img_height)
+                norm_x2 = float(x2) / float(img_width)
+                norm_y2 = float(y2) / float(img_height)
+                
+                # 座標の範囲を0-1に制限
+                norm_x1 = max(0.0, min(1.0, norm_x1))
+                norm_y1 = max(0.0, min(1.0, norm_y1))
+                norm_x2 = max(0.0, min(1.0, norm_x2))
+                norm_y2 = max(0.0, min(1.0, norm_y2))
+                
                 detections.append({
                     'class': class_name,
-                    'bbox': [float(x1), float(y1), float(x2), float(y2)],
+                    'bbox': [norm_x1, norm_y1, norm_x2, norm_y2],
                     'confidence': float(conf)
                 })
         
@@ -148,11 +160,20 @@ def detect_objects_and_segments(image_path, model=None, conf_threshold=0.25):
                     epsilon = 0.02 * cv2.arcLength(largest_contour, True)
                     approx = cv2.approxPolyDP(largest_contour, epsilon, True)
                     
-                    # ポイントリストに変換
+                    # ポイントリストに変換（正規化座標に変換）
                     points = []
+                    mask_height, mask_width = mask_array.shape
                     for point in approx:
                         x, y = point[0]
-                        points.append([float(x), float(y)])
+                        # マスク座標を0-1に正規化し、float型で統一
+                        normalized_x = float(x) / float(mask_width)
+                        normalized_y = float(y) / float(mask_height)
+                        
+                        # 座標を0-1範囲内に制限
+                        normalized_x = max(0.0, min(1.0, normalized_x))
+                        normalized_y = max(0.0, min(1.0, normalized_y))
+                        
+                        points.append([float(normalized_x), float(normalized_y)])
                     
                     if len(points) >= 3:  # 最低3点必要
                         # 対応するバウンディングボックスのクラス情報を取得

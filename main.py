@@ -659,27 +659,22 @@ class ImageLabel(QLabel):
         """セグメンテーション推論結果の描画"""
         if not (hasattr(self.main_window, 'segmentation_inference_results') and 
                 hasattr(self.main_window, 'show_segmentation_inference')):
-            print("DEBUG: セグメンテーション推論結果の描画 - 属性なし")
             return
         
         # セグメンテーション推論表示がOFFの場合は描画しない
         show_seg_inference = getattr(self.main_window, 'show_segmentation_inference', False)
-        print(f"DEBUG: セグメンテーション推論表示設定: {show_seg_inference}")
         if not show_seg_inference:
             return
         
         # 現在の画像の推論結果を取得
         if self.main_window.images and self.main_window.current_index < len(self.main_window.images):
             current_img_path = self.main_window.images[self.main_window.current_index]
-            print(f"DEBUG: 現在の画像パス: {current_img_path}")
-            print(f"DEBUG: セグメンテーション推論結果キー: {list(self.main_window.segmentation_inference_results.keys())}")
             
             if (current_img_path in self.main_window.segmentation_inference_results and
                 self.main_window.segmentation_inference_results[current_img_path]):
                 
                 result = self.main_window.segmentation_inference_results[current_img_path]
                 segments = result.get('segments', [])
-                print(f"DEBUG: 描画するセグメント数: {len(segments)}")
                 
                 # 各セグメンテーションを描画
                 for segment in segments:
@@ -688,15 +683,12 @@ class ImageLabel(QLabel):
                     confidence = segment.get('confidence', 0.0)
                     
                     if len(points) >= 3:
-                        # クラス名に基づいて色を決定（推論結果用の色）
-                        from hashlib import md5
-                        color_hash = int(md5(class_name.encode()).hexdigest(), 16) % 0xFFFFFF
-                        r = (color_hash & 0xFF0000) >> 16
-                        g = (color_hash & 0x00FF00) >> 8
-                        b = color_hash & 0x0000FF
+                        # 手動アノテーションと同じ色定義を使用
+                        class_colors = SEGMENTATION_CLASS_COLORS
+                        color_tuple = class_colors.get(class_name, (128, 128, 128, 120))
                         
-                        # 推論結果は少し透明度を高くして手動アノテーションと区別
-                        base_color = QColor(r, g, b, 80)  # 透明度を80に設定
+                        # 推論結果は少し透明度を低くして手動アノテーションと区別（透明度80）
+                        base_color = QColor(color_tuple[0], color_tuple[1], color_tuple[2], 80)
                         
                         # 推論結果は点線で描画して区別
                         pen = QPen(base_color.darker(), 2, Qt.DashLine)
@@ -732,7 +724,10 @@ class ImageLabel(QLabel):
                             # 背景矩形を描画
                             bg_rect = QRect(center_x - text_width//2 - 2, center_y - text_height//2 - 2,
                                           text_width + 4, text_height + 4)
-                            painter.fillRect(bg_rect, QColor(r, g, b, 180))
+                            # base_colorを少し濃くして背景に使用
+                            bg_color = base_color.darker()
+                            bg_color.setAlpha(180)
+                            painter.fillRect(bg_rect, bg_color)
                             
                             # テキストを描画
                             painter.setPen(QPen(Qt.white))
@@ -2767,6 +2762,15 @@ class ImageAnnotationTool(QMainWindow):
             print(f"セッション情報を保存しました: {session_file}")
         except Exception as e:
             print(f"セッション情報の保存に失敗: {e}")
+    
+    def closeEvent(self, event):
+        """アプリケーション終了時の処理"""
+        # セッション情報を保存
+        self.save_session_info()
+        
+        # 親クラスのcloseEventを呼び出す
+        super().closeEvent(event)
+        event.accept()
 
     def load_session_info(self):
         """保存されたセッション情報を読み込む"""
@@ -7598,7 +7602,6 @@ class ImageAnnotationTool(QMainWindow):
                         
                         # マスクサイズを取得
                         mask_height, mask_width = mask_array.shape
-                        print(f"DEBUG: マスクサイズ: {mask_width}x{mask_height}, 元画像サイズ: {img_width}x{img_height}")
                         
                         # マスクから輪郭ポイントを抽出
                         mask_uint8 = (mask_array * 255).astype(np.uint8)
@@ -7644,12 +7647,6 @@ class ImageAnnotationTool(QMainWindow):
                                     'points': points,
                                     'confidence': confidence
                                 })
-                                
-                                # デバッグ: 正規化座標範囲をチェック
-                                if points:
-                                    x_coords = [p[0] for p in points]
-                                    y_coords = [p[1] for p in points]
-                                    print(f"Segment {class_name}: normalized_x_range=({min(x_coords):.3f}-{max(x_coords):.3f}), normalized_y_range=({min(y_coords):.3f}-{max(y_coords):.3f})")
             
             # 結果を保存
             self.segmentation_inference_results[current_img_path] = {
@@ -9582,6 +9579,9 @@ class ImageAnnotationTool(QMainWindow):
         if reply == QMessageBox.Yes:
             # アノテーションデータ読み込みメソッドを呼び出す
             self.load_annotations()
+        
+        # セッション情報を保存
+        self.save_session_info()
 
     def load_annotations(self):
         """
@@ -10030,6 +10030,9 @@ class ImageAnnotationTool(QMainWindow):
                 confirm_message
             )
             
+            # セッション情報を保存
+            self.save_session_info()
+            
         except Exception as e:
             # エラー発生時も進捗ダイアログを閉じる
             progress.close()
@@ -10408,6 +10411,7 @@ class ImageAnnotationTool(QMainWindow):
             # 画像を読み込み
             image = load_image_safely(current_image_path)
             if image is None:
+                print(f"画像読み込み失敗: {current_image_path}")
                 return
             
             # PIL画像をQImageに変換してQPixmapに設定
@@ -10418,15 +10422,41 @@ class ImageAnnotationTool(QMainWindow):
             if hasattr(self, 'main_image_view'):
                 self.main_image_view.setPixmap(pixmap)
                 
-                # YOLOオートアノテーション結果があれば表示用データを設定
-                if hasattr(self, 'object_annotations') and current_image_path in self.object_annotations:
+                # バウンディングボックスアノテーションがあれば表示用データを設定
+                if hasattr(self, 'bbox_annotations') and self.current_index in self.bbox_annotations:
                     # ObjectDetectionImageLabelがあればバウンディングボックスを設定
                     if hasattr(self.main_image_view, 'set_boxes'):
                         boxes = []
-                        for detection in self.object_annotations[current_image_path]:
-                            class_name = detection['class']
-                            bbox = detection['bbox']  # [x1, y1, x2, y2]
-                            boxes.append((class_name, bbox))
+                        for bbox_data in self.bbox_annotations[self.current_index]:
+                            class_name = bbox_data.get('class', 'unknown')
+                            # 座標を適切に取得し、明示的にfloat型に変換
+                            try:
+                                x1 = float(bbox_data.get('x1', 0.0))
+                                y1 = float(bbox_data.get('y1', 0.0))
+                                x2 = float(bbox_data.get('x2', x1))
+                                y2 = float(bbox_data.get('y2', y1))
+                                
+                                # 座標を0-1範囲内に制限
+                                x1 = max(0.0, min(1.0, x1))
+                                y1 = max(0.0, min(1.0, y1))
+                                x2 = max(0.0, min(1.0, x2))
+                                y2 = max(0.0, min(1.0, y2))
+                                
+                                # ObjectDetectionImageLabelが期待するピクセル座標に変換
+                                img_width = pixmap.width()
+                                img_height = pixmap.height()
+                                
+                                pixel_x1 = int(x1 * img_width)
+                                pixel_y1 = int(y1 * img_height)
+                                pixel_x2 = int(x2 * img_width)
+                                pixel_y2 = int(y2 * img_height)
+                                
+                                bbox = (pixel_x1, pixel_y1, pixel_x2, pixel_y2)
+                                boxes.append((class_name, bbox))
+                            except (ValueError, TypeError) as e:
+                                print(f"Error converting bbox coordinates: {e}")
+                                print(f"Problematic bbox_data: {bbox_data}")
+                                continue
                         self.main_image_view.set_boxes(boxes)
                 
                 # セグメンテーション推論結果があれば表示更新
@@ -10442,7 +10472,16 @@ class ImageAnnotationTool(QMainWindow):
                     pass
                     
         except Exception as e:
-            print(f"画像表示エラー: {e}")
+            error_message = str(e)
+            print(f"Error loading image {current_image_path}: {error_message}")
+            print(f"画像パス: {current_image_path}")
+            if hasattr(self, 'bbox_annotations') and self.current_index in self.bbox_annotations:
+                print(f"バウンディングボックス数: {len(self.bbox_annotations[self.current_index])}")
+                for i, bbox in enumerate(self.bbox_annotations[self.current_index]):
+                    print(f"  BBox {i}: {bbox}")
+                    print(f"    座標型チェック: x1={bbox.get('x1')}({type(bbox.get('x1'))}), y1={bbox.get('y1')}({type(bbox.get('y1'))}), x2={bbox.get('x2')}({type(bbox.get('x2'))}), y2={bbox.get('y2')}({type(bbox.get('y2'))})")
+            import traceback
+            traceback.print_exc()
             return
 
     def update_gallery(self):
@@ -12696,6 +12735,49 @@ class ImageAnnotationTool(QMainWindow):
             QMessageBox.warning(self, "警告", "画像が読み込まれていません。")
             return
         
+        # モデルタイプを先に判定
+        model_type = "detect"
+        if hasattr(self, 'yolo_seg_model') and self.yolo_seg_model is not None:
+            model_type = "segment"
+        elif hasattr(self, 'yolo_model') and self.yolo_model is not None:
+            model_type = "detect"
+        
+        # 既存のアノテーションがある場合は確認（モデルタイプに応じて）
+        if model_type == "segment":
+            existing_count = len(self.segmentation_annotations) if hasattr(self, 'segmentation_annotations') else 0
+            if existing_count > 0:
+                msg = f"既存のセグメンテーションアノテーションがあります:\n"
+                msg += f"・{existing_count}個の画像\n"
+                msg += "\nどのように処理しますか？"
+        else:
+            existing_count = len(self.bbox_annotations) if hasattr(self, 'bbox_annotations') else 0
+            if existing_count > 0:
+                msg = f"既存のバウンディングボックスアノテーションがあります:\n"
+                msg += f"・{existing_count}個の画像\n"
+                msg += "\nどのように処理しますか？"
+        
+        if 'msg' in locals():
+            
+            msgBox = QMessageBox()
+            msgBox.setWindowTitle("既存アノテーションの処理")
+            msgBox.setText(msg)
+            msgBox.addButton("上書き", QMessageBox.AcceptRole)
+            msgBox.addButton("追加", QMessageBox.AcceptRole)
+            msgBox.addButton("キャンセル", QMessageBox.RejectRole)
+            
+            result = msgBox.exec_()
+            
+            if result == 2:  # キャンセル
+                return
+            elif result == 0:  # 上書き
+                # モデルタイプに応じてクリア
+                if model_type == "segment":
+                    if hasattr(self, 'segmentation_annotations'):
+                        self.segmentation_annotations.clear()
+                else:
+                    if hasattr(self, 'bbox_annotations'):
+                        self.bbox_annotations.clear()
+        
         # 信頼度の設定を取得
         conf_threshold = 0.25
         if hasattr(self, 'yolo_conf_spinbox'):
@@ -12706,9 +12788,107 @@ class ImageAnnotationTool(QMainWindow):
         if hasattr(self, 'classes_input') and self.classes_input.text():
             target_classes = [cls.strip() for cls in self.classes_input.text().split(',') if cls.strip()]
         
+        # スキップ枚数の設定ダイアログ
+        dialog = QDialog(self)
+        dialog.setWindowTitle("オートアノテーション設定")
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+        
+        # 説明ラベル
+        info_label = QLabel("オートアノテーションの実行方法を選択してください")
+        layout.addWidget(info_label)
+        
+        # ラジオボタングループ
+        radio_group = QButtonGroup(dialog)
+        
+        # 全画像オプション
+        all_radio = QRadioButton("すべての画像を処理")
+        all_radio.setChecked(True)
+        radio_group.addButton(all_radio, 0)
+        layout.addWidget(all_radio)
+        
+        # スキップオプション
+        skip_radio = QRadioButton("指定枚数ごとに処理")
+        radio_group.addButton(skip_radio, 1)
+        layout.addWidget(skip_radio)
+        
+        # スキップ枚数入力
+        skip_layout = QHBoxLayout()
+        skip_layout.addSpacing(20)
+        skip_label = QLabel("スキップ枚数:")
+        skip_layout.addWidget(skip_label)
+        
+        skip_spinbox = QSpinBox()
+        skip_spinbox.setMinimum(1)
+        skip_spinbox.setMaximum(100)
+        skip_spinbox.setValue(5)
+        skip_spinbox.setEnabled(False)
+        skip_layout.addWidget(skip_spinbox)
+        
+        skip_layout.addWidget(QLabel("枚ごと"))
+        skip_layout.addStretch()
+        layout.addLayout(skip_layout)
+        
+        # スキップラジオボタンが選択されたときにスピンボックスを有効化
+        skip_radio.toggled.connect(skip_spinbox.setEnabled)
+        
+        # 現在の画像から開始オプション
+        from_current_checkbox = QCheckBox("現在の画像から開始")
+        from_current_checkbox.setChecked(False)
+        layout.addWidget(from_current_checkbox)
+        
+        # 処理枚数の見積もり表示
+        estimate_label = QLabel()
+        def update_estimate():
+            if all_radio.isChecked():
+                if from_current_checkbox.isChecked():
+                    count = len(self.images) - self.current_index
+                else:
+                    count = len(self.images)
+                estimate_label.setText(f"処理予定: {count}枚")
+            else:
+                skip = skip_spinbox.value()
+                if from_current_checkbox.isChecked():
+                    remaining = len(self.images) - self.current_index
+                    count = (remaining + skip - 1) // skip
+                else:
+                    count = (len(self.images) + skip - 1) // skip
+                estimate_label.setText(f"処理予定: 約{count}枚（{skip}枚ごと）")
+        
+        all_radio.toggled.connect(update_estimate)
+        skip_spinbox.valueChanged.connect(update_estimate)
+        from_current_checkbox.toggled.connect(update_estimate)
+        update_estimate()
+        layout.addWidget(estimate_label)
+        
+        # ボタン
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        
+        # 設定を取得
+        process_all = all_radio.isChecked()
+        skip_count = skip_spinbox.value() if not process_all else 1
+        from_current = from_current_checkbox.isChecked()
+        
+        # 処理する画像リストを作成
+        if from_current:
+            start_index = self.current_index
+        else:
+            start_index = 0
+        
+        if process_all:
+            images_to_process = self.images[start_index:]
+        else:
+            images_to_process = self.images[start_index::skip_count]
+        
         # 進捗ダイアログを表示
         progress = QProgressDialog(
-            f"YOLO オートアノテーション準備中... ({len(self.images)}枚の画像)",
+            f"YOLO オートアノテーション準備中... ({len(images_to_process)}枚の画像)",
             "キャンセル", 0, 100, self
         )
         progress.setWindowTitle("YOLO オートアノテーション実行中")
@@ -12724,14 +12904,38 @@ class ImageAnnotationTool(QMainWindow):
             progress.setValue(10)
             QApplication.processEvents()
             
-            # モデルパスの設定
-            model_path = None
-            if os.path.exists("yolo11n.pt"):
-                model_path = "yolo11n.pt"
-            elif os.path.exists("yolov8n-seg.pt"):  # セグメンテーション用
-                model_path = "yolov8n-seg.pt"
+            # 現在読み込まれているモデルを使用するか、デフォルトモデルを使用
+            model = None
+            model_type = "detect"  # デフォルトは物体検知
             
-            model = get_yolo_model(model_path)
+            # 既に読み込まれているモデルがあるか確認
+            if hasattr(self, 'yolo_model') and self.yolo_model is not None:
+                # 物体検知モデルが読み込まれている
+                model = self.yolo_model
+                model_type = "detect"
+                progress.setLabelText("物体検知モデルを使用します...")
+            elif hasattr(self, 'yolo_seg_model') and self.yolo_seg_model is not None:
+                # セグメンテーションモデルが読み込まれている
+                model = self.yolo_seg_model
+                model_type = "segment"
+                progress.setLabelText("セグメンテーションモデルを使用します...")
+            else:
+                # モデルが読み込まれていない場合はデフォルトモデルを使用
+                model_path = None
+                if os.path.exists("yolo11n.pt"):
+                    model_path = "yolo11n.pt"
+                    model_type = "detect"
+                elif os.path.exists("yolov8n-seg.pt"):
+                    model_path = "yolov8n-seg.pt"
+                    model_type = "segment"
+                
+                from yolo_utils import get_yolo_model
+                model = get_yolo_model(model_path)
+            
+            if model is None:
+                QMessageBox.warning(self, "警告", "YOLOモデルが読み込まれていません。")
+                progress.close()
+                return
             
             # 進捗コールバック関数
             def progress_callback(current, total, message):
@@ -12745,12 +12949,16 @@ class ImageAnnotationTool(QMainWindow):
                 return True
             
             # バッチ処理実行
-            progress.setLabelText("物体検知とセグメンテーションを実行中...")
+            if model_type == "segment":
+                progress.setLabelText("セグメンテーションを実行中...")
+            else:
+                progress.setLabelText("物体検知を実行中...")
             progress.setValue(15)
             QApplication.processEvents()
             
+            from yolo_utils import batch_detect_objects_and_segments
             results = batch_detect_objects_and_segments(
-                self.images, model, conf_threshold, progress_callback
+                images_to_process, model, conf_threshold, progress_callback
             )
             
             if progress.wasCanceled():
@@ -12761,18 +12969,26 @@ class ImageAnnotationTool(QMainWindow):
             progress.setValue(95)
             QApplication.processEvents()
             
-            # 物体検知アノテーション用の辞書を初期化
-            if not hasattr(self, 'object_annotations'):
-                self.object_annotations = {}
+            # 手動アノテーションと同じ辞書を使用
+            if not hasattr(self, 'bbox_annotations'):
+                self.bbox_annotations = {}
             if not hasattr(self, 'segmentation_annotations'):
                 self.segmentation_annotations = {}
             
             detection_count = 0
             segmentation_count = 0
             
+            # 画像パスからインデックスへのマッピングを作成
+            img_path_to_index = {path: idx for idx, path in enumerate(self.images)}
+            
             for img_path, result in results.items():
-                # バウンディングボックス処理
-                if result['detections']:
+                # 画像インデックスを取得
+                if img_path not in img_path_to_index:
+                    continue
+                img_index = img_path_to_index[img_path]
+                
+                # バウンディングボックス処理（物体検知モデルの場合のみ）
+                if model_type == "detect" and result['detections']:
                     if target_classes:
                         # 指定されたクラスのみフィルタリング
                         filtered_detections = [
@@ -12783,11 +12999,41 @@ class ImageAnnotationTool(QMainWindow):
                         filtered_detections = result['detections']
                     
                     if filtered_detections:
-                        self.object_annotations[img_path] = filtered_detections
-                        detection_count += len(filtered_detections)
+                        # 手動アノテーションと同じ形式に変換（既に正規化座標）
+                        bbox_annotations = []
+                        for det in filtered_detections:
+                            # bboxは既に正規化座標（0-1）で受け取り、型の一貫性を確保
+                            x1 = float(det['bbox'][0])
+                            y1 = float(det['bbox'][1])
+                            x2 = float(det['bbox'][2])
+                            y2 = float(det['bbox'][3])
+                            
+                            # 範囲チェック（0-1の間に収まることを確認）し、明示的にfloat型で保存
+                            x1 = float(max(0.0, min(1.0, x1)))
+                            y1 = float(max(0.0, min(1.0, y1)))
+                            x2 = float(max(0.0, min(1.0, x2)))
+                            y2 = float(max(0.0, min(1.0, y2)))
+                            
+                            bbox_annotations.append({
+                                'x1': x1,
+                                'y1': y1,
+                                'x2': x2,
+                                'y2': y2,
+                                'class': det['class'],
+                                'confidence': float(det.get('confidence', 1.0))
+                            })
+                        
+                        # 既存のアノテーションがある場合は確認
+                        if img_index in self.bbox_annotations:
+                            # 既存のアノテーションに追加（重複チェックなし）
+                            self.bbox_annotations[img_index].extend(bbox_annotations)
+                        else:
+                            self.bbox_annotations[img_index] = bbox_annotations
+                        
+                        detection_count += len(bbox_annotations)
                 
-                # セグメンテーション処理
-                if result['segments']:
+                # セグメンテーション処理（セグメンテーションモデルの場合のみ）
+                if model_type == "segment" and result['segments']:
                     if target_classes:
                         # 指定されたクラスのみフィルタリング
                         filtered_segments = [
@@ -12798,23 +13044,81 @@ class ImageAnnotationTool(QMainWindow):
                         filtered_segments = result['segments']
                     
                     if filtered_segments:
-                        self.segmentation_annotations[img_path] = filtered_segments
-                        segmentation_count += len(filtered_segments)
+                        # 手動アノテーションと同じ形式に変換
+                        seg_annotations = []
+                        # 現在の画像サイズを取得
+                        current_img_path = self.images[img_index]
+                        try:
+                            from PIL import Image
+                            with Image.open(current_img_path) as img:
+                                img_width, img_height = img.size
+                        except Exception as e:
+                            print(f"画像サイズ取得エラー {current_img_path}: {e}")
+                            continue
+                        
+                        for seg in filtered_segments:
+                            # 正規化座標をピクセル座標に変換（手動セグメンテーションと同じ形式）
+                            pixel_points = []
+                            for point in seg['points']:
+                                # 正規化座標からピクセル座標へ変換
+                                norm_x = float(max(0.0, min(1.0, float(point[0]))))
+                                norm_y = float(max(0.0, min(1.0, float(point[1]))))
+                                
+                                pixel_x = int(norm_x * img_width)
+                                pixel_y = int(norm_y * img_height)
+                                
+                                # ピクセル座標を画像境界内に制限
+                                pixel_x = max(0, min(img_width - 1, pixel_x))
+                                pixel_y = max(0, min(img_height - 1, pixel_y))
+                                
+                                pixel_points.append((pixel_x, pixel_y))
+                            
+                            seg_annotations.append({
+                                'class': seg['class'],
+                                'points': pixel_points,  # ピクセル座標で保存
+                                'confidence': float(seg.get('confidence', 1.0))
+                            })
+                        
+                        # 既存のアノテーションがある場合は確認
+                        if img_index in self.segmentation_annotations:
+                            # 既存のアノテーションに追加
+                            self.segmentation_annotations[img_index].extend(seg_annotations)
+                        else:
+                            self.segmentation_annotations[img_index] = seg_annotations
+                        
+                        segmentation_count += len(seg_annotations)
             
             # UI更新
             progress.setLabelText("表示を更新中...")
             progress.setValue(98)
             QApplication.processEvents()
             
+            # 現在の画像表示を更新
             self.display_current_image()
+            
+            # ギャラリー更新
+            self.update_gallery()
+            
+            # 統計情報更新
+            self.update_ui()
             
             progress.setValue(100)
             progress.close()
             
             # 完了メッセージ
-            message = f"YOLO オートアノテーションが完了しました。\n"
-            message += f"検出されたバウンディングボックス: {detection_count}個\n"
-            message += f"検出されたセグメンテーション: {segmentation_count}個"
+            if model_type == "segment":
+                message = f"セグメンテーション オートアノテーションが完了しました。\n"
+                message += f"処理画像数: {len(images_to_process)}枚"
+                if not process_all:
+                    message += f"（{skip_count}枚ごと）"
+                message += f"\n検出されたセグメンテーション: {segmentation_count}個"
+            else:
+                message = f"物体検知 オートアノテーションが完了しました。\n"
+                message += f"処理画像数: {len(images_to_process)}枚"
+                if not process_all:
+                    message += f"（{skip_count}枚ごと）"
+                message += f"\n検出されたバウンディングボックス: {detection_count}個"
+            
             if target_classes:
                 message += f"\n対象クラス: {', '.join(target_classes)}"
             
