@@ -186,3 +186,7 @@ cython_debug/
 
 #VSCode
 .vscode/
+
+#YOLO
+yolo8*
+yolo11*
