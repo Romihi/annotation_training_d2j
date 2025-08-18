@@ -85,32 +85,54 @@ def enhanced_display_current_image(self):
     if current_index in self.annotations:
         anno = self.annotations[current_index]
         
-        # 基本的なアノテーション情報
-        annotation_text = f"<b>運転アノテーション情報:</b><br>"
-        if is_deleted:
-            annotation_text = f"<span style='color: #FF5555;'><b>削除済み</b></span><br>" + annotation_text
+        # アノテーション辞書が存在するがデータが空の場合をチェック
+        has_driving_annotation = 'angle' in anno or 'throttle' in anno or 'loc' in anno
+        
+        if has_driving_annotation:
+            # 基本的なアノテーション情報
+            annotation_text = f"<b>運転アノテーション情報:</b><br>"
+            if is_deleted:
+                annotation_text = f"<span style='color: #FF5555;'><b>削除済み</b></span><br>" + annotation_text
 
-        annotation_text += f"angle = <span style='color: #FF6666;'>{anno['angle']:.4f}</span><br>"
-        annotation_text += f"throttle = <span style='color: #FF6666;'>{anno['throttle']:.4f}</span>"
-        
-        # 位置情報があれば追加して強調表示
-        if 'loc' in anno:
-            loc_value = anno['loc']
-            loc_color = get_location_color(loc_value)
+            # angleとthrottleの存在チェックを追加
+            if 'angle' in anno:
+                annotation_text += f"angle = <span style='color: #FF6666;'>{anno['angle']:.4f}</span><br>"
+            else:
+                annotation_text += f"angle = <span style='color: #999999;'>未設定</span><br>"
+                
+            if 'throttle' in anno:
+                annotation_text += f"throttle = <span style='color: #FF6666;'>{anno['throttle']:.4f}</span>"
+            else:
+                annotation_text += f"throttle = <span style='color: #999999;'>未設定</span>"
             
-            # 位置情報を色付きのバッジとして表示
-            annotation_text += f"<br><div style='margin-top: 10px;'>"
-            annotation_text += f"<div style='display: inline-block; background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 5px; border-radius: 5px;'>"
-            annotation_text += f"位置 {loc_value}</div></div>"
-        
-        # 物体検知アノテーション情報を追加
-        bbox_info = update_annotation_info_label(self)
-        if bbox_info:
-            annotation_text += f"<br><br>{bbox_info}"
-        
-        # リッチテキストとして設定
-        self.annotation_info_label.setText(annotation_text)
-        self.annotation_info_label.setTextFormat(Qt.RichText)
+            # 位置情報があれば追加して強調表示
+            if 'loc' in anno:
+                loc_value = anno['loc']
+                loc_color = get_location_color(loc_value)
+                
+                # 位置情報を色付きのバッジとして表示
+                annotation_text += f"<br><div style='margin-top: 10px;'>"
+                annotation_text += f"<div style='display: inline-block; background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 5px; border-radius: 5px;'>"
+                annotation_text += f"位置 {loc_value}</div></div>"
+            
+            # 物体検知アノテーション情報を追加
+            bbox_info = update_annotation_info_label(self)
+            if bbox_info:
+                annotation_text += f"<br><br>{bbox_info}"
+            
+            # リッチテキストとして設定
+            self.annotation_info_label.setText(annotation_text)
+            self.annotation_info_label.setTextFormat(Qt.RichText)
+        else:
+            # 運転アノテーションデータが空の場合、物体検知アノテーションのみ表示
+            bbox_info = update_annotation_info_label(self)
+            if bbox_info:
+                if is_deleted:
+                    bbox_info = f"<span style='color: #FF5555;'><b>削除済み</b></span><br>" + bbox_info
+                self.annotation_info_label.setText(bbox_info)
+                self.annotation_info_label.setTextFormat(Qt.RichText)
+            else:
+                self.annotation_info_label.setText("")
     # 修正: インデックスベースでバウンディングボックスをチェック
     elif (current_index in self.bbox_annotations and 
           self.bbox_annotations[current_index]):
@@ -211,7 +233,9 @@ def enhanced_display_current_image(self):
                 self.main_image_view.setCursor(Qt.CrossCursor)
     
     # アノテーションポイントの設定（画像読み込みの成功/失敗に関係なく実行）
-    if self.current_index in self.annotations :
+    if (self.current_index in self.annotations and 
+        'x' in self.annotations[self.current_index] and 
+        'y' in self.annotations[self.current_index]):
         anno = self.annotations[self.current_index]
         self.main_image_view.annotation_point = QPoint(anno['x'], anno['y'])
     else:

@@ -1840,15 +1840,17 @@ class ThumbnailWidget(QWidget):
                 padding: 1px;
             """)
             info_layout.addWidget(deleted_badge)
-        # アノテーション情報
+        # アノテーション情報（angleとthrottleが実際に存在する場合のみ表示）
         if annotation:
-            angle_label = QLabel(f"A: {annotation.get('angle', 0):.2f}")
-            angle_label.setStyleSheet("color: #FF6666; font-size: 12px;font-weight: bold;")
-            info_layout.addWidget(angle_label)
+            if 'angle' in annotation:
+                angle_label = QLabel(f"A: {annotation['angle']:.2f}")
+                angle_label.setStyleSheet("color: #FF6666; font-size: 12px;font-weight: bold;")
+                info_layout.addWidget(angle_label)
             
-            throttle_label = QLabel(f"T: {annotation.get('throttle', 0):.2f}")
-            throttle_label.setStyleSheet("color: #FF6666; font-size: 12px;font-weight: bold;")
-            info_layout.addWidget(throttle_label)
+            if 'throttle' in annotation:
+                throttle_label = QLabel(f"T: {annotation['throttle']:.2f}")
+                throttle_label.setStyleSheet("color: #FF6666; font-size: 12px;font-weight: bold;")
+                info_layout.addWidget(throttle_label)
 
             # 位置情報バッジ（位置情報がある場合）
             if location_value is not None:
@@ -2202,10 +2204,11 @@ class ImageAnnotationTool(QMainWindow):
 
 
         # 一括推論実行ボタンを追加
-        batch_inference_button = QPushButton("全画像を推論")
-        batch_inference_button.setToolTip("全ての画像に対して推論を実行します")
-        batch_inference_button.clicked.connect(self.run_batch_inference)
-        inference_layout.addWidget(batch_inference_button)
+        self.batch_inference_button = QPushButton("全画像を推論")
+        self.batch_inference_button.setToolTip("自動運転モデルが読み込まれていません")
+        self.batch_inference_button.setEnabled(False)  # 初期状態は無効
+        self.batch_inference_button.clicked.connect(self.run_batch_inference)
+        inference_layout.addWidget(self.batch_inference_button)
 
         pilot_layout.addLayout(inference_layout)
 
@@ -2237,10 +2240,11 @@ class ImageAnnotationTool(QMainWindow):
         inference_button_layout = QHBoxLayout()
 
         # オートアノテーションボタン
-        auto_annotate_button = QPushButton("オートアノテーション実行")
-        auto_annotate_button.clicked.connect(self.auto_annotate)
-        apply_style(auto_annotate_button, 'special')
-        inference_button_layout.addWidget(auto_annotate_button)
+        self.auto_annotate_button = QPushButton("オートアノテーション実行")
+        self.auto_annotate_button.clicked.connect(self.auto_annotate)
+        self.auto_annotate_button.setEnabled(False)  # 初期状態で非アクティブ
+        apply_style(self.auto_annotate_button, 'special')
+        inference_button_layout.addWidget(self.auto_annotate_button)
 
         left_layout.addLayout(inference_button_layout)
 
@@ -2261,19 +2265,12 @@ class ImageAnnotationTool(QMainWindow):
         obj_detection_layout.addWidget(load_yolo_btn)
 
         # YOLOオートアノテーション実行ボタン
-        yolo_auto_annotate_btn = QPushButton("YOLO オートアノテーション実行")
-        yolo_auto_annotate_btn.clicked.connect(self.yolo_auto_annotate)
-        apply_style(yolo_auto_annotate_btn, 'special')
-        obj_detection_layout.addWidget(yolo_auto_annotate_btn)
+        self.yolo_auto_annotate_btn = QPushButton("YOLO オートアノテーション実行")
+        self.yolo_auto_annotate_btn.clicked.connect(self.yolo_auto_annotate)
+        self.yolo_auto_annotate_btn.setEnabled(False)  # 初期状態で非アクティブ
+        apply_style(self.yolo_auto_annotate_btn, 'special')
+        obj_detection_layout.addWidget(self.yolo_auto_annotate_btn)
 
-        # クラス設定グループ（既存のコード）
-        classes_group = QGroupBox("検知クラス設定")
-        classes_group.setMinimumWidth(320)  # 最小幅を設定（新しい左パネル幅に合わせて調整）
-        classes_group.setMaximumHeight(140)  # 最大高さを制限
-        classes_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)  # 横は拡張、縦は固定
-        classes_group_layout = QVBoxLayout(classes_group)
-        classes_group_layout.setContentsMargins(8, 8, 8, 8)  # マージンを適切に設定
-        
         # クラス入力フィールド
         classes_layout = QHBoxLayout()
         class_label = QLabel("検知クラス:")
@@ -2286,7 +2283,7 @@ class ImageAnnotationTool(QMainWindow):
         self.classes_input.setMinimumWidth(200)  # 入力フィールドの最小幅を設定（拡張）
         self.classes_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)  # 横は拡張、縦は固定
         classes_layout.addWidget(self.classes_input)
-        classes_group_layout.addLayout(classes_layout)
+        obj_detection_layout.addLayout(classes_layout)
         
         # クラス操作ボタン
         class_buttons_layout = QHBoxLayout()
@@ -2302,9 +2299,7 @@ class ImageAnnotationTool(QMainWindow):
         
         # ボタンレイアウトにストレッチを追加して均等配置
         class_buttons_layout.addStretch()
-        classes_group_layout.addLayout(class_buttons_layout)
-        
-        obj_detection_layout.addWidget(classes_group)
+        obj_detection_layout.addLayout(class_buttons_layout)
         
         # クラス入力フィールドの変更を監視
         self.classes_input.textChanged.connect(self.on_classes_changed)
@@ -2529,11 +2524,11 @@ class ImageAnnotationTool(QMainWindow):
         self.prev_multi_button.clicked.connect(lambda: self.skip_images(-self.skip_count_spin.value()))
         nav_layout.addWidget(self.prev_multi_button)
         
-        prev_button = QPushButton("◀ 前へ")
+        prev_button = QPushButton("-1")
         prev_button.clicked.connect(lambda: self.skip_images(-1))
         nav_layout.addWidget(prev_button)
         
-        next_button = QPushButton("次へ ▶")
+        next_button = QPushButton("+1")
         next_button.clicked.connect(lambda: self.skip_images(1))
         nav_layout.addWidget(next_button)
         
@@ -2547,13 +2542,13 @@ class ImageAnnotationTool(QMainWindow):
         play_layout = QHBoxLayout()
         
         play_layout.addWidget(QLabel("再生:"))
-        reverse_play_button = QPushButton("◀️")
-        reverse_play_button.clicked.connect(self.play_reverse)
-        play_layout.addWidget(reverse_play_button)
+        self.reverse_play_button = QPushButton("◀逆再生")
+        self.reverse_play_button.clicked.connect(self.play_reverse)
+        play_layout.addWidget(self.reverse_play_button)
         
-        play_button = QPushButton("▶️")
-        play_button.clicked.connect(self.play_forward)
-        play_layout.addWidget(play_button)
+        self.play_button = QPushButton("▶再生")
+        self.play_button.clicked.connect(self.play_forward)
+        play_layout.addWidget(self.play_button)
         
         nav_container_layout.addLayout(play_layout)
 
@@ -2580,7 +2575,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # 削除機能を追加 - 2. クリップ機能（範囲指定削除）- ここを修正
         clip_layout = QHBoxLayout()
-        clip_layout.addWidget(QLabel("クリップ範囲:"))
+        clip_layout.addWidget(QLabel("削除範囲指定:"))
 
         # クリップ開始位置入力と「現在位置を設定」ボタン
         start_layout = QHBoxLayout()
@@ -2640,15 +2635,40 @@ class ImageAnnotationTool(QMainWindow):
         self.auto_mode_button.setCheckable(True)
         self.auto_mode_button.setChecked(True)
         self.auto_mode_button.clicked.connect(self.toggle_annotation_mode)
+        self.auto_mode_button.setToolTip(
+            "自動運転アノテーションモード\n"
+            "・画像上をクリックして角度(angle)とスロットル(throttle)を設定\n"
+            "・左クリック: ポイント追加/移動\n"
+            "・右クリック: ポイント削除\n"
+            "・数字キー(0-7): 運転位置を設定（同じキー再押下で解除）\n"
+            "・Deleteキー: 現在の画像のアノテーション（angle/throttle/位置）を削除"
+        )
 
         self.detection_mode_button = QPushButton("物体検知")
         self.detection_mode_button.setCheckable(True)
         self.detection_mode_button.clicked.connect(self.toggle_annotation_mode)
+        self.detection_mode_button.setToolTip(
+            "物体検知アノテーションモード\n"
+            "・ドラッグしてバウンディングボックスを作成\n"
+            "・作成したボックスをクリックして選択/移動\n"
+            "・ボックスの角をドラッグしてサイズ調整\n"
+            "・右クリック: 選択したボックスを削除\n"
+            "・1-5キー: クラス変更(car/person/sign/cone/unknown)"
+        )
 
         # 新規追加: セグメンテーションモードボタン
         self.segmentation_mode_button = QPushButton("セグメンテーション")
         self.segmentation_mode_button.setCheckable(True)
         self.segmentation_mode_button.clicked.connect(self.toggle_annotation_mode)
+        self.segmentation_mode_button.setToolTip(
+            "セグメンテーションアノテーションモード\n"
+            "・左クリック: ポリゴン頂点を追加\n"
+            "・右クリック: ポリゴンを閉じる/完成させる\n"
+            "・ポリゴン上で右クリック: 新しい頂点を追加\n"
+            "・頂点をドラッグ: 頂点位置を調整\n"
+            "・1-5キー: クラス変更(car/person/sign/cone/unknown)\n"
+            "・Escキー: 作成中のポリゴンをキャンセル"
+        )
 
         mode_layout.addWidget(self.auto_mode_button)
         mode_layout.addWidget(self.detection_mode_button)
@@ -2916,8 +2936,9 @@ class ImageAnnotationTool(QMainWindow):
             cm = plt.get_cmap('viridis')
             bins = 20
             
-            # angle分布をヒストグラムで表示
-            n1, bins1, patches1 = ax1.hist(angles, bins=bins, alpha=0.7, color='skyblue')
+            # angle分布をヒストグラムで表示（パーセント表記）
+            weights1 = [100.0 / len(angles)] * len(angles)  # アノテーション総数を100%として重み付け
+            n1, bins1, patches1 = ax1.hist(angles, bins=bins, weights=weights1, alpha=0.7, color='skyblue')
             # 度数に応じた色付け
             bin_centers1 = 0.5 * (bins1[:-1] + bins1[1:])
             col1 = bin_centers1 - min(bin_centers1)
@@ -2928,13 +2949,14 @@ class ImageAnnotationTool(QMainWindow):
             # スタイル設定
             ax1.set_title('Angle dist', fontsize=10)
             # ax1.set_xlabel('Angle値 (-1.0～1.0)', fontsize=8)
-            # ax1.set_ylabel('頻度', fontsize=8)
+            ax1.set_ylabel('Percentage (%)', fontsize=8)
             ax1.tick_params(axis='both', which='major', labelsize=7)
             ax1.grid(True, alpha=0.3)
             ax1.set_xlim(-1.05, 1.05)
                         
-            # throttle分布をヒストグラムで表示
-            n2, bins2, patches2 = ax2.hist(throttles, bins=bins, alpha=0.7, color='salmon')
+            # throttle分布をヒストグラムで表示（パーセント表記）
+            weights2 = [100.0 / len(throttles)] * len(throttles)  # アノテーション総数を100%として重み付け
+            n2, bins2, patches2 = ax2.hist(throttles, bins=bins, weights=weights2, alpha=0.7, color='salmon')
             # 度数に応じた色付け
             bin_centers2 = 0.5 * (bins2[:-1] + bins2[1:])
             col2 = bin_centers2 - min(bin_centers2)
@@ -2945,7 +2967,7 @@ class ImageAnnotationTool(QMainWindow):
             # スタイル設定
             ax2.set_title('Throttle dist', fontsize=10)
             # ax2.set_xlabel('Throttle値 (-1.0～1.0)', fontsize=8)
-            # ax2.set_ylabel('頻度', fontsize=8)
+            ax2.set_ylabel('Percentage (%)', fontsize=8)
             ax2.tick_params(axis='both', which='major', labelsize=7)
             ax2.grid(True, alpha=0.3)
             ax2.set_xlim(-1.05, 1.05)
@@ -3052,13 +3074,29 @@ class ImageAnnotationTool(QMainWindow):
                 self.skip_images(skip_count)
                 return True
 
-            # 削除キーが押された場合、選択されたバウンディングボックスを削除
+            # 削除キーが押された場合の処理
             elif key in [Qt.Key_Delete, Qt.Key_Backspace]:
-                if self.main_image_view.selected_bbox_index is not None:
+                if self.current_mode == 0:  # 自動運転モードの場合
+                    # 現在の画像の自動運転アノテーションを削除
+                    self.delete_current_driving_annotation()
+                elif self.current_mode == 1:  # 物体検知モードの場合
+                    if self.main_image_view.selected_bbox_index is not None:
                         self.delete_selected_bbox()
-                if self.main_image_view.selected_segmentation_index is not None:
+                elif self.current_mode == 2:  # セグメンテーションモードの場合
+                    if self.main_image_view.selected_segmentation_index is not None:
                         self.delete_selected_segmentation()
-                return True  
+                return True
+            
+            # 数字キー（0-7）による位置アノテーション（自動運転モードのみ）
+            elif key in [Qt.Key_0, Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4, Qt.Key_5, Qt.Key_6, Qt.Key_7]:
+                if self.current_mode == 0:  # 自動運転モードの場合のみ
+                    # キーコードから数字を取得
+                    location_value = key - Qt.Key_0  # Qt.Key_0 = 48, Qt.Key_1 = 49, ...
+                    
+                    # 同じ位置が既に選択されている場合は解除、そうでなければ設定
+                    # set_locationメソッド内で自動的に判定されるため、そのまま呼び出す
+                    self.set_location(location_value)
+                    return True  
 
         # 親クラスのイベントフィルタを呼び出す
         return super().eventFilter(obj, event)
@@ -3152,6 +3190,88 @@ class ImageAnnotationTool(QMainWindow):
 
                 # 確認メッセージ
                 self.statusBar().showMessage(f"'{class_name}' のセグメンテーションを削除しました", 3000)
+
+    def delete_current_driving_annotation(self):
+        """現在の画像の自動運転アノテーション（angle/throttle/位置）を削除する"""
+        if not self.images:
+            return
+        
+        current_index = self.current_index
+        if current_index is None:
+            return
+        
+        deleted_items = []
+        
+        # angle/throttleアノテーションを削除
+        if current_index in self.annotations:
+            annotation = self.annotations[current_index]
+            
+            # angleを削除
+            if 'angle' in annotation:
+                del annotation['angle']
+                deleted_items.append('angle')
+            
+            # throttleを削除  
+            if 'throttle' in annotation:
+                del annotation['throttle']
+                deleted_items.append('throttle')
+            
+            # 位置情報を削除
+            if 'loc' in annotation:
+                del annotation['loc']
+                deleted_items.append('位置情報')
+            
+            # 座標情報も削除（赤丸表示用）
+            if 'x' in annotation:
+                del annotation['x']
+            if 'y' in annotation:
+                del annotation['y']
+            
+            # アノテーションが空になった場合は削除
+            if not annotation:
+                del self.annotations[current_index]
+        
+        # 位置アノテーションを削除
+        if current_index in self.location_annotations:
+            del self.location_annotations[current_index]
+            if '位置情報' not in deleted_items:
+                deleted_items.append('位置情報')
+        
+        # 現在の位置選択をクリア
+        self.current_location = None
+        
+        # 位置ボタンの選択状態をクリア
+        for button in self.location_buttons:
+            button.setChecked(False)
+        
+        # 位置情報ラベルを更新
+        self.current_location_label.setText("現在の位置情報: なし")
+        self.current_location_label.setStyleSheet("")
+        
+        # アノテーションポイントもクリア（赤丸表示を削除）
+        if hasattr(self.main_image_view, 'annotation_point'):
+            self.main_image_view.annotation_point = None
+        
+        # 画面更新
+        self.display_current_image()
+        
+        # 明示的にメイン画像ビューを更新
+        if hasattr(self.main_image_view, 'update'):
+            self.main_image_view.update()
+        
+        self.update_gallery()  # ギャラリー更新を追加
+        self.update_driving_annotation_stats()
+        
+        # 分布グラフも更新
+        if hasattr(self, 'update_distribution_graph'):
+            self.update_distribution_graph()
+        
+        # 確認メッセージ
+        if deleted_items:
+            items_str = '、'.join(deleted_items)
+            self.statusBar().showMessage(f"自動運転アノテーション ({items_str}) を削除しました", 3000)
+        else:
+            self.statusBar().showMessage("削除するアノテーションがありませんでした", 3000)
 
     def toggle_auto_apply_segmentation(self, state):
         """前回のセグメンテーションを自動適用するかどうかを設定"""
@@ -3476,6 +3596,13 @@ class ImageAnnotationTool(QMainWindow):
         # UI更新
         self.display_current_image()
         self.update_gallery()
+        
+        # 情報パネルの統計情報を更新
+        self.update_driving_annotation_stats()
+        
+        # 分布グラフも更新（位置情報変更時）
+        if hasattr(self, 'update_distribution_graph'):
+            self.update_distribution_graph()
 
     def on_method_changed(self, index):
         """学習方法が変更されたときの処理"""
@@ -3530,15 +3657,13 @@ class ImageAnnotationTool(QMainWindow):
         self.auto_play(forward=True)
         
         # 再生状態に応じてボタンテキストを更新
-        sender = self.sender()
-        if sender:
-            if is_playing:
-                # 停止した場合
-                sender.setText("⏵")
-                self.statusBar().clearMessage()
-            else:
-                # 再生開始した場合
-                sender.setText("⏹")
+        if is_playing:
+            # 停止した場合
+            self.play_button.setText("▶再生")
+            self.statusBar().clearMessage()
+        else:
+            # 再生開始した場合
+            self.play_button.setText("■停止")
 
     def auto_play(self, forward=True):
         """画像を自動再生する（スキップ枚数対応、推論表示時は速度調整）"""
@@ -3584,15 +3709,13 @@ class ImageAnnotationTool(QMainWindow):
         self.auto_play(forward=False)
         
         # 再生状態に応じてボタンテキストを更新
-        sender = self.sender()
-        if sender:
-            if is_playing:
-                # 停止した場合
-                sender.setText("⏪")
-                self.statusBar().clearMessage()
-            else:
-                # 再生開始した場合
-                sender.setText("⏹")
+        if is_playing:
+            # 停止した場合
+            self.reverse_play_button.setText("◀逆再生")
+            self.statusBar().clearMessage()
+        else:
+            # 再生開始した場合
+            self.reverse_play_button.setText("■停止")
 
     def on_variant_changed(self, variant):
         """
@@ -4086,6 +4209,15 @@ class ImageAnnotationTool(QMainWindow):
             self.diff_vector_checkbox.setEnabled(False)
             self.diff_vector_checkbox.setChecked(False)
             self.diff_vector_checkbox.setToolTip("自動運転モデルが読み込まれていません")
+            
+        # 全画像推論ボタン（自動運転モデルに依存）
+        if hasattr(self, 'batch_inference_button'):
+            if hasattr(self, 'model') and self.model is not None:
+                self.batch_inference_button.setEnabled(True)
+                self.batch_inference_button.setToolTip("全ての画像に対して推論を実行します")
+            else:
+                self.batch_inference_button.setEnabled(False)
+                self.batch_inference_button.setToolTip("自動運転モデルが読み込まれていません")
     
     def _disable_other_model_checkboxes(self, exclude_detection=False, exclude_segmentation=False, exclude_location=False, exclude_auto=False):
         """指定したモデル以外のチェックボックスを無効にする"""
@@ -4100,6 +4232,9 @@ class ImageAnnotationTool(QMainWindow):
                 self.diff_vector_checkbox.setEnabled(False)
                 self.diff_vector_checkbox.setChecked(False)
                 self.diff_vector_checkbox.setToolTip("自動運転モデルが読み込まれていません")
+            if hasattr(self, 'batch_inference_button'):
+                self.batch_inference_button.setEnabled(False)
+                self.batch_inference_button.setToolTip("自動運転モデルが読み込まれていません")
         
         # 物体検知モデル
         if not exclude_detection:
@@ -4635,79 +4770,6 @@ class ImageAnnotationTool(QMainWindow):
         
         if train_success == 0 or val_success == 0:
             raise Exception("セグメンテーションデータのエクスポートに失敗しました。")
-
-    # def _export_segmentation_subset(self, indices, output_dir, class_to_index):
-    #     """セグメンテーションサブセットのエクスポート"""
-        
-    #     success_count = 0
-        
-    #     for idx in indices:
-    #         if idx in self.segmentation_annotations:
-    #             try:
-    #                 # 画像をコピー
-    #                 source_image_path = self.images[idx]
-    #                 image_filename = os.path.basename(source_image_path)
-    #                 dest_image_path = os.path.join(output_dir, "images", image_filename)
-    #                 ####
-    #                 print(source_image_path, image_filename, dest_image_path)
-                    
-    #                 import shutil
-    #                 shutil.copy2(source_image_path, dest_image_path)
-                    
-    #                 # セグメンテーションアノテーションを処理
-    #                 label_filename = os.path.splitext(image_filename)[0] + ".txt"
-    #                 label_path = os.path.join(output_dir, "labels", label_filename)
-                    
-    #                 # 画像サイズを取得
-    #                 from PIL import Image
-    #                 with Image.open(source_image_path) as img:
-    #                     img_width, img_height = img.size
-                    
-    #                 # ラベルファイルを作成（セグメンテーション形式）
-    #                 with open(label_path, 'w') as f:
-    #                     for seg in self.segmentation_annotations[idx]:
-    #                         # クラス名を取得
-    #                         class_name = None
-    #                         if isinstance(seg, dict):
-    #                             class_name = seg.get('class_name')
-    #                             points = seg.get('points', [])
-    #                         else:
-    #                             class_name = getattr(seg, 'class_name', None)
-    #                             points = getattr(seg, 'points', [])
-                            
-    #                         if class_name in class_to_index and points and len(points) >= 3:
-    #                             class_id = class_to_index[class_name]
-                                
-    #                             # ポイントを正規化座標に変換
-    #                             normalized_points = []
-    #                             for point in points:
-    #                                 if isinstance(point, dict):
-    #                                     x = point.get('x', 0) / img_width
-    #                                     y = point.get('y', 0) / img_height
-    #                                 else:
-    #                                     x = getattr(point, 'x', 0) / img_width
-    #                                     y = getattr(point, 'y', 0) / img_height
-                                    
-    #                                 # 座標を0-1の範囲にクランプ
-    #                                 x = max(0.0, min(1.0, x))
-    #                                 y = max(0.0, min(1.0, y))
-                                    
-    #                                 normalized_points.extend([x, y])
-                                
-    #                             # YOLO セグメンテーション形式で書き込み
-    #                             # フォーマット: class_id x1 y1 x2 y2 x3 y3 ...
-    #                             if len(normalized_points) >= 6:  # 最低3点 (6座標)
-    #                                 points_str = ' '.join([f"{coord:.6f}" for coord in normalized_points])
-    #                                 f.write(f"{class_id} {points_str}\n")
-                    
-    #                 success_count += 1
-                    
-    #             except Exception as e:
-    #                 print(f"セグメンテーション インデックス {idx} の処理中にエラー: {e}")
-    #                 import traceback
-    #                 traceback.print_exc()
-        
-    #     return success_count
 
     def export_bbox_only_to_yolo(self, train_dir, val_dir, classes):
         """バウンディングボックスのみをYOLO形式でエクスポート（既存メソッドの改良版）"""
@@ -5718,6 +5780,10 @@ class ImageAnnotationTool(QMainWindow):
                 f"信頼度閾値: {confidence}\n\n"
                 f"画像送りごとに自動的に{task_type}推論が実行されます。"
             )
+            
+            # 自動運転モデル読み込み完了後、オートアノテーションボタンを有効化
+            if hasattr(self, 'auto_annotate_button'):
+                self.auto_annotate_button.setEnabled(True)
             
         except Exception as e:
             progress.close()
@@ -7015,6 +7081,10 @@ class ImageAnnotationTool(QMainWindow):
                 f"検出閾値: {confidence}\n\n"
                 f"画像送りごとに自動的に推論が実行されます。"
             )
+            
+            # YOLOモデル読み込み完了後、YOLOオートアノテーションボタンを有効化
+            if hasattr(self, 'yolo_auto_annotate_btn'):
+                self.yolo_auto_annotate_btn.setEnabled(True)
             
             progress.close()
             
@@ -8729,7 +8799,7 @@ class ImageAnnotationTool(QMainWindow):
             self.load_annotation_button,       # アノテーションデータを読込ボタン
             self.model_load_button,            # モデル読込ボタン
             # self.model_refresh_button,         # モデル一覧更新ボタン
-            self.inference_checkbox,           # 推論結果表示チェックボックス
+            # 推論結果表示チェックボックスは除外（モデル読み込み状態で制御）
         ]
         
         # 検索してボタン追加（UIから見つける方法）
@@ -8740,7 +8810,7 @@ class ImageAnnotationTool(QMainWindow):
             if any(keyword in button_text for keyword in [
                 "Donkeycar", "Jetracer", "アノテーション動画作成", 
                 "オートアノテーション実行", "一括推論実行",
-                "モデルを学習・保存"
+                "モデルを学習・保存", "全画像を推論"
             ]):
                 additional_buttons.append(button)
         
@@ -8750,12 +8820,28 @@ class ImageAnnotationTool(QMainWindow):
         # ボタンの有効/無効を設定
         for button in all_buttons:
             if button:  # Noneでない場合のみ設定
+                # 全画像推論ボタンは除外（モデル依存制御）
+                if hasattr(self, 'batch_inference_button') and button == self.batch_inference_button:
+                    continue
+                # オートアノテーションボタンは除外（モデル依存制御）
+                if hasattr(self, 'auto_annotate_button') and button == self.auto_annotate_button:
+                    continue
+                if hasattr(self, 'yolo_auto_annotate_btn') and button == self.yolo_auto_annotate_btn:
+                    continue
                 button.setEnabled(enabled)
         
         # ボタンの色も状態に応じて変更
         button_style = "" if enabled else "QPushButton:disabled { color: #aaaaaa; }"
         for button in all_buttons:
             if button and not isinstance(button, QCheckBox):  # チェックボックス以外のボタンにスタイル適用
+                # 全画像推論ボタンは除外（モデル依存制御）
+                if hasattr(self, 'batch_inference_button') and button == self.batch_inference_button:
+                    continue
+                # オートアノテーションボタンは除外（モデル依存制御）
+                if hasattr(self, 'auto_annotate_button') and button == self.auto_annotate_button:
+                    continue
+                if hasattr(self, 'yolo_auto_annotate_btn') and button == self.yolo_auto_annotate_btn:
+                    continue
                 current_style = button.styleSheet()
                 if "background-color" not in current_style:  # 特殊スタイルがないボタンのみ
                     button.setStyleSheet(button_style)
@@ -9889,11 +9975,25 @@ class ImageAnnotationTool(QMainWindow):
         # 位置ボタンのカウント表示を更新
         self.update_location_button_counts()
         
+        # アノテーション分布を初期化
+        if hasattr(self, 'distribution_label'):
+            self.distribution_label.clear()
+            self.distribution_label.setText("アノテーションがありません")
+        
         # 統計情報を更新（画像読み込み時）
         self.update_driving_annotation_stats()
         
         # アノテーション関連ボタンをアクティブ化
         self.set_annotation_buttons_enabled(True)
+        
+        # オートアノテーションボタンは各モデルが読み込まれるまで無効化
+        if hasattr(self, 'auto_annotate_button'):
+            self.auto_annotate_button.setEnabled(False)
+        if hasattr(self, 'yolo_auto_annotate_btn'):
+            self.yolo_auto_annotate_btn.setEnabled(False)
+        
+        # 推論結果表示チェックボックスの状態を正しく設定
+        self.update_inference_checkboxes_status()
         
         # プログレスダイアログを閉じる
         progress.setValue(100)
@@ -10347,6 +10447,11 @@ class ImageAnnotationTool(QMainWindow):
             # 差分ベクトル表示チェックボックスも有効にする
             self.diff_vector_checkbox.setEnabled(True)
             self.diff_vector_checkbox.setToolTip("自動運転モデルが読み込まれています")
+            
+            # 全画像推論ボタンも有効にする
+            if hasattr(self, 'batch_inference_button'):
+                self.batch_inference_button.setEnabled(True)
+                self.batch_inference_button.setToolTip("全ての画像に対して推論を実行します")
             
             # 他のモデルのチェックボックスを無効にする
             self._disable_other_model_checkboxes(exclude_auto=True)
