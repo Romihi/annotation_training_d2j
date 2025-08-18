@@ -655,9 +655,97 @@ class ImageLabel(QLabel):
         arrow_polygon = QPolygon(arrow_points)
         painter.drawPolygon(arrow_polygon)
 
+    def draw_segmentation_inference_results(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
+        """セグメンテーション推論結果の描画"""
+        if not (hasattr(self.main_window, 'segmentation_inference_results') and 
+                hasattr(self.main_window, 'show_segmentation_inference')):
+            print("DEBUG: セグメンテーション推論結果の描画 - 属性なし")
+            return
+        
+        # セグメンテーション推論表示がOFFの場合は描画しない
+        show_seg_inference = getattr(self.main_window, 'show_segmentation_inference', False)
+        print(f"DEBUG: セグメンテーション推論表示設定: {show_seg_inference}")
+        if not show_seg_inference:
+            return
+        
+        # 現在の画像の推論結果を取得
+        if self.main_window.images and self.main_window.current_index < len(self.main_window.images):
+            current_img_path = self.main_window.images[self.main_window.current_index]
+            print(f"DEBUG: 現在の画像パス: {current_img_path}")
+            print(f"DEBUG: セグメンテーション推論結果キー: {list(self.main_window.segmentation_inference_results.keys())}")
+            
+            if (current_img_path in self.main_window.segmentation_inference_results and
+                self.main_window.segmentation_inference_results[current_img_path]):
+                
+                result = self.main_window.segmentation_inference_results[current_img_path]
+                segments = result.get('segments', [])
+                print(f"DEBUG: 描画するセグメント数: {len(segments)}")
+                
+                # 各セグメンテーションを描画
+                for segment in segments:
+                    class_name = segment['class']
+                    points = segment['points']
+                    confidence = segment.get('confidence', 0.0)
+                    
+                    if len(points) >= 3:
+                        # クラス名に基づいて色を決定（推論結果用の色）
+                        from hashlib import md5
+                        color_hash = int(md5(class_name.encode()).hexdigest(), 16) % 0xFFFFFF
+                        r = (color_hash & 0xFF0000) >> 16
+                        g = (color_hash & 0x00FF00) >> 8
+                        b = color_hash & 0x0000FF
+                        
+                        # 推論結果は少し透明度を高くして手動アノテーションと区別
+                        base_color = QColor(r, g, b, 80)  # 透明度を80に設定
+                        
+                        # 推論結果は点線で描画して区別
+                        pen = QPen(base_color.darker(), 2, Qt.DashLine)
+                        painter.setPen(pen)
+                        painter.setBrush(QBrush(base_color))
+                        
+                        # ポリゴンの描画
+                        # 推論結果のpointsは正規化座標（0-1）なので直接画面座標に変換
+                        polygon_points = []
+                        for px, py in points:
+                            # 正規化座標を画面座標に変換（バウンディングボックスと同じ方式）
+                            screen_x = int(target_rect.x() + px * target_rect.width())
+                            screen_y = int(target_rect.y() + py * target_rect.height())
+                            polygon_points.append(QPoint(screen_x, screen_y))
+                        
+                        # 塗りつぶし
+                        painter.drawPolygon(polygon_points)
+                        
+                        # クラス名と信頼度を表示（推論結果のラベル）
+                        if polygon_points:
+                            # ポリゴンの重心を計算
+                            center_x = sum(p.x() for p in polygon_points) // len(polygon_points)
+                            center_y = sum(p.y() for p in polygon_points) // len(polygon_points)
+                            
+                            # ラベルテキスト
+                            label = f"{class_name} ({confidence:.2f})"
+                            painter.setFont(QFont("Arial", 8))
+                            
+                            # ラベル背景
+                            text_width = painter.fontMetrics().horizontalAdvance(label)
+                            text_height = painter.fontMetrics().height()
+                            
+                            # 背景矩形を描画
+                            bg_rect = QRect(center_x - text_width//2 - 2, center_y - text_height//2 - 2,
+                                          text_width + 4, text_height + 4)
+                            painter.fillRect(bg_rect, QColor(r, g, b, 180))
+                            
+                            # テキストを描画
+                            painter.setPen(QPen(Qt.white))
+                            painter.drawText(center_x - text_width//2, center_y + text_height//4, label)
+
     ###
     def draw_segmentation(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
-        """セグメンテーションポリゴンの描画と編集"""
+        """セグメンテーションポリゴンの描画と編集（手動アノテーション + 推論結果）"""
+        
+        # 1. 推論結果のセグメンテーションを描画
+        self.draw_segmentation_inference_results(pix_width, pix_height, painter, target_rect)
+        
+        # 2. 手動アノテーションのセグメンテーションを描画
         if hasattr(self.main_window, 'segmentation_annotations'):
             current_index = self.main_window.current_index  # インデックスベースに変更
             if current_index in self.main_window.segmentation_annotations:
@@ -1824,6 +1912,7 @@ class ImageAnnotationTool(QMainWindow):
         self.segmentation_inference_results = {}  # セグメンテーション推論結果
         self.yolo_seg_model = None  # YOLOセグメンテーションモデル
         self.last_segmentations = []
+        self.show_segmentation_inference = False  # セグメンテーション推論表示フラグ
 
         # 削除インデックス
         self.deleted_indexes = []
@@ -2096,6 +2185,12 @@ class ImageAnnotationTool(QMainWindow):
         load_yolo_btn.clicked.connect(self.load_yolo_annotations)
         apply_style(load_yolo_btn, 'primary')
         obj_detection_layout.addWidget(load_yolo_btn)
+
+        # YOLOオートアノテーション実行ボタン
+        yolo_auto_annotate_btn = QPushButton("YOLO オートアノテーション実行")
+        yolo_auto_annotate_btn.clicked.connect(self.yolo_auto_annotate)
+        apply_style(yolo_auto_annotate_btn, 'special')
+        obj_detection_layout.addWidget(yolo_auto_annotate_btn)
 
         # クラス設定グループ（既存のコード）
         classes_group = QGroupBox("検知クラス設定")
@@ -5178,9 +5273,14 @@ class ImageAnnotationTool(QMainWindow):
         # 画面更新
         self.main_image_view.update()
         
+        # 表示情報の更新
         if show_inference:
+            self.update_segmentation_inference_display()
             self.statusBar().showMessage("セグメンテーション推論結果表示をオンにしました", 3000)
         else:
+            # 表示をクリア
+            if hasattr(self, 'segmentation_inference_info_label'):
+                self.segmentation_inference_info_label.setText("")
             self.statusBar().showMessage("セグメンテーション推論結果表示をオフにしました", 3000)
 
     def refresh_yolo_unified_model_list(self):
@@ -5236,9 +5336,11 @@ class ImageAnnotationTool(QMainWindow):
                     if not model_match:
                         continue
                     
-                    # タスクタイプを判定（フォルダ名とファイル名から）
+                    # タスクタイプを判定（フォルダ名、親フォルダ名、ファイル名から）
+                    full_folder_path = root  # フルパスを取得
                     if ('seg' in folder_name.lower() or 'segment' in folder_name.lower() or 
-                        'seg' in file.lower() or 'segment' in file.lower()):
+                        'seg' in file.lower() or 'segment' in file.lower() or
+                        'seg' in full_folder_path.lower() or 'segment' in full_folder_path.lower()):
                         task_type = "セグメンテーション"
                     else:
                         task_type = "物体検知"
@@ -5382,8 +5484,7 @@ class ImageAnnotationTool(QMainWindow):
             
             # 現在の画像で推論テスト
             if is_segmentation:
-                # セグメンテーション推論テスト（実装が必要な場合）
-                pass
+                self.run_single_yolo_segmentation_inference()
             else:
                 self.run_single_yolo_inference()
             
@@ -7447,6 +7548,318 @@ class ImageAnnotationTool(QMainWindow):
             print(f"単一画像YOLO推論エラー: {e}")
             return False
 
+    def run_single_yolo_segmentation_inference(self):
+        """現在表示中の画像に対してYOLOセグメンテーション推論を実行"""
+        if not self.images or not hasattr(self, 'yolo_seg_model'):
+            return False
+        
+        current_img_path = self.images[self.current_index]
+        
+        try:
+            # 推論実行
+            results = self.yolo_seg_model(current_img_path, conf=self.yolo_seg_confidence_threshold)
+            
+            # 推論結果をクリア（現在の画像のみ）
+            if current_img_path in self.segmentation_inference_results:
+                del self.segmentation_inference_results[current_img_path]
+            
+            # セグメンテーション結果を保存
+            segments = []
+            bboxes = []
+            
+            # 画像サイズを取得
+            img = Image.open(current_img_path)
+            img_width, img_height = img.size
+            
+            for result in results:
+                # バウンディングボックス処理
+                if hasattr(result, 'boxes') and result.boxes is not None:
+                    for det in result.boxes.data.cpu().numpy():
+                        if len(det) >= 6:
+                            x1, y1, x2, y2, conf, class_id = det[:6]
+                            
+                            # クラス名を取得
+                            class_name = result.names[int(class_id)]
+                            
+                            bboxes.append({
+                                'class': class_name,
+                                'bbox': [float(x1), float(y1), float(x2), float(y2)],
+                                'confidence': float(conf)
+                            })
+                
+                # セグメンテーションマスク処理
+                if hasattr(result, 'masks') and result.masks is not None:
+                    import cv2
+                    import numpy as np
+                    
+                    for i, mask in enumerate(result.masks.data):
+                        # マスクを numpy 配列に変換
+                        mask_array = mask.cpu().numpy()
+                        
+                        # マスクサイズを取得
+                        mask_height, mask_width = mask_array.shape
+                        print(f"DEBUG: マスクサイズ: {mask_width}x{mask_height}, 元画像サイズ: {img_width}x{img_height}")
+                        
+                        # マスクから輪郭ポイントを抽出
+                        mask_uint8 = (mask_array * 255).astype(np.uint8)
+                        contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        
+                        if contours:
+                            # 最大の輪郭を取得
+                            largest_contour = max(contours, key=cv2.contourArea)
+                            
+                            # 輪郭を簡略化
+                            epsilon = 0.02 * cv2.arcLength(largest_contour, True)
+                            approx = cv2.approxPolyDP(largest_contour, epsilon, True)
+                            
+                            # ポイントリストに変換（正規化座標に変換）
+                            points = []
+                            for point in approx:
+                                x, y = point[0]
+                                
+                                # マスク座標を元画像座標にスケール
+                                scaled_x = float(x) * img_width / mask_width
+                                scaled_y = float(y) * img_height / mask_height
+                                
+                                # スケール後の座標を0-1の正規化座標に変換
+                                normalized_x = scaled_x / img_width
+                                normalized_y = scaled_y / img_height
+                                
+                                # 0-1の範囲内にクリップ
+                                normalized_x = max(0.0, min(1.0, normalized_x))
+                                normalized_y = max(0.0, min(1.0, normalized_y))
+                                
+                                points.append([normalized_x, normalized_y])
+                            
+                            if len(points) >= 3:
+                                # 対応するクラス情報を取得
+                                class_name = "unknown"
+                                confidence = 0.0
+                                if i < len(bboxes):
+                                    class_name = bboxes[i]['class']
+                                    confidence = bboxes[i]['confidence']
+                                
+                                segments.append({
+                                    'class': class_name,
+                                    'points': points,
+                                    'confidence': confidence
+                                })
+                                
+                                # デバッグ: 正規化座標範囲をチェック
+                                if points:
+                                    x_coords = [p[0] for p in points]
+                                    y_coords = [p[1] for p in points]
+                                    print(f"Segment {class_name}: normalized_x_range=({min(x_coords):.3f}-{max(x_coords):.3f}), normalized_y_range=({min(y_coords):.3f}-{max(y_coords):.3f})")
+            
+            # 結果を保存
+            self.segmentation_inference_results[current_img_path] = {
+                'segments': segments,
+                'bboxes': bboxes
+            }
+            
+            print(f"セグメンテーション推論完了: {len(segments)}個のセグメント, {len(bboxes)}個のボックス")
+            print(f"使用した信頼度閾値: {self.yolo_seg_confidence_threshold}")
+            
+            # 低信頼度でもテスト推論実行
+            if len(segments) == 0:
+                print("低信頼度（0.1）でも推論テスト...")
+                low_conf_results = self.yolo_seg_model(current_img_path, conf=0.1)
+                low_segments = 0
+                low_boxes = 0
+                for result in low_conf_results:
+                    if hasattr(result, 'boxes') and result.boxes is not None:
+                        low_boxes = len(result.boxes.data)
+                    if hasattr(result, 'masks') and result.masks is not None:
+                        low_segments = len(result.masks.data)
+                print(f"低信頼度結果: {low_segments}個のセグメント, {low_boxes}個のボックス")
+            
+            # セグメンテーション推論チェックボックスを自動的にON
+            if hasattr(self, 'segmentation_inference_checkbox'):
+                self.segmentation_inference_checkbox.setChecked(True)
+            
+            # 推論結果表示を更新
+            self.update_segmentation_inference_display()
+            # 画像表示も更新
+            self.main_image_view.update()
+            
+            return True
+            
+        except Exception as e:
+            print(f"YOLOセグメンテーション推論エラー: {e}")
+            import traceback
+            traceback.print_exc()
+            self.segmentation_inference_results[current_img_path] = {'segments': [], 'bboxes': []}
+            return False
+
+    def test_model_comparison(self):
+        """セグメンテーションモデルと物体検知モデルの比較テスト"""
+        if not self.images:
+            print("画像が読み込まれていません")
+            return
+            
+        current_img_path = self.images[self.current_index]
+        print(f"\n=== モデル比較テスト: {os.path.basename(current_img_path)} ===")
+        
+        # セグメンテーションモデルのテスト
+        if hasattr(self, 'yolo_seg_model'):
+            print("\n--- セグメンテーションモデル ---")
+            for conf in [0.1, 0.3, 0.5, 0.6, 0.8]:
+                try:
+                    results = self.yolo_seg_model(current_img_path, conf=conf)
+                    seg_count = 0
+                    bbox_count = 0
+                    for result in results:
+                        if hasattr(result, 'boxes') and result.boxes is not None:
+                            bbox_count = len(result.boxes.data)
+                        if hasattr(result, 'masks') and result.masks is not None:
+                            seg_count = len(result.masks.data)
+                    print(f"信頼度 {conf}: セグメント={seg_count}個, ボックス={bbox_count}個")
+                except Exception as e:
+                    print(f"信頼度 {conf}: エラー - {e}")
+        else:
+            print("セグメンテーションモデルが読み込まれていません")
+        
+        # 物体検知モデルのテスト
+        if hasattr(self, 'yolo_model'):
+            print("\n--- 物体検知モデル ---")
+            for conf in [0.1, 0.3, 0.5, 0.6, 0.8]:
+                try:
+                    results = self.yolo_model(current_img_path, conf=conf)
+                    bbox_count = 0
+                    for result in results:
+                        if hasattr(result, 'boxes') and result.boxes is not None:
+                            bbox_count = len(result.boxes.data)
+                    print(f"信頼度 {conf}: ボックス={bbox_count}個")
+                except Exception as e:
+                    print(f"信頼度 {conf}: エラー - {e}")
+        else:
+            print("物体検知モデルが読み込まれていません")
+
+    def convert_segmentation_to_bbox_dataset(self, seg_dataset_path, bbox_dataset_path):
+        """セグメンテーション用YOLOデータセットからバウンディングボックス用データセットを生成"""
+        import shutil
+        
+        try:
+            # 出力ディレクトリの作成
+            os.makedirs(bbox_dataset_path, exist_ok=True)
+            
+            # 画像ディレクトリのコピー
+            seg_images_dir = os.path.join(seg_dataset_path, 'train', 'images')
+            seg_val_images_dir = os.path.join(seg_dataset_path, 'val', 'images')
+            
+            bbox_images_dir = os.path.join(bbox_dataset_path, 'train', 'images')
+            bbox_val_images_dir = os.path.join(bbox_dataset_path, 'val', 'images')
+            bbox_labels_dir = os.path.join(bbox_dataset_path, 'train', 'labels')
+            bbox_val_labels_dir = os.path.join(bbox_dataset_path, 'val', 'labels')
+            
+            # ディレクトリ作成
+            for dir_path in [bbox_images_dir, bbox_val_images_dir, bbox_labels_dir, bbox_val_labels_dir]:
+                os.makedirs(dir_path, exist_ok=True)
+            
+            # 画像をコピー
+            if os.path.exists(seg_images_dir):
+                shutil.copytree(seg_images_dir, bbox_images_dir, dirs_exist_ok=True)
+            if os.path.exists(seg_val_images_dir):
+                shutil.copytree(seg_val_images_dir, bbox_val_images_dir, dirs_exist_ok=True)
+            
+            # ラベル変換
+            self._convert_seg_labels_to_bbox('train', seg_dataset_path, bbox_dataset_path)
+            self._convert_seg_labels_to_bbox('val', seg_dataset_path, bbox_dataset_path)
+            
+            # dataset.yamlをコピー・修正
+            seg_yaml = os.path.join(seg_dataset_path, 'dataset.yaml')
+            bbox_yaml = os.path.join(bbox_dataset_path, 'dataset.yaml')
+            
+            if os.path.exists(seg_yaml):
+                with open(seg_yaml, 'r', encoding='utf-8') as f:
+                    yaml_content = f.read()
+                # パスを更新
+                yaml_content = yaml_content.replace(seg_dataset_path, bbox_dataset_path)
+                # コメントを更新
+                yaml_content = yaml_content.replace('セグメンテーション用', '物体検知用（セグメンテーションから変換）')
+                
+                with open(bbox_yaml, 'w', encoding='utf-8') as f:
+                    f.write(yaml_content)
+            
+            print(f"セグメンテーションデータセットを物体検知用に変換完了: {bbox_dataset_path}")
+            return bbox_dataset_path
+            
+        except Exception as e:
+            print(f"データセット変換エラー: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _convert_seg_labels_to_bbox(self, split, seg_dataset_path, bbox_dataset_path):
+        """セグメンテーションラベルをバウンディングボックスラベルに変換"""
+        seg_labels_dir = os.path.join(seg_dataset_path, split, 'labels')
+        bbox_labels_dir = os.path.join(bbox_dataset_path, split, 'labels')
+        
+        if not os.path.exists(seg_labels_dir):
+            return
+        
+        converted_count = 0
+        for label_file in os.listdir(seg_labels_dir):
+            if not label_file.endswith('.txt'):
+                continue
+                
+            seg_label_path = os.path.join(seg_labels_dir, label_file)
+            bbox_label_path = os.path.join(bbox_labels_dir, label_file)
+            
+            try:
+                with open(seg_label_path, 'r') as f:
+                    lines = f.readlines()
+                
+                bbox_lines = []
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    parts = line.split()
+                    if len(parts) < 7:  # class + at least 3 points (x1 y1 x2 y2 x3 y3)
+                        continue
+                    
+                    class_id = parts[0]
+                    # 座標ポイントを取得
+                    coords = [float(x) for x in parts[1:]]
+                    
+                    # ポイントをx,yのペアに変換
+                    if len(coords) % 2 != 0:
+                        continue  # 奇数個の座標は無効
+                    
+                    points = [(coords[i], coords[i+1]) for i in range(0, len(coords), 2)]
+                    
+                    if len(points) < 3:
+                        continue  # 最低3点必要
+                    
+                    # バウンディングボックスを計算
+                    x_coords = [p[0] for p in points]
+                    y_coords = [p[1] for p in points]
+                    
+                    x_min, x_max = min(x_coords), max(x_coords)
+                    y_min, y_max = min(y_coords), max(y_coords)
+                    
+                    # YOLO形式のバウンディングボックス: center_x, center_y, width, height
+                    center_x = (x_min + x_max) / 2.0
+                    center_y = (y_min + y_max) / 2.0
+                    width = x_max - x_min
+                    height = y_max - y_min
+                    
+                    bbox_line = f"{class_id} {center_x:.6f} {center_y:.6f} {width:.6f} {height:.6f}\n"
+                    bbox_lines.append(bbox_line)
+                
+                # バウンディングボックスラベルファイルを保存
+                with open(bbox_label_path, 'w') as f:
+                    f.writelines(bbox_lines)
+                
+                converted_count += 1
+                
+            except Exception as e:
+                print(f"ラベル変換エラー {label_file}: {e}")
+        
+        print(f"{split} セット: {converted_count}個のラベルファイルを変換しました")
+
     # 5. 情報パネルに物体検知推論結果を表示する処理の追加
     def update_detection_inference_display(self):
         """物体検知推論結果の表示を更新"""
@@ -7503,6 +7916,84 @@ class ImageAnnotationTool(QMainWindow):
             if hasattr(self, 'detection_inference_info_label'):
                 self.detection_inference_info_label.setText("")
 
+    def update_segmentation_inference_display(self):
+        """セグメンテーション推論結果の表示を更新"""
+        if not self.images or not hasattr(self, 'show_segmentation_inference'):
+            return
+        
+        current_img_path = self.images[self.current_index]
+        
+        # セグメンテーション推論表示がOFFの場合は何も表示しない
+        if not self.show_segmentation_inference:
+            if hasattr(self, 'segmentation_inference_info_label'):
+                self.segmentation_inference_info_label.setText("")
+            return
+        
+        # セグメンテーション推論結果がある場合は表示を更新
+        if (current_img_path in self.segmentation_inference_results and 
+            self.segmentation_inference_results[current_img_path]):
+            
+            result = self.segmentation_inference_results[current_img_path]
+            segments = result.get('segments', [])
+            bboxes = result.get('bboxes', [])
+            
+            # クラス別にカウント
+            segment_class_counts = {}
+            bbox_class_counts = {}
+            
+            for segment in segments:
+                class_name = segment['class']
+                segment_class_counts[class_name] = segment_class_counts.get(class_name, 0) + 1
+            
+            for bbox in bboxes:
+                class_name = bbox['class']
+                bbox_class_counts[class_name] = bbox_class_counts.get(class_name, 0) + 1
+            
+            # HTML形式で表示テキストを作成
+            inference_text = "<b>セグメンテーション推論結果:</b><br>"
+            
+            if segments:
+                inference_text += "<b>セグメント:</b><br>"
+                for class_name, count in segment_class_counts.items():
+                    # クラス名に基づいて色を決定
+                    from hashlib import md5
+                    color_hash = int(md5(class_name.encode()).hexdigest(), 16) % 0xFFFFFF
+                    r = (color_hash & 0xFF0000) >> 16
+                    g = (color_hash & 0x00FF00) >> 8
+                    b = color_hash & 0x0000FF
+                    color = f"#{r:02x}{g:02x}{b:02x}"
+                    
+                    inference_text += f"<span style='color: {color}; font-weight: bold;'>● {class_name}</span>: {count}個<br>"
+            
+            if bboxes:
+                inference_text += "<b>バウンディングボックス:</b><br>"
+                for class_name, count in bbox_class_counts.items():
+                    # クラス名に基づいて色を決定
+                    from hashlib import md5
+                    color_hash = int(md5(class_name.encode()).hexdigest(), 16) % 0xFFFFFF
+                    r = (color_hash & 0xFF0000) >> 16
+                    g = (color_hash & 0x00FF00) >> 8
+                    b = color_hash & 0x0000FF
+                    color = f"#{r:02x}{g:02x}{b:02x}"
+                    
+                    inference_text += f"<span style='color: {color}; font-weight: bold;'>□ {class_name}</span>: {count}個<br>"
+            
+            # 推論情報ラベルを更新または作成
+            if hasattr(self, 'segmentation_inference_info_label'):
+                self.segmentation_inference_info_label.setText(inference_text)
+            else:
+                self.segmentation_inference_info_label = QLabel(inference_text)
+                self.segmentation_inference_info_label.setTextFormat(Qt.RichText)
+                
+                # レイアウトに追加
+                if hasattr(self, 'detection_inference_info_label') and self.detection_inference_info_label.parent():
+                    parent_layout = self.detection_inference_info_label.parent().layout()
+                    if parent_layout:
+                        parent_layout.addWidget(self.segmentation_inference_info_label)
+        else:
+            # 推論結果がない場合は表示をクリア
+            if hasattr(self, 'segmentation_inference_info_label'):
+                self.segmentation_inference_info_label.setText("")
 
     ###TODO:統合
     def on_classes_changed(self, text):
@@ -8264,6 +8755,16 @@ class ImageAnnotationTool(QMainWindow):
                 # 推論結果がまだない場合のみ推論を実行
                 if current_img_path not in self.detection_inference_results:
                     self.update_detection_info_panel()
+            
+            # セグメンテーション推論表示の更新
+            if hasattr(self, 'segmentation_inference_checkbox') and self.segmentation_inference_checkbox.isChecked():
+                current_img_path = self.images[self.current_index]
+                # 推論結果がまだない場合のみ推論を実行
+                if current_img_path not in self.segmentation_inference_results:
+                    self.run_single_yolo_segmentation_inference()
+                else:
+                    # 既にある結果の表示を更新
+                    self.update_segmentation_inference_display()
             
             self.update_ui()
 
@@ -9897,7 +10398,52 @@ class ImageAnnotationTool(QMainWindow):
         return True
     
     def display_current_image(self):
-        pass
+        """現在の画像を表示（YOLOアノテーションも含む）"""
+        if not self.images or self.current_index >= len(self.images):
+            return
+        
+        current_image_path = self.images[self.current_index]
+        
+        try:
+            # 画像を読み込み
+            image = load_image_safely(current_image_path)
+            if image is None:
+                return
+            
+            # PIL画像をQImageに変換してQPixmapに設定
+            qimage = pil_to_qimage(image)
+            pixmap = QPixmap.fromImage(qimage)
+            
+            # main_image_viewに画像を設定
+            if hasattr(self, 'main_image_view'):
+                self.main_image_view.setPixmap(pixmap)
+                
+                # YOLOオートアノテーション結果があれば表示用データを設定
+                if hasattr(self, 'object_annotations') and current_image_path in self.object_annotations:
+                    # ObjectDetectionImageLabelがあればバウンディングボックスを設定
+                    if hasattr(self.main_image_view, 'set_boxes'):
+                        boxes = []
+                        for detection in self.object_annotations[current_image_path]:
+                            class_name = detection['class']
+                            bbox = detection['bbox']  # [x1, y1, x2, y2]
+                            boxes.append((class_name, bbox))
+                        self.main_image_view.set_boxes(boxes)
+                
+                # セグメンテーション推論結果があれば表示更新
+                if hasattr(self, 'segmentation_inference_results') and current_image_path in self.segmentation_inference_results:
+                    result = self.segmentation_inference_results[current_image_path]
+                    if result and result.get('segments'):
+                        # セグメンテーション推論結果の表示を更新
+                        self.update_segmentation_inference_display()
+                
+                # セグメンテーション手動アノテーション結果があれば表示
+                if hasattr(self, 'segmentation_annotations') and current_image_path in self.segmentation_annotations:
+                    # セグメンテーションデータを設定する処理を追加（今後の拡張用）
+                    pass
+                    
+        except Exception as e:
+            print(f"画像表示エラー: {e}")
+            return
 
     def update_gallery(self):
         """ギャラリー表示を更新する - 位置情報の問題を根本的に修正"""
@@ -10136,6 +10682,15 @@ class ImageAnnotationTool(QMainWindow):
 
         # 物体検知推論表示の更新
         self.update_detection_info_panel()
+
+        # セグメンテーション推論表示の更新
+        if hasattr(self, 'segmentation_inference_checkbox') and self.segmentation_inference_checkbox.isChecked():
+            # 推論結果がまだない場合のみ推論を実行
+            if new_img_path not in self.segmentation_inference_results:
+                self.run_single_yolo_segmentation_inference()
+            else:
+                # 既にある結果の表示を更新
+                self.update_segmentation_inference_display()
 
         # 画面を更新
         self.update_gallery()
@@ -12131,6 +12686,146 @@ class ImageAnnotationTool(QMainWindow):
                 self, 
                 "エラー", 
                 f"オートアノテーション中にエラーが発生しました: {str(e)}"
+            )
+
+    def yolo_auto_annotate(self):
+        """YOLOを使用した物体検知・セグメンテーションのオートアノテーション"""
+        from yolo_utils import get_yolo_model, batch_detect_objects_and_segments
+        
+        if not self.images:
+            QMessageBox.warning(self, "警告", "画像が読み込まれていません。")
+            return
+        
+        # 信頼度の設定を取得
+        conf_threshold = 0.25
+        if hasattr(self, 'yolo_conf_spinbox'):
+            conf_threshold = self.yolo_conf_spinbox.value()
+        
+        # 処理するクラスの設定を取得
+        target_classes = []
+        if hasattr(self, 'classes_input') and self.classes_input.text():
+            target_classes = [cls.strip() for cls in self.classes_input.text().split(',') if cls.strip()]
+        
+        # 進捗ダイアログを表示
+        progress = QProgressDialog(
+            f"YOLO オートアノテーション準備中... ({len(self.images)}枚の画像)",
+            "キャンセル", 0, 100, self
+        )
+        progress.setWindowTitle("YOLO オートアノテーション実行中")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+        
+        try:
+            # モデル読み込み
+            progress.setLabelText("YOLOモデルを読み込み中...")
+            progress.setValue(10)
+            QApplication.processEvents()
+            
+            # モデルパスの設定
+            model_path = None
+            if os.path.exists("yolo11n.pt"):
+                model_path = "yolo11n.pt"
+            elif os.path.exists("yolov8n-seg.pt"):  # セグメンテーション用
+                model_path = "yolov8n-seg.pt"
+            
+            model = get_yolo_model(model_path)
+            
+            # 進捗コールバック関数
+            def progress_callback(current, total, message):
+                if progress.wasCanceled():
+                    return False
+                
+                progress_value = 10 + int((current / total) * 85)
+                progress.setValue(progress_value)
+                progress.setLabelText(message)
+                QApplication.processEvents()
+                return True
+            
+            # バッチ処理実行
+            progress.setLabelText("物体検知とセグメンテーションを実行中...")
+            progress.setValue(15)
+            QApplication.processEvents()
+            
+            results = batch_detect_objects_and_segments(
+                self.images, model, conf_threshold, progress_callback
+            )
+            
+            if progress.wasCanceled():
+                return
+            
+            # 結果を既存のアノテーションデータに統合
+            progress.setLabelText("アノテーションデータを統合中...")
+            progress.setValue(95)
+            QApplication.processEvents()
+            
+            # 物体検知アノテーション用の辞書を初期化
+            if not hasattr(self, 'object_annotations'):
+                self.object_annotations = {}
+            if not hasattr(self, 'segmentation_annotations'):
+                self.segmentation_annotations = {}
+            
+            detection_count = 0
+            segmentation_count = 0
+            
+            for img_path, result in results.items():
+                # バウンディングボックス処理
+                if result['detections']:
+                    if target_classes:
+                        # 指定されたクラスのみフィルタリング
+                        filtered_detections = [
+                            det for det in result['detections'] 
+                            if det['class'] in target_classes
+                        ]
+                    else:
+                        filtered_detections = result['detections']
+                    
+                    if filtered_detections:
+                        self.object_annotations[img_path] = filtered_detections
+                        detection_count += len(filtered_detections)
+                
+                # セグメンテーション処理
+                if result['segments']:
+                    if target_classes:
+                        # 指定されたクラスのみフィルタリング
+                        filtered_segments = [
+                            seg for seg in result['segments'] 
+                            if seg['class'] in target_classes
+                        ]
+                    else:
+                        filtered_segments = result['segments']
+                    
+                    if filtered_segments:
+                        self.segmentation_annotations[img_path] = filtered_segments
+                        segmentation_count += len(filtered_segments)
+            
+            # UI更新
+            progress.setLabelText("表示を更新中...")
+            progress.setValue(98)
+            QApplication.processEvents()
+            
+            self.display_current_image()
+            
+            progress.setValue(100)
+            progress.close()
+            
+            # 完了メッセージ
+            message = f"YOLO オートアノテーションが完了しました。\n"
+            message += f"検出されたバウンディングボックス: {detection_count}個\n"
+            message += f"検出されたセグメンテーション: {segmentation_count}個"
+            if target_classes:
+                message += f"\n対象クラス: {', '.join(target_classes)}"
+            
+            QMessageBox.information(self, "完了", message)
+            
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(
+                self,
+                "エラー", 
+                f"YOLO オートアノテーション中にエラーが発生しました: {str(e)}"
             )
 
     def show_augmentation_preview_dialog(self, aug_params):        

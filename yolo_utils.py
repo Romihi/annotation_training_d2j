@@ -89,6 +89,94 @@ def detect_objects(image_path, model=None, conf_threshold=0.25):
         print(f"検出エラー: {e}")
         return []
 
+def detect_objects_and_segments(image_path, model=None, conf_threshold=0.25):
+    """
+    画像内の物体検出とセグメンテーションを実行する
+    Args:
+        image_path: 画像のパス
+        model: YOLOモデル (セグメンテーション対応)
+        conf_threshold: 信頼度のしきい値
+    Returns:
+        検出結果の辞書 {'detections': [...], 'segments': [...]}
+    """
+    if model is None:
+        model = get_yolo_model()
+    
+    if not os.path.exists(image_path):
+        print(f"画像が見つかりません: {image_path}")
+        return {'detections': [], 'segments': []}
+    
+    try:
+        # 画像を読み込み
+        img = Image.open(image_path)
+        img_width, img_height = img.size
+        
+        # 推論実行
+        results = model(image_path, conf=conf_threshold)[0]
+        
+        detections = []
+        segments = []
+        
+        # バウンディングボックス処理
+        if hasattr(results, 'boxes') and results.boxes is not None:
+            for i, det in enumerate(results.boxes.data):
+                x1, y1, x2, y2, conf, cls = det.tolist()
+                class_name = results.names[int(cls)]
+                
+                detections.append({
+                    'class': class_name,
+                    'bbox': [float(x1), float(y1), float(x2), float(y2)],
+                    'confidence': float(conf)
+                })
+        
+        # セグメンテーションマスク処理
+        if hasattr(results, 'masks') and results.masks is not None:
+            for i, mask in enumerate(results.masks.data):
+                # マスクを numpy 配列に変換
+                mask_array = mask.cpu().numpy()
+                
+                # マスクから輪郭ポイントを抽出
+                import cv2
+                mask_uint8 = (mask_array * 255).astype(np.uint8)
+                contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                
+                if contours:
+                    # 最大の輪郭を取得
+                    largest_contour = max(contours, key=cv2.contourArea)
+                    
+                    # 輪郭を簡略化
+                    epsilon = 0.02 * cv2.arcLength(largest_contour, True)
+                    approx = cv2.approxPolyDP(largest_contour, epsilon, True)
+                    
+                    # ポイントリストに変換
+                    points = []
+                    for point in approx:
+                        x, y = point[0]
+                        points.append([float(x), float(y)])
+                    
+                    if len(points) >= 3:  # 最低3点必要
+                        # 対応するバウンディングボックスのクラス情報を取得
+                        class_name = "unknown"
+                        confidence = 0.0
+                        if i < len(detections):
+                            class_name = detections[i]['class']
+                            confidence = detections[i]['confidence']
+                        
+                        segments.append({
+                            'class': class_name,
+                            'points': points,
+                            'confidence': confidence
+                        })
+        
+        return {
+            'detections': detections,
+            'segments': segments
+        }
+    
+    except Exception as e:
+        print(f"検出・セグメンテーションエラー: {e}")
+        return {'detections': [], 'segments': []}
+
 def train_yolo_model(dataset_dir, epochs=50, batch_size=16, img_size=640, save_dir=None, pretrained=True):
     """
     YOLOv8モデルを学習する
@@ -293,6 +381,33 @@ def batch_detect_objects(image_paths, model=None, conf_threshold=0.25, progress_
     
     return results
 
+def batch_detect_objects_and_segments(image_paths, model=None, conf_threshold=0.25, progress_callback=None):
+    """
+    複数の画像で物体検出とセグメンテーションを実行する
+    Args:
+        image_paths: 画像パスのリスト
+        model: YOLOモデル (セグメンテーション対応)
+        conf_threshold: 信頼度のしきい値
+        progress_callback: 進捗コールバック関数
+    Returns:
+        検出結果の辞書 {画像パス: {'detections': [...], 'segments': [...]}, ...}
+    """
+    if model is None:
+        model = get_yolo_model()
+    
+    results = {}
+    total = len(image_paths)
+    
+    for i, img_path in enumerate(image_paths):
+        if progress_callback:
+            if not progress_callback(i, total, f"画像 {i+1}/{total} を処理中: {os.path.basename(img_path)}"):
+                break
+                
+        result = detect_objects_and_segments(img_path, model, conf_threshold)
+        results[img_path] = result
+    
+    return results
+
 def draw_detection_preview(image_path, detections, output_path=None):
     """
     検出結果のプレビュー画像を生成する
@@ -371,6 +486,11 @@ class ObjectDetectionImageLabel(QLabel):
     def set_detections(self, detections):
         """検出結果を設定する"""
         self.detections = detections
+        self.update()
+    
+    def toggle_detection_display(self):
+        """検出結果の表示をトグル"""
+        self.show_detections = not self.show_detections
         self.update()
     
     def set_current_class(self, class_name):
