@@ -310,15 +310,27 @@ class EnhancedThumbnailWidget(QWidget):
                 padding: 1px;
             """)
             info_layout.addWidget(deleted_badge)
-        # アノテーション情報
-        if annotation: # and not is_deleted:
-            angle_label = QLabel(f"A: {annotation.get('angle', 0):.2f}")
-            angle_label.setStyleSheet("color: #FF6666; font-size: 12px;font-weight: bold;")
-            info_layout.addWidget(angle_label)
+        # アノテーション情報（angleとthrottleが実際に存在し、有効な値の場合のみ表示）
+        if annotation:
+            # angleが存在し、かつ有効な値（None, 空文字列、0ではない）の場合のみ表示
+            if ('angle' in annotation and 
+                annotation['angle'] is not None and 
+                annotation['angle'] != '' and
+                annotation['angle'] != 0 and 
+                annotation['angle'] != 0.0):
+                angle_label = QLabel(f"A: {annotation['angle']:.2f}")
+                angle_label.setStyleSheet("color: #FF6666; font-size: 12px;font-weight: bold;")
+                info_layout.addWidget(angle_label)
             
-            throttle_label = QLabel(f"T: {annotation.get('throttle', 0):.2f}")
-            throttle_label.setStyleSheet("color: #FF6666; font-size: 12px;font-weight: bold;")
-            info_layout.addWidget(throttle_label)
+            # throttleが存在し、かつ有効な値（None, 空文字列、0ではない）の場合のみ表示
+            if ('throttle' in annotation and 
+                annotation['throttle'] is not None and 
+                annotation['throttle'] != '' and
+                annotation['throttle'] != 0 and 
+                annotation['throttle'] != 0.0):
+                throttle_label = QLabel(f"T: {annotation['throttle']:.2f}")
+                throttle_label.setStyleSheet("color: #FF6666; font-size: 12px;font-weight: bold;")
+                info_layout.addWidget(throttle_label)
 
             # 位置情報バッジ（位置情報がある場合）
             # 変更: 辞書からの参照ではなく、直接location_valueを使用
@@ -493,8 +505,8 @@ class EnhancedThumbnailWidget(QWidget):
             draw_img = pil_img.copy()
             draw = ImageDraw.Draw(draw_img)
             
-            # 基本的なアノテーションを描画
-            if self.annotation:  # and not self.is_deleted:
+            # 基本的なアノテーションを描画（座標が存在する場合のみ）
+            if self.annotation and 'x' in self.annotation and 'y' in self.annotation:
                 # アノテーションの座標を取得
                 x, y = self.annotation["x"], self.annotation["y"]
                 

@@ -1840,17 +1840,35 @@ class ThumbnailWidget(QWidget):
                 padding: 1px;
             """)
             info_layout.addWidget(deleted_badge)
-        # アノテーション情報（angleとthrottleが実際に存在する場合のみ表示）
+        # アノテーション情報（angleとthrottleが実際に存在し、有効な値の場合のみ表示）
         if annotation:
-            if 'angle' in annotation:
+            # angleが存在し、かつ有効な値（None, 空文字列、0ではない）の場合のみ表示
+            if ('angle' in annotation and 
+                annotation['angle'] is not None and 
+                annotation['angle'] != '' and
+                annotation['angle'] != 0 and 
+                annotation['angle'] != 0.0):
+                print(f"Angle表示: {annotation['angle']}")
                 angle_label = QLabel(f"A: {annotation['angle']:.2f}")
                 angle_label.setStyleSheet("color: #FF6666; font-size: 12px;font-weight: bold;")
                 info_layout.addWidget(angle_label)
+            else:
+                if 'angle' in annotation:
+                    print(f"Angle表示スキップ: 値={annotation['angle']}, 型={type(annotation['angle'])}")
             
-            if 'throttle' in annotation:
+            # throttleが存在し、かつ有効な値（None, 空文字列、0ではない）の場合のみ表示
+            if ('throttle' in annotation and 
+                annotation['throttle'] is not None and 
+                annotation['throttle'] != '' and
+                annotation['throttle'] != 0 and 
+                annotation['throttle'] != 0.0):
+                print(f"Throttle表示: {annotation['throttle']}")
                 throttle_label = QLabel(f"T: {annotation['throttle']:.2f}")
                 throttle_label.setStyleSheet("color: #FF6666; font-size: 12px;font-weight: bold;")
                 info_layout.addWidget(throttle_label)
+            else:
+                if 'throttle' in annotation:
+                    print(f"Throttle表示スキップ: 値={annotation['throttle']}, 型={type(annotation['throttle'])}")
 
             # 位置情報バッジ（位置情報がある場合）
             if location_value is not None:
@@ -3202,19 +3220,23 @@ class ImageAnnotationTool(QMainWindow):
         
         deleted_items = []
         
-        # angle/throttleアノテーションを削除
+        # angle/throttleアノテーションを削除（インデックスベース）
         if current_index in self.annotations:
             annotation = self.annotations[current_index]
             
-            # angleを削除
+            # angleを削除（キーが存在する場合は無条件で削除）
             if 'angle' in annotation:
+                print(f"削除前のangle値: {annotation['angle']} (型: {type(annotation['angle'])})")
                 del annotation['angle']
                 deleted_items.append('angle')
+                print("angleキーを削除しました")
             
-            # throttleを削除  
+            # throttleを削除（キーが存在する場合は無条件で削除）
             if 'throttle' in annotation:
+                print(f"削除前のthrottle値: {annotation['throttle']} (型: {type(annotation['throttle'])})")
                 del annotation['throttle']
                 deleted_items.append('throttle')
+                print("throttleキーを削除しました")
             
             # 位置情報を削除
             if 'loc' in annotation:
@@ -3230,6 +3252,40 @@ class ImageAnnotationTool(QMainWindow):
             # アノテーションが空になった場合は削除
             if not annotation:
                 del self.annotations[current_index]
+        
+        # パスベースのアノテーションも削除（重複格納対策）
+        if hasattr(self, 'images') and 0 <= current_index < len(self.images):
+            current_img_path = self.images[current_index]
+            if current_img_path in self.annotations:
+                path_annotation = self.annotations[current_img_path]
+                
+                # angleを削除
+                if 'angle' in path_annotation:
+                    del path_annotation['angle']
+                    if 'angle' not in deleted_items:
+                        deleted_items.append('angle (path)')
+                
+                # throttleを削除
+                if 'throttle' in path_annotation:
+                    del path_annotation['throttle']
+                    if 'throttle' not in deleted_items:
+                        deleted_items.append('throttle (path)')
+                
+                # 位置情報を削除
+                if 'loc' in path_annotation:
+                    del path_annotation['loc']
+                    if '位置情報' not in deleted_items:
+                        deleted_items.append('位置情報 (path)')
+                
+                # 座標情報も削除
+                if 'x' in path_annotation:
+                    del path_annotation['x']
+                if 'y' in path_annotation:
+                    del path_annotation['y']
+                
+                # アノテーションが空になった場合は削除
+                if not path_annotation:
+                    del self.annotations[current_img_path]
         
         # 位置アノテーションを削除
         if current_index in self.location_annotations:
@@ -3265,6 +3321,23 @@ class ImageAnnotationTool(QMainWindow):
         # 分布グラフも更新
         if hasattr(self, 'update_distribution_graph'):
             self.update_distribution_graph()
+        
+        # デバッグ：削除後のアノテーション内容を確認
+        if current_index in self.annotations:
+            print(f"削除後のアノテーション内容 (index {current_index}): {self.annotations[current_index]}")
+        else:
+            print(f"アノテーション辞書からindex {current_index}が完全削除されました")
+        
+        # デバッグ：現在の画像パスもチェック
+        if hasattr(self, 'images') and 0 <= current_index < len(self.images):
+            current_img_path = self.images[current_index]
+            if current_img_path in self.annotations:
+                print(f"パスベースのアノテーション内容 ({current_img_path}): {self.annotations[current_img_path]}")
+            else:
+                print(f"パスベースのアノテーションは存在しません: {current_img_path}")
+        
+        # デバッグ：アノテーション辞書の全キーを確認
+        print(f"アノテーション辞書の全キー（最初の10個）: {list(self.annotations.keys())[:10]}")
         
         # 確認メッセージ
         if deleted_items:
@@ -3326,13 +3399,24 @@ class ImageAnnotationTool(QMainWindow):
             inference = self.inference_results[index]
                 
         if annotation and inference:
-            # 角度と速度の差分を計算
-            if "pilot/angle" in inference and "pilot/throttle" in inference:
-                angle_diff = inference["pilot/angle"] - annotation["angle"]
-                throttle_diff = inference["pilot/throttle"] - annotation["throttle"]
+            # アノテーションと推論結果の両方にangle/throttleキーが存在するかチェック
+            if ("angle" in annotation and "throttle" in annotation and 
+                annotation["angle"] is not None and annotation["throttle"] is not None):
+                # 角度と速度の差分を計算
+                if "pilot/angle" in inference and "pilot/throttle" in inference:
+                    angle_diff = inference["pilot/angle"] - annotation["angle"]
+                    throttle_diff = inference["pilot/throttle"] - annotation["throttle"]
+                elif "angle" in inference and "throttle" in inference:
+                    angle_diff = inference["angle"] - annotation["angle"]
+                    throttle_diff = inference["throttle"] - annotation["throttle"]
+                else:
+                    # 推論結果にangle/throttleがない場合はスキップ
+                    return
             else:
-                angle_diff = inference["angle"] - annotation["angle"]
-                throttle_diff = inference["throttle"] - annotation["throttle"]
+                # アノテーションにangle/throttleがない場合（削除済み等）は差分ベクトルも削除
+                if index in self.inference_diff_vectors:
+                    del self.inference_diff_vectors[index]
+                return
             
             # ベクトルの大きさと角度を計算
             import math
@@ -3348,6 +3432,9 @@ class ImageAnnotationTool(QMainWindow):
             }
             
         else:
+            # アノテーションまたは推論結果がない場合は差分ベクトルを削除
+            if index in self.inference_diff_vectors:
+                del self.inference_diff_vectors[index]
             print(f"差分ベクトル計算スキップ: アノテーションまたは推論結果が不足")
 
     def update_bbox_stats(self):
@@ -4219,43 +4306,7 @@ class ImageAnnotationTool(QMainWindow):
                 self.batch_inference_button.setEnabled(False)
                 self.batch_inference_button.setToolTip("自動運転モデルが読み込まれていません")
     
-    def _disable_other_model_checkboxes(self, exclude_detection=False, exclude_segmentation=False, exclude_location=False, exclude_auto=False):
-        """指定したモデル以外のチェックボックスを無効にする"""
-        
-        # 自動運転モデル関連
-        if not exclude_auto:
-            if hasattr(self, 'inference_checkbox'):
-                self.inference_checkbox.setEnabled(False)
-                self.inference_checkbox.setChecked(False)
-                self.inference_checkbox.setToolTip("自動運転モデルが読み込まれていません")
-            if hasattr(self, 'diff_vector_checkbox'):
-                self.diff_vector_checkbox.setEnabled(False)
-                self.diff_vector_checkbox.setChecked(False)
-                self.diff_vector_checkbox.setToolTip("自動運転モデルが読み込まれていません")
-            if hasattr(self, 'batch_inference_button'):
-                self.batch_inference_button.setEnabled(False)
-                self.batch_inference_button.setToolTip("自動運転モデルが読み込まれていません")
-        
-        # 物体検知モデル
-        if not exclude_detection:
-            if hasattr(self, 'detection_inference_checkbox'):
-                self.detection_inference_checkbox.setEnabled(False)
-                self.detection_inference_checkbox.setChecked(False)
-                self.detection_inference_checkbox.setToolTip("物体検知モデルが読み込まれていません")
-        
-        # セグメンテーションモデル
-        if not exclude_segmentation:
-            if hasattr(self, 'segmentation_inference_checkbox'):
-                self.segmentation_inference_checkbox.setEnabled(False)
-                self.segmentation_inference_checkbox.setChecked(False)
-                self.segmentation_inference_checkbox.setToolTip("セグメンテーションモデルが読み込まれていません")
-        
-        # 位置モデル
-        if not exclude_location:
-            if hasattr(self, 'location_inference_checkbox'):
-                self.location_inference_checkbox.setEnabled(False)
-                self.location_inference_checkbox.setChecked(False)
-                self.location_inference_checkbox.setToolTip("位置モデルが読み込まれていません")   
+   
 
     def add_segmentation_annotation(self, polygon_data):
         """セグメンテーションアノテーションを追加"""
@@ -5742,8 +5793,8 @@ class ImageAnnotationTool(QMainWindow):
                     self.segmentation_inference_checkbox.setToolTip("セグメンテーションモデルが読み込まれています")
                     self.segmentation_inference_checkbox.setChecked(True)
                 
-                # 他のモデルのチェックボックスを無効にする
-                self._disable_other_model_checkboxes(exclude_segmentation=True)
+                # 各モデルの状態を更新
+                self.update_inference_checkboxes_status()
             else:
                 self.yolo_model = yolo_model
                 self.yolo_confidence_threshold = confidence
@@ -5755,8 +5806,8 @@ class ImageAnnotationTool(QMainWindow):
                     self.detection_inference_checkbox.setToolTip("物体検知モデルが読み込まれています")
                     self.detection_inference_checkbox.setChecked(True)
                 
-                # 他のモデルのチェックボックスを無効にする
-                self._disable_other_model_checkboxes(exclude_detection=True)
+                # 各モデルの状態を更新
+                self.update_inference_checkboxes_status()
             
             progress.setValue(70)
             progress.setLabelText("推論テストを実行中...")
@@ -10416,6 +10467,17 @@ class ImageAnnotationTool(QMainWindow):
             progress.setValue(70)
             QApplication.processEvents()
             
+            # モデルを明示的に読み込み（self.modelに保存）
+            from model_catalog import get_model, load_model_weights
+            
+            # モデルインスタンスを作成
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.model = get_model(model_type, pretrained=False)
+            
+            # 重みを読み込み
+            load_model_weights(self.model, model_path, device)
+            self.model.eval()
+            
             # モデルを強制的に再読み込み（現在表示中の画像だけ推論）
             inference_results = batch_inference(
                 [current_img_path],
@@ -10453,8 +10515,8 @@ class ImageAnnotationTool(QMainWindow):
                 self.batch_inference_button.setEnabled(True)
                 self.batch_inference_button.setToolTip("全ての画像に対して推論を実行します")
             
-            # 他のモデルのチェックボックスを無効にする
-            self._disable_other_model_checkboxes(exclude_auto=True)
+            # 各モデルの状態を更新
+            self.update_inference_checkboxes_status()
             
             # 推論表示を更新
             self.update_inference_display()
@@ -10986,19 +11048,28 @@ class ImageAnnotationTool(QMainWindow):
                 # 削除されたインデックスの場合、削除済みフラグをセット
                 is_deleted = hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes
                 
-                # アノテーション情報を取得
+                # アノテーション情報を取得（インデックスベースに統一）
                 annotation = None
                 location_value = None  # Initialize here to prevent the error
                 
-                if  img_path in self.annotations:
-                    annotation = self.annotations[img_path]
+                # インデックスベースでアノテーションを取得
+                if idx in self.annotations:
+                    annotation = self.annotations[idx]
+                    # デバッグ：サムネイル作成時のアノテーション内容を確認
+                    print(f"サムネイル作成時のアノテーション (index {idx}): {annotation}")
+                    print(f"  angle存在: {'angle' in annotation}, throttle存在: {'throttle' in annotation}")
+                    if 'angle' in annotation:
+                        print(f"  angle値: {annotation['angle']} (型: {type(annotation['angle'])})")
+                    if 'throttle' in annotation:
+                        print(f"  throttle値: {annotation['throttle']} (型: {type(annotation['throttle'])})")
                 
                     # 位置情報を事前に特定
                     if annotation and 'loc' in annotation:
                         location_value = annotation['loc']
-                    # あるいは位置情報専用の辞書を確認 (uncomment this)
-                    elif img_path in self.location_annotations:
-                        location_value = self.location_annotations[img_path]
+                
+                # 位置情報専用の辞書をインデックスベースで確認
+                if location_value is None and idx in self.location_annotations:
+                    location_value = self.location_annotations[idx]
                 
                 # サムネイルウィジェットを作成
                 thumb = ThumbnailWidget(
@@ -11043,10 +11114,8 @@ class ImageAnnotationTool(QMainWindow):
             # ギャラリー更新
             self.update_gallery()
             
-            # スキップ枚数分だけ自動的に次に進める（選択したのが現在の画像より前の場合は戻る）
-            if self.skip_images_on_click.isChecked():  # チェックボックスで制御
-                skip_count = self.skip_count_spin.value()
-                QTimer.singleShot(300, lambda: self.skip_images(skip_count))
+            # サムネイルクリック時は自動スキップしない（ユーザーが明示的に選択した画像で停止）
+            # 自動スキップ機能は矢印キーなどの他の操作でのみ有効
 
     def skip_images(self, count):
         """指定した数だけ画像をスキップする - 位置推論の自動実行も追加"""
@@ -13990,8 +14059,8 @@ class ImageAnnotationTool(QMainWindow):
             self.location_inference_checkbox.setToolTip("位置モデルが読み込まれています")
             self.location_inference_checkbox.setChecked(True)
             
-            # 他のモデルのチェックボックスを無効にする
-            self._disable_other_model_checkboxes(exclude_location=True)
+            # 各モデルの状態を更新
+            self.update_inference_checkboxes_status()
             
             update_progress(100)
             progress.close()
