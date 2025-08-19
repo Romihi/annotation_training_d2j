@@ -312,22 +312,18 @@ class EnhancedThumbnailWidget(QWidget):
             info_layout.addWidget(deleted_badge)
         # アノテーション情報（angleとthrottleが実際に存在し、有効な値の場合のみ表示）
         if annotation:
-            # angleが存在し、かつ有効な値（None, 空文字列、0ではない）の場合のみ表示
+            # angleが存在し、かつ有効な値（None, 空文字列ではない）の場合のみ表示
             if ('angle' in annotation and 
                 annotation['angle'] is not None and 
-                annotation['angle'] != '' and
-                annotation['angle'] != 0 and 
-                annotation['angle'] != 0.0):
+                annotation['angle'] != ''):
                 angle_label = QLabel(f"A: {annotation['angle']:.2f}")
                 angle_label.setStyleSheet("color: #FF6666; font-size: 12px;font-weight: bold;")
                 info_layout.addWidget(angle_label)
             
-            # throttleが存在し、かつ有効な値（None, 空文字列、0ではない）の場合のみ表示
+            # throttleが存在し、かつ有効な値（None, 空文字列ではない）の場合のみ表示
             if ('throttle' in annotation and 
                 annotation['throttle'] is not None and 
-                annotation['throttle'] != '' and
-                annotation['throttle'] != 0 and 
-                annotation['throttle'] != 0.0):
+                annotation['throttle'] != ''):
                 throttle_label = QLabel(f"T: {annotation['throttle']:.2f}")
                 throttle_label.setStyleSheet("color: #FF6666; font-size: 12px;font-weight: bold;")
                 info_layout.addWidget(throttle_label)

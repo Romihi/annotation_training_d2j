@@ -1842,33 +1842,21 @@ class ThumbnailWidget(QWidget):
             info_layout.addWidget(deleted_badge)
         # アノテーション情報（angleとthrottleが実際に存在し、有効な値の場合のみ表示）
         if annotation:
-            # angleが存在し、かつ有効な値（None, 空文字列、0ではない）の場合のみ表示
+            # angleが存在し、かつ有効な値（None, 空文字列ではない）の場合のみ表示
             if ('angle' in annotation and 
                 annotation['angle'] is not None and 
-                annotation['angle'] != '' and
-                annotation['angle'] != 0 and 
-                annotation['angle'] != 0.0):
-                print(f"Angle表示: {annotation['angle']}")
+                annotation['angle'] != ''):
                 angle_label = QLabel(f"A: {annotation['angle']:.2f}")
                 angle_label.setStyleSheet("color: #FF6666; font-size: 12px;font-weight: bold;")
                 info_layout.addWidget(angle_label)
-            else:
-                if 'angle' in annotation:
-                    print(f"Angle表示スキップ: 値={annotation['angle']}, 型={type(annotation['angle'])}")
             
-            # throttleが存在し、かつ有効な値（None, 空文字列、0ではない）の場合のみ表示
+            # throttleが存在し、かつ有効な値（None, 空文字列ではない）の場合のみ表示
             if ('throttle' in annotation and 
                 annotation['throttle'] is not None and 
-                annotation['throttle'] != '' and
-                annotation['throttle'] != 0 and 
-                annotation['throttle'] != 0.0):
-                print(f"Throttle表示: {annotation['throttle']}")
+                annotation['throttle'] != ''):
                 throttle_label = QLabel(f"T: {annotation['throttle']:.2f}")
                 throttle_label.setStyleSheet("color: #FF6666; font-size: 12px;font-weight: bold;")
                 info_layout.addWidget(throttle_label)
-            else:
-                if 'throttle' in annotation:
-                    print(f"Throttle表示スキップ: 値={annotation['throttle']}, 型={type(annotation['throttle'])}")
 
             # 位置情報バッジ（位置情報がある場合）
             if location_value is not None:
@@ -3226,17 +3214,13 @@ class ImageAnnotationTool(QMainWindow):
             
             # angleを削除（キーが存在する場合は無条件で削除）
             if 'angle' in annotation:
-                print(f"削除前のangle値: {annotation['angle']} (型: {type(annotation['angle'])})")
                 del annotation['angle']
                 deleted_items.append('angle')
-                print("angleキーを削除しました")
             
             # throttleを削除（キーが存在する場合は無条件で削除）
             if 'throttle' in annotation:
-                print(f"削除前のthrottle値: {annotation['throttle']} (型: {type(annotation['throttle'])})")
                 del annotation['throttle']
                 deleted_items.append('throttle')
-                print("throttleキーを削除しました")
             
             # 位置情報を削除
             if 'loc' in annotation:
@@ -3323,21 +3307,7 @@ class ImageAnnotationTool(QMainWindow):
             self.update_distribution_graph()
         
         # デバッグ：削除後のアノテーション内容を確認
-        if current_index in self.annotations:
-            print(f"削除後のアノテーション内容 (index {current_index}): {self.annotations[current_index]}")
-        else:
-            print(f"アノテーション辞書からindex {current_index}が完全削除されました")
         
-        # デバッグ：現在の画像パスもチェック
-        if hasattr(self, 'images') and 0 <= current_index < len(self.images):
-            current_img_path = self.images[current_index]
-            if current_img_path in self.annotations:
-                print(f"パスベースのアノテーション内容 ({current_img_path}): {self.annotations[current_img_path]}")
-            else:
-                print(f"パスベースのアノテーションは存在しません: {current_img_path}")
-        
-        # デバッグ：アノテーション辞書の全キーを確認
-        print(f"アノテーション辞書の全キー（最初の10個）: {list(self.annotations.keys())[:10]}")
         
         # 確認メッセージ
         if deleted_items:
