@@ -232,12 +232,14 @@ class ImageLabel(QLabel):
         
         self.draw_initial_frame(painter)
 
-        # 各機能毎に描画
+        # 各機能毎に描画（描画順序を調整）
         self.draw_grid(painter, self.target_rect)
         self.draw_background_frame(painter, self.target_rect)
-        self.draw_control_points(painter, self.target_rect)
+        # バウンディングボックス（YOLO推論結果含む）を先に描画
         self.draw_bbox(self.pix_width, self.pix_height, painter, self.target_rect)
         self.draw_segmentation(self.pix_width, self.pix_height, painter, self.target_rect)
+        # アノテーション点、推論点、差分ベクトルを最後に描画（上に表示）
+        self.draw_control_points(painter, self.target_rect)
 
         painter.end()
 
@@ -2198,6 +2200,12 @@ class ImageAnnotationTool(QMainWindow):
 
         pilot_layout.addLayout(model_buttons_layout)
         
+        # オートアノテーションボタン
+        self.auto_annotate_button = QPushButton("オートアノテーション実行")
+        self.auto_annotate_button.clicked.connect(self.auto_annotate)
+        self.auto_annotate_button.setEnabled(False)  # 初期状態で非アクティブ
+        apply_style(self.auto_annotate_button, 'special')
+        pilot_layout.addWidget(self.auto_annotate_button)
 
         # 推論結果表示オプション
         inference_layout = QHBoxLayout()
@@ -2245,13 +2253,6 @@ class ImageAnnotationTool(QMainWindow):
         # 推論実行ボタン
         inference_button_layout = QHBoxLayout()
 
-        # オートアノテーションボタン
-        self.auto_annotate_button = QPushButton("オートアノテーション実行")
-        self.auto_annotate_button.clicked.connect(self.auto_annotate)
-        self.auto_annotate_button.setEnabled(False)  # 初期状態で非アクティブ
-        apply_style(self.auto_annotate_button, 'special')
-        inference_button_layout.addWidget(self.auto_annotate_button)
-
         left_layout.addLayout(inference_button_layout)
 
 
@@ -2269,13 +2270,6 @@ class ImageAnnotationTool(QMainWindow):
         load_yolo_btn.clicked.connect(self.load_yolo_annotations)
         apply_style(load_yolo_btn, 'primary')
         obj_detection_layout.addWidget(load_yolo_btn)
-
-        # YOLOオートアノテーション実行ボタン
-        self.yolo_auto_annotate_btn = QPushButton("YOLO オートアノテーション実行")
-        self.yolo_auto_annotate_btn.clicked.connect(self.yolo_auto_annotate)
-        self.yolo_auto_annotate_btn.setEnabled(False)  # 初期状態で非アクティブ
-        apply_style(self.yolo_auto_annotate_btn, 'special')
-        obj_detection_layout.addWidget(self.yolo_auto_annotate_btn)
 
         # クラス入力フィールド
         classes_layout = QHBoxLayout()
@@ -2348,6 +2342,13 @@ class ImageAnnotationTool(QMainWindow):
         yolo_model_buttons_layout.addWidget(self.yolo_load_button)
 
         obj_detection_layout.addLayout(yolo_model_buttons_layout)
+
+        # YOLOオートアノテーション実行ボタン
+        self.yolo_auto_annotate_btn = QPushButton("YOLO オートアノテーション実行")
+        self.yolo_auto_annotate_btn.clicked.connect(self.yolo_auto_annotate)
+        self.yolo_auto_annotate_btn.setEnabled(False)  # 初期状態で非アクティブ
+        apply_style(self.yolo_auto_annotate_btn, 'special')
+        obj_detection_layout.addWidget(self.yolo_auto_annotate_btn)
 
         # 推論結果表示オプション
         inference_layout = QHBoxLayout()
@@ -2447,8 +2448,14 @@ class ImageAnnotationTool(QMainWindow):
         self.inference_info_label.setWordWrap(True)
         self.inference_info_label.setStyleSheet("color: blue;")
         info_layout.addWidget(self.inference_info_label)
+        
+        # 位置推論結果表示ラベル（推論結果の直下）
+        self.location_inference_info_label = QLabel("")
+        self.location_inference_info_label.setWordWrap(True)
+        self.location_inference_info_label.setStyleSheet("color: purple;")  # 紫色で表示して区別
+        info_layout.addWidget(self.location_inference_info_label)
 
-        # 物体検知推論結果表示ラベル
+        # 物体検知推論結果表示ラベル（位置推論結果の下）
         self.detection_inference_info_label = QLabel("")
         self.detection_inference_info_label.setWordWrap(True)
         self.detection_inference_info_label.setStyleSheet("color: green;")  # 緑色で表示して区別
@@ -3681,9 +3688,13 @@ class ImageAnnotationTool(QMainWindow):
         # モデルファイルを検索
         all_model_files = [f for f in os.listdir(models_dir) if f.endswith('.pth')]
         
-        # モデルアーキでフィルタリング
+        # モデルアーキでフィルタリング（自動運転モデルのみ）
         model_files = []
         for model_file in all_model_files:
+            # 位置推論モデルとYOLOモデルを除外
+            if "_location_" in model_file or "yolo" in model_file.lower():
+                continue
+            
             # モデルファイル名にアーキ名が含まれていれば対象とする
             # 通常、モデルファイル名は「アーキ名_日時.pth」等の形式
             if current_arch.lower() in model_file.lower():
@@ -4066,18 +4077,17 @@ class ImageAnnotationTool(QMainWindow):
                 inference = self.location_inference_results[current_img_path]
                 
                 # 位置推論情報のリッチテキスト
-                inference_text = "<b>位置推論結果:</b><br>"
-                
                 # 位置情報を取得
                 location = inference.get("loc", None)
                 
-                # 位置情報があれば色付きバッジとして表示
+                # 位置情報があれば色付きバッジとして表示（インラインで表示）
                 if location is not None:
                     loc_color = get_location_color(location)
-                    
-                    inference_text += f"<br><div style='margin-top: 10px;'>"
-                    inference_text += f"<div style='display: inline-block; background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 5px; border-radius: 5px;'>"
-                    inference_text += f"推論位置 {location}</div></div>"
+                    inference_text = f"<b>位置推論結果:</b> "
+                    inference_text += f"<span style='background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 2px 5px; border-radius: 3px;'>"
+                    inference_text += f"位置 {location}</span>"
+                else:
+                    inference_text = ""
 
                 # リッチテキストとして設定
                 if hasattr(self, 'location_inference_info_label'):
@@ -4231,26 +4241,35 @@ class ImageAnnotationTool(QMainWindow):
             self.inference_checkbox.setChecked(False)
             self.inference_checkbox.setToolTip("自動運転モデルが読み込まれていません")
         
-        # YOLOモデル（物体検知）
-        if hasattr(self, 'yolo_model') and self.yolo_model is not None:
+        # YOLOモデル（相互排他制御）
+        has_detection_model = hasattr(self, 'yolo_model') and self.yolo_model is not None
+        has_segmentation_model = hasattr(self, 'yolo_seg_model') and self.yolo_seg_model is not None
+        
+        # 物体検知モデル
+        if has_detection_model:
             self.detection_inference_checkbox.setEnabled(True)
             self.detection_inference_checkbox.setToolTip("物体検知モデルが読み込まれています")
+            # セグメンテーションチェックボックスを無効化
+            if has_segmentation_model:
+                self.segmentation_inference_checkbox.setEnabled(False)
+                self.segmentation_inference_checkbox.setChecked(False)
+                self.segmentation_inference_checkbox.setToolTip("物体検知モデルが読み込まれているため無効")
         else:
             self.detection_inference_checkbox.setEnabled(False)
             self.detection_inference_checkbox.setChecked(False)
             self.detection_inference_checkbox.setToolTip("物体検知モデルが読み込まれていません")
         
-        # YOLOモデル（セグメンテーション）
-        if hasattr(self, 'yolo_seg_model') and self.yolo_seg_model is not None:
+        # セグメンテーションモデル
+        if has_segmentation_model and not has_detection_model:
             self.segmentation_inference_checkbox.setEnabled(True)
             self.segmentation_inference_checkbox.setToolTip("セグメンテーションモデルが読み込まれています")
-        else:
+        elif not has_segmentation_model:
             self.segmentation_inference_checkbox.setEnabled(False)
             self.segmentation_inference_checkbox.setChecked(False)
             self.segmentation_inference_checkbox.setToolTip("セグメンテーションモデルが読み込まれていません")
         
         # 位置モデル
-        if hasattr(self, 'location_model') and self.location_model is not None:
+        if hasattr(self, 'location_model_manager') and self.location_model_manager.is_model_loaded():
             self.location_inference_checkbox.setEnabled(True)
             self.location_inference_checkbox.setToolTip("位置モデルが読み込まれています")
         else:
@@ -4421,7 +4440,7 @@ class ImageAnnotationTool(QMainWindow):
         task_name = "物体検知" if task_type == "detect" else "セグメンテーション"
         
         # 学習設定ダイアログを表示
-        training_config = self._get_yolo_training_config(task_name, model_type)
+        training_config = self._get_yolo_training_config(task_name, model_type, annotation_info)
         if not training_config:
             return
         
@@ -5205,7 +5224,7 @@ class ImageAnnotationTool(QMainWindow):
             f"{mlflow_info}"
         )
 
-    def _create_yolo_training_dialog(self, task_name, model_type):
+    def _create_yolo_training_dialog(self, task_name, model_type, annotation_info):
         """YOLO学習設定ダイアログを作成"""
         
         training_settings = QDialog(self)
@@ -5214,6 +5233,30 @@ class ImageAnnotationTool(QMainWindow):
         training_settings.setMinimumHeight(600)
         
         settings_layout = QVBoxLayout(training_settings)
+        
+        # 統計情報を表示（削除済みマークを考慮）
+        excluded_count = annotation_info.get("excluded_count", 0)
+        total_images = len(self.images) if self.images else 0
+        total_count = annotation_info.get("total_count", 0)
+        image_count = annotation_info.get("image_count", 0)
+        
+        # アノテーション総数から削除済みを取得（物体検知/セグメンテーション別）
+        if task_name == "物体検知":
+            total_annotated_images = len(getattr(self, 'bbox_annotations', {}))
+        else:  # セグメンテーション
+            total_annotated_images = len(getattr(self, 'segmentation_annotations', {}))
+        
+        stats_label = QLabel(f"<b>学習データ統計:</b><br>"
+                           f"総読み込み画像数: {total_images}枚<br>"
+                           f"{task_name}アノテーション済み画像数: {total_annotated_images}枚<br>"
+                           f"<b style='color: #2E7D32; font-size: 14px;'>実際の学習使用枚数: {image_count}枚</b><br>"
+                           f"({total_annotated_images}枚 - 削除済み{excluded_count}枚)<br>"
+                           f"総{task_name}アノテーション数: {total_count}個<br>"
+                           f"<span style='color: #FF6600;'>※ 削除マークされた画像は学習対象から除外されます</span>")
+        stats_label.setStyleSheet("padding: 10px; background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 5px;")
+        settings_layout.addWidget(stats_label)
+        
+        settings_layout.addWidget(QLabel(""))  # スペース追加
         
         # タブウィジェットを作成
         tabs = QTabWidget()
@@ -5465,11 +5508,11 @@ class ImageAnnotationTool(QMainWindow):
         
         return training_settings
 
-    def _get_yolo_training_config(self, task_name, model_type):
+    def _get_yolo_training_config(self, task_name, model_type, annotation_info):
         """YOLO学習設定ダイアログから設定を取得（修正版）"""
         
         # 設定ダイアログを作成
-        training_settings = self._create_yolo_training_dialog(task_name, model_type)
+        training_settings = self._create_yolo_training_dialog(task_name, model_type, annotation_info)
         
         if not training_settings.exec_():
             return None
@@ -5569,9 +5612,9 @@ class ImageAnnotationTool(QMainWindow):
             self.update_segmentation_inference_display()
             self.statusBar().showMessage("セグメンテーション推論結果表示をオンにしました", 3000)
         else:
-            # 表示をクリア
-            if hasattr(self, 'segmentation_inference_info_label'):
-                self.segmentation_inference_info_label.setText("")
+            # 表示をクリア（物体検知推論結果ラベルをクリア）
+            if hasattr(self, 'detection_inference_info_label'):
+                self.detection_inference_info_label.setText("")
             self.statusBar().showMessage("セグメンテーション推論結果表示をオフにしました", 3000)
 
     def refresh_yolo_unified_model_list(self):
@@ -5751,6 +5794,12 @@ class ImageAnnotationTool(QMainWindow):
             progress.setValue(50)
             QApplication.processEvents()
             
+            # 新しいモデルを読み込む前に、既存のYOLOモデルをクリア
+            if hasattr(self, 'yolo_model'):
+                self.yolo_model = None
+            if hasattr(self, 'yolo_seg_model'):
+                self.yolo_seg_model = None
+            
             # タスクタイプに応じてモデルを適切な変数に設定
             if is_segmentation:
                 self.yolo_seg_model = yolo_model
@@ -5763,8 +5812,11 @@ class ImageAnnotationTool(QMainWindow):
                     self.segmentation_inference_checkbox.setToolTip("セグメンテーションモデルが読み込まれています")
                     self.segmentation_inference_checkbox.setChecked(True)
                 
-                # 各モデルの状態を更新
-                self.update_inference_checkboxes_status()
+                # 物体検知推論チェックボックスを無効化
+                if hasattr(self, 'detection_inference_checkbox'):
+                    self.detection_inference_checkbox.setEnabled(False)
+                    self.detection_inference_checkbox.setChecked(False)
+                    self.detection_inference_checkbox.setToolTip("セグメンテーションモデルが読み込まれているため無効")
             else:
                 self.yolo_model = yolo_model
                 self.yolo_confidence_threshold = confidence
@@ -5776,8 +5828,14 @@ class ImageAnnotationTool(QMainWindow):
                     self.detection_inference_checkbox.setToolTip("物体検知モデルが読み込まれています")
                     self.detection_inference_checkbox.setChecked(True)
                 
-                # 各モデルの状態を更新
-                self.update_inference_checkboxes_status()
+                # セグメンテーション推論チェックボックスを無効化
+                if hasattr(self, 'segmentation_inference_checkbox'):
+                    self.segmentation_inference_checkbox.setEnabled(False)
+                    self.segmentation_inference_checkbox.setChecked(False)
+                    self.segmentation_inference_checkbox.setToolTip("物体検知モデルが読み込まれているため無効")
+            
+            # 各モデルの状態を更新
+            self.update_inference_checkboxes_status()
             
             progress.setValue(70)
             progress.setLabelText("推論テストを実行中...")
@@ -8219,16 +8277,16 @@ class ImageAnnotationTool(QMainWindow):
                 self.detection_inference_info_label.setText("")
 
     def update_segmentation_inference_display(self):
-        """セグメンテーション推論結果の表示を更新"""
+        """セグメンテーション推論結果の表示を更新（物体検知推論結果ラベルと同じ場所に表示）"""
         if not self.images or not hasattr(self, 'show_segmentation_inference'):
             return
         
         current_img_path = self.images[self.current_index]
         
-        # セグメンテーション推論表示がOFFの場合は何も表示しない
+        # セグメンテーション推論表示がOFFの場合は表示をクリア
         if not self.show_segmentation_inference:
-            if hasattr(self, 'segmentation_inference_info_label'):
-                self.segmentation_inference_info_label.setText("")
+            if hasattr(self, 'detection_inference_info_label'):
+                self.detection_inference_info_label.setText("")
             return
         
         # セグメンテーション推論結果がある場合は表示を更新
@@ -8237,65 +8295,40 @@ class ImageAnnotationTool(QMainWindow):
             
             result = self.segmentation_inference_results[current_img_path]
             segments = result.get('segments', [])
-            bboxes = result.get('bboxes', [])
             
-            # クラス別にカウント
-            segment_class_counts = {}
-            bbox_class_counts = {}
+            # クラス別にカウント（セグメントのみカウント、バウンディングボックスは重複なので除外）
+            all_objects = {}
             
+            # セグメントをカウント（セグメンテーションではこれがメインのオブジェクト）
             for segment in segments:
                 class_name = segment['class']
-                segment_class_counts[class_name] = segment_class_counts.get(class_name, 0) + 1
+                all_objects[class_name] = all_objects.get(class_name, 0) + 1
             
-            for bbox in bboxes:
-                class_name = bbox['class']
-                bbox_class_counts[class_name] = bbox_class_counts.get(class_name, 0) + 1
-            
-            # HTML形式で表示テキストを作成
+            # HTML形式で表示テキストを作成（物体検知と同じ形式）
             inference_text = "<b>セグメンテーション推論結果:</b><br>"
             
-            if segments:
-                inference_text += "<b>セグメント:</b><br>"
-                for class_name, count in segment_class_counts.items():
-                    # クラス名に基づいて色を決定
-                    from hashlib import md5
-                    color_hash = int(md5(class_name.encode()).hexdigest(), 16) % 0xFFFFFF
-                    r = (color_hash & 0xFF0000) >> 16
-                    g = (color_hash & 0x00FF00) >> 8
-                    b = color_hash & 0x0000FF
-                    color = f"#{r:02x}{g:02x}{b:02x}"
-                    
-                    inference_text += f"<span style='color: {color}; font-weight: bold;'>● {class_name}</span>: {count}個<br>"
+            # 物体検知推論結果と同じ色定数を使用
+            from config import DETECTION_INFERENCE_TEXT_COLORS
             
-            if bboxes:
-                inference_text += "<b>バウンディングボックス:</b><br>"
-                for class_name, count in bbox_class_counts.items():
-                    # クラス名に基づいて色を決定
-                    from hashlib import md5
-                    color_hash = int(md5(class_name.encode()).hexdigest(), 16) % 0xFFFFFF
-                    r = (color_hash & 0xFF0000) >> 16
-                    g = (color_hash & 0x00FF00) >> 8
-                    b = color_hash & 0x0000FF
-                    color = f"#{r:02x}{g:02x}{b:02x}"
-                    
-                    inference_text += f"<span style='color: {color}; font-weight: bold;'>□ {class_name}</span>: {count}個<br>"
+            # オブジェクトごとに表示
+            total_count = 0
+            for class_name, count in all_objects.items():
+                total_count += count
+                # クラス名に対応する色を取得（なければデフォルト色）
+                color = DETECTION_INFERENCE_TEXT_COLORS.get(class_name, "#808080")
+                inference_text += f"<span style='color: {color}; font-weight: bold;'>□ {class_name}</span>: {count}個<br>"
             
-            # 推論情報ラベルを更新または作成
-            if hasattr(self, 'segmentation_inference_info_label'):
-                self.segmentation_inference_info_label.setText(inference_text)
-            else:
-                self.segmentation_inference_info_label = QLabel(inference_text)
-                self.segmentation_inference_info_label.setTextFormat(Qt.RichText)
-                
-                # レイアウトに追加
-                if hasattr(self, 'detection_inference_info_label') and self.detection_inference_info_label.parent():
-                    parent_layout = self.detection_inference_info_label.parent().layout()
-                    if parent_layout:
-                        parent_layout.addWidget(self.segmentation_inference_info_label)
+            # 合計を表示
+            inference_text += f"合計: {total_count}個のオブジェクト<br>"
+            
+            # 物体検知推論結果と同じラベルに表示
+            if hasattr(self, 'detection_inference_info_label'):
+                self.detection_inference_info_label.setText(inference_text)
+                self.detection_inference_info_label.setTextFormat(Qt.RichText)
         else:
             # 推論結果がない場合は表示をクリア
-            if hasattr(self, 'segmentation_inference_info_label'):
-                self.segmentation_inference_info_label.setText("")
+            if hasattr(self, 'detection_inference_info_label'):
+                self.detection_inference_info_label.setText("")
 
     ###TODO:統合
     def on_classes_changed(self, text):
@@ -9620,13 +9653,13 @@ class ImageAnnotationTool(QMainWindow):
             if current_index in self.annotations:
                 self.calculate_and_store_diff_vector(current_index)
                 
-                # 差分ベクトル情報を表示に追加
-                if current_index in self.inference_diff_vectors:
-                    diff_data = self.inference_diff_vectors[current_index]
-                    inference_text += f"<br><br><b>推論-操作値の差分ベクトル:</b><br>"
-                    inference_text += f"angle差分 = <span style='color: #228B22;'>{diff_data['angle_diff']:+.4f}</span><br>"
-                    inference_text += f"throttle差分 = <span style='color: #228B22;'>{diff_data['throttle_diff']:+.4f}</span><br>"
-                    inference_text += f"ベクトル長 = <span style='color: #228B22;'>{diff_data['vector_magnitude']:.4f}</span>"
+                # # 差分ベクトル情報を表示に追加
+                # if current_index in self.inference_diff_vectors:
+                #     diff_data = self.inference_diff_vectors[current_index]
+                #     inference_text += f"<br><br><b>推論-操作値の差分ベクトル:</b><br>"
+                #     inference_text += f"angle差分 = <span style='color: #228B22;'>{diff_data['angle_diff']:+.4f}</span><br>"
+                #     inference_text += f"throttle差分 = <span style='color: #228B22;'>{diff_data['throttle_diff']:+.4f}</span><br>"
+                #     inference_text += f"ベクトル長 = <span style='color: #228B22;'>{diff_data['vector_magnitude']:.4f}</span>"
 
             # 位置情報を取得
             location = None
@@ -10440,9 +10473,21 @@ class ImageAnnotationTool(QMainWindow):
             # モデルを明示的に読み込み（self.modelに保存）
             from model_catalog import get_model, load_model_weights
             
+            # モデルファイル名から実際のモデルタイプを判定
+            model_filename = os.path.basename(model_path)
+            actual_model_type = model_type  # デフォルトは選択されたタイプ
+            
+            # ファイル名に基づいてモデルタイプを調整
+            if "_location_" in model_filename:
+                # 位置推論モデルの場合は適切なエラーメッセージを表示
+                raise ValueError(f"選択されたファイルは位置推論モデルです。自動運転モデルを選択してください。\nファイル: {model_filename}")
+            elif "yolo" in model_filename.lower():
+                # YOLOモデルの場合
+                raise ValueError(f"選択されたファイルはYOLOモデルです。自動運転モデルを選択してください。\nファイル: {model_filename}")
+            
             # モデルインスタンスを作成
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.model = get_model(model_type, pretrained=False)
+            self.model = get_model(actual_model_type, pretrained=False)
             
             # 重みを読み込み
             load_model_weights(self.model, model_path, device)
@@ -12357,20 +12402,73 @@ class ImageAnnotationTool(QMainWindow):
             set_start_button.setEnabled(data_radio_range.isChecked())
             set_end_button.setEnabled(data_radio_range.isChecked())
             
-            # サンプル数の計算と表示
+            # サンプル数の計算と表示（削除済みマークを考慮）
             if data_radio_all.isChecked():
-                sample_count = len(self.annotations)
-                data_sample_label.setText(f"使用データ数: {sample_count}枚 (全データ)")
+                # 削除済みでないアノテーションをカウント
+                valid_annotations = []
+                excluded_annotations = []
+                for idx in self.annotations.keys():
+                    if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
+                        excluded_annotations.append(idx)
+                        continue
+                    if (idx in self.annotations and "original_index" in self.annotations[idx] and
+                        hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
+                        excluded_annotations.append(idx)
+                        continue
+                    valid_annotations.append(idx)
+                
+                sample_count = len(valid_annotations)
+                total_annotations = len(self.annotations)
+                excluded_count = len(excluded_annotations)
+                data_sample_label.setText(f"<b>使用データ数: {sample_count}枚</b> (全{total_annotations}枚 - 削除済み{excluded_count}枚)")
+                data_sample_label.setStyleSheet("color: #2E7D32; font-weight: bold; font-size: 13px;")
             elif data_radio_skip.isChecked():
                 skip = custom_skip_spin.value()
-                sample_count = len(self.annotations) // skip + (1 if len(self.annotations) % skip > 0 else 0)
-                data_sample_label.setText(f"使用データ数: {sample_count}枚 ({skip}枚ごとに1枚)")
+                # 削除済みでないアノテーションでスキップ計算
+                valid_annotations = []
+                excluded_annotations = []
+                total_skipped_annotations = []
+                
+                for idx in self.annotations.keys():
+                    if idx % skip == 0:  # スキップ対象のインデックス
+                        total_skipped_annotations.append(idx)
+                        if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
+                            excluded_annotations.append(idx)
+                            continue
+                        if (idx in self.annotations and "original_index" in self.annotations[idx] and
+                            hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
+                            excluded_annotations.append(idx)
+                            continue
+                        valid_annotations.append(idx)
+                
+                sample_count = len(valid_annotations)
+                total_skipped = len(total_skipped_annotations)
+                excluded_count = len(excluded_annotations)
+                data_sample_label.setText(f"<b>使用データ数: {sample_count}枚</b> ({skip}枚ごと、対象{total_skipped}枚 - 削除済み{excluded_count}枚)")
+                data_sample_label.setStyleSheet("color: #2E7D32; font-weight: bold; font-size: 13px;")
             elif data_radio_range.isChecked():
                 start = range_start_spin.value()
                 end = range_end_spin.value()
-                # インデックス範囲内のアノテーションをカウント
-                sample_count = sum(1 for idx in self.annotations if start <= idx <= end)
-                data_sample_label.setText(f"使用データ数: {sample_count}枚 (インデックス {start} から {end})")
+                # インデックス範囲内の削除済みでないアノテーションをカウント
+                valid_annotations = []
+                excluded_annotations = []
+                
+                for idx in self.annotations:
+                    if start <= idx <= end:
+                        if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
+                            excluded_annotations.append(idx)
+                            continue
+                        if (idx in self.annotations and "original_index" in self.annotations[idx] and
+                            hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
+                            excluded_annotations.append(idx)
+                            continue
+                        valid_annotations.append(idx)
+                
+                sample_count = len(valid_annotations)
+                total_in_range = sum(1 for idx in self.annotations if start <= idx <= end)
+                excluded_count = len(excluded_annotations)
+                data_sample_label.setText(f"<b>使用データ数: {sample_count}枚</b> (範囲{start}-{end}、対象{total_in_range}枚 - 削除済み{excluded_count}枚)")
+                data_sample_label.setStyleSheet("color: #2E7D32; font-weight: bold; font-size: 13px;")
 
         # ラジオボタンの状態変更イベントを接続
         data_radio_all.toggled.connect(update_data_selection_ui)
@@ -12724,8 +12822,13 @@ class ImageAnnotationTool(QMainWindow):
             # 学習データの準備（データ選択設定を適用）
             image_paths = []
             for idx in self.annotations.keys():
-                # 削除済みインデックスをスキップ
+                # 削除済みインデックスをスキップ（削除ボタン・範囲削除ボタンでマークされたもの）
                 if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
+                    continue
+                
+                # original_indexがある場合もチェック
+                if (idx in self.annotations and "original_index" in self.annotations[idx] and
+                    hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
                     continue
 
                 if isinstance(idx, int) and 0 <= idx < len(self.images):
@@ -12752,7 +12855,6 @@ class ImageAnnotationTool(QMainWindow):
                 # パスからインデックスを逆引き
                 idx = self.images.index(img_path)
                 if idx in self.annotations:
-            
                     annotation_values.append(self.annotations[idx])
 
             # データ数の確認と最小バッチサイズの調整
@@ -14097,12 +14199,25 @@ class ImageAnnotationTool(QMainWindow):
         # 選択されたモデル
         model_type = self.location_model_combo.currentText()
         
-        # アノテーション統計情報を収集
+        # アノテーション統計情報を収集（削除済みマークを考慮）
         total_images = len(self.images)
-        annotated_images = len(self.location_annotations)
+        
+        # 削除済みでない位置アノテーションをカウント
+        valid_location_annotations = 0
+        for idx in self.location_annotations.keys():
+            # 削除マークされていないかチェック
+            if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
+                continue
+            if (idx in self.annotations and "original_index" in self.annotations[idx] and
+                hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
+                continue
+            valid_location_annotations += 1
+        
+        annotated_images = len(self.location_annotations)  # 全体数
+        deleted_count = len(getattr(self, 'deleted_indexes', []))
         
         # 学習設定ダイアログを表示
-        training_settings = self._create_location_training_dialog(actual_classes, unique_locations, num_classes, total_images, annotated_images)
+        training_settings = self._create_location_training_dialog(actual_classes, unique_locations, num_classes, total_images, annotated_images, valid_location_annotations, deleted_count)
         
         if not training_settings.exec_():
             return
@@ -14219,7 +14334,7 @@ class ImageAnnotationTool(QMainWindow):
                 f"位置モデル学習中にエラーが発生しました: {str(e)}"
             )
 
-    def _create_location_training_dialog(self, actual_classes, unique_locations, num_classes, total_images, annotated_images):
+    def _create_location_training_dialog(self, actual_classes, unique_locations, num_classes, total_images, annotated_images, valid_location_annotations, deleted_count):
         """位置モデル学習設定ダイアログを作成"""
         
         training_settings = QDialog(self)
@@ -14228,11 +14343,13 @@ class ImageAnnotationTool(QMainWindow):
         
         settings_layout = QVBoxLayout(training_settings)
         
-        # アノテーション統計情報を表示
+        # アノテーション統計情報を表示（削除済みマークを考慮）
         stats_label = QLabel(f"<b>学習データ統計:</b><br>"
                            f"総読み込み画像数: {total_images}枚<br>"
                            f"位置アノテーション済み画像数: {annotated_images}枚<br>"
-                           f"<span style='color: #FF6600;'>※ 位置アノテーションがされている画像のみが学習に使用されます</span>")
+                           f"<b style='color: #2E7D32; font-size: 14px;'>実際の学習使用枚数: {valid_location_annotations}枚</b><br>"
+                           f"({annotated_images}枚 - 削除済み{deleted_count}枚)<br>"
+                           f"<span style='color: #FF6600;'>※ 削除マークされた画像は学習対象から除外されます</span>")
         stats_label.setStyleSheet("padding: 10px; background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 5px;")
         settings_layout.addWidget(stats_label)
         
@@ -14326,10 +14443,24 @@ class ImageAnnotationTool(QMainWindow):
         for idx, location in self.location_annotations.items():
             # インデックスが有効範囲内かチェック
             if isinstance(idx, int) and 0 <= idx < len(self.images):
-                # インデックスから画像パスを取得
-                img_path = self.images[idx]
-                image_paths.append(img_path)
-                location_labels.append(location)
+                # 削除マークされたアノテーションは学習データから除外（削除ボタン・範囲削除ボタン）
+                is_deleted = False
+                
+                # deleted_indexesでマークされているかチェック
+                if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
+                    is_deleted = True
+                
+                # original_indexがある場合もチェック
+                if (not is_deleted and idx in self.annotations and "original_index" in self.annotations[idx] and
+                    hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
+                    is_deleted = True
+                
+                # 削除マークされていない場合のみ学習データに追加
+                if not is_deleted:
+                    # インデックスから画像パスを取得
+                    img_path = self.images[idx]
+                    image_paths.append(img_path)
+                    location_labels.append(location)
         
         # ラベルをインデックスに変換
         location_indices = [location_to_index[label] for label in location_labels]
@@ -14646,15 +14777,16 @@ class ImageAnnotationTool(QMainWindow):
                 confidence = result['confidence']
                 all_probs = result.get('all_probs', [])
                 
-                # 情報テキストを構築
-                inference_text = "<b>位置推論結果:</b><br>"
+                # 情報テキストを構築（インライン表示）
+                inference_text = "<b>位置推論結果:</b> "
                 
                 # 一番高いクラスは背景色付きで表示
                 loc_color = get_location_color(pred_class)
                 
                 # 予測クラスを背景色付きで表示
-                inference_text += f"<div style='background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 5px; border-radius: 5px; margin: 5px 0;'>"
-                inference_text += f"予測位置: {pred_class} (確信度: {confidence:.4f})</div>"
+                inference_text += f"<div style='background-color: {loc_color.name()};'>"
+                #inference_text += f"<div style='background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 5px; border-radius: 5px; margin: 5px 0;'>"
+                #inference_text += f"予測位置: {pred_class} (確信度: {confidence:.4f})</div>"
                 
                 # 上位3クラスの予測結果を表示（すでに確率でソートされている前提）
                 if all_probs:
@@ -14665,7 +14797,7 @@ class ImageAnnotationTool(QMainWindow):
                     top_k = min(3, len(sorted_indices))
                     top_indices = sorted_indices[:top_k]
                     
-                    inference_text += "<br>上位クラス:<br>"
+                    inference_text += "" #"<br>上位クラス:<br>"
                     
                     for i, idx in enumerate(top_indices):
                         # すでに表示したクラスは飛ばす
@@ -14673,30 +14805,18 @@ class ImageAnnotationTool(QMainWindow):
                             continue
                         
                         # 位置によって色を変える
-                        color = get_location_color(idx).name()
+                        if i == 0:
+                            color = "white"
+                        else:
+                            color = get_location_color(idx).name()
                         
                         # 各クラスの予測確率
-                        inference_text += f"{i+1}. 位置 {idx}: <span style='color: {color}; font-weight: bold;'>{all_probs[idx]:.4f}</span><br>"
+                        inference_text += f"<span style='color: {color}; font-weight: bold;'>{i+1}. 位置 {idx}: {all_probs[idx]:.4f}</span><br>"
                 
-                # テキストをラベルに設定
+                # テキストをラベルに設定（ラベルは初期化時に作成済み）
                 if hasattr(self, 'location_inference_info_label'):
                     self.location_inference_info_label.setText(inference_text)
                     self.location_inference_info_label.setTextFormat(Qt.RichText)
-                else:
-                    # ラベルがない場合は新規作成
-                    self.location_inference_info_label = QLabel(inference_text)
-                    self.location_inference_info_label.setWordWrap(True)
-                    self.location_inference_info_label.setStyleSheet("color: purple;")
-                    
-                    # レイアウトに追加（推論結果表示の下）
-                    if hasattr(self, 'detection_inference_info_label') and self.detection_inference_info_label.parent():
-                        parent_layout = self.detection_inference_info_label.parent().layout()
-                        if parent_layout:
-                            parent_layout.addWidget(self.location_inference_info_label)
-                    elif hasattr(self, 'inference_info_label') and self.inference_info_label.parent():
-                        parent_layout = self.inference_info_label.parent().layout()
-                        if parent_layout:
-                            parent_layout.addWidget(self.location_inference_info_label)
                 
                 return True
                     
@@ -14890,23 +15010,63 @@ class ImageAnnotationTool(QMainWindow):
 
     # アノテーション検証の改善
     def _validate_yolo_annotations(self, task_type):
-        """YOLOアノテーションの検証 - クラス名確認強化版"""
+        """YOLOアノテーションの検証 - クラス名確認強化版（削除マーク除外対応）"""
         
         if task_type == "detect":
             if not hasattr(self, 'bbox_annotations') or not self.bbox_annotations:
                 QMessageBox.warning(self, "警告", "物体検知アノテーションがありません。")
                 return None, None
             
-            annotations = self.bbox_annotations
+            # 削除マークされていないアノテーションのみ抽出
+            valid_annotations = {}
+            excluded_count = 0
+            
+            for idx, boxes in self.bbox_annotations.items():
+                # 削除マークされていないかチェック
+                if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
+                    excluded_count += 1
+                    continue
+                if (idx in self.annotations and "original_index" in self.annotations[idx] and
+                    hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
+                    excluded_count += 1
+                    continue
+                
+                # 有効なアノテーションのみ追加
+                if boxes:
+                    valid_annotations[idx] = boxes
+            
+            if not valid_annotations:
+                QMessageBox.warning(self, "警告", f"有効な物体検知アノテーションがありません。\n（削除マーク済み: {excluded_count}件）")
+                return None, None
+            
+            annotations = valid_annotations
             total_boxes = sum(len(boxes) for boxes in annotations.values())
-            return annotations, {"total_count": total_boxes, "image_count": len(annotations)}
+            return annotations, {"total_count": total_boxes, "image_count": len(annotations), "excluded_count": excluded_count}
         
         if task_type == "segment":
             if not self.segmentation_annotations:
                 QMessageBox.warning(self, "警告", "セグメンテーションアノテーションがありません。")
                 return None, None
             
-            annotations = self.segmentation_annotations
+            # 削除マークされていないアノテーションのみ抽出
+            valid_annotations = {}
+            excluded_count = 0
+            
+            for idx, segments in self.segmentation_annotations.items():
+                # 削除マークされていないかチェック
+                if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
+                    excluded_count += 1
+                    continue
+                if (idx in self.annotations and "original_index" in self.annotations[idx] and
+                    hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
+                    excluded_count += 1
+                    continue
+                
+                # 有効なアノテーションのみ追加
+                if segments:
+                    valid_annotations[idx] = segments
+            
+            annotations = valid_annotations
             
             # セグメンテーションデータの詳細検証
             total_segments = 0
@@ -14974,7 +15134,7 @@ class ImageAnnotationTool(QMainWindow):
                 )
                 return None, None
             
-            return annotations, {"total_count": valid_segments, "image_count": valid_images}
+            return annotations, {"total_count": valid_segments, "image_count": valid_images, "excluded_count": excluded_count}
         
         # ... 検出タスクの処理は既存と同じ ...
         
