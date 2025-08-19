@@ -2313,11 +2313,6 @@ class ImageAnnotationTool(QMainWindow):
         model_type_layout.addWidget(self.yolo_model_combo)
         obj_detection_layout.addLayout(model_type_layout)
 
-        # 統合されたモデル選択コンボボックス
-        model_selection_label = QLabel("学習済みモデル (物体検知・セグメンテーション):")
-        model_selection_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
-        obj_detection_layout.addWidget(model_selection_label)
-
         self.yolo_unified_model_combo = QComboBox()
         self.yolo_unified_model_combo.setMinimumWidth(180)
         self.yolo_unified_model_combo.setStyleSheet("combobox-popup: 0;")
@@ -2442,23 +2437,31 @@ class ImageAnnotationTool(QMainWindow):
         
         self.annotation_info_label = QLabel("")
         self.annotation_info_label.setWordWrap(True)  # テキスト折り返し
+        self.annotation_info_label.setMinimumHeight(45)  # アノテーション情報の最小高さを固定
+        self.annotation_info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         info_layout.addWidget(self.annotation_info_label)
         
         self.inference_info_label = QLabel("")
         self.inference_info_label.setWordWrap(True)
         self.inference_info_label.setStyleSheet("color: blue;")
+        self.inference_info_label.setMinimumHeight(45)  # 推論結果に十分な高さを設定
+        self.inference_info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         info_layout.addWidget(self.inference_info_label)
         
         # 位置推論結果表示ラベル（推論結果の直下）
         self.location_inference_info_label = QLabel("")
         self.location_inference_info_label.setWordWrap(True)
         self.location_inference_info_label.setStyleSheet("color: purple;")  # 紫色で表示して区別
+        self.location_inference_info_label.setMinimumHeight(25)  # 固定の最小高さを設定
+        self.location_inference_info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         info_layout.addWidget(self.location_inference_info_label)
 
         # 物体検知推論結果表示ラベル（位置推論結果の下）
         self.detection_inference_info_label = QLabel("")
         self.detection_inference_info_label.setWordWrap(True)
         self.detection_inference_info_label.setStyleSheet("color: green;")  # 緑色で表示して区別
+        self.detection_inference_info_label.setMinimumHeight(40)  # YOLO推論結果は複数行になる可能性があるため高めに設定
+        self.detection_inference_info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         info_layout.addWidget(self.detection_inference_info_label)
         
         # 上部のウィジェットと分布グラフの間にスペーサーを入れる
@@ -2475,7 +2478,7 @@ class ImageAnnotationTool(QMainWindow):
         # 分布グラフ用ラベル - 固定サイズで配置
         self.distribution_label = QLabel()
         self.distribution_label.setAlignment(Qt.AlignCenter)
-        self.distribution_label.setFixedHeight(400)  # 高さを固定
+        self.distribution_label.setFixedHeight(360)  # 高さを20%拡大（300→360）
         self.distribution_label.setStyleSheet("background-color: #f8f8f8; border: 1px solid #dddddd; border-radius: 4px;")
 
         # 初期表示テキストの設定
@@ -2818,28 +2821,20 @@ class ImageAnnotationTool(QMainWindow):
             if hasattr(self, 'update_driving_annotation_stats'):
                 self.update_driving_annotation_stats()
             
-            # 推論情報パネルを更新（推論表示がONの場合のみ）
-            if (hasattr(self, 'inference_checkbox') and 
-                hasattr(self, 'update_inference_display') and 
-                self.inference_checkbox.isChecked()):
+            # 推論情報パネルを更新（各関数内部でチェックボックス状態を確認）
+            if hasattr(self, 'update_inference_display'):
                 self.update_inference_display()
             
-            # 物体検知推論情報パネルを更新（表示がONの場合のみ）
-            if (hasattr(self, 'detection_inference_checkbox') and 
-                hasattr(self, 'update_detection_info_panel') and 
-                self.detection_inference_checkbox.isChecked()):
+            # 物体検知推論情報パネルを更新
+            if hasattr(self, 'update_detection_info_panel'):
                 self.update_detection_info_panel()
             
-            # 自動運転推論情報パネルを更新（推論表示がONの場合のみ）
-            if (hasattr(self, 'inference_checkbox') and 
-                hasattr(self, 'update_driving_info_panel') and 
-                self.inference_checkbox.isChecked()):
+            # 自動運転推論情報パネルを更新
+            if hasattr(self, 'update_driving_info_panel'):
                 self.update_driving_info_panel()
 
-            # 位置情報パネルを更新（表示がONの場合のみ）
-            if (hasattr(self, 'location_inference_checkbox') and 
-                hasattr(self, 'update_location_info_panel') and 
-                self.location_inference_checkbox.isChecked()):
+            # 位置情報パネルを更新
+            if hasattr(self, 'update_location_info_panel'):
                 self.update_location_info_panel()
 
             # 統計情報を更新
@@ -2943,7 +2938,7 @@ class ImageAnnotationTool(QMainWindow):
             # 情報パネルの幅に合わせてグラフサイズを調整
             panel_width = self.info_panel_width - self.info_panel_margin
             # 縦に2つのグラフを配置（縦長）
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(panel_width/100, 4))
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(panel_width/100, 3.6))
             
             # カラーマップとヒストグラムの設定
             cm = plt.get_cmap('viridis')
@@ -3040,14 +3035,16 @@ class ImageAnnotationTool(QMainWindow):
         stats_text = f"アノテーション済み: {self.annotated_count} / {total_images}"
         
         # バウンディングボックスの統計情報を追加
-        if hasattr(self, 'bbox_annotations') and self.bbox_annotations:
-            bbox_count = len(self.bbox_annotations)
-            stats_text += f" | Bounding Boxes: {bbox_count}"
+        if hasattr(self, 'bbox_annotations'):
+            bbox_count = len(self.bbox_annotations) if self.bbox_annotations else 0
+            if bbox_count > 0:
+                stats_text += f" | bbox_images: {bbox_count}"
         
         # セグメンテーションの統計情報を追加
-        if hasattr(self, 'segmentation_annotations') and self.segmentation_annotations:
-            seg_count = len(self.segmentation_annotations)
-            stats_text += f" | Segmentations: {seg_count}"
+        if hasattr(self, 'segmentation_annotations'):
+            seg_count = len(self.segmentation_annotations) if self.segmentation_annotations else 0
+            if seg_count > 0:
+                stats_text += f" | seg_images: {seg_count}"
         
         # ラベルを更新
         self.stats_label.setText(stats_text)
@@ -3139,6 +3136,11 @@ class ImageAnnotationTool(QMainWindow):
                                 
                 # 削除実行
                 del bboxes[selected_index]
+                
+                # もしこの画像のバウンディングボックスが全てなくなった場合、辞書のキーを削除
+                if not bboxes:  # リストが空になった場合
+                    del self.bbox_annotations[current_index]
+                
                 # 選択をクリア
                 self.main_image_view.selected_bbox_index = None
 
@@ -3184,6 +3186,11 @@ class ImageAnnotationTool(QMainWindow):
                 
                 # 削除実行
                 del segmentations[index]
+                
+                # もしこの画像のセグメンテーションが全てなくなった場合、辞書のキーを削除
+                if not segmentations:  # リストが空になった場合
+                    del self.segmentation_annotations[current_index]
+                
                 # 選択をクリア
                 self.main_image_view.selected_segmentation_index = None
 
@@ -3462,6 +3469,13 @@ class ImageAnnotationTool(QMainWindow):
 
         self.show_detection_inference = show_inference
 
+        # ONにした時、現在の画像に推論結果がなければ推論を実行
+        if show_inference and self.images and hasattr(self, 'yolo_model') and self.yolo_model is not None:
+            current_img_path = self.images[self.current_index]
+            if current_img_path not in self.detection_inference_results:
+                # 現在の画像に対して推論を実行
+                self.run_single_yolo_inference()
+
         # 画面更新
         self.update_detection_info_panel()        
         self.update_ui()
@@ -3480,9 +3494,20 @@ class ImageAnnotationTool(QMainWindow):
         print(f"位置推論表示切替: {show_inference} (state={state}, Qt.Checked={Qt.Checked})")
 
         self.show_location_inference = show_inference
-
+        
         # 画面更新
-        self.update_ui()
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+        
+        # 表示情報の更新
+        if show_inference:
+            self.update_location_info_panel()
+            self.statusBar().showMessage("位置推論結果表示をオンにしました", 3000)
+        else:
+            # 表示をクリア
+            if hasattr(self, 'location_inference_info_label'):
+                self.location_inference_info_label.setText(" ")  # スペースで高さを維持
+            self.statusBar().showMessage("位置推論結果表示をオフにしました", 3000)
         
 
     # location関連
@@ -3830,6 +3855,9 @@ class ImageAnnotationTool(QMainWindow):
             self.display_current_image()
             self.update_gallery()   
             self.update_slider_deleted_indexes()
+            
+            # 画像ソース（キー）切り替え時の推論実行
+            self.run_inference_after_image_source_change()
         
         # キーボタン群を更新
         self.update_variant_buttons()
@@ -4058,7 +4086,7 @@ class ImageAnnotationTool(QMainWindow):
         else:
             # 表示がオフの場合は情報パネルをクリア
             if hasattr(self, 'inference_info_label'):
-                self.inference_info_label.setText("")
+                self.inference_info_label.setText(" ")  # スペースで高さを維持
             
             self.main_image_view.inference_point = None
             
@@ -4070,6 +4098,17 @@ class ImageAnnotationTool(QMainWindow):
             return False
                 
         current_img_path = self.images[self.current_index]
+        
+        # 位置推論表示がOFFの場合は表示をクリア
+        if not hasattr(self, 'show_location_inference') or not self.show_location_inference:
+            if hasattr(self, 'location_inference_info_label'):
+                self.location_inference_info_label.setText(" ")  # スペースで高さを維持
+            
+            # 位置推論ポイントをクリア
+            if hasattr(self, 'main_image_view'):
+                self.main_image_view.location_inference_result = None
+            
+            return False
         
         if hasattr(self, 'location_inference_checkbox') and self.location_inference_checkbox.isChecked():
             if current_img_path in self.location_inference_results:
@@ -4087,7 +4126,7 @@ class ImageAnnotationTool(QMainWindow):
                     inference_text += f"<span style='background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 2px 5px; border-radius: 3px;'>"
                     inference_text += f"位置 {location}</span>"
                 else:
-                    inference_text = ""
+                    inference_text = " "  # 空文字ではなくスペースを設定して高さを維持
 
                 # リッチテキストとして設定
                 if hasattr(self, 'location_inference_info_label'):
@@ -4112,9 +4151,9 @@ class ImageAnnotationTool(QMainWindow):
                 
                 return False
         else:
-            # 表示がオフの場合は情報パネルをクリア
+            # 表示がオフの場合は情報パネルをクリア（スペースで高さを維持）
             if hasattr(self, 'location_inference_info_label'):
-                self.location_inference_info_label.setText("")
+                self.location_inference_info_label.setText(" ")
             
             # 位置推論ポイントをクリア
             if hasattr(self, 'main_image_view'):
@@ -5614,7 +5653,7 @@ class ImageAnnotationTool(QMainWindow):
         else:
             # 表示をクリア（物体検知推論結果ラベルをクリア）
             if hasattr(self, 'detection_inference_info_label'):
-                self.detection_inference_info_label.setText("")
+                self.detection_inference_info_label.setText(" ")  # スペースで高さを維持
             self.statusBar().showMessage("セグメンテーション推論結果表示をオフにしました", 3000)
 
     def refresh_yolo_unified_model_list(self):
@@ -8274,7 +8313,7 @@ class ImageAnnotationTool(QMainWindow):
         else:
             # 推論結果がない場合は表示をクリア
             if hasattr(self, 'detection_inference_info_label'):
-                self.detection_inference_info_label.setText("")
+                self.detection_inference_info_label.setText(" ")  # スペースで高さを維持
 
     def update_segmentation_inference_display(self):
         """セグメンテーション推論結果の表示を更新（物体検知推論結果ラベルと同じ場所に表示）"""
@@ -8286,7 +8325,7 @@ class ImageAnnotationTool(QMainWindow):
         # セグメンテーション推論表示がOFFの場合は表示をクリア
         if not self.show_segmentation_inference:
             if hasattr(self, 'detection_inference_info_label'):
-                self.detection_inference_info_label.setText("")
+                self.detection_inference_info_label.setText(" ")  # スペースで高さを維持
             return
         
         # セグメンテーション推論結果がある場合は表示を更新
@@ -8328,7 +8367,7 @@ class ImageAnnotationTool(QMainWindow):
         else:
             # 推論結果がない場合は表示をクリア
             if hasattr(self, 'detection_inference_info_label'):
-                self.detection_inference_info_label.setText("")
+                self.detection_inference_info_label.setText(" ")  # スペースで高さを維持
 
     ###TODO:統合
     def on_classes_changed(self, text):
@@ -9174,12 +9213,23 @@ class ImageAnnotationTool(QMainWindow):
             self.update_ui()
 
     def toggle_inference_display(self, state):
+        """自動運転推論表示の切り替え"""
         show_inference = (state == Qt.Checked)
         self.main_image_view.show_inference = show_inference
         
-        # 表示を更新
-        self.update_inference_display()
+        # 画面更新
+        #if hasattr(self, 'main_image_view'):
         self.main_image_view.update()
+        
+        # 表示情報の更新
+        if show_inference:
+            self.update_inference_display()
+            self.statusBar().showMessage("自動運転推論結果表示をオンにしました", 3000)
+        else:
+            # 表示をクリア
+            if hasattr(self, 'inference_info_label'):
+                self.inference_info_label.setText(" ")  # スペースで高さを維持
+            self.statusBar().showMessage("自動運転推論結果表示をオフにしました", 3000)
         
         # 再生中なら一度停止して再開（速度調整のため）
         if hasattr(self, 'auto_play_timer') and self.auto_play_timer.isActive():
@@ -9628,6 +9678,17 @@ class ImageAnnotationTool(QMainWindow):
             return
                 
         current_index = self.current_index
+        
+        # 自動運転推論表示がOFFの場合は表示をクリア
+        if not hasattr(self, 'inference_checkbox') or not self.inference_checkbox.isChecked():
+            if hasattr(self, 'inference_info_label'):
+                self.inference_info_label.setText(" ")  # スペースで高さを維持
+            
+            # 推論ポイントをクリア
+            if hasattr(self, 'main_image_view'):
+                self.main_image_view.inference_point = None
+            
+            return
                 
         # 推論結果がある場合、表示を更新（インデックスベースで探す）
         inference = None
@@ -9653,14 +9714,6 @@ class ImageAnnotationTool(QMainWindow):
             if current_index in self.annotations:
                 self.calculate_and_store_diff_vector(current_index)
                 
-                # # 差分ベクトル情報を表示に追加
-                # if current_index in self.inference_diff_vectors:
-                #     diff_data = self.inference_diff_vectors[current_index]
-                #     inference_text += f"<br><br><b>推論-操作値の差分ベクトル:</b><br>"
-                #     inference_text += f"angle差分 = <span style='color: #228B22;'>{diff_data['angle_diff']:+.4f}</span><br>"
-                #     inference_text += f"throttle差分 = <span style='color: #228B22;'>{diff_data['throttle_diff']:+.4f}</span><br>"
-                #     inference_text += f"ベクトル長 = <span style='color: #228B22;'>{diff_data['vector_magnitude']:.4f}</span>"
-
             # 位置情報を取得
             location = None
             if "pilot/loc" in inference:
@@ -9683,8 +9736,8 @@ class ImageAnnotationTool(QMainWindow):
             # ImageLabelに推論ポイントを設定
             self.main_image_view.inference_point = QPoint(inference['x'], inference['y'])
         else:
-            # 推論結果がない場合はクリア
-            self.inference_info_label.setText("")
+            # 推論結果がない場合はクリア（スペースで高さを維持）
+            self.inference_info_label.setText(" ")
             self.main_image_view.inference_point = None
         
         # 推論表示のチェック状態を反映
@@ -10049,6 +10102,9 @@ class ImageAnnotationTool(QMainWindow):
         # 推論結果表示チェックボックスの状態を正しく設定
         self.update_inference_checkboxes_status()
         
+        # 画像ソース切り替え時の推論実行
+        self.run_inference_after_image_source_change()
+        
         # プログレスダイアログを閉じる
         progress.setValue(100)
         progress.close()
@@ -10079,6 +10135,59 @@ class ImageAnnotationTool(QMainWindow):
         
         # セッション情報を保存
         self.save_session_info()
+
+    def run_inference_after_image_source_change(self):
+        """画像ソース切り替え後の推論実行"""
+        if not self.images:
+            return
+            
+        # 自動運転推論の実行
+        if (hasattr(self, 'inference_checkbox') and 
+            self.inference_checkbox.isChecked() and 
+            hasattr(self, 'model') and self.model is not None):
+            
+            print("画像ソース切り替え検出: 自動運転推論を実行します")
+            self.statusBar().showMessage("画像ソース切り替えのため推論を実行中...", 3000)
+            try:
+                # 現在の画像のみ推論を実行
+                self.run_inference_check(all_images=False)
+            except Exception as e:
+                print(f"自動運転推論エラー: {e}")
+        
+        # 位置推論の実行
+        if (hasattr(self, 'location_inference_checkbox') and 
+            self.location_inference_checkbox.isChecked() and 
+            hasattr(self, 'location_model_manager') and 
+            self.location_model_manager.is_model_loaded()):
+            
+            print("画像ソース切り替え検出: 位置推論を実行します")
+            try:
+                # 現在の画像のみ位置推論を実行
+                self.run_location_inference_check(all_images=False)
+            except Exception as e:
+                print(f"位置推論エラー: {e}")
+        
+        # YOLO物体検知推論の実行
+        if (hasattr(self, 'detection_inference_checkbox') and 
+            self.detection_inference_checkbox.isChecked() and 
+            hasattr(self, 'yolo_model') and self.yolo_model is not None):
+            
+            print("画像ソース切り替え検出: YOLO物体検知推論を実行します")
+            try:
+                self.run_single_yolo_inference()
+            except Exception as e:
+                print(f"YOLO物体検知推論エラー: {e}")
+        
+        # YOLOセグメンテーション推論の実行
+        if (hasattr(self, 'segmentation_inference_checkbox') and 
+            self.segmentation_inference_checkbox.isChecked() and 
+            hasattr(self, 'yolo_seg_model') and self.yolo_seg_model is not None):
+            
+            print("画像ソース切り替え検出: YOLOセグメンテーション推論を実行します")
+            try:
+                self.run_single_yolo_segmentation_inference()
+            except Exception as e:
+                print(f"YOLOセグメンテーション推論エラー: {e}")
 
     def load_annotations(self):
         """
@@ -10506,8 +10615,20 @@ class ImageAnnotationTool(QMainWindow):
             progress.setValue(80)
             QApplication.processEvents()
             
-            # 推論結果を保存
-            self.inference_results.update(inference_results)
+            # 推論結果を保存（インデックスベースに変換）
+            old_count = len(self.inference_results)
+            
+            # 画像パスからインデックスに変換して保存
+            for img_path, result in inference_results.items():
+                # 画像パスから対応するインデックスを取得
+                try:
+                    img_index = self.images.index(img_path)
+                    self.inference_results[img_index] = result
+                    print(f"推論結果保存: インデックス{img_index} <- {os.path.basename(img_path)}")
+                except ValueError:
+                    print(f"警告: 画像パス {img_path} がself.imagesに見つかりません")
+                    # パスでも保存（後方互換性のため）
+                    self.inference_results[img_path] = result
             
             # モデル変更を検出するための状態を保持
             self._last_model_info = (model_type, model_path)
@@ -13906,7 +14027,7 @@ class ImageAnnotationTool(QMainWindow):
         else:
             # 表示がオフの場合はラベルをクリア
             if hasattr(self, 'detection_inference_info_label'):
-                self.detection_inference_info_label.setText("")
+                self.detection_inference_info_label.setText(" ")  # スペースで高さを維持
         
         return False
 
@@ -14826,9 +14947,9 @@ class ImageAnnotationTool(QMainWindow):
                 # 再帰的に呼び出して表示を更新
                 return self.update_location_inference_display()
         else:
-            # 表示がオフの場合はラベルをクリア
+            # 表示がオフの場合はラベルをクリア（スペースで高さを維持）
             if hasattr(self, 'location_inference_info_label'):
-                self.location_inference_info_label.setText("")
+                self.location_inference_info_label.setText(" ")
         
         return False
     
