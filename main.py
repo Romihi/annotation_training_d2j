@@ -691,6 +691,7 @@ class ImageLabel(QLabel):
 
                     self.draw_vector_arrow(painter, anno_scaled_x, anno_scaled_y, scaled_x, scaled_y)
 
+
     def draw_vector_arrow(self, painter, start_x, start_y, end_x, end_y):
         """教師データから推論結果への矢印を描画する"""
         # 矢印の色とスタイル設定
@@ -3509,12 +3510,12 @@ class ImageAnnotationTool(QMainWindow):
 
         self.show_location_inference = show_inference
         
-        # 画面更新
-        if hasattr(self, 'main_image_view'):
-            self.main_image_view.update()
-        
         # 表示情報の更新
         if show_inference:
+            # チェックボックスをONにした時は現在の画像に対して推論を実行
+            if hasattr(self, 'location_model_manager') and self.location_model_manager.model is not None:
+                self.run_location_inference()
+                self.update_location_inference_display()
             self.update_location_info_panel()
             self.statusBar().showMessage("位置推論結果表示をオンにしました", 3000)
         else:
@@ -3522,6 +3523,10 @@ class ImageAnnotationTool(QMainWindow):
             if hasattr(self, 'location_inference_info_label'):
                 self.location_inference_info_label.setText(" ")  # スペースで高さを維持
             self.statusBar().showMessage("位置推論結果表示をオフにしました", 3000)
+        
+        # 画面更新
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
         
 
     # location関連
@@ -4114,7 +4119,11 @@ class ImageAnnotationTool(QMainWindow):
         current_img_path = self.images[self.current_index]
         
         # 位置推論表示がOFFの場合は表示をクリア
-        if not hasattr(self, 'show_location_inference') or not self.show_location_inference:
+        show_location_inference = getattr(self, 'show_location_inference', False)
+        checkbox_checked = hasattr(self, 'location_inference_checkbox') and self.location_inference_checkbox.isChecked()
+        
+        
+        if not show_location_inference:
             if hasattr(self, 'location_inference_info_label'):
                 self.location_inference_info_label.setText(" ")  # スペースで高さを維持
             
@@ -4125,29 +4134,11 @@ class ImageAnnotationTool(QMainWindow):
             return False
         
         if hasattr(self, 'location_inference_checkbox') and self.location_inference_checkbox.isChecked():
-            if current_img_path in self.location_inference_results:
+            current_index = self.current_index
+            if current_index in self.location_inference_results:
                 # 推論結果を取得
-                inference = self.location_inference_results[current_img_path]
+                inference = self.location_inference_results[current_index]
                 
-                # 位置推論情報のリッチテキスト
-                # 位置情報を取得
-                location = inference.get("loc", None)
-                
-                # 位置情報があれば色付きバッジとして表示（インラインで表示）
-                if location is not None:
-                    loc_color = get_location_color(location)
-                    inference_text = f"<b>位置推論結果:</b> "
-                    inference_text += f"<span style='background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 2px 5px; border-radius: 3px;'>"
-                    inference_text += f"位置 {location}</span>"
-                else:
-                    inference_text = " "  # 空文字ではなくスペースを設定して高さを維持
-
-                # リッチテキストとして設定
-                if hasattr(self, 'location_inference_info_label'):
-                    self.location_inference_info_label.setText(inference_text)
-                    self.location_inference_info_label.setTextFormat(Qt.RichText)
-                    self.location_inference_info_label.repaint()
-                    QApplication.processEvents()  # UIを即時更新
 
                 # ImageLabelに位置推論ポイントを設定（後で実装するdraw_location_inference関数用）
                 self.main_image_view.location_inference_result = inference
@@ -4167,7 +4158,9 @@ class ImageAnnotationTool(QMainWindow):
         else:
             # 表示がオフの場合は情報パネルをクリア（スペースで高さを維持）
             if hasattr(self, 'location_inference_info_label'):
-                self.location_inference_info_label.setText(" ")
+                # モデル読み込み直後はクリアしないようにする
+                if not hasattr(self, 'show_location_inference') or not self.show_location_inference:
+                    self.location_inference_info_label.setText(" ")
             
             # 位置推論ポイントをクリア
             if hasattr(self, 'main_image_view'):
@@ -4630,14 +4623,7 @@ class ImageAnnotationTool(QMainWindow):
     def _validate_yolo_annotations(self, task_type):
         """YOLOアノテーションの検証"""
         
-        print(f"DEBUG: Validating YOLO annotations for task: {task_type}")
-        
         if task_type == "detect":
-            print(f"DEBUG: Checking bbox_annotations exist: {hasattr(self, 'bbox_annotations')}")
-            if hasattr(self, 'bbox_annotations'):
-                print(f"DEBUG: bbox_annotations content: {bool(self.bbox_annotations)}")
-                if self.bbox_annotations:
-                    print(f"DEBUG: Number of bbox annotations: {len(self.bbox_annotations)}")
             if not self.bbox_annotations:
                 QMessageBox.warning(self, "警告", "物体検知アノテーションがありません。")
                 return None, None
@@ -9636,9 +9622,15 @@ class ImageAnnotationTool(QMainWindow):
                 QMessageBox.warning(self, "警告", "サポートされていない推論方法です。")
                 return
             
-            # 推論結果を保存
+            # 推論結果を保存（インデックスベースに変換）
             old_count = len(self.location_inference_results)
             for img_path, result in inference_results.items():
+                # 画像パスからインデックスを取得
+                try:
+                    img_index = self.images.index(img_path)
+                except ValueError:
+                    continue  # 画像がリストにない場合はスキップ
+                    
                 # 結果から位置情報を抽出
                 if "pilot/loc" in result:
                     location = result["pilot/loc"]
@@ -9648,8 +9640,8 @@ class ImageAnnotationTool(QMainWindow):
                     # 位置情報がない場合、何らかのロジックで判断（例：角度から推定）
                     location = estimate_location_from_angle(result.get("angle", 0))
                 
-                # 位置情報付きの結果を保存
-                self.location_inference_results[img_path] = {
+                # 位置情報付きの結果を保存（インデックスベース）
+                self.location_inference_results[img_index] = {
                     "loc": location,
                     "x": result.get("x", 0),
                     "y": result.get("y", 0)
@@ -14222,8 +14214,21 @@ class ImageAnnotationTool(QMainWindow):
             self.location_inference_checkbox.setToolTip("位置モデルが読み込まれています")
             self.location_inference_checkbox.setChecked(True)
             
+            # show_location_inferenceフラグを設定
+            self.show_location_inference = True
+            
+            # 情報パネルを先に更新（基本的な情報表示）
+            self.update_location_info_panel()
+            
+            # 位置推論表示を更新（推論結果の詳細表示）- これを最後にして上書きを防ぐ
+            self.update_location_inference_display()
+            
             # 各モデルの状態を更新
             self.update_inference_checkboxes_status()
+            
+            # 画面描画を更新
+            if hasattr(self, 'main_image_view'):
+                self.main_image_view.update()
             
             update_progress(100)
             progress.close()
@@ -14254,16 +14259,16 @@ class ImageAnnotationTool(QMainWindow):
             return
         
         current_img_path = self.images[self.current_index]
+        current_index = self.current_index
         
         # マネージャーを使用して推論を実行
         result = self.location_model_manager.run_inference(current_img_path)
         
         if result:
-            # 推論結果を保存
-            self.location_inference_results[current_img_path] = result
+            # 推論結果を保存（インデックスベース）
+            self.location_inference_results[current_index] = result
             
-            # 表示を更新
-            self.update_location_inference_display()
+            # 表示更新は呼び出し元で行うため、ここでは呼ばない
             
             return True
         
@@ -14858,12 +14863,12 @@ class ImageAnnotationTool(QMainWindow):
         if not self.images:
             return
         
-        current_img_path = self.images[self.current_index]
+        current_index = self.current_index
     
         if hasattr(self, 'location_inference_checkbox') and self.location_inference_checkbox.isChecked():
-            if current_img_path in self.location_inference_results:
+            if current_index in self.location_inference_results:
                 # 推論結果を取得
-                result = self.location_inference_results[current_img_path]
+                result = self.location_inference_results[current_index]
                 pred_class = result['pred_class']
                 confidence = result['confidence']
                 all_probs = result.get('all_probs', [])
@@ -14904,10 +14909,34 @@ class ImageAnnotationTool(QMainWindow):
                         # 各クラスの予測確率
                         inference_text += f"<span style='color: {color}; font-weight: bold;'>{i+1}. 位置 {idx}: {all_probs[idx]:.4f}</span><br>"
                 
+                # HTMLタグを閉じる
+                inference_text += "</div>"
+                
                 # テキストをラベルに設定（ラベルは初期化時に作成済み）
                 if hasattr(self, 'location_inference_info_label'):
+                    # ラベルを確実に表示
+                    self.location_inference_info_label.show()
+                    self.location_inference_info_label.setVisible(True)
+                    
                     self.location_inference_info_label.setText(inference_text)
                     self.location_inference_info_label.setTextFormat(Qt.RichText)
+                    
+                    # 即座に更新を強制
+                    self.location_inference_info_label.repaint()
+                    self.location_inference_info_label.update()
+                    
+                    # 親ウィジェットと情報パネル全体も更新
+                    if self.location_inference_info_label.parent():
+                        self.location_inference_info_label.parent().update()
+                    
+                    # 情報パネル全体を更新
+                    if hasattr(self, 'info_scroll'):
+                        self.info_scroll.update()
+                        
+                    # メインウィンドウも更新
+                    self.update()
+                    
+                    QApplication.processEvents()
                 
                 return True
                     
