@@ -9,15 +9,15 @@ class AnnotationDataManager:
     def __init__(self):
         # アノテーションデータ
         self.annotations: Dict[int, Dict[str, Any]] = {}
-        self.bbox_annotations: Dict[str, List[Dict]] = {}
-        self.segmentation_annotations: Dict[str, List[Dict]] = {}
+        self.bbox_annotations: Dict[int, List[Dict]] = {}
+        self.segmentation_annotations: Dict[int, List[Dict]] = {}
         self.location_annotations: Dict[int, int] = {}
         
         # 推論結果
         self.inference_results: Dict[int, Dict] = {}
-        self.detection_inference_results: Dict[str, List] = {}
-        self.location_inference_results: Dict[str, Dict] = {}
-        self.segmentation_inference_results: Dict[str, Any] = {}
+        self.detection_inference_results: Dict[int, List] = {}
+        self.location_inference_results: Dict[int, Dict] = {}
+        self.segmentation_inference_results: Dict[int, Any] = {}
         
         # 管理データ
         self.deleted_indexes: List[int] = []
@@ -44,15 +44,17 @@ class AnnotationDataManager:
         self.annotations[index] = annotation
         self.annotation_timestamps[index] = int(time.time() * 1000)
         
-    def add_bbox_annotation(self, img_path: str, bbox: Dict) -> None:
+    def add_bbox_annotation(self, index: int, bbox: Dict) -> None:
         """バウンディングボックスアノテーションを追加"""
-        if img_path not in self.bbox_annotations:
-            self.bbox_annotations[img_path] = []
-        self.bbox_annotations[img_path].append(bbox)
+        if index not in self.bbox_annotations:
+            self.bbox_annotations[index] = []
+        self.bbox_annotations[index].append(bbox)
         
-    def add_segmentation_annotation(self, segmentation: Dict) -> None:
+    def add_segmentation_annotation(self, index: int, segmentation: Dict) -> None:
         """セグメンテーションアノテーションを追加"""
-        self.segmentation_annotations[self.images[self.current_index]].append(segmentation)
+        if index not in self.segmentation_annotations:
+            self.segmentation_annotations[index] = []
+        self.segmentation_annotations[index].append(segmentation)
         
     def get_annotation_by_index(self, index: int) -> Optional[Dict]:
         """インデックスでアノテーションを取得"""

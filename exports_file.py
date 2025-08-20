@@ -1182,8 +1182,14 @@ def export_to_video_multi_source(
     
     return frames_processed
 
-def export_segmentation_to_yolo(output_folder, segmentation_annotations, class_names=None):
-    """セグメンテーションアノテーションをYOLO形式でエクスポート"""
+def export_segmentation_to_yolo(output_folder, segmentation_annotations, class_names=None, images_list=None):
+    """セグメンテーションアノテーションをYOLO形式でエクスポート
+    Args:
+        output_folder: 出力フォルダ
+        segmentation_annotations: アノテーションデータ (パスベースまたはインデックスベース)
+        class_names: クラス名のリスト
+        images_list: インデックスベースの場合の画像パスリスト
+    """
     if class_names is None:
         # 全クラスを収集
         all_classes = set()
@@ -1199,7 +1205,18 @@ def export_segmentation_to_yolo(output_folder, segmentation_annotations, class_n
     os.makedirs(labels_dir, exist_ok=True)
     
     # 各画像のアノテーションを処理
-    for img_path, annotations in segmentation_annotations.items():
+    for key, annotations in segmentation_annotations.items():
+        # インデックスベースかパスベースか判定
+        if images_list is not None and isinstance(key, int):
+            # インデックスベース: インデックスからパスを取得
+            img_index = key
+            if img_index >= len(images_list):
+                continue
+            img_path = images_list[img_index]
+        else:
+            # パスベース: キーがパス
+            img_path = key
+            
         # 画像をコピー
         img_filename = os.path.basename(img_path)
         shutil.copy2(img_path, os.path.join(images_dir, img_filename))

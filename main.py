@@ -424,9 +424,9 @@ class ImageLabel(QLabel):
                 self.main_window.current_index is not None and
                 self.main_window.current_index < len(self.main_window.images)):
                 
-                current_img_path = self.main_window.images[self.main_window.current_index]
-                if current_img_path in self.main_window.detection_inference_results:
-                    inference_bboxes = self.main_window.detection_inference_results[current_img_path]
+                current_index = self.main_window.current_index
+                if current_index in self.main_window.detection_inference_results:
+                    inference_bboxes = self.main_window.detection_inference_results[current_index]
                     
                     for i, bbox in enumerate(inference_bboxes):
                         # クラスに応じた色を設定 (推論結果は別の透明度で表示)
@@ -661,6 +661,7 @@ class ImageLabel(QLabel):
             scaled_y = int(target_rect.y() + rel_y * target_rect.height())
 
             painter.setPen(QPen(QColor(255, 0, 0), 4))
+            painter.setBrush(QBrush())  # 塗りつぶしなし（透明）
             painter.drawEllipse(scaled_x - 15, scaled_y - 15, 30, 30)
 
         # 青：推論点（推論結果）
@@ -671,6 +672,7 @@ class ImageLabel(QLabel):
             scaled_y = int(target_rect.y() + rel_y * target_rect.height())
 
             painter.setPen(QPen(QColor(0, 0, 255), 4))
+            painter.setBrush(QBrush())  # 塗りつぶしなし（透明）
             painter.drawEllipse(scaled_x - 15, scaled_y - 15, 30, 30)
 
             # 緑のベクトル：教師 → 推論
@@ -822,11 +824,10 @@ class ImageLabel(QLabel):
             current_index = self.main_window.current_index  # インデックスベースに変更
             if current_index in self.main_window.segmentation_annotations:
                 polygons = self.main_window.segmentation_annotations[current_index]
-            # current_img_path = self.main_window.images[self.main_window.current_index]
-            # if current_img_path in self.main_window.segmentation_annotations:
-            #     polygons = self.main_window.segmentation_annotations[current_img_path]
                 
                 for i, polygon_data in enumerate(polygons):
+                    if polygon_data is None:  # Noneの場合はスキップ
+                        continue
                     class_name = polygon_data.get('class', 'unknown')
                     points = polygon_data.get('points', [])
                     
@@ -1051,14 +1052,20 @@ class ImageLabel(QLabel):
                     self.selected_bbox_index = None
                     self.bbox_start = QPoint(orig_x, orig_y)
                     self.is_drawing_bbox = True
-                    self.bbox_end = self.bbox_start  
+                    self.bbox_end = self.bbox_start
+                    # 作成中はホバー状態をクリア
+                    self.hovering_bbox_index = None
+                    self.hovering_segmentation_index = None
                     self.update()  
                 else:
                     # バウンディングボックスがない場合、新規描画開始
                     self.selected_bbox_index = None
                     self.bbox_start = QPoint(orig_x, orig_y)
                     self.is_drawing_bbox = True
-                    self.bbox_end = self.bbox_start  
+                    self.bbox_end = self.bbox_start
+                    # 作成中はホバー状態をクリア
+                    self.hovering_bbox_index = None
+                    self.hovering_segmentation_index = None
                     self.update()
 
             ## セグモード
@@ -1122,6 +1129,11 @@ class ImageLabel(QLabel):
                         self.current_segmentation_polygon = [QPoint(orig_x, orig_y)]
                         self.is_drawing_segmentation = True
                         self.selected_segmentation_index = None
+                        # 作成中はホバー状態をクリア
+                        self.hovering_bbox_index = None
+                        self.hovering_segmentation_index = None
+                        self.hovering_polygon_index = None
+                        self.hovering_vertex_index = None
                     else:
                         # ポリゴンに点を追加
                         new_point = QPoint(orig_x, orig_y)
@@ -1148,9 +1160,10 @@ class ImageLabel(QLabel):
                     # 右クリックでポリゴンを完了（3点以上必要）
                     if len(self.current_segmentation_polygon) >= 3:
                         polygon_data = self.complete_segmentation_polygon()
-                        self.main_window.add_segmentation_annotation(polygon_data)
+                        if polygon_data:  # キャンセルされていない場合のみ追加
+                            self.main_window.add_segmentation_annotation(polygon_data)
 
-                        # 描画状態をリセット
+                        # 描画状態をリセット（キャンセルした場合も含む）
                         self.current_segmentation_polygon = []
                         self.is_drawing_segmentation = False
                         self.update()
@@ -1401,8 +1414,8 @@ class ImageLabel(QLabel):
             
             self.update()  # 画面を更新
         
-        # 既存のホバー効果（別の条件）
-        elif not self.is_moving_bbox and not self.is_drawing_bbox and not self.is_resizing_bbox:
+        # 既存のホバー効果（別の条件）- セグメンテーション作成中も除外
+        elif not self.is_moving_bbox and not self.is_drawing_bbox and not self.is_resizing_bbox and not self.is_drawing_segmentation:
             self.check_bbox_hover_and_resize_handles(event.pos())
 
         # 頂点移動処理を追加（セグメンテーション移動処理の前に追加）
@@ -1563,8 +1576,8 @@ class ImageLabel(QLabel):
             self.update()
 
         ###
-        # セグメンテーションホバー検出（移動中でない場合のみ）
-        elif not self.is_moving_segmentation and hasattr(self.main_window, 'current_mode') and self.main_window.current_mode == 2:
+        # セグメンテーションホバー検出（移動中および作成中でない場合のみ）
+        elif not self.is_moving_segmentation and not self.is_drawing_segmentation and hasattr(self.main_window, 'current_mode') and self.main_window.current_mode == 2:
             hover_index = self.check_segmentation_hover(event.pos())
             
             if hover_index != self.hovering_segmentation_index:
@@ -1760,7 +1773,8 @@ class ImageLabel(QLabel):
                     'class': class_name,
                     'points': [(p.x(), p.y()) for p in self.current_segmentation_polygon]
                 }
-        return polygon_data
+                return polygon_data
+        return None  # キャンセルまたは無効な場合はNoneを返す
 
     def check_segmentation_hover(self, pos):
         """マウス位置がセグメンテーション上にあるかチェック"""
@@ -4338,7 +4352,7 @@ class ImageAnnotationTool(QMainWindow):
 
     def add_segmentation_annotation(self, polygon_data):
         """セグメンテーションアノテーションを追加"""
-        if not self.images:
+        if not self.images or not polygon_data:
             return
         
         # インデックスベースに変更
@@ -4351,6 +4365,11 @@ class ImageAnnotationTool(QMainWindow):
         
         # 前回のセグメンテーションとして保存
         self.last_segmentation = polygon_data.copy()
+        
+        # データクリーンアップ: Noneエントリを削除
+        self.segmentation_annotations[current_index] = [
+            seg for seg in self.segmentation_annotations[current_index] if seg is not None
+        ]
         
         # 現在のすべてのセグメンテーションを保存
         self.last_segmentations = [seg.copy() for seg in self.segmentation_annotations[current_index]]
@@ -7894,14 +7913,15 @@ class ImageAnnotationTool(QMainWindow):
             return
         
         current_img_path = self.images[self.current_index]
+        current_index = self.current_index
         
         try:
             # 推論実行
             results = self.yolo_model(current_img_path, conf=self.yolo_confidence_threshold)
             
             # 推論結果をクリア（現在の画像のみ）
-            if current_img_path in self.detection_inference_results:
-                del self.detection_inference_results[current_img_path]
+            if current_index in self.detection_inference_results:
+                del self.detection_inference_results[current_index]
             
             # 検出結果を保存
             bboxes = []
@@ -7937,9 +7957,9 @@ class ImageAnnotationTool(QMainWindow):
                         
                         bboxes.append(bbox)
             
-            # 推論結果を保存
+            # 推論結果を保存（インデックスベース）
             if bboxes:
-                self.detection_inference_results[current_img_path] = bboxes
+                self.detection_inference_results[current_index] = bboxes
             
             # 表示を更新
             self.main_image_view.update()
@@ -8265,15 +8285,15 @@ class ImageAnnotationTool(QMainWindow):
         if not self.images:
             return
         
-        current_img_path = self.images[self.current_index]
+        current_index = self.current_index
         
         # 削除済みか推論表示OFFの場合は何も表示しない
         if not self.show_detection_inference:
             return
         
-        # 物体検知推論結果がある場合は表示を更新
-        if current_img_path in self.detection_inference_results:
-            inference_bboxes = self.detection_inference_results[current_img_path]
+        # 物体検知推論結果がある場合は表示を更新（インデックスベース）
+        if current_index in self.detection_inference_results:
+            inference_bboxes = self.detection_inference_results[current_index]
             
             # クラスごとのカウント辞書
             class_counts = {}
@@ -11623,9 +11643,8 @@ class ImageAnnotationTool(QMainWindow):
                     print(f"警告: インデックス {index} が画像リストの範囲外です")
                     continue
                     
-                img_path = self.images[index]
                 success = self._export_single_bbox_annotation(
-                    index, img_path, train_dir, class_to_index
+                    index, train_dir, class_to_index
                 )
                 if success:
                     train_success += 1
@@ -11643,9 +11662,8 @@ class ImageAnnotationTool(QMainWindow):
                     print(f"警告: インデックス {index} が画像リストの範囲外です")
                     continue
                     
-                img_path = self.images[index]
                 success = self._export_single_bbox_annotation(
-                    index, img_path, val_dir, class_to_index
+                    index, val_dir, class_to_index
                 )
                 if success:
                     val_success += 1
@@ -11655,69 +11673,16 @@ class ImageAnnotationTool(QMainWindow):
         print(f"処理成功: {val_success}/{len(val_indices)}")
         print(f"バウンディングボックスアノテーションエクスポート完了")
 
-    # def _export_single_bbox_annotation(self, index, img_path, output_dir, class_to_index):
-    #     """単一のバウンディングボックスアノテーションをエクスポート"""
-        
-    #     # 画像ファイルの存在確認
-    #     if not os.path.exists(img_path):
-    #         print(f"画像ファイルが見つかりません: {img_path}")
-    #         return False
-        
-    #     # バウンディングボックスデータを取得
-    #     bboxes = self.bbox_annotations.get(index, [])
-    #     if not bboxes:
-    #         print(f"インデックス {index} にバウンディングボックスデータがありません")
-    #         return False
-        
-    #     # 画像ファイルをコピー
-    #     img_filename = os.path.basename(img_path)
-    #     dest_img_path = os.path.join(output_dir, "images", img_filename)
-        
-    #     try:
-    #         import shutil
-    #         shutil.copy2(img_path, dest_img_path)
-    #     except Exception as e:
-    #         print(f"画像コピーエラー {img_path}: {str(e)}")
-    #         return False
-        
-    #     # ラベルファイルの作成
-    #     label_filename = os.path.splitext(img_filename)[0] + ".txt"
-    #     label_path = os.path.join(output_dir, "labels", label_filename)
-        
-    #     try:
-    #         with open(label_path, 'w') as f:
-    #             for bbox in bboxes:
-    #                 class_name = bbox.get('class', 'unknown')
-                    
-    #                 # クラスインデックスを取得
-    #                 if class_name not in class_to_index:
-    #                     print(f"警告: 未知のクラス '{class_name}' をスキップします")
-    #                     continue
-                    
-    #                 class_idx = class_to_index[class_name]
-                    
-    #                 # バウンディングボックス座標（既に正規化済み）
-    #                 x1, y1, x2, y2 = bbox['x1'], bbox['y1'], bbox['x2'], bbox['y2']
-                    
-    #                 print("exp: ",bbox)
 
-    #                 # YOLO形式に変換: center_x, center_y, width, height
-    #                 center_x = (x1 + x2) / 2
-    #                 center_y = (y1 + y2) / 2
-    #                 width = x2 - x1
-    #                 height = y2 - y1
-                    
-    #                 # YOLO形式で書き込み
-    #                 f.write(f"{class_idx} {center_x:.6f} {center_y:.6f} {width:.6f} {height:.6f}\n")
-            
-    #         return True
-            
-    #     except Exception as e:
-    #         print(f"ラベルファイル作成エラー {label_path}: {str(e)}")
-    #         return False
-
-    def _export_single_bbox_annotation(self, index, img_path, output_dir, class_to_index):
-        """単一のバウンディングボックスアノテーションをエクスポート（修正版）"""
+    def _export_single_bbox_annotation(self, index, output_dir, class_to_index):
+        """単一のバウンディングボックスアノテーションをエクスポート（インデックスベース）"""
+        
+        # インデックスから画像パスを取得
+        if index >= len(self.images):
+            print(f"インデックス {index} が範囲外です")
+            return False
+        
+        img_path = self.images[index]
         
         # 画像ファイルの存在確認
         if not os.path.exists(img_path):
@@ -11826,9 +11791,8 @@ class ImageAnnotationTool(QMainWindow):
                     print(f"警告: インデックス {index} が画像リストの範囲外です")
                     continue
                     
-                img_path = self.images[index]
                 success = self._export_single_segmentation_annotation(
-                    index, img_path, train_dir, class_to_index
+                    index, train_dir, class_to_index
                 )
                 if success:
                     train_success += 1
@@ -11846,9 +11810,8 @@ class ImageAnnotationTool(QMainWindow):
                     print(f"警告: インデックス {index} が画像リストの範囲外です")
                     continue
                     
-                img_path = self.images[index]
                 success = self._export_single_segmentation_annotation(
-                    index, img_path, val_dir, class_to_index
+                    index, val_dir, class_to_index
                 )
                 if success:
                     val_success += 1
@@ -11858,8 +11821,15 @@ class ImageAnnotationTool(QMainWindow):
         print(f"検証用処理成功: {val_success}/{len(val_indices)}")
         print(f"セグメンテーションアノテーションエクスポート完了")
 
-    def _export_single_segmentation_annotation(self, index, img_path, output_dir, class_to_index):
-        """単一のセグメンテーションアノテーションをYOLO形式でエクスポート"""
+    def _export_single_segmentation_annotation(self, index, output_dir, class_to_index):
+        """単一のセグメンテーションアノテーションをYOLO形式でエクスポート（インデックスベース）"""
+        
+        # インデックスから画像パスを取得
+        if index >= len(self.images):
+            print(f"インデックス {index} が範囲外です")
+            return False
+        
+        img_path = self.images[index]
         
         # 画像ファイルの存在確認
         if not os.path.exists(img_path):
@@ -13987,13 +13957,13 @@ class ImageAnnotationTool(QMainWindow):
         if not self.images:
             return
             
-        current_img_path = self.images[self.current_index]
+        current_index = self.current_index
         
         if hasattr(self, 'detection_inference_checkbox') and self.detection_inference_checkbox.isChecked():
-            if current_img_path in self.detection_inference_results:
+            if current_index in self.detection_inference_results:
                 # クラスごとのカウント辞書を作成
                 class_counts = {}
-                inference_bboxes = self.detection_inference_results[current_img_path]
+                inference_bboxes = self.detection_inference_results[current_index]
                 
                 for bbox in inference_bboxes:
                     class_name = bbox.get('class', 'unknown')

@@ -375,7 +375,7 @@ def _convert_single_annotation(img_path, annotations, output_images_dir, output_
     except Exception as e:
         print(f"変換エラー ({img_path}): {e}")
 
-def batch_detect_objects(image_paths, model=None, conf_threshold=0.25, progress_callback=None):
+def batch_detect_objects(image_paths, model=None, conf_threshold=0.25, progress_callback=None, use_index_keys=False):
     """
     複数の画像で物体検出を実行する
     Args:
@@ -383,8 +383,9 @@ def batch_detect_objects(image_paths, model=None, conf_threshold=0.25, progress_
         model: YOLOモデル
         conf_threshold: 信頼度のしきい値
         progress_callback: 進捗コールバック関数
+        use_index_keys: Trueの場合、インデックスをキーにして結果を返す
     Returns:
-        検出結果の辞書 {画像パス: 検出結果, ...}
+        検出結果の辞書 {画像パス or インデックス: 検出結果, ...}
     """
     if model is None:
         model = get_yolo_model()
@@ -398,11 +399,12 @@ def batch_detect_objects(image_paths, model=None, conf_threshold=0.25, progress_
                 break
                 
         detections = detect_objects(img_path, model, conf_threshold)
-        results[img_path] = detections
+        key = i if use_index_keys else img_path
+        results[key] = detections
     
     return results
 
-def batch_detect_objects_and_segments(image_paths, model=None, conf_threshold=0.25, progress_callback=None):
+def batch_detect_objects_and_segments(image_paths, model=None, conf_threshold=0.25, progress_callback=None, use_index_keys=False):
     """
     複数の画像で物体検出とセグメンテーションを実行する
     Args:
@@ -410,8 +412,9 @@ def batch_detect_objects_and_segments(image_paths, model=None, conf_threshold=0.
         model: YOLOモデル (セグメンテーション対応)
         conf_threshold: 信頼度のしきい値
         progress_callback: 進捗コールバック関数
+        use_index_keys: Trueの場合、インデックスをキーにして結果を返す
     Returns:
-        検出結果の辞書 {画像パス: {'detections': [...], 'segments': [...]}, ...}
+        検出結果の辞書 {画像パス or インデックス: {'detections': [...], 'segments': [...]}, ...}
     """
     if model is None:
         model = get_yolo_model()
@@ -425,7 +428,8 @@ def batch_detect_objects_and_segments(image_paths, model=None, conf_threshold=0.
                 break
                 
         result = detect_objects_and_segments(img_path, model, conf_threshold)
-        results[img_path] = result
+        key = i if use_index_keys else img_path
+        results[key] = result
     
     return results
 

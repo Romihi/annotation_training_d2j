@@ -1045,8 +1045,13 @@ class LocationModelManager:
             traceback.print_exc()
             return None
     
-    def batch_inference(self, img_paths, progress_callback=None):
-        """複数の画像に対してバッチ推論を実行"""
+    def batch_inference(self, img_paths, progress_callback=None, use_index_keys=False):
+        """複数の画像に対してバッチ推論を実行
+        Args:
+            img_paths: 画像パスのリスト
+            progress_callback: 進捗コールバック関数
+            use_index_keys: Trueの場合、インデックスをキーにして結果を返す
+        """
         results = {}
         total = len(img_paths)
         
@@ -1056,7 +1061,8 @@ class LocationModelManager:
             
             result = self.run_inference(img_path)
             if result:
-                results[img_path] = result
+                key = i if use_index_keys else img_path
+                results[key] = result
         
         return results
     
