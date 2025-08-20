@@ -2684,7 +2684,7 @@ class ImageAnnotationTool(QMainWindow):
             "・作成したボックスをクリックして選択/移動\n"
             "・ボックスの角をドラッグしてサイズ調整\n"
             "・右クリック: 選択したボックスを削除\n"
-            "・1-5キー: クラス変更(car/person/sign/cone/unknown)"
+            "・Deleteキー: 選択したボックスを削除"
         )
 
         # 新規追加: セグメンテーションモードボタン
@@ -2697,7 +2697,7 @@ class ImageAnnotationTool(QMainWindow):
             "・右クリック: ポリゴンを閉じる/完成させる\n"
             "・ポリゴン上で右クリック: 新しい頂点を追加\n"
             "・頂点をドラッグ: 頂点位置を調整\n"
-            "・1-5キー: クラス変更(car/person/sign/cone/unknown)\n"
+            "・Deleteキー: 選択したポリゴンを削除\n"
             "・Escキー: 作成中のポリゴンをキャンセル"
         )
 
@@ -3691,12 +3691,15 @@ class ImageAnnotationTool(QMainWindow):
             self.current_location_label.setText(f"現在の位置情報: {location_value}")
             self.current_location_label.setStyleSheet(f"color: {loc_color.name()}; font-weight: bold;")
             
-            # アノテーションがある場合はアノテーションにも位置情報を追加
+            # 運転アノテーション（角度・スロットル）がある場合はそこに位置情報を追加
             if self.current_index in self.annotations:
                 self.annotations[self.current_index]["loc"] = location_value
+            else:
+                # 運転アノテーションがない場合でも位置アノテーション専用エントリを作成
+                self.annotations[self.current_index] = {"loc": location_value}
         
         # 保存用のデータ形式を更新するため、アノテーションタイムスタンプも更新
-        self.annotation_timestamps[current_img_path] = int(time.time() * 1000)
+        self.annotation_timestamps[self.current_index] = int(time.time() * 1000)
         
         # 位置ボタンのカウント表示を更新
         self.update_location_button_counts()
@@ -11455,7 +11458,7 @@ class ImageAnnotationTool(QMainWindow):
         if self.current_location is not None:
             self.annotations[self.current_index]["loc"] = self.current_location
             # 位置情報アノテーションも更新
-            self.location_annotations[current_img_path] = self.current_location 
+            self.location_annotations[self.current_index] = self.current_location 
 
         # 位置ボタンのカウント表示を更新
         self.update_location_button_counts()
@@ -13331,7 +13334,7 @@ class ImageAnnotationTool(QMainWindow):
                         if "loc" in result or "pilot/loc" in result:
                             loc_value = result.get("pilot/loc", result.get("loc", 0))
                             self.annotations[self.current_index]["loc"] = loc_value
-                            self.location_annotations[img_path] = loc_value
+                            self.location_annotations[self.current_index] = loc_value
                             
                             # 位置情報ボタンがまだなimg_pathければ追加
                             self.ensure_location_button_exists(loc_value)

@@ -56,6 +56,21 @@ class AnnotationDataManager:
             self.segmentation_annotations[index] = []
         self.segmentation_annotations[index].append(segmentation)
         
+    def add_location_annotation(self, index: int, location: int) -> None:
+        """位置アノテーションを独立して追加（運転アノテーションがない場合でも）"""
+        # 位置情報専用辞書に保存
+        self.location_annotations[index] = location
+        
+        # メインアノテーションに既にエントリがある場合は位置情報を追加
+        if index in self.annotations:
+            self.annotations[index]["loc"] = location
+        else:
+            # 運転アノテーションがない場合でも位置アノテーション専用エントリを作成
+            self.annotations[index] = {"loc": location}
+            
+        # タイムスタンプを更新
+        self.annotation_timestamps[index] = int(time.time() * 1000)
+        
     def get_annotation_by_index(self, index: int) -> Optional[Dict]:
         """インデックスでアノテーションを取得"""
         return self.annotations.get(index)
@@ -77,12 +92,25 @@ class AnnotationDataManager:
             
     def get_statistics(self) -> Dict[str, int]:
         """統計情報を取得"""
+        # 位置アノテーションのみ（運転アノテーションがない）の数をカウント
+        location_only_count = 0
+        driving_annotations_count = 0
+        
+        for index, annotation in self.annotations.items():
+            if "loc" in annotation:
+                if len(annotation) == 1:  # "loc"のみの場合
+                    location_only_count += 1
+                else:  # 運転アノテーションも含む場合
+                    driving_annotations_count += 1
+        
         return {
             "total_annotations": len(self.annotations),
             "deleted_count": len(self.deleted_indexes),
             "bbox_count": sum(len(bboxes) for bboxes in self.bbox_annotations.values()),
             "segmentation_count": sum(len(segs) for segs in self.segmentation_annotations.values()),
-            "location_count": len(self.location_annotations)
+            "location_count": len(self.location_annotations),
+            "location_only_count": location_only_count,
+            "driving_annotations_count": driving_annotations_count
         }
         
     def clear_all(self) -> None:
