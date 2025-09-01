@@ -183,7 +183,7 @@ class BaseModel(nn.Module):
         
         # 必要に応じて、出力を[-1, 1]の範囲に正規化
         #if self.name != "donkey" and self.name != "donkey_fcn":
-        result = result * 2 - 1
+        #result = result * 2 - 1
         
         return result[0], result[1]  # angle, throttle
 
