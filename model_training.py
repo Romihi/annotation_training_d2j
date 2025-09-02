@@ -14,7 +14,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from typing import Dict, List, Any, Optional, Tuple, Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 import traceback
 
 
@@ -22,6 +22,114 @@ from model_catalog import get_model, AnnotationDataset
 
 import random
 from PIL import Image, ImageOps, ImageEnhance
+
+
+def format_time(seconds):
+    """秒数を時:分:秒の形式にフォーマット"""
+    if seconds < 0:
+        return "計算中..."
+    
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    
+    if hours > 0:
+        return f"{hours}時間{minutes:02d}分{secs:02d}秒"
+    elif minutes > 0:
+        return f"{minutes}分{secs:02d}秒"
+    else:
+        return f"{secs}秒"
+
+
+def get_eta(remaining_seconds):
+    """残り時間から終了予定時刻を計算"""
+    if remaining_seconds < 0:
+        return "計算中..."
+    
+    eta = datetime.now() + timedelta(seconds=remaining_seconds)
+    return eta.strftime("%H:%M:%S")
+
+
+def create_unified_progress_message(epoch, num_epochs, elapsed_time, epoch_times=None, 
+                                  batch_info=None, epoch_loss=None, val_loss=None, current_loss=None, is_epoch_start=False,
+                                  steering_loss=None, throttle_loss=None, val_steering_loss=None, val_throttle_loss=None):
+    """統一された進捗メッセージを作成"""
+    # 基本情報
+    if batch_info:
+        batch_i, batch_total = batch_info
+        status_line = f"エポック {epoch+1}/{num_epochs} - バッチ {batch_i}/{batch_total}"
+    elif is_epoch_start:
+        status_line = f"エポック {epoch+1}/{num_epochs} 開始"
+    else:
+        status_line = f"エポック {epoch+1}/{num_epochs} 完了"
+    
+    # 損失情報
+    loss_line = ""
+    if current_loss is not None:
+        if isinstance(current_loss, dict) and 'steering' in current_loss and 'throttle' in current_loss and 'total' in current_loss:
+            loss_line = (f"損失 - Total: {current_loss['total']:.4f} "
+                        f"(Steering: {current_loss['steering']:.4f}, Throttle: {current_loss['throttle']:.4f})")
+        elif isinstance(current_loss, dict) and 'steering' in current_loss and 'throttle' in current_loss:
+            loss_line = f"損失 - Steering: {current_loss['steering']:.4f}, Throttle: {current_loss['throttle']:.4f}"
+        else:
+            loss_line = f"現在の損失: {current_loss:.4f}"
+    elif epoch_loss is not None and val_loss is not None:
+        if steering_loss is not None and throttle_loss is not None and val_steering_loss is not None and val_throttle_loss is not None:
+            loss_line = (f"学習損失 - Total: {epoch_loss:.4f} (Steering: {steering_loss:.4f}, Throttle: {throttle_loss:.4f})\n"
+                        f"検証損失 - Total: {val_loss:.4f} (Steering: {val_steering_loss:.4f}, Throttle: {val_throttle_loss:.4f})")
+        else:
+            loss_line = f"学習損失: {epoch_loss:.4f}, 検証損失: {val_loss:.4f}"
+    
+    # 時間情報
+    elapsed_str = format_time(elapsed_time)
+    time_line = f"経過時間: {elapsed_str}"
+    
+    # 残り時間推定（エポック履歴がある場合）
+    if epoch_times and len(epoch_times) > 0:
+        avg_epoch_time = sum(epoch_times) / len(epoch_times)
+        
+        if batch_info:
+            # バッチ進捗を考慮した残り時間計算
+            batch_progress = batch_info[0] / batch_info[1]
+            current_epoch_remaining = avg_epoch_time * (1 - batch_progress)
+            remaining_epochs = num_epochs - epoch - 1
+            estimated_remaining_time = current_epoch_remaining + (avg_epoch_time * remaining_epochs)
+        elif is_epoch_start:
+            # エポック開始時の残り時間計算
+            remaining_epochs = num_epochs - epoch
+            estimated_remaining_time = avg_epoch_time * remaining_epochs
+        else:
+            # エポック完了時の残り時間計算
+            remaining_epochs = num_epochs - (epoch + 1)
+            estimated_remaining_time = avg_epoch_time * remaining_epochs
+        
+        if estimated_remaining_time > 0:
+            remaining_str = format_time(estimated_remaining_time)
+            eta_str = get_eta(estimated_remaining_time)
+            time_line += f" | 残り時間: {remaining_str} | 終了予定: {eta_str}"
+    
+    # メッセージ組み立て
+    message_parts = [status_line]
+    if loss_line:
+        message_parts.append(loss_line)
+    message_parts.append(time_line)
+    
+    return "\n".join(message_parts)
+
+
+def calculate_individual_losses(outputs, targets, criterion):
+    """steering（角度）とthrottle（スロットル）の個別損失を計算"""
+    # outputs と targets の形状: [batch_size, 2] （0: steering, 1: throttle）
+    steering_outputs = outputs[:, 0:1]  # steering (angle)
+    throttle_outputs = outputs[:, 1:2]  # throttle
+    
+    steering_targets = targets[:, 0:1]
+    throttle_targets = targets[:, 1:2]
+    
+    steering_loss = criterion(steering_outputs, steering_targets).item()
+    throttle_loss = criterion(throttle_outputs, throttle_targets).item()
+    
+    return steering_loss, throttle_loss
 
 def create_augmentation_transform(
     use_flip=True,
@@ -328,19 +436,27 @@ def create_datasets(
     train_size = len(dataset) - val_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
     
+    # GPU使用時の最適化設定
+    use_cuda = torch.cuda.is_available()
+    pin_memory = use_cuda
+    # Windows環境では num_workers=0 が推奨される場合が多い
+    actual_num_workers = 0 if os.name == 'nt' and use_cuda else num_workers
+    
     # データローダーの作成
     train_loader = DataLoader(
         train_dataset, 
         batch_size=batch_size, 
         shuffle=True, 
-        num_workers=num_workers
+        num_workers=actual_num_workers,
+        pin_memory=pin_memory
     )
     
     val_loader = DataLoader(
         val_dataset, 
         batch_size=batch_size, 
         shuffle=False, 
-        num_workers=num_workers
+        num_workers=actual_num_workers,
+        pin_memory=pin_memory
     )
     
     # データセット情報
@@ -444,6 +560,10 @@ def train_model(
     # トレーニングループ
     train_losses = []
     val_losses = []
+    train_steering_losses = []
+    train_throttle_losses = []
+    val_steering_losses = []
+    val_throttle_losses = []
     best_val_loss = float('inf')
     
     # Early Stopping用の変数
@@ -459,17 +579,35 @@ def train_model(
     model_path = os.path.join(save_dir, f'{model_name}_{timestamp}.pth')
     best_model_path = os.path.join(save_dir, f'{model_name}_best_{timestamp}.pth')
     
+    # 時間計測用の変数
+    training_start_time = time.time()
+    epoch_times = []
+    
     completed_epochs = 0
     for epoch in range(num_epochs):
-        # 進捗コールバック - エポック開始
+        epoch_start_time = time.time()
+        
+        # 進捗コールバック - エポック開始（統一フォーマット）
         if progress_callback:
-            message = f"エポック {epoch+1}/{num_epochs} 開始"
+            elapsed_time = time.time() - training_start_time
+            
+            # エポック開始メッセージ
+            message = create_unified_progress_message(
+                epoch=epoch,
+                num_epochs=num_epochs,
+                elapsed_time=elapsed_time,
+                epoch_times=epoch_times if epoch > 0 else None,
+                is_epoch_start=True
+            )
+            
             should_continue = progress_callback(epoch, num_epochs, message)
             if not should_continue:
                 break
         
         model.train()
         epoch_loss = 0.0
+        epoch_steering_loss = 0.0
+        epoch_throttle_loss = 0.0
         
         # トレーニングステップ
         for i, (inputs, targets) in enumerate(train_loader):
@@ -483,29 +621,58 @@ def train_model(
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             
+            # 個別損失の計算
+            steering_loss, throttle_loss = calculate_individual_losses(outputs, targets, criterion)
+            
             # 逆伝播と最適化
             loss.backward()
             optimizer.step()
             
             # 損失の記録
             epoch_loss += loss.item() * inputs.size(0)
+            epoch_steering_loss += steering_loss * inputs.size(0)
+            epoch_throttle_loss += throttle_loss * inputs.size(0)
             
             # バッチごとの進捗コールバック（10%ごと）
             if progress_callback and (i % max(1, len(train_loader) // 10) == 0):
                 batch_progress = i / len(train_loader)
                 total_progress = (epoch + batch_progress) / num_epochs
-                message = f"エポック {epoch+1}/{num_epochs}, バッチ {i}/{len(train_loader)}, 損失: {loss.item():.4f}"
+                
+                elapsed_time = time.time() - training_start_time
+                
+                # 統一フォーマットでバッチ進捗メッセージを作成（統合+個別損失付き）
+                current_losses = {
+                    'total': loss.item(),
+                    'steering': steering_loss,
+                    'throttle': throttle_loss
+                }
+                
+                message = create_unified_progress_message(
+                    epoch=epoch,
+                    num_epochs=num_epochs,
+                    elapsed_time=elapsed_time,
+                    epoch_times=epoch_times,
+                    batch_info=(i, len(train_loader)),
+                    current_loss=current_losses
+                )
+                
                 should_continue = progress_callback(int(total_progress * num_epochs), num_epochs, message)
                 if not should_continue:
                     break
         
         # エポック損失の計算
         epoch_loss /= len(train_loader.dataset)
+        epoch_steering_loss /= len(train_loader.dataset)
+        epoch_throttle_loss /= len(train_loader.dataset)
         train_losses.append(epoch_loss)
+        train_steering_losses.append(epoch_steering_loss)
+        train_throttle_losses.append(epoch_throttle_loss)
         
         # 検証
         model.eval()
         val_loss = 0.0
+        val_steering_loss = 0.0
+        val_throttle_loss = 0.0
         with torch.no_grad():
             for inputs, targets in val_loader:
                 inputs = inputs.to(device)
@@ -514,10 +681,19 @@ def train_model(
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
                 
+                # 検証時の個別損失計算
+                batch_steering_loss, batch_throttle_loss = calculate_individual_losses(outputs, targets, criterion)
+                
                 val_loss += loss.item() * inputs.size(0)
+                val_steering_loss += batch_steering_loss * inputs.size(0)
+                val_throttle_loss += batch_throttle_loss * inputs.size(0)
         
         val_loss /= len(val_loader.dataset)
+        val_steering_loss /= len(val_loader.dataset)
+        val_throttle_loss /= len(val_loader.dataset)
         val_losses.append(val_loss)
+        val_steering_losses.append(val_steering_loss)
+        val_throttle_losses.append(val_throttle_loss)
         
         # 学習率の調整
         scheduler.step(val_loss)
@@ -525,9 +701,28 @@ def train_model(
         # エポックの完了をカウント
         completed_epochs = epoch + 1
         
-        # 進捗コールバック - エポック終了
+        # エポック時間を記録
+        epoch_time = time.time() - epoch_start_time
+        epoch_times.append(epoch_time)
+        
+        # 進捗コールバック - エポック終了（統一フォーマット、個別損失付き）
         if progress_callback:
-            message = f"エポック {epoch+1}/{num_epochs}, 学習損失: {epoch_loss:.4f}, 検証損失: {val_loss:.4f}"
+            elapsed_time = time.time() - training_start_time
+            
+            # エポック完了メッセージ（個別損失付き）
+            message = create_unified_progress_message(
+                epoch=epoch,
+                num_epochs=num_epochs,
+                elapsed_time=elapsed_time,
+                epoch_times=epoch_times,
+                epoch_loss=epoch_loss,
+                val_loss=val_loss,
+                steering_loss=epoch_steering_loss,
+                throttle_loss=epoch_throttle_loss,
+                val_steering_loss=val_steering_loss,
+                val_throttle_loss=val_throttle_loss
+            )
+            
             should_continue = progress_callback(epoch + 1, num_epochs, message)
             if not should_continue:
                 break
@@ -578,6 +773,10 @@ def train_model(
         'input_size': model_input_size,
     }, model_path)
     
+    # 学習時間を計算
+    total_training_time = time.time() - training_start_time
+    avg_epoch_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0
+    
     # トレーニング結果
     training_results = {
         'model_name': model_name,
@@ -595,6 +794,13 @@ def train_model(
         'early_stopped': early_stopped,
         'stopped_epoch': stopped_epoch if early_stopped else completed_epochs,
         'patience': patience if use_early_stopping else 0,
+        'total_training_time': total_training_time,
+        'avg_epoch_time': avg_epoch_time,
+        'epoch_times': epoch_times,
+        'train_steering_losses': train_steering_losses,
+        'train_throttle_losses': train_throttle_losses,
+        'val_steering_losses': val_steering_losses,
+        'val_throttle_losses': val_throttle_losses
     }
     
     # トレーニング結果の可視化
@@ -1291,11 +1497,27 @@ def train_location_model(
     model_path = os.path.join(save_dir, f'{model_name}_{timestamp}.pth')
     best_model_path = os.path.join(save_dir, f'{model_name}_best_{timestamp}.pth')
     
+    # 時間計測用の変数
+    training_start_time = time.time()
+    epoch_times = []
+    
     completed_epochs = 0
     for epoch in range(num_epochs):
-        # 進捗コールバック - エポック開始
+        epoch_start_time = time.time()
+        
+        # 進捗コールバック - エポック開始（統一フォーマット）
         if progress_callback:
-            message = f"エポック {epoch+1}/{num_epochs} 開始"
+            elapsed_time = time.time() - training_start_time
+            
+            # エポック開始メッセージ
+            message = create_unified_progress_message(
+                epoch=epoch,
+                num_epochs=num_epochs,
+                elapsed_time=elapsed_time,
+                epoch_times=epoch_times if epoch > 0 else None,
+                is_epoch_start=True
+            )
+            
             should_continue = progress_callback(epoch, num_epochs, message)
             if not should_continue:
                 break
@@ -1325,7 +1547,19 @@ def train_location_model(
             if progress_callback and (i % max(1, len(train_loader) // 10) == 0):
                 batch_progress = i / len(train_loader)
                 total_progress = (epoch + batch_progress) / num_epochs
-                message = f"エポック {epoch+1}/{num_epochs}, バッチ {i}/{len(train_loader)}, 損失: {loss.item():.4f}"
+                
+                elapsed_time = time.time() - training_start_time
+                
+                # 統一フォーマットでバッチ進捗メッセージを作成
+                message = create_unified_progress_message(
+                    epoch=epoch,
+                    num_epochs=num_epochs,
+                    elapsed_time=elapsed_time,
+                    epoch_times=epoch_times,
+                    batch_info=(i, len(train_loader)),
+                    current_loss=loss.item()
+                )
+                
                 should_continue = progress_callback(int(total_progress * num_epochs), num_epochs, message)
                 if not should_continue:
                     break
@@ -1449,6 +1683,10 @@ def train_location_model(
         'num_classes': num_classes
     }, model_path)
     
+    # 学習時間を計算
+    total_training_time = time.time() - training_start_time
+    avg_epoch_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0
+    
     # トレーニング結果
     training_results = {
         'model_name': model_name,
@@ -1469,7 +1707,10 @@ def train_location_model(
         'early_stopped': early_stopped,
         'stopped_epoch': stopped_epoch if early_stopped else completed_epochs,
         'patience': patience if use_early_stopping else 0,
-        'num_classes': num_classes
+        'num_classes': num_classes,
+        'total_training_time': total_training_time,
+        'avg_epoch_time': avg_epoch_time,
+        'epoch_times': epoch_times
     }
     
     # トレーニング結果の可視化

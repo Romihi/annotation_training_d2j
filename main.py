@@ -12554,69 +12554,66 @@ class ImageAnnotationTool(QMainWindow):
             
             # サンプル数の計算と表示（削除済みマークを考慮）
             if data_radio_all.isChecked():
-                # 削除済みでないアノテーションをカウント
-                valid_annotations = []
+                # アノテーション総数と削除済み数を計算
+                total_annotations = len(self.annotations)
+                
+                # 削除済みアノテーションをカウント
                 excluded_annotations = []
                 for idx in self.annotations.keys():
                     if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
                         excluded_annotations.append(idx)
-                        continue
-                    if (idx in self.annotations and "original_index" in self.annotations[idx] and
+                    elif (idx in self.annotations and "original_index" in self.annotations[idx] and
                         hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
                         excluded_annotations.append(idx)
-                        continue
-                    valid_annotations.append(idx)
                 
-                sample_count = len(valid_annotations)
-                total_annotations = len(self.annotations)
-                excluded_count = len(excluded_annotations)
+                excluded_count = len(set(excluded_annotations))  # 重複を除去
+                sample_count = total_annotations - excluded_count  # 実際に使用される数
+                
                 data_sample_label.setText(f"<b>使用データ数: {sample_count}枚</b> (全{total_annotations}枚 - 削除済み{excluded_count}枚)")
                 data_sample_label.setStyleSheet("color: #2E7D32; font-weight: bold; font-size: 13px;")
             elif data_radio_skip.isChecked():
                 skip = custom_skip_spin.value()
-                # 削除済みでないアノテーションでスキップ計算
-                valid_annotations = []
-                excluded_annotations = []
+                # スキップ対象のアノテーションと削除済みを計算
                 total_skipped_annotations = []
+                excluded_in_skip = []
                 
                 for idx in self.annotations.keys():
                     if idx % skip == 0:  # スキップ対象のインデックス
                         total_skipped_annotations.append(idx)
+                        # 削除済みチェック
                         if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
-                            excluded_annotations.append(idx)
-                            continue
-                        if (idx in self.annotations and "original_index" in self.annotations[idx] and
+                            excluded_in_skip.append(idx)
+                        elif (idx in self.annotations and "original_index" in self.annotations[idx] and
                             hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
-                            excluded_annotations.append(idx)
-                            continue
-                        valid_annotations.append(idx)
+                            excluded_in_skip.append(idx)
                 
-                sample_count = len(valid_annotations)
                 total_skipped = len(total_skipped_annotations)
-                excluded_count = len(excluded_annotations)
+                excluded_count = len(set(excluded_in_skip))  # 重複を除去
+                sample_count = total_skipped - excluded_count  # 実際に使用される数
+                
                 data_sample_label.setText(f"<b>使用データ数: {sample_count}枚</b> ({skip}枚ごと、対象{total_skipped}枚 - 削除済み{excluded_count}枚)")
                 data_sample_label.setStyleSheet("color: #2E7D32; font-weight: bold; font-size: 13px;")
             elif data_radio_range.isChecked():
                 start = range_start_spin.value()
                 end = range_end_spin.value()
-                # インデックス範囲内の削除済みでないアノテーションをカウント
-                valid_annotations = []
-                excluded_annotations = []
+                # インデックス範囲内のアノテーションと削除済みを計算
+                in_range_annotations = []
+                excluded_in_range = []
                 
                 for idx in self.annotations:
                     if start <= idx <= end:
+                        in_range_annotations.append(idx)
+                        # 削除済みチェック
                         if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
-                            excluded_annotations.append(idx)
-                            continue
-                        if (idx in self.annotations and "original_index" in self.annotations[idx] and
+                            excluded_in_range.append(idx)
+                        elif (idx in self.annotations and "original_index" in self.annotations[idx] and
                             hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
-                            excluded_annotations.append(idx)
-                            continue
-                        valid_annotations.append(idx)
+                            excluded_in_range.append(idx)
                 
-                sample_count = len(valid_annotations)
-                total_in_range = sum(1 for idx in self.annotations if start <= idx <= end)
-                excluded_count = len(excluded_annotations)
+                total_in_range = len(in_range_annotations)
+                excluded_count = len(set(excluded_in_range))  # 重複を除去
+                sample_count = total_in_range - excluded_count  # 実際に使用される数
+                
                 data_sample_label.setText(f"<b>使用データ数: {sample_count}枚</b> (範囲{start}-{end}、対象{total_in_range}枚 - 削除済み{excluded_count}枚)")
                 data_sample_label.setStyleSheet("color: #2E7D32; font-weight: bold; font-size: 13px;")
 
@@ -12887,23 +12884,26 @@ class ImageAnnotationTool(QMainWindow):
         
         # モデルトレーニングの続きの確認
         sampling_info = ""
+        # deleted_indexesを安全に取得
+        deleted_indexes = getattr(self, 'deleted_indexes', [])
+        
         if use_all:
             total_annotations = len(self.annotations)
-            excluded_count = sum(1 for idx in self.annotations if idx in self.deleted_indexes)
+            excluded_count = sum(1 for idx in self.annotations if idx in deleted_indexes)
             used_count = total_annotations - excluded_count
             sampling_info = f"データサンプリング: すべて使用 ({used_count}/{total_annotations}枚使用, 削除済み{excluded_count}枚を除外)"
         elif use_skip:
             total_annotations = len(self.annotations)
-            valid_indices = [idx for idx in self.annotations if idx not in self.deleted_indexes]
+            valid_indices = [idx for idx in self.annotations if idx not in deleted_indexes]
             sampled_count = len([idx for idx in valid_indices if idx % skip_count == 0])
-            excluded_count = sum(1 for idx in self.annotations if idx in self.deleted_indexes)
+            excluded_count = sum(1 for idx in self.annotations if idx in deleted_indexes)
             sampling_info = f"データサンプリング: {skip_count}枚ごとに1枚 ({sampled_count}/{total_annotations}枚使用, 削除済み{excluded_count}枚を除外)"
         elif use_range:
             start = range_start
             end = range_end
             # インデックス範囲内のアノテーションをカウント（削除済みを除く）
             in_range_count = sum(1 for idx in self.annotations if start <= idx <= end)
-            excluded_count = sum(1 for idx in self.annotations if start <= idx <= end and idx in self.deleted_indexes)
+            excluded_count = sum(1 for idx in self.annotations if start <= idx <= end and idx in deleted_indexes)
             sample_count = in_range_count - excluded_count
             total_count = len(self.annotations)
             sampling_info = f"データサンプリング: インデックス範囲 {start}～{end} ({sample_count}/{total_count}枚使用, 削除済み{excluded_count}枚を除外)"
@@ -13007,8 +13007,21 @@ class ImageAnnotationTool(QMainWindow):
                 if idx in self.annotations:
                     annotation_values.append(self.annotations[idx])
 
-            # データ数の確認と最小バッチサイズの調整
-            batch_size = min(32, len(image_paths))  # バッチサイズを調整
+            # データ数の確認とバッチサイズの調整
+            # GPUメモリに応じて適切なバッチサイズを設定
+            if torch.cuda.is_available():
+                # GPUメモリサイズに応じてバッチサイズを調整
+                gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB単位
+                if gpu_mem >= 8:
+                    default_batch_size = 64*4
+                elif gpu_mem >= 4:
+                    default_batch_size = 32*4
+                else:
+                    default_batch_size = 16*4
+            else:
+                default_batch_size = 16*4
+            
+            batch_size = min(default_batch_size, len(image_paths))  # バッチサイズを調整
             if batch_size < 2:
                 QMessageBox.warning(self, "警告", "データ数が不足しています。最低2枚の画像が必要です。")
                 return
@@ -13247,6 +13260,14 @@ class ImageAnnotationTool(QMainWindow):
         input_size = dataset_info['input_size']
         input_size_info = f"入力サイズ: {input_size[0]}x{input_size[1]} (H x W)\n"
         
+        # 学習時間情報
+        time_info = ""
+        if 'total_training_time' in training_results:
+            from model_training import format_time
+            total_time_str = format_time(training_results['total_training_time'])
+            avg_epoch_time_str = format_time(training_results.get('avg_epoch_time', 0))
+            time_info = f"学習時間: {total_time_str} (平均エポック時間: {avg_epoch_time_str})\n"
+        
         # 成功メッセージを表示
         QMessageBox.information(
             self, 
@@ -13255,6 +13276,7 @@ class ImageAnnotationTool(QMainWindow):
             f"最良検証損失: {training_results['best_val_loss']:.6f}\n" +
             f"実施エポック数: {training_results.get('completed_epochs', training_params['num_epochs'])}/{training_params['num_epochs']}\n" +
             early_stopping_info +
+            time_info +
             f"学習データ数: {dataset_info['image_paths_count']}枚 {dataset_info['sampling_info']}\n" +
             input_size_info + 
             weights_info +
@@ -14905,6 +14927,14 @@ class ImageAnnotationTool(QMainWindow):
             else:
                 early_stopping_info = f"Early Stopping: 発動せず (忍耐値: {training_config['patience']})\n"
         
+        # 学習時間情報
+        time_info = ""
+        if 'total_training_time' in training_results:
+            from model_training import format_time
+            total_time_str = format_time(training_results['total_training_time'])
+            avg_epoch_time_str = format_time(training_results.get('avg_epoch_time', 0))
+            time_info = f"学習時間: {total_time_str} (平均エポック時間: {avg_epoch_time_str})\n"
+        
         # 学習完了メッセージ
         QMessageBox.information(
             self, 
@@ -14914,6 +14944,7 @@ class ImageAnnotationTool(QMainWindow):
             f"最良検証精度: {training_results['best_val_acc']:.2f}%\n" +
             f"実施エポック数: {training_results['completed_epochs']}/{training_config['num_epochs']}\n" +
             early_stopping_info +
+            time_info +
             f"出力クラス数: {dataset_info['num_classes']} (実際の位置クラス数: {dataset_info['actual_classes']})\n" +
             f"学習データ数: {dataset_info['image_paths_count']}枚\n" +
             f"学習率: {training_config['learning_rate']}\n" +

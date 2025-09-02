@@ -1087,10 +1087,12 @@ def get_timm_model_groups():
     
 class AnnotationDataset(torch.utils.data.Dataset):
     """アノテーションデータのためのカスタムデータセット"""
-    def __init__(self, image_paths, annotations, transform=None):
+    def __init__(self, image_paths, annotations, transform=None, cache_images=False):
         self.image_paths = image_paths
         self.annotations = annotations
         self.transform = transform
+        self.cache_images = cache_images
+        self.image_cache = {} if cache_images else None
         
     def __len__(self):
         return len(self.image_paths)
@@ -1098,8 +1100,14 @@ class AnnotationDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
         
-        # PILで画像を読み込む
-        img = Image.open(img_path).convert('RGB')
+        # キャッシュから画像を取得または読み込み
+        if self.cache_images and idx in self.image_cache:
+            img = self.image_cache[idx]
+        else:
+            # PILで画像を読み込む
+            img = Image.open(img_path).convert('RGB')
+            if self.cache_images:
+                self.image_cache[idx] = img
         
         # 変換を適用
         if self.transform:
