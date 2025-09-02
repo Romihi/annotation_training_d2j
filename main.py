@@ -10859,51 +10859,8 @@ class ImageAnnotationTool(QMainWindow):
                         # エントリのインデックスを取得
                         entry_index = entry.get('_index', None)
                         
-                        # 削除されたインデックスの場合、実際の画像インデックスを記録してスキップ
-                        if entry_index in deleted_indexes:
-                            # 画像ファイル名を取得して実際のインデックスを見つける
-                            # */image_array パターンを検索
-                            img_name = ''
-                            for key in entry.keys():
-                                if key.endswith('/image_array'):
-                                    img_name = entry[key]
-                                    break
-                            if img_name:
-                                # 画像パスの処理 - 複数のパターンを試す
-                                img_path = None
-                                
-                                # 様々なパターンで画像を検索
-                                path_patterns = [
-                                    os.path.join(images_folder, img_name),
-                                    os.path.join(catalog_folder, img_name),
-                                    os.path.join(os.path.dirname(catalog_path), img_name),
-                                    os.path.join(catalog_folder, "images", img_name),
-                                    os.path.join(os.path.dirname(catalog_folder), img_name),
-                                    os.path.join(os.path.dirname(catalog_folder), "images", img_name)
-                                ]
-                                
-                                for path in path_patterns:
-                                    if os.path.exists(path) and path in self.images:
-                                        img_path = path
-                                        break
-                                
-                                # 画像が見つからない場合、ファイル名のみで探す
-                                if img_path is None:
-                                    basename = os.path.basename(img_name)
-                                    for path in self.images:
-                                        if os.path.basename(path) == basename:
-                                            img_path = path
-                                            break
-                                
-                                # 実際のインデックスを取得して削除リストに追加
-                                if img_path is not None:
-                                    try:
-                                        actual_index = self.images.index(img_path)
-                                        deleted_actual_indexes.append(actual_index)
-                                        print(f"  削除エントリ: エントリインデックス {entry_index} -> 画像インデックス {actual_index}")
-                                    except ValueError:
-                                        pass
-                            continue
+                        # 削除されたインデックスかどうかをチェック
+                        is_deleted = entry_index in deleted_indexes
                         
                         # 画像ファイル名を取得
                         # */image_array パターンを検索
@@ -10994,8 +10951,14 @@ class ImageAnnotationTool(QMainWindow):
                             # タイムスタンプを保存
                             self.annotation_timestamps[actual_index] = entry.get('_timestamp_ms', int(time.time() * 1000))
                             
+                            # 削除されたエントリの場合、削除インデックスリストに追加
+                            if is_deleted:
+                                deleted_actual_indexes.append(actual_index)
+                                print(f"  削除エントリ読み込み: 画像インデックス {actual_index}, 元のエントリインデックス {entry_index}")
+                            else:
+                                print(f"  アノテーション追加: 画像インデックス {actual_index}, 元のエントリインデックス {entry_index}")
+                            
                             loaded_count += 1
-                            print(f"  アノテーション追加: 画像インデックス {actual_index}, 元のエントリインデックス {entry_index}")
                             
                             # 推論結果があれば保存（ユーザーアノテーションと異なる場合）
                             if "pilot/angle" in entry and "pilot/throttle" in entry and \
