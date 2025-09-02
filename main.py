@@ -10767,9 +10767,10 @@ class ImageAnnotationTool(QMainWindow):
                         deleted_indexes = catalog_info["deleted_indexes"]
                         print(f"manifest.jsonから{len(deleted_indexes)}個の削除済みインデックスを読み込みました")
                         
-                        # 削除済みインデックスは各フォルダのローカルなインデックスなので、
-                        # グローバルなdeleted_indexesには追加しない（後で別途処理が必要な場合は要検討）
-                        # ここではローカル変数として保持するのみ
+                        # 削除済みインデックスをインスタンス変数に初期化（後で実際の画像インデックスも追加される）
+                        if not hasattr(self, 'deleted_indexes'):
+                            self.deleted_indexes = []
+                        print(f"削除済みエントリインデックス: {deleted_indexes}")
             
             if not catalog_files:
                 print("manifest.jsonからカタログファイルを取得できませんでした")
@@ -10814,6 +10815,9 @@ class ImageAnnotationTool(QMainWindow):
             total_entries = 0
             progress_step = 50 / len(catalog_files)  # カタログファイル処理に50%の進捗割り当て
             
+            # 削除されたエントリに対応する実際の画像インデックスを記録するための辞書
+            deleted_actual_indexes = []
+            
             for i, catalog_file in enumerate(catalog_files):
                 if progress.wasCanceled():
                     progress.close()
@@ -10855,12 +10859,59 @@ class ImageAnnotationTool(QMainWindow):
                         # エントリのインデックスを取得
                         entry_index = entry.get('_index', None)
                         
-                        # 削除されたインデックスの場合はスキップ
+                        # 削除されたインデックスの場合、実際の画像インデックスを記録してスキップ
                         if entry_index in deleted_indexes:
+                            # 画像ファイル名を取得して実際のインデックスを見つける
+                            # */image_array パターンを検索
+                            img_name = ''
+                            for key in entry.keys():
+                                if key.endswith('/image_array'):
+                                    img_name = entry[key]
+                                    break
+                            if img_name:
+                                # 画像パスの処理 - 複数のパターンを試す
+                                img_path = None
+                                
+                                # 様々なパターンで画像を検索
+                                path_patterns = [
+                                    os.path.join(images_folder, img_name),
+                                    os.path.join(catalog_folder, img_name),
+                                    os.path.join(os.path.dirname(catalog_path), img_name),
+                                    os.path.join(catalog_folder, "images", img_name),
+                                    os.path.join(os.path.dirname(catalog_folder), img_name),
+                                    os.path.join(os.path.dirname(catalog_folder), "images", img_name)
+                                ]
+                                
+                                for path in path_patterns:
+                                    if os.path.exists(path) and path in self.images:
+                                        img_path = path
+                                        break
+                                
+                                # 画像が見つからない場合、ファイル名のみで探す
+                                if img_path is None:
+                                    basename = os.path.basename(img_name)
+                                    for path in self.images:
+                                        if os.path.basename(path) == basename:
+                                            img_path = path
+                                            break
+                                
+                                # 実際のインデックスを取得して削除リストに追加
+                                if img_path is not None:
+                                    try:
+                                        actual_index = self.images.index(img_path)
+                                        deleted_actual_indexes.append(actual_index)
+                                        print(f"  削除エントリ: エントリインデックス {entry_index} -> 画像インデックス {actual_index}")
+                                    except ValueError:
+                                        pass
                             continue
                         
                         # 画像ファイル名を取得
-                        img_name = entry.get('cam/image_array', '')
+                        # */image_array パターンを検索
+                        img_name = ''
+                        for key in entry.keys():
+                            if key.endswith('/image_array'):
+                                img_name = entry[key]
+                                break
                         if not img_name:
                             continue
                         
@@ -10981,6 +11032,16 @@ class ImageAnnotationTool(QMainWindow):
                             print(f"画像 {img_path} の処理中にエラー: {e}")
                             continue
             
+            # 削除されたインデックスを設定（実際の画像インデックスとオリジナルのエントリインデックスの両方を含む）
+            if deleted_actual_indexes:
+                # 実際の画像インデックスを設定
+                self.deleted_indexes.extend(deleted_actual_indexes)
+                # オリジナルのエントリインデックスも追加（既に読み込んだものに加えて）
+                self.deleted_indexes.extend(deleted_indexes)
+                # 重複を削除してソート
+                self.deleted_indexes = sorted(list(set(self.deleted_indexes)))
+                print(f"削除済みインデックスを設定: 実際の画像インデックス {len(deleted_actual_indexes)}個、総計 {len(self.deleted_indexes)}個")
+            
             # 位置情報の更新処理
             progress.setLabelText("位置情報ボタンを更新中...")
             progress.setValue(85)
@@ -11015,8 +11076,11 @@ class ImageAnnotationTool(QMainWindow):
             # 運転アノテーションの統計情報を更新
             self.update_driving_annotation_stats()
             
+            # スライダーの削除インデックスを更新
+            self.update_slider_deleted_indexes()
+            
             print(f"読み込み完了: {loaded_count}個のアノテーションを読み込みました")
-            print(f"削除済みインデックス数: {len(deleted_indexes)}")
+            print(f"削除済みインデックス数: {len(self.deleted_indexes)}")
             return self.annotated_count > 0
                 
         except Exception as e:

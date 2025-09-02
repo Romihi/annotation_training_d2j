@@ -140,7 +140,6 @@ def export_to_donkey(
             "user/throttle": annotation["throttle"]
         }
         
-        print(annotation)
         # 位置情報があれば追加
         if 'loc' in annotation:
             catalog_entry["user/loc"] = annotation["loc"]
