@@ -875,7 +875,7 @@ def export_to_video(
                 if inference:
                     x, y = inference["x"], inference["y"]
                     # 青い円を描画
-                    draw.ellipse((x-15, y-15, x+15, y+15), outline='blue', width=3)
+                    draw.ellipse((x-15, y-15, x+15, y+15), outline='cyan', width=3)
                     
                     # 推論結果の角度と速度を表示
                     if "pilot/angle" in inference and "pilot/throttle" in inference:
@@ -885,13 +885,13 @@ def export_to_video(
                         p_angle = inference.get("angle", 0)
                         p_throttle = inference.get("throttle", 0)
                     
-                    draw.text((width - 150, 10), f"P.Angle: {p_angle:.2f}", fill='blue')
-                    draw.text((width - 150, 30), f"P.Throttle: {p_throttle:.2f}", fill='blue')
+                    draw.text((width - 150, 10), f"P.Angle: {p_angle:.2f}", fill='cyan')
+                    draw.text((width - 150, 30), f"P.Throttle: {p_throttle:.2f}", fill='cyan')
                     
                     # 位置情報があれば表示
                     if "pilot/loc" in inference or "loc" in inference:
                         p_loc = inference.get("pilot/loc", inference.get("loc", 0))
-                        draw.text((width - 150, 50), f"P.Loc: {p_loc}", fill='blue')
+                        draw.text((width - 150, 50), f"P.Loc: {p_loc}", fill='cyan')
             
            # 追加: 差分ベクトル矢印を描画
             if annotation and x is not None and y is not None and diff_vectors:
@@ -1118,7 +1118,7 @@ def export_to_video_multi_source(
                             if inference:
                                 x, y = inference["x"], inference["y"]
                                 # 青い円を描画
-                                draw.ellipse((x-15, y-15, x+15, y+15), outline='blue', width=3)
+                                draw.ellipse((x-15, y-15, x+15, y+15), outline='cyan', width=3)
                                 
                                 # 推論結果の角度と速度を表示
                                 if "pilot/angle" in inference and "pilot/throttle" in inference:
@@ -1129,13 +1129,13 @@ def export_to_video_multi_source(
                                     p_throttle = inference.get("throttle", 0)
                                 
                                 width, height = pil_img.size
-                                draw.text((width - 150, 10), f"P.Angle: {p_angle:.2f}", fill='blue')
-                                draw.text((width - 150, 30), f"P.Throttle: {p_throttle:.2f}", fill='blue')
+                                draw.text((width - 150, 10), f"P.Angle: {p_angle:.2f}", fill='cyan')
+                                draw.text((width - 150, 30), f"P.Throttle: {p_throttle:.2f}", fill='cyan')
                                 
                                 # 位置情報があれば表示
                                 if "pilot/loc" in inference or "loc" in inference:
                                     p_loc = inference.get("pilot/loc", inference.get("loc", 0))
-                                    draw.text((width - 150, 50), f"P.Loc: {p_loc}", fill='blue')
+                                    draw.text((width - 150, 50), f"P.Loc: {p_loc}", fill='cyan')
                         
                         # ソース名を表示
                         draw.text((10, height - 30), f"Source: {source_names[source_idx]}", fill='white')

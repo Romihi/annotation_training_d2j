@@ -622,7 +622,10 @@ class ImageLabel(QLabel):
 
         # 目盛り表示
         painter.setFont(QFont("Arial", 10))
-        painter.setPen(QPen(QColor(80, 80, 80, 200), 1))
+        # ダークモードの場合は明るい色、ライトモードの場合は暗い色を使用
+        is_dark = self.main_window.is_dark_mode if self.main_window else False
+        text_color = QColor(200, 200, 200, 200) if is_dark else QColor(80, 80, 80, 200)
+        painter.setPen(QPen(text_color, 1))
         painter.drawText(target_rect.x() - 25, target_rect.y() - 5, "-1")
         painter.drawText(target_rect.x() + target_rect.width() + 5, target_rect.y() - 5, "1")
 
@@ -664,14 +667,14 @@ class ImageLabel(QLabel):
             painter.setBrush(QBrush())  # 塗りつぶしなし（透明）
             painter.drawEllipse(scaled_x - 15, scaled_y - 15, 30, 30)
 
-        # 青：推論点（推論結果）
+        # 明るい水色：推論点（推論結果）
         if self.show_inference and self.inference_point:
             rel_x = self.inference_point.x() / pix_width
             rel_y = self.inference_point.y() / pix_height
             scaled_x = int(target_rect.x() + rel_x * target_rect.width())
             scaled_y = int(target_rect.y() + rel_y * target_rect.height())
 
-            painter.setPen(QPen(QColor(0, 0, 255), 4))
+            painter.setPen(QPen(QColor(0, 255, 255), 4))  # 明るい水色(cyan)
             painter.setBrush(QBrush())  # 塗りつぶしなし（透明）
             painter.drawEllipse(scaled_x - 15, scaled_y - 15, 30, 30)
 
@@ -2035,6 +2038,9 @@ class ImageAnnotationTool(QMainWindow):
         self.yolo_model = None  # YOLOモデルのインスタンス
         self.yolo_confidence_threshold = 0.6  
         self.bbox_annotations = {} 
+        
+        # ダークモード状態
+        self.is_dark_mode = False
 
         # Setup UI
         self.init_ui()
@@ -2262,7 +2268,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # 物体検知推論結果表示用ラベルを作成
         self.detection_inference_info_label = QLabel("")
-        self.detection_inference_info_label.setStyleSheet("color: blue;")
+        self.detection_inference_info_label.setStyleSheet("color: #009999;")  # ダークシアン（ライトモード対応）
         self.detection_inference_info_label.setWordWrap(True)
 
         # 推論実行ボタン
@@ -2411,10 +2417,22 @@ class ImageAnnotationTool(QMainWindow):
         settings_label.setStyleSheet("font-weight: bold;")
         settings_layout.addWidget(settings_label)
         
+        # ボタンを横並びにするレイアウト
+        settings_buttons_layout = QHBoxLayout()
+        
         settings_button = QPushButton("ウィンドウ・フォントサイズ設定")
         settings_button.clicked.connect(self.show_display_settings)
-        apply_style(settings_button, 'primary')
-        settings_layout.addWidget(settings_button)
+        apply_style(settings_button, 'special')
+        settings_buttons_layout.addWidget(settings_button)
+        
+        # ダークモード切替ボタンを追加
+        self.dark_mode_button = QPushButton("ダークモード")
+        self.dark_mode_button.setCheckable(True)
+        self.dark_mode_button.clicked.connect(self.toggle_dark_mode)
+        apply_style(self.dark_mode_button, 'special')
+        settings_buttons_layout.addWidget(self.dark_mode_button)
+        
+        settings_layout.addLayout(settings_buttons_layout)
         
         left_layout.addLayout(settings_layout)
 
@@ -2458,7 +2476,7 @@ class ImageAnnotationTool(QMainWindow):
         
         self.inference_info_label = QLabel("")
         self.inference_info_label.setWordWrap(True)
-        self.inference_info_label.setStyleSheet("color: blue;")
+        self.inference_info_label.setStyleSheet("color: #009999;")  # ダークシアン（ライトモード対応）
         self.inference_info_label.setMinimumHeight(45)  # 推論結果に十分な高さを設定
         self.inference_info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         info_layout.addWidget(self.inference_info_label)
@@ -2474,7 +2492,7 @@ class ImageAnnotationTool(QMainWindow):
         # 物体検知推論結果表示ラベル（位置推論結果の下）
         self.detection_inference_info_label = QLabel("")
         self.detection_inference_info_label.setWordWrap(True)
-        self.detection_inference_info_label.setStyleSheet("color: green;")  # 緑色で表示して区別
+        self.detection_inference_info_label.setStyleSheet("color: #009999;")  # ダークシアン（ライトモード対応）
         self.detection_inference_info_label.setMinimumHeight(40)  # YOLO推論結果は複数行になる可能性があるため高めに設定
         self.detection_inference_info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         info_layout.addWidget(self.detection_inference_info_label)
@@ -2485,10 +2503,10 @@ class ImageAnnotationTool(QMainWindow):
         info_layout.addWidget(spacer)
 
         # 分布タイトルラベル
-        graph_title = QLabel("運転アノテーション分布")
-        graph_title.setStyleSheet("font-weight: bold; color: #333333;")
-        graph_title.setAlignment(Qt.AlignCenter)
-        info_layout.addWidget(graph_title)
+        self.graph_title = QLabel("運転アノテーション分布")
+        self.graph_title.setStyleSheet("font-weight: bold; color: #333333;")
+        self.graph_title.setAlignment(Qt.AlignCenter)
+        info_layout.addWidget(self.graph_title)
 
         # 分布グラフ用ラベル - 固定サイズで配置
         self.distribution_label = QLabel()
@@ -4065,8 +4083,8 @@ class ImageAnnotationTool(QMainWindow):
 
                 # 推論情報のリッチテキスト
                 inference_text = f"<b>自動運転推論結果:</b><br>"
-                inference_text += f"angle = <span style='color: #6666FF;'>{angle:.4f}</span><br>"
-                inference_text += f"throttle = <span style='color: #6666FF;'>{throttle:.4f}</span>"
+                inference_text += f"angle = <span style='color: #009999;'>{angle:.4f}</span><br>"
+                inference_text += f"throttle = <span style='color: #009999;'>{throttle:.4f}</span>"
 
                 # 位置情報を取得
                 location = None
@@ -5207,6 +5225,7 @@ class ImageAnnotationTool(QMainWindow):
         try:
             # 学習パラメータの準備
             training_params = {
+                "model_type": model_type,
                 "epochs": training_config['num_epochs'],
                 "batch_size": training_config['batch_size'],
                 "img_size": training_config['img_size'],
@@ -5221,7 +5240,8 @@ class ImageAnnotationTool(QMainWindow):
                 "hsv_v": training_config['hsv_v'],
                 "translate": training_config['translate'],
                 "scale": training_config['scale'],
-                "erasing": training_config['erasing']
+                "erasing": training_config['erasing'],
+                "data_folder": os.path.basename(self.folder_path) if hasattr(self, 'folder_path') and self.folder_path else "unknown"
             }
             
             # タスクタイプに応じてMLflowに記録
@@ -8741,7 +8761,7 @@ class ImageAnnotationTool(QMainWindow):
         
         # 設定を保存
         if self.save_settings_check.isChecked():
-            self.save_display_settings(new_width, new_height, new_font_size)
+            self.save_display_settings(new_width, new_height, new_font_size, self.is_dark_mode)
         
         # ステータスバーに通知
         self.statusBar().showMessage(
@@ -8761,7 +8781,7 @@ class ImageAnnotationTool(QMainWindow):
                     child_font = QFont(font)
                     child.setFont(child_font)
     
-    def save_display_settings(self, width, height, font_size):
+    def save_display_settings(self, width, height, font_size, dark_mode=None):
         """表示設定をファイルに保存"""
         settings_path = os.path.join(session_dir, "display_settings.json")
         settings = {
@@ -8770,6 +8790,11 @@ class ImageAnnotationTool(QMainWindow):
             "font_size": font_size
         }
         
+        if dark_mode is not None:
+            settings["dark_mode"] = dark_mode
+        elif hasattr(self, 'is_dark_mode'):
+            settings["dark_mode"] = self.is_dark_mode
+            
         try:
             with open(settings_path, 'w', encoding='utf-8') as f:
                 json.dump(settings, f, indent=2)
@@ -8795,9 +8820,163 @@ class ImageAnnotationTool(QMainWindow):
                     font.setPointSize(settings["font_size"])
                     self.setFont(font)
                     self.apply_font_to_children(self, font)
+                
+                # ダークモード設定を適用
+                if "dark_mode" in settings:
+                    self.is_dark_mode = settings["dark_mode"]
+                    if hasattr(self, 'dark_mode_button'):
+                        self.dark_mode_button.setChecked(self.is_dark_mode)
+                    self.apply_dark_mode(self.is_dark_mode)
                     
             except Exception as e:
                 print(f"表示設定の読み込みエラー: {e}")
+
+    def toggle_dark_mode(self):
+        """ダークモードを切り替える"""
+        self.is_dark_mode = not self.is_dark_mode
+        self.dark_mode_button.setChecked(self.is_dark_mode)
+        self.apply_dark_mode(self.is_dark_mode)
+        
+        # 設定を保存
+        if hasattr(self, 'width_spin') and hasattr(self, 'height_spin'):
+            # 設定ダイアログが開いている場合
+            self.save_display_settings(
+                self.width_spin.value(), 
+                self.height_spin.value(), 
+                self.font().pointSize(),
+                self.is_dark_mode
+            )
+        else:
+            # 通常の場合
+            self.save_display_settings(
+                self.width(), 
+                self.height(), 
+                self.font().pointSize(),
+                self.is_dark_mode
+            )
+    
+    def apply_dark_mode(self, is_dark):
+        """ダークモードのスタイルシートを適用"""
+        if is_dark:
+            # ダークモードのスタイル
+            dark_style = """
+            QMainWindow {
+                background-color: #2b2b2b;
+                color: #ffffff;
+            }
+            QWidget {
+                background-color: #2b2b2b;
+                color: #ffffff;
+            }
+            QPushButton {
+                background-color: #404040;
+                border: 1px solid #555555;
+                border-radius: 4px;
+                padding: 6px;
+                color: #ffffff;
+            }
+            QPushButton:hover {
+                background-color: #505050;
+            }
+            QPushButton:pressed {
+                background-color: #606060;
+            }
+            QPushButton:checked {
+                background-color: #0078d4;
+                border-color: #106ebe;
+            }
+            QLabel {
+                background-color: transparent;
+                color: #ffffff;
+            }
+            QLineEdit {
+                background-color: #404040;
+                border: 1px solid #555555;
+                border-radius: 4px;
+                padding: 4px;
+                color: #ffffff;
+            }
+            QComboBox {
+                background-color: #404040;
+                border: 1px solid #555555;
+                border-radius: 4px;
+                padding: 4px;
+                color: #ffffff;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #404040;
+                border: 1px solid #555555;
+                selection-background-color: #0078d4;
+                color: #ffffff;
+            }
+            QScrollArea {
+                background-color: #2b2b2b;
+                border: none;
+            }
+            QGroupBox {
+                border: 2px solid #555555;
+                border-radius: 5px;
+                margin-top: 10px;
+                color: #ffffff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+                color: #ffffff;
+            }
+            QSpinBox {
+                background-color: #404040;
+                border: 1px solid #555555;
+                border-radius: 4px;
+                padding: 4px;
+                color: #ffffff;
+            }
+            QDialog {
+                background-color: #2b2b2b;
+                color: #ffffff;
+            }
+            QTabWidget::pane {
+                border: 1px solid #555555;
+                background-color: #2b2b2b;
+            }
+            QTabBar::tab {
+                background-color: #404040;
+                border: 1px solid #555555;
+                border-bottom: none;
+                padding: 6px;
+                color: #ffffff;
+            }
+            QTabBar::tab:selected {
+                background-color: #0078d4;
+            }
+            """
+            self.setStyleSheet(dark_style)
+            self.dark_mode_button.setText("ライトモード")
+            
+            # ラベルの色を明示的に更新
+            if hasattr(self, 'idx_label'):
+                self.idx_label.update()
+            if hasattr(self, 'current_image_label'):
+                self.current_image_label.update()
+            if hasattr(self, 'current_image_info'):
+                self.current_image_info.setStyleSheet("color: #ffffff; font-weight: bold;")
+            if hasattr(self, 'graph_title'):
+                self.graph_title.setStyleSheet("font-weight: bold; color: #ffffff;")
+        else:
+            # ライトモードのスタイル（デフォルト）
+            self.setStyleSheet("")
+            self.dark_mode_button.setText("ダークモード")
+            
+            # ラベルの色を明示的に更新
+            if hasattr(self, 'idx_label'):
+                self.idx_label.update()
+            if hasattr(self, 'current_image_label'):
+                self.current_image_label.update()
+            if hasattr(self, 'current_image_info'):
+                self.current_image_info.setStyleSheet("color: #333333; font-weight: bold;")
+            if hasattr(self, 'graph_title'):
+                self.graph_title.setStyleSheet("font-weight: bold; color: #333333;")
 
     def add_bbox_annotation(self, bbox):
         """バウンディングボックスアノテーションを追加"""
@@ -9342,6 +9521,10 @@ class ImageAnnotationTool(QMainWindow):
                     img_index = self.images.index(img_path)
                     self.inference_results[img_index] = result
                     print(f"推論結果保存: インデックス{img_index} <- {os.path.basename(img_path)}")
+                    
+                    # 差分ベクトルの計算と保存
+                    self.calculate_and_store_diff_vector(img_index)
+                    
                 except ValueError:
                     print(f"警告: 画像パス {img_path} がself.imagesに見つかりません")
                     # パスでも保存（後方互換性のため）
@@ -9518,6 +9701,10 @@ class ImageAnnotationTool(QMainWindow):
                             self.inference_results[img_index] = result
                             success_count += 1
                             print(f"推論結果保存: インデックス{img_index} <- {os.path.basename(img_path)}")
+                            
+                            # 差分ベクトルの計算と保存
+                            self.calculate_and_store_diff_vector(img_index)
+                            
                         except ValueError:
                             print(f"警告: 画像パス {img_path} がself.imagesに見つかりません")
                             # パスでも保存（後方互換性のため）
@@ -9721,8 +9908,8 @@ class ImageAnnotationTool(QMainWindow):
 
             # 推論情報のリッチテキスト
             inference_text = f"<b>推論結果:</b><br>"
-            inference_text += f"angle = <span style='color: #6666FF;'>{angle:.4f}</span><br>"
-            inference_text += f"throttle = <span style='color: #6666FF;'>{throttle:.4f}</span>"
+            inference_text += f"angle = <span style='color: #009999;'>{angle:.4f}</span><br>"
+            inference_text += f"throttle = <span style='color: #009999;'>{throttle:.4f}</span>"
 
 
             # 追加: 差分ベクトルの計算と表示
@@ -10640,6 +10827,10 @@ class ImageAnnotationTool(QMainWindow):
                     img_index = self.images.index(img_path)
                     self.inference_results[img_index] = result
                     print(f"推論結果保存: インデックス{img_index} <- {os.path.basename(img_path)}")
+                    
+                    # 差分ベクトルの計算と保存
+                    self.calculate_and_store_diff_vector(img_index)
+                    
                 except ValueError:
                     print(f"警告: 画像パス {img_path} がself.imagesに見つかりません")
                     # パスでも保存（後方互換性のため）
@@ -10672,6 +10863,13 @@ class ImageAnnotationTool(QMainWindow):
             # 推論表示を更新
             self.update_inference_display()
             self.update_ui()
+            
+            # ダークモードの状態を再適用（モデル読み込み後のスタイルリセット対策）
+            if hasattr(self, 'is_dark_mode') and self.is_dark_mode:
+                if hasattr(self, 'current_image_info'):
+                    self.current_image_info.setStyleSheet("color: #ffffff; font-weight: bold;")
+                if hasattr(self, 'graph_title'):
+                    self.graph_title.setStyleSheet("font-weight: bold; color: #ffffff;")
 
             progress.setValue(100)
             QApplication.processEvents()
@@ -10702,6 +10900,10 @@ class ImageAnnotationTool(QMainWindow):
             
             # セッション情報を保存
             self.save_session_info()
+            
+            # 自動運転モデル読み込み完了後、オートアノテーションボタンを有効化
+            if hasattr(self, 'auto_annotate_button'):
+                self.auto_annotate_button.setEnabled(True)
             
         except Exception as e:
             # エラー発生時も進捗ダイアログを閉じる
@@ -12012,7 +12214,7 @@ class ImageAnnotationTool(QMainWindow):
         dialog_layout.addLayout(skip_layout)
         
         # 推論結果表示設定
-        inference_check = QCheckBox("推論結果を表示する（青丸）")
+        inference_check = QCheckBox("推論結果を表示する（水色丸）")
         inference_check.setChecked(self.inference_checkbox.isChecked())  # UIの設定を初期値に
         dialog_layout.addWidget(inference_check)
         
@@ -13047,6 +13249,7 @@ class ImageAnnotationTool(QMainWindow):
                 model_type=model_type,
                 training_results=training_results,
                 training_params={
+                    "model_type": model_type,
                     "num_epochs": num_epochs,
                     "completed_epochs": training_results.get('completed_epochs', num_epochs),
                     "learning_rate": learning_rate,
@@ -13057,7 +13260,8 @@ class ImageAnnotationTool(QMainWindow):
                     "initial_weights": "fine-tuned" if load_weights else "pretrained",
                     "augmentation_enabled": augmentation_params['enabled'],
                     "sampling_strategy": self._get_sampling_strategy_name(use_all, use_skip, use_range, skip_count),
-                    "augmentation_params": augmentation_params
+                    "augmentation_params": augmentation_params,
+                    "data_folder": os.path.basename(self.folder_path) if hasattr(self, 'folder_path') and self.folder_path else "unknown"
                 },
                 dataset_info={
                     "total_annotations": len(self.annotations),
@@ -13075,13 +13279,15 @@ class ImageAnnotationTool(QMainWindow):
                 model_type=model_type,
                 training_results=training_results,
                 training_params={
+                    "model_type": model_type,
                     "num_epochs": num_epochs,
                     "learning_rate": learning_rate,
                     "batch_size": batch_size,
                     "use_early_stopping": use_early_stopping,
                     "patience": patience,
                     "load_weights": load_weights,
-                    "selected_model": selected_model if load_weights else None
+                    "selected_model": selected_model if load_weights else None,
+                    "data_folder": os.path.basename(self.folder_path) if hasattr(self, 'folder_path') and self.folder_path else "unknown"
                 },
                 dataset_info={
                     "image_paths_count": len(image_paths),
@@ -14857,7 +15063,8 @@ class ImageAnnotationTool(QMainWindow):
                 "coordinate_system": "classification",  # 位置推論特有
                 "estimation_method": "cnn_classification",  # 位置推論特有
                 "fixed_classes": dataset_info['num_classes'],
-                "actual_classes": dataset_info['actual_classes']
+                "actual_classes": dataset_info['actual_classes'],
+                "data_folder": os.path.basename(self.folder_path) if hasattr(self, 'folder_path') and self.folder_path else "unknown"
             }
             
             # MLflowに記録

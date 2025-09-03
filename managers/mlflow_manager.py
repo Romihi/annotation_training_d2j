@@ -152,6 +152,7 @@ class MLflowManager:
         params = {
             "framework": "pytorch",
             "model_type": training_params.get("model_type", "autonomous_driving"),
+            "data_folder": training_params.get("data_folder", "unknown"),
             "epochs": training_params.get("num_epochs", 0),
             "completed_epochs": training_params.get("completed_epochs", 0),
             "learning_rate": training_params.get("learning_rate", 0.001),
@@ -261,6 +262,7 @@ class MLflowManager:
         params = {
             "framework": "pytorch",
             "model_type": training_params.get("model_type", "position_estimation"),
+            "data_folder": training_params.get("data_folder", "unknown"),
             "task_type": "classification",  # 位置推論は分類タスク
             "epochs": training_params.get("num_epochs", 0),
             "completed_epochs": training_params.get("completed_epochs", 0),
@@ -371,6 +373,7 @@ class MLflowManager:
         params = {
             "framework": "yolo",
             "model_type": model_type,
+            "data_folder": training_params.get("data_folder", "unknown"),
             "epochs": training_params.get("epochs", 0),
             "batch_size": training_params.get("batch_size", 16),
             "img_size": training_params.get("img_size", 640),
@@ -474,6 +477,7 @@ class MLflowManager:
         params = {
             "framework": training_params.get("framework", "yolo"),
             "model_type": training_params.get("model_type", "yolo_segmentation"),
+            "data_folder": training_params.get("data_folder", "unknown"),
             "architecture": training_params.get("architecture", "yolo_segmentation"),
             "epochs": training_params.get("epochs", 0),
             "batch_size": training_params.get("batch_size", 16),
