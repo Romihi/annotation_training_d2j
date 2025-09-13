@@ -398,10 +398,6 @@ def create_datasets(
                     )
                 )
             
-            # 正規化（ベース変換の一部として）
-            transform_list.append(
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            )
             
             transform = transforms.Compose(transform_list)
         else:
@@ -412,15 +408,13 @@ def create_datasets(
                 transforms.RandomHorizontalFlip(),
                 transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
                 transforms.RandomAffine(degrees=5, translate=(0.1, 0.1)),
-                transforms.RandomErasing(p=0.5, scale=(0.02, 0.2)),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                transforms.RandomErasing(p=0.5, scale=(0.02, 0.2))
             ])
     else:
         # オーグメンテーションなしの場合も明示的なToTensorを含める
         transform = transforms.Compose([
             transforms.Resize(actual_size),  # 実際のサイズにリサイズ
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.ToTensor()
         ])
 
     # データセットの作成
@@ -1348,16 +1342,12 @@ def create_location_datasets(
             transforms.RandomHorizontalFlip(),
             transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
             transforms.RandomAffine(degrees=5, translate=(0.1, 0.1)),
-            transforms.RandomErasing(p=0.5, scale=(0.02, 0.2)),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                std=[0.229, 0.224, 0.225])
+            transforms.RandomErasing(p=0.5, scale=(0.02, 0.2))
         ])
     else:
         transform = transforms.Compose([
             transforms.Resize(actual_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                std=[0.229, 0.224, 0.225])
+            transforms.ToTensor()
         ])
 
     # データセット作成

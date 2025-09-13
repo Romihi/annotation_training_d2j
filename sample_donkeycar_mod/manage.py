@@ -539,7 +539,6 @@ def drive(cfg, model_path=None,model_path2=None,duo=None, use_joystick=False, mo
                 preprocess = transforms.Compose([
                     transforms.Resize((height, width)),
                     transforms.ToTensor(),
-                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
                 ])
                 
                 # ONNXモデルのラッパークラスを作成

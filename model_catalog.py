@@ -130,8 +130,7 @@ class BaseModel(nn.Module):
         return transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.ToTensor()
         ])
     
     def forward(self, x):
@@ -246,8 +245,7 @@ class TIMMBasedModel(BaseModel):
         # データ拡張なしのシンプルな評価用前処理
         return transforms.Compose([
             transforms.Resize((input_size[0], input_size[1])),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.ToTensor()
         ])
 
 # 各モデルの実装クラス
@@ -582,8 +580,7 @@ class DonkeyModel(BaseModel):
         """Donkeycar用の前処理 - 保存されている入力サイズを使用"""
         return transforms.Compose([
             transforms.Resize(self.input_size),  # 保存された入力サイズを使用
-            transforms.ToTensor(),
-            #transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.ToTensor()
         ])
 
 class DonkeyModel_FCN(BaseModel):
@@ -627,8 +624,7 @@ class DonkeyModel_FCN(BaseModel):
         """Donkeycar用の前処理 - 保存されている入力サイズを使用"""
         return transforms.Compose([
             transforms.Resize(self.input_size),  # 保存された入力サイズを使用
-            transforms.ToTensor(),
-            #transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.ToTensor()
         ])
 
 # Add these classification models to model_catalog.py
@@ -693,7 +689,8 @@ class DonkeyModel_FCN(BaseModel):
 #         return transforms.Compose([
 #             transforms.Resize(self.input_size),
 #             transforms.ToTensor(),
-#             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+#             # donkeycar形式：ToTensorで[0,1]正規化済み
+            # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 #         ])
 
 #     def run(self, img_arr):
@@ -909,8 +906,7 @@ class DonkeyLocationModel(BaseLocationModel):
         """Donkeycar用の前処理 - 保存されている入力サイズを使用"""
         return transforms.Compose([
             transforms.Resize(self.input_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.ToTensor()
         ])
 
     def run(self, img_arr):
@@ -952,8 +948,7 @@ class ResNet18LocationModel(BaseLocationModel):
         input_size = self._get_model_input_size()
         return transforms.Compose([
             transforms.Resize((input_size[0], input_size[1])),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.ToTensor()
         ])
 
     def run(self, img_arr):
