@@ -678,8 +678,15 @@ if __name__ == "__main__":
 ## ライセンス（License）
 This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
 
+**重要**: このプロジェクトはUltralytics YOLOv8/YOLOv11を使用しており、AGPL-3.0ライセンスの条件に従います。商用利用の場合は、Ultralyticsの商用ライセンスの取得を検討してください。
+
 ## Third-party Libraries
 - PyQt5: Licensed under GPL v3
+- Ultralytics YOLO (YOLOv8/YOLOv11): Licensed under AGPL-3.0 ([https://github.com/ultralytics/ultralytics](https://github.com/ultralytics/ultralytics))
+- PyTorch: Licensed under BSD-3-Clause ([https://github.com/pytorch/pytorch](https://github.com/pytorch/pytorch))
+- PIL/Pillow: Licensed under HPND ([https://github.com/python-pillow/Pillow](https://github.com/python-pillow/Pillow))
+- NumPy: Licensed under BSD-3-Clause ([https://github.com/numpy/numpy](https://github.com/numpy/numpy))
+- MLflow: Licensed under Apache-2.0 ([https://github.com/mlflow/mlflow](https://github.com/mlflow/mlflow))
 
 
 ## 変更履歴
