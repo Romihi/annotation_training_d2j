@@ -142,8 +142,8 @@
 - PyTorch
 - Pillow
 - NumPy
-- MLflow (オプション、実験追跡用)
-- Ultralytics (YOLOサポート用)
+- MLflow
+- Ultralytics
 
 詳細なバージョン要件については、requirements.txtを参照してください。
 
