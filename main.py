@@ -9950,61 +9950,64 @@ class ImageAnnotationTool(QMainWindow):
         """
         画像フォルダを選択するダイアログを表示
         選択されたフォルダの下のimagesフォルダを画像フォルダとして取り扱う
-        """        
+        """
         # 複数フォルダ選択が可能なダイアログを表示
         dialog = QFileDialog(self)
         dialog.setFileMode(QFileDialog.DirectoryOnly)
         dialog.setOption(QFileDialog.DontUseNativeDialog, True)
-        
+
         # QFileDialogのリストビューを取得して複数選択を可能にする
         listView = dialog.findChild(QListView, "listView")
         if listView:
             listView.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        
+
         treeView = dialog.findChild(QTreeView)
         if treeView:
             treeView.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        
+
         # 選択されたフォルダを取得
-        if dialog.exec_():
-            selected_folders = dialog.selectedFiles()
-            
-            # 複数のフォルダを選択した場合は、セミコロン区切りでテキストフィールドに表示
-            if selected_folders:
-                # 選択されたフォルダ内にimagesフォルダが存在するか確認
-                valid_folders = []
-                missing_images_folders = []
-                
-                for folder in selected_folders:
-                    images_path = os.path.join(folder, "images")
-                    if os.path.exists(images_path) and os.path.isdir(images_path):
-                        valid_folders.append(folder)
-                    else:
-                        missing_images_folders.append(folder)
-                
-                # imagesフォルダが見つからなかった場合は警告メッセージを表示
-                if missing_images_folders:
-                    missing_folders_str = "\n".join(missing_images_folders)
-                    QMessageBox.warning(
-                        self,
-                        "imagesフォルダ未検出",
-                        f"次のフォルダ内にimagesフォルダが見つかりませんでした：\n{missing_folders_str}\n\n有効なフォルダのみ処理を続行します。"
-                    )
-                
-                # 有効なフォルダをテキストフィールドに設定
-                if valid_folders:
-                    self.folder_input.setText(";".join(valid_folders))
+        if not dialog.exec_():
+            # キャンセルまたは×ボタンが押された場合は何もせずに終了
+            return
+
+        selected_folders = dialog.selectedFiles()
+
+        # 複数のフォルダを選択した場合は、セミコロン区切りでテキストフィールドに表示
+        if selected_folders:
+            # 選択されたフォルダ内にimagesフォルダが存在するか確認
+            valid_folders = []
+            missing_images_folders = []
+
+            for folder in selected_folders:
+                images_path = os.path.join(folder, "images")
+                if os.path.exists(images_path) and os.path.isdir(images_path):
+                    valid_folders.append(folder)
                 else:
-                    self.folder_input.setText("")
-                    QMessageBox.critical(
-                        self,
-                        "エラー",
-                        "選択されたフォルダのいずれにもimagesフォルダが含まれていません。\n処理を中止します。"
-                    )
-                    return
-        
-        # 少し遅延させてから画像読み込みを実行（UIが更新される時間を確保）
-        QTimer.singleShot(100, self.load_images)
+                    missing_images_folders.append(folder)
+
+            # imagesフォルダが見つからなかった場合は警告メッセージを表示
+            if missing_images_folders:
+                missing_folders_str = "\n".join(missing_images_folders)
+                QMessageBox.warning(
+                    self,
+                    "imagesフォルダ未検出",
+                    f"次のフォルダ内にimagesフォルダが見つかりませんでした：\n{missing_folders_str}\n\n有効なフォルダのみ処理を続行します。"
+                )
+
+            # 有効なフォルダをテキストフィールドに設定
+            if valid_folders:
+                self.folder_input.setText(";".join(valid_folders))
+                # 有効なフォルダがある場合のみ画像読み込みを実行
+                # 少し遅延させてから画像読み込みを実行（UIが更新される時間を確保）
+                QTimer.singleShot(100, self.load_images)
+            else:
+                self.folder_input.setText("")
+                QMessageBox.critical(
+                    self,
+                    "エラー",
+                    "選択されたフォルダのいずれにもimagesフォルダが含まれていません。\n処理を中止します。"
+                )
+                return
 
     def load_images(self):
         """
