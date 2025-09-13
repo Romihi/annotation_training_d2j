@@ -188,5 +188,7 @@ cython_debug/
 .vscode/
 
 #YOLO
-yolo8*
-yolo11*
+yolo*
+
+#Claude
+.claude

@@ -35,17 +35,18 @@ from ultralytics import settings
 import mlflow
 import mlflow.pytorch
 
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                             QLabel, QPushButton, QFileDialog, QMessageBox,
                             QScrollArea, QGridLayout, QFrame, QLineEdit, QProgressDialog,
-                            QCheckBox, QSpinBox, QComboBox, QSlider, QInputDialog, 
+                            QCheckBox, QSpinBox, QComboBox, QSlider, QInputDialog,
                             QDoubleSpinBox, QDialog, QDialogButtonBox,
                             QGroupBox, QRadioButton, QTabWidget, QSizePolicy,QButtonGroup,
-                            QListView, QTreeView, QAbstractItemView,QStyleOptionSlider,QStyle, QTextEdit, QPlainTextEdit)
+                            QListView, QTreeView, QAbstractItemView,QStyleOptionSlider,QStyle, QTextEdit, QPlainTextEdit,
+                            QGraphicsOpacityEffect)
 from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont, QPolygon
-from PyQt5.QtCore import Qt, QRect, QPoint, QTimer, QEvent
+from PyQt5.QtCore import Qt, QRect, QPoint, QTimer, QEvent, QThread, pyqtSignal
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 # ユーティリティのインポート
 #from utils.color_utils import get_location_color, get_class_color, get_segmentation_color
@@ -65,17 +66,17 @@ from utils.image_utils import (
 
 # カスタムモジュールのインポート
 from model_catalog import get_model, list_available_models
-from inference_utils import batch_inference
-from exports_file import export_to_donkey, export_to_jetracer, export_to_video, export_to_video_multi_source
+from utils.inference_utils import batch_inference
+from utils.export_utils import export_to_donkey, export_to_jetracer, export_to_video, export_to_video_multi_source
 from model_training import train_model, create_datasets
 from model_training import train_location_model, create_location_datasets, LocationModelManager
 from model_training import generate_augmentation_samples
 # TODO:ボタンのスタイルを実装、他のUIの移植については後ほど検討
 from styles import get_location_color, apply_style, set_theme, get_current_theme, PRIMARY_STYLE, MODEL_STYLE, TRAINING_STYLE, EXPORT_STYLE, SPECIAL_STYLE, DESTRUCTIVE_STYLE, NAV_STYLE
 
-from enhanced_annotations import apply_enhanced_annotations_display
 
 from managers import AnnotationDataManager, MLflowManager, ModelType
+from utils.yolo_utils import train_yolo_with_ui, TrainingOutputDialog
 
 import traceback
 def exception_hook(exc_type, exc_value, exc_traceback):
@@ -1807,28 +1808,31 @@ class ImageLabel(QLabel):
         
         return None
 
-# 下部ギャラリー系
+# 下部ギャラリー系（物体検知・セグメンテーション対応強化版）
 class ThumbnailWidget(QWidget):
-    def __init__(self, parent=None, img_path="", index=0, is_selected=False, 
-                 annotation=None, on_click=None, location_value=None, is_deleted=False):
+    def __init__(self, parent=None, img_path="", index=0, is_selected=False,
+                 annotation=None, on_click=None, location_value=None, is_deleted=False,
+                 bbox_annotations=None, segmentation_annotations=None):
         super().__init__(parent)
         self.img_path = img_path
         self.index = index
         self.on_click = on_click
         self.is_selected = is_selected
-        self.annotation = annotation  # アノテーション情報
-        self.location_value = location_value  # 変更: 辞書ではなく直接位置情報の値を受け取る
-        self.is_deleted = is_deleted  # 削除済みフラグ
-        
+        self.annotation = annotation
+        self.location_value = location_value
+        self.is_deleted = is_deleted
+        self.bbox_annotations = bbox_annotations
+        self.segmentation_annotations = segmentation_annotations
+
         # サムネイル全体のサイズも調整
         self.setMinimumWidth(210)
         self.setMinimumHeight(170)  # 高さを少し小さく
-        
+
         # メインレイアウト（水平レイアウト）
         self.layout = QHBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)  # マージンをなくす
         self.layout.setSpacing(1)  # 最小限のスペーシング
-        
+
         # 左側の情報パネル
         info_panel = QWidget()
         info_panel.setFixedWidth(70)  # 情報パネル幅
@@ -1836,16 +1840,12 @@ class ThumbnailWidget(QWidget):
         info_layout.setContentsMargins(0, 0, 0, 0)
         info_layout.setSpacing(1)
 
-        # ラベル
-        info_panel_label = QLabel("情報パネル:")
-        info_panel_label.setStyleSheet("font-weight: bold;")
-        info_layout.addWidget(info_panel_label)
-
         # インデックス番号
         self.idx_label = QLabel(f"{index + 1}")
         self.idx_label.setAlignment(Qt.AlignCenter)
+        self.idx_label.setStyleSheet("font-weight: bold;")
         info_layout.addWidget(self.idx_label)
-        
+
         # 削除済みバッジ（削除されている場合）
         if is_deleted:
             deleted_badge = QLabel("削除済")
@@ -1863,25 +1863,26 @@ class ThumbnailWidget(QWidget):
         # アノテーション情報（angleとthrottleが実際に存在し、有効な値の場合のみ表示）
         if annotation:
             # angleが存在し、かつ有効な値（None, 空文字列ではない）の場合のみ表示
-            if ('angle' in annotation and 
-                annotation['angle'] is not None and 
+            if ('angle' in annotation and
+                annotation['angle'] is not None and
                 annotation['angle'] != ''):
                 angle_label = QLabel(f"A: {annotation['angle']:.2f}")
                 angle_label.setStyleSheet("color: #FF6666; font-size: 12px;font-weight: bold;")
                 info_layout.addWidget(angle_label)
-            
+
             # throttleが存在し、かつ有効な値（None, 空文字列ではない）の場合のみ表示
-            if ('throttle' in annotation and 
-                annotation['throttle'] is not None and 
+            if ('throttle' in annotation and
+                annotation['throttle'] is not None and
                 annotation['throttle'] != ''):
                 throttle_label = QLabel(f"T: {annotation['throttle']:.2f}")
                 throttle_label.setStyleSheet("color: #FF6666; font-size: 12px;font-weight: bold;")
                 info_layout.addWidget(throttle_label)
 
             # 位置情報バッジ（位置情報がある場合）
+            # 変更: 辞書からの参照ではなく、直接location_valueを使用
             if location_value is not None:
                 loc_color = get_location_color(location_value)
-                
+
                 loc_badge = QLabel(str(location_value))
                 loc_badge.setAlignment(Qt.AlignCenter)
                 loc_badge.setStyleSheet(f"""
@@ -1894,41 +1895,99 @@ class ThumbnailWidget(QWidget):
                     padding: 1px;
                 """)
                 info_layout.addWidget(loc_badge)
-                    
 
-        # 分布グラフ用ラベルを追加 (info_layoutに追加)
-        self.distribution_label = QLabel("アノテーションがありません")
-        self.distribution_label.setAlignment(Qt.AlignCenter)
-        self.distribution_label.setMinimumHeight(300)  # 高さを確保
-        self.distribution_label.setStyleSheet("background-color: #f5f5f5; border: 1px solid #dddddd;")
-        info_layout.addWidget(self.distribution_label)
+        # 物体検知アノテーション情報を追加 (新規追加)
+        if bbox_annotations : #and not is_deleted:
+            # オブジェクト数を表示するバッジ
+            obj_count = len(bbox_annotations)
+            bbox_badge = QLabel(f"物体: {obj_count}")
+            bbox_badge.setAlignment(Qt.AlignCenter)
+            bbox_badge.setStyleSheet("""
+                background-color: #2196F3;
+                color: white;
+                font-weight: bold;
+                border-radius: 10px;
+                min-width: 20px;
+                min-height: 20px;
+                padding: 1px;
+                font-size: 10px;
+            """)
+            info_layout.addWidget(bbox_badge)
+
+            # クラスごとのカウントを集計
+            class_counts = {}
+            for bbox in bbox_annotations:
+                class_name = bbox.get('class', 'unknown')
+                class_counts[class_name] = class_counts.get(class_name, 0) + 1
+
+            # 主要なクラスを最大2つまで表示
+            for i, (class_name, count) in enumerate(class_counts.items()):
+                if i >= 2:  # 最大2クラスまで表示
+                    break
+
+                class_label = QLabel(f"{class_name}: {count}")
+                class_label.setStyleSheet("font-size: 10px; color: #333;")
+                info_layout.addWidget(class_label)
+
+        # セグメンテーションアノテーション情報を追加（物体検知アノテーション情報の後に）
+        if segmentation_annotations and not is_deleted:
+            # セグメンテーション数を表示するバッジ
+            seg_count = len(segmentation_annotations)
+            seg_badge = QLabel(f"セグ: {seg_count}")
+            seg_badge.setAlignment(Qt.AlignCenter)
+            seg_badge.setStyleSheet("""
+                background-color: #9C27B0;
+                color: white;
+                font-weight: bold;
+                border-radius: 10px;
+                min-width: 20px;
+                min-height: 20px;
+                padding: 1px;
+                font-size: 10px;
+            """)
+            info_layout.addWidget(seg_badge)
+
+            # クラスごとのカウントを集計
+            seg_class_counts = {}
+            for seg in segmentation_annotations:
+                class_name = seg.get('class', 'unknown')
+                seg_class_counts[class_name] = seg_class_counts.get(class_name, 0) + 1
+
+            # 主要なクラスを最大2つまで表示
+            for i, (class_name, count) in enumerate(seg_class_counts.items()):
+                if i >= 2:  # 最大2クラスまで表示
+                    break
+
+                seg_class_label = QLabel(f"{class_name}: {count}")
+                seg_class_label.setStyleSheet("font-size: 10px; color: #9C27B0;")
+                info_layout.addWidget(seg_class_label)
 
         # 残りのスペースを埋めるスペーサー
         info_layout.addStretch()
-        
+
         # 左側の情報パネルをメインレイアウトに追加
         self.layout.addWidget(info_panel)
-        
+
         # 右側の画像パネル
         image_panel = QWidget()
         image_layout = QVBoxLayout(image_panel)
         image_layout.setContentsMargins(0, 0, 0, 0)
         image_layout.setSpacing(0)  # スペーシングをなくす
-        
+
         # ファイル名ラベルを画像の上部に配置
         filename = os.path.basename(img_path)
         if len(filename) > 20:  # ファイル名が長い場合は切り詰める
             filename = filename[:18] + "..."
-        
+
         name_label = QLabel(filename)
         name_label.setAlignment(Qt.AlignCenter)
         name_label.setStyleSheet("font-size: 12px; color: #444444; background-color: #f8f8f8;font-weight: bold;")
         name_label.setFixedHeight(10)  # 高さを最小限に
         image_layout.addWidget(name_label)
-        
+
         # 画像コンテナ（枠を付けるための外側のコンテナ）
         image_container = QFrame()
-        
+
         # ボーダーのスタイル設定
         border_style = ""
         if is_selected:
@@ -1940,35 +1999,38 @@ class ThumbnailWidget(QWidget):
             border_style = f"border: 2px solid {loc_color.name()};"
         elif annotation:
             border_style = "border: 2px solid #FF9966;"  # アノテーションのみはオレンジ系
+        elif bbox_annotations:  # 物体検知アノテーションがある場合は青い枠線
+            border_style = "border: 2px solid #2196F3;"
         else:
             border_style = "border: 1px solid #dddddd;"
-        
+
         # 画像コンテナのレイアウト - マージンを完全に削除
         image_container_layout = QVBoxLayout(image_container)
         image_container_layout.setContentsMargins(0, 0, 0, 0)  # 余白なし
         image_container_layout.setSpacing(0)  # スペーシングなし
-        
+
         # 画像ラベル
         self.img_label = QLabel()
         self.img_label.setAlignment(Qt.AlignCenter)
-        #self.img_label.setFixedSize(150, 140)  # 幅を少し広げる
-        self.img_label.setMinimumSize(150, 120)  # 最小サイズを設定
-        self.img_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)  # サイズポリシーを設定
-        
+        self.img_label.setFixedSize(150, 140)  # 幅を少し広げる
+
         # 削除済みの場合は半透明になるスタイルを追加
         if is_deleted:
             self.img_label.setStyleSheet(f"{border_style} padding: 0px; opacity: 0.5;")
         else:
             self.img_label.setStyleSheet(f"{border_style} padding: 0px;")
-            
+
         image_container_layout.addWidget(self.img_label)
-        
+
         # 画像コンテナをイメージパネルに追加
         image_layout.addWidget(image_container)
-        
+
         # 画像パネルをメインレイアウトに追加
         self.layout.addWidget(image_panel)
-                
+
+        # 画像を読み込む
+        self.load_image(img_path)
+
         # ウィジェット全体の枠線はなし
         self.setStyleSheet("border: none;")
 
@@ -1976,6 +2038,142 @@ class ThumbnailWidget(QWidget):
         # クリック時にon_click関数を呼び出す
         if self.on_click and event.button() == Qt.LeftButton:
             self.on_click(self.index)
+
+    def load_image(self, img_path):
+        if not os.path.exists(img_path):
+            return
+
+        try:
+            # PILで画像を開く
+            pil_img = Image.open(img_path)
+
+            # 画像のコピーを作成して描画する
+            draw_img = pil_img.copy()
+            draw = ImageDraw.Draw(draw_img)
+
+            # 基本的なアノテーションを描画（座標が存在する場合のみ）
+            if self.annotation and 'x' in self.annotation and 'y' in self.annotation:
+                # アノテーションの座標を取得
+                x, y = self.annotation["x"], self.annotation["y"]
+
+                # 丸を描画
+                circle_size = 15  # サムネイル用の丸のサイズ
+                draw.ellipse((x-circle_size, y-circle_size, x+circle_size, y+circle_size),
+                            outline='red', width=4)
+
+           # セグメンテーションアノテーションの描画（新規追加）
+            if self.segmentation_annotations and not self.is_deleted:
+                for seg_data in self.segmentation_annotations:
+                    class_name = seg_data.get('class', 'unknown')
+                    points = seg_data.get('points', [])
+
+                    if len(points) >= 3:
+                        # クラスに応じた色を定義
+                        class_colors = {
+                            'car': (255, 0, 0, 120),      # 赤
+                            'person': (0, 255, 0, 120),   # 緑
+                            'sign': (0, 0, 255, 120),     # 青
+                            'cone': (255, 255, 0, 120),   # 黄
+                            'unknown': (128, 128, 128, 120)  # グレー
+                        }
+
+                        color = class_colors.get(class_name, (255, 0, 0, 120))
+
+                        # ポリゴンを描画（アウトライン）
+                        outline_color = (color[0], color[1], color[2])  # アルファ値なし
+                        draw.polygon(points, outline=outline_color, width=2)
+
+                        # ラベルを表示（中心点に）
+                        if points:
+                            center_x = sum(p[0] for p in points) // len(points)
+                            center_y = sum(p[1] for p in points) // len(points)
+
+                            # ラベル背景を描画
+                            label_text = class_name[0].upper()  # 頭文字のみ
+                            text_size = 12
+
+                            # 背景矩形
+                            label_bg = (center_x-text_size//2, center_y-text_size//2,
+                                    center_x+text_size//2, center_y+text_size//2)
+                            draw.rectangle(label_bg, fill=outline_color)
+
+                            # テキスト描画
+                            draw.text((center_x-4, center_y-6), label_text, fill=(255, 255, 255))
+
+            # 物体検知アノテーションがある場合は矩形を描画
+            if self.bbox_annotations: # and not self.is_deleted:
+                img_width, img_height = pil_img.size
+
+                for bbox in self.bbox_annotations:
+                    # クラスに応じた色を定義
+                    class_colors = {
+                        'car': (255, 0, 0),      # 赤
+                        'person': (0, 255, 0),   # 緑
+                        'sign': (0, 0, 255),     # 青
+                        'cone': (255, 255, 0),   # 黄
+                        'unknown': (128, 128, 128)  # グレー
+                    }
+
+                    class_name = bbox.get('class', 'unknown')
+                    color = class_colors.get(class_name, (255, 0, 0))
+
+                    # 正規化された座標を実際の座標に変換
+                    x1 = int(bbox['x1'] * img_width)
+                    y1 = int(bbox['y1'] * img_height)
+                    x2 = int(bbox['x2'] * img_width)
+                    y2 = int(bbox['y2'] * img_height)
+
+                    # 矩形を描画
+                    draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+
+                    # ラベルを表示 (サムネイルでは小さいのでクラス名の1文字目だけ表示)
+                    label_text = class_name[0].upper()  # 頭文字のみ
+
+                    # ラベル背景
+                    text_size = 10  # 大まかなテキストサイズ
+                    label_bg = (x1, y1-text_size, x1+text_size, y1)
+                    draw.rectangle(label_bg, fill=color)
+
+                    # テキスト描画
+                    draw.text((x1+2, y1-text_size), label_text, fill=(255, 255, 255))
+
+            # 画像をQImageに変換
+            draw_img = draw_img.convert("RGBA")
+            data = draw_img.tobytes("raw", "RGBA")
+            qimg = QImage(data, draw_img.width, draw_img.height, QImage.Format_RGBA8888)
+
+            # QImageをQPixmapに変換してサムネイルに設定
+            pixmap = QPixmap.fromImage(qimg)
+
+            if not pixmap.isNull():
+                # 画像ラベルのサイズを取得
+                label_width = self.img_label.width()
+                label_height = self.img_label.height()
+
+                # サイズが0の場合は固定サイズを使用
+                if label_width == 0 or label_height == 0:
+                    label_width = 150
+                    label_height = 140
+
+                # 重要な変更: ラベルサイズと同じサイズでスケーリング
+                scaled_pixmap = pixmap.scaled(
+                    label_width,
+                    label_height,
+                    Qt.KeepAspectRatio,  # アスペクト比を維持
+                    Qt.SmoothTransformation  # 滑らかな変換
+                )
+
+                self.img_label.setPixmap(scaled_pixmap)
+                self.img_label.setAlignment(Qt.AlignCenter)  # 中央揃え
+
+                # 削除済みの場合は半透明にする追加の処理
+                if self.is_deleted:
+                    opacity_effect = QGraphicsOpacityEffect()
+                    opacity_effect.setOpacity(0.5)
+                    self.img_label.setGraphicsEffect(opacity_effect)
+
+        except Exception as e:
+            print(f"Error loading image {img_path}: {e}")
     
 # データ操作全体系
 class ImageAnnotationTool(QMainWindow):
@@ -2830,8 +3028,6 @@ class ImageAnnotationTool(QMainWindow):
         self.auto_mode_button.setChecked(True)
         self.detection_mode_button.setChecked(False)
 
-        # TODO:enhanced_annotationsの組み込み
-        apply_enhanced_annotations_display(self)
 
     def update_ui(self):
             """アノテーション変更後のUI更新を一括処理"""
@@ -4518,15 +4714,30 @@ class ImageAnnotationTool(QMainWindow):
         
         # 進捗ダイアログを事前に初期化
         progress = None
-        
+
+        # 学習出力ダイアログを表示
+        training_dialog = TrainingOutputDialog(self, f"YOLO {task_name} ({model_type})")
+        training_dialog.show()
+        QApplication.processEvents()
+
+        # 学習前の準備情報をダイアログに追加
+        training_dialog.add_preparation_message(f"=== {task_name}データセット作成 ===")
+        training_dialog.add_preparation_message(f"{task_name}アノテーションエクスポート開始")
+
+        # クラス情報を表示
+        class_mapping = {classes[i]: i for i in range(len(classes))}
+        training_dialog.add_preparation_message(f"クラス-インデックスマッピング: {class_mapping}")
+
+        QApplication.processEvents()
+
         try:
-            # データセット準備
-            dataset_info = self._prepare_yolo_dataset(task_type, classes, annotations)
+            # データセット準備（ダイアログ参照を渡して出力を転送）
+            dataset_info = self._prepare_yolo_dataset(task_type, classes, annotations, training_dialog)
             
             # MLflowManagerの初期化
             if not hasattr(self, 'mlflow_manager'):
                 self.mlflow_manager = MLflowManager(self.folder_path)
-            
+
             # Ultralytics YOLOモデルとMLflowのインポート
             try:
                 from ultralytics import YOLO, settings
@@ -4536,10 +4747,16 @@ class ImageAnnotationTool(QMainWindow):
                 missing_package = "ultralytics" if "ultralytics" in str(e) else "mlflow" if "mlflow" in str(e) else "依存パッケージ"
                 QMessageBox.critical(self, "エラー", f"{missing_package}パッケージがインストールされていません。\npip install {missing_package} でインストールしてください。")
                 return
-            
+
             # デバイスの選択
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            print(f"Using device for YOLO training: {device}")
+            self._log_to_dialog(f"Using device for YOLO training: {device}", training_dialog)
+
+            # MLflow情報を表示
+            mlflow_uri = f"file:///{self.folder_path}/mlruns"
+            self._log_to_dialog(f"MLflowトラッキングURI: {mlflow_uri}", training_dialog)
+            self._log_to_dialog("MLflow初期化成功: " + mlflow_uri, training_dialog)
+            self._log_to_dialog("実験を設定: yolo_detection_models", training_dialog)
             
             # 学習用の進捗ダイアログ
             progress = QProgressDialog(
@@ -4567,34 +4784,58 @@ class ImageAnnotationTool(QMainWindow):
             progress.setValue(20)
             QApplication.processEvents()
             
-            # YOLO学習実行
-            results = model.train(
-                data=dataset_info['yaml_file'],
-                epochs=training_config['num_epochs'],
-                batch=training_config['batch_size'],
-                imgsz=training_config['img_size'],
-                project=models_dir,
-                name=run_name,
-                device=device.type,
-                workers=0,
-                close_mosaic=10 if training_config['mosaic'] > 0 else 0,
-                patience=training_config['patience'],
-                exist_ok=True,
-                lr0=training_config['learning_rate'],
-                lrf=training_config['learning_rate'] / 10,
+            # 学習パラメータを準備
+            training_params = {
+                'data': dataset_info['yaml_file'],
+                'epochs': training_config['num_epochs'],
+                'batch': training_config['batch_size'],
+                'imgsz': training_config['img_size'],
+                'project': models_dir,
+                'name': run_name,
+                'device': device.type,
+                'workers': 0,
+                'close_mosaic': 10 if training_config['mosaic'] > 0 else 0,
+                'patience': training_config['patience'],
+                'exist_ok': True,
+                'lr0': training_config['learning_rate'],
+                'lrf': training_config['learning_rate'] / 10,
                 # オーグメンテーション設定
-                mosaic=training_config['mosaic'],
-                fliplr=training_config['fliplr'],
-                hsv_h=training_config['hsv_h'],
-                hsv_s=training_config['hsv_s'],
-                hsv_v=training_config['hsv_v'],
-                translate=training_config['translate'],
-                scale=training_config['scale'],
-                erasing=training_config['erasing']
+                'mosaic': training_config['mosaic'],
+                'fliplr': training_config['fliplr'],
+                'hsv_h': training_config['hsv_h'],
+                'hsv_s': training_config['hsv_s'],
+                'hsv_v': training_config['hsv_v'],
+                'translate': training_config['translate'],
+                'scale': training_config['scale'],
+                'erasing': training_config['erasing']
+            }
+
+            # 進捗ダイアログを閉じる
+            if progress:
+                progress.close()
+
+            # 学習を開始
+            training_dialog.start_training(model, training_params)
+            training_dialog.exec_()
+
+            # 学習が完了したかチェック
+            if not training_dialog.training_completed:
+                print("学習がキャンセルまたは失敗しました")
+                return
+
+            # 学習結果を取得（ワーカーから保存された結果を取得）
+            results = training_dialog.worker.results
+
+            # 新しい進捗ダイアログを作成（MLflow記録用）
+            progress = QProgressDialog(
+                "MLflowに学習結果を記録中...",
+                None, 0, 100, self
             )
-            
-            progress.setValue(90)
-            progress.setLabelText("MLflowに学習結果を記録中...")
+            progress.setWindowTitle("学習結果記録")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setCancelButton(None)  # キャンセル不可
+            progress.show()
+            progress.setValue(10)
             QApplication.processEvents()
             
             # MLflowに学習結果を記録
@@ -4764,9 +5005,15 @@ class ImageAnnotationTool(QMainWindow):
     #         'yaml_file': yaml_file
     #     }
 
-    def _prepare_yolo_dataset(self, task_type, classes, annotations):
+    def _log_to_dialog(self, message, training_dialog=None):
+        """メッセージをダイアログとターミナルの両方に出力"""
+        print(message)  # ターミナルにも出力
+        if training_dialog:
+            training_dialog.add_preparation_message(message)
+
+    def _prepare_yolo_dataset(self, task_type, classes, annotations, training_dialog=None):
         """YOLOデータセットの準備 - タスク別データ分離版"""
-        
+
         # データディレクトリ構造の作成
         train_dir = os.path.join(yolo_dataset_dir, "train")
         val_dir = os.path.join(yolo_dataset_dir, "val")
@@ -11302,6 +11549,52 @@ class ImageAnnotationTool(QMainWindow):
         self.add_location_button()
         return True
     
+    def update_annotation_info_label(self):
+        """物体検知アノテーション情報を表示する"""
+        if not self.images:
+            return ""
+
+        # インデックスベースに変更
+        current_index = self.current_index
+        is_deleted = hasattr(self, 'deleted_indexes') and current_index in self.deleted_indexes
+
+        # 物体検知アノテーション情報
+        bbox_info = ""
+        # 修正: パスベース → インデックスベース
+        if (current_index in self.bbox_annotations and
+            self.bbox_annotations[current_index]):
+            bboxes = self.bbox_annotations[current_index]
+            bbox_info = f"<b>物体検知アノテーション:</b><br>"
+
+            # 削除済みの場合は表示を追加
+            if is_deleted:
+                bbox_info = f"<span style='color: #FF5555;'>[削除済み]</span> " + bbox_info
+
+            # クラスごとのカウント辞書
+            class_counts = {}
+            for bbox in bboxes:
+                class_name = bbox.get('class', 'unknown')
+                class_counts[class_name] = class_counts.get(class_name, 0) + 1
+
+            # クラスカウント情報のフォーマット
+            bbox_info += "検出オブジェクト:<br>"
+            for class_name, count in class_counts.items():
+                # このクラスの色を取得
+                class_colors = {
+                    'car': "#FF0000",     # 赤
+                    'person': "#00FF00",  # 緑
+                    'sign': "#0000FF",    # 青
+                    'cone': "#FFFF00",    # 黄
+                    'unknown': "#808080"  # グレー
+                }
+                color = class_colors.get(class_name, "#FF0000")
+
+                bbox_info += f"<span style='color: {color}; font-weight: bold;'>● {class_name}</span>: {count}個<br>"
+
+            bbox_info += f"合計: {len(bboxes)}個のオブジェクト<br>"
+
+        return bbox_info
+
     def display_current_image(self):
         """現在の画像を表示（YOLOアノテーションも含む）"""
         if not self.images or self.current_index >= len(self.images):
@@ -11372,7 +11665,16 @@ class ImageAnnotationTool(QMainWindow):
                 if hasattr(self, 'segmentation_annotations') and current_image_path in self.segmentation_annotations:
                     # セグメンテーションデータを設定する処理を追加（今後の拡張用）
                     pass
-                    
+
+                # 運転アノテーションポイント（赤丸）の設定
+                self._set_annotation_point_on_canvas()
+
+                # 推論結果ポイント（青丸）の設定
+                self._set_inference_point_on_canvas()
+
+            # Enhanced annotations display processing - UI要素の更新
+            self._update_enhanced_ui_elements()
+
         except Exception as e:
             error_message = str(e)
             print(f"Error loading image {current_image_path}: {error_message}")
@@ -11433,28 +11735,31 @@ class ImageAnnotationTool(QMainWindow):
                 
                 # アノテーション情報を取得（インデックスベースに統一）
                 annotation = None
-                location_value = None  # Initialize here to prevent the error
-                
+                location_value = None
+                bbox_annotations = None
+                segmentation_annotations = None
+
                 # インデックスベースでアノテーションを取得
                 if idx in self.annotations:
                     annotation = self.annotations[idx]
-                    # デバッグ：サムネイル作成時のアノテーション内容を確認
-                    print(f"サムネイル作成時のアノテーション (index {idx}): {annotation}")
-                    print(f"  angle存在: {'angle' in annotation}, throttle存在: {'throttle' in annotation}")
-                    if 'angle' in annotation:
-                        print(f"  angle値: {annotation['angle']} (型: {type(annotation['angle'])})")
-                    if 'throttle' in annotation:
-                        print(f"  throttle値: {annotation['throttle']} (型: {type(annotation['throttle'])})")
-                
                     # 位置情報を事前に特定
                     if annotation and 'loc' in annotation:
                         location_value = annotation['loc']
-                
+
                 # 位置情報専用の辞書をインデックスベースで確認
                 if location_value is None and idx in self.location_annotations:
                     location_value = self.location_annotations[idx]
-                
-                # サムネイルウィジェットを作成
+
+                # 修正: インデックスベースでバウンディングボックスを取得
+                if idx in self.bbox_annotations:
+                    bbox_annotations = self.bbox_annotations[idx]
+
+                # 修正: インデックスベースでセグメンテーションアノテーションを取得
+                if (hasattr(self, 'segmentation_annotations') and
+                    idx in self.segmentation_annotations):
+                    segmentation_annotations = self.segmentation_annotations[idx]
+
+                # 拡張サムネイルウィジェットを作成
                 thumb = ThumbnailWidget(
                     img_path=img_path,
                     index=idx,
@@ -11462,7 +11767,9 @@ class ImageAnnotationTool(QMainWindow):
                     annotation=annotation,
                     on_click=self.select_image,
                     location_value=location_value,
-                    is_deleted=is_deleted
+                    is_deleted=is_deleted,
+                    bbox_annotations=bbox_annotations,
+                    segmentation_annotations=segmentation_annotations
                 )
                 
                 # col_count列のグリッドで配置
@@ -11470,6 +11777,195 @@ class ImageAnnotationTool(QMainWindow):
                 col = i % col_count
                 
                 self.gallery_layout.addWidget(thumb, row, col)
+
+    def _update_enhanced_ui_elements(self):
+        """Enhanced annotations display UI更新処理"""
+        if not self.images:
+            return
+
+        current_index = self.current_index
+        current_img_path = self.images[current_index]
+        is_deleted = hasattr(self, 'deleted_indexes') and current_index in self.deleted_indexes
+
+        # スライダーの表示を更新
+        if hasattr(self, 'slider_value_label'):
+            self.slider_value_label.setText(f"{current_index + 1}/{len(self.images)}")
+
+        # 画像情報表示の更新
+        if hasattr(self, 'current_image_info'):
+            filename = os.path.basename(current_img_path)
+            status_text = " [削除済み]" if is_deleted else ""
+            self.current_image_info.setText(
+                f"画像 {current_index + 1} of {len(self.images)}:{status_text}\n{filename}"
+            )
+
+            # 削除済みの場合は赤字で表示
+            if is_deleted:
+                self.current_image_info.setStyleSheet("color: #FF5555; font-weight: bold;")
+            else:
+                self.current_image_info.setStyleSheet("color: #333333; font-weight: bold;")
+
+        # アノテーション情報の表示
+        self._update_annotation_info_display(current_index, is_deleted)
+
+        # 位置情報ラベルの更新
+        self._update_location_info_display(current_index, is_deleted)
+
+    def _update_annotation_info_display(self, current_index, is_deleted):
+        """アノテーション情報表示の更新"""
+        if not hasattr(self, 'annotation_info_label'):
+            return
+
+        if current_index in self.annotations:
+            anno = self.annotations[current_index]
+
+            # アノテーション辞書が存在するがデータが空の場合をチェック
+            has_driving_annotation = 'angle' in anno or 'throttle' in anno or 'loc' in anno
+
+            if has_driving_annotation:
+                # 基本的なアノテーション情報
+                annotation_text = f"<b>運転アノテーション情報:</b><br>"
+                if is_deleted:
+                    annotation_text = f"<span style='color: #FF5555;'><b>削除済み</b></span><br>" + annotation_text
+
+                # angleとthrottleの存在チェックを追加
+                if 'angle' in anno:
+                    annotation_text += f"angle = <span style='color: #FF6666;'>{anno['angle']:.4f}</span><br>"
+                else:
+                    annotation_text += f"angle = <span style='color: #999999;'>未設定</span><br>"
+
+                if 'throttle' in anno:
+                    annotation_text += f"throttle = <span style='color: #FF6666;'>{anno['throttle']:.4f}</span>"
+                else:
+                    annotation_text += f"throttle = <span style='color: #999999;'>未設定</span>"
+
+                # 位置情報があれば追加して強調表示
+                if 'loc' in anno:
+                    loc_value = anno['loc']
+                    loc_color = get_location_color(loc_value)
+
+                    # 位置情報を色付きのバッジとして表示
+                    annotation_text += f"<br><div style='margin-top: 10px;'>"
+                    annotation_text += f"<div style='display: inline-block; background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 5px; border-radius: 5px;'>"
+                    annotation_text += f"位置 {loc_value}</div></div>"
+
+                # 物体検知アノテーション情報を追加
+                bbox_info = self.update_annotation_info_label()
+                if bbox_info:
+                    annotation_text += f"<br><br>{bbox_info}"
+
+                # リッチテキストとして設定
+                self.annotation_info_label.setText(annotation_text)
+                self.annotation_info_label.setTextFormat(Qt.RichText)
+            else:
+                # 運転アノテーションデータが空の場合、物体検知アノテーションのみ表示
+                bbox_info = self.update_annotation_info_label()
+                if bbox_info:
+                    if is_deleted:
+                        bbox_info = f"<span style='color: #FF5555;'><b>削除済み</b></span><br>" + bbox_info
+                    self.annotation_info_label.setText(bbox_info)
+                    self.annotation_info_label.setTextFormat(Qt.RichText)
+                else:
+                    self.annotation_info_label.setText("")
+        # 修正: インデックスベースでバウンディングボックスをチェック
+        elif (current_index in self.bbox_annotations and
+              self.bbox_annotations[current_index]):
+            # 自動運転アノテーションはないが、物体検知アノテーションはある場合
+            bbox_info = self.update_annotation_info_label()
+
+            # 削除済みの場合は削除済み表示を追加
+            if is_deleted:
+                bbox_info = f"<span style='color: #FF5555;'><b>削除済み</b></span><br>" + bbox_info
+
+            self.annotation_info_label.setText(bbox_info)
+            self.annotation_info_label.setTextFormat(Qt.RichText)
+        elif is_deleted:
+            # 削除済みの場合のメッセージ
+            self.annotation_info_label.setText(
+                "<span style='color: #FF5555;'>この画像は削除済みです。<br>"
+                "画像をクリックするか「削除状態を復元」ボタンを押して<br>"
+                "再度アノテーションを行えます。</span>"
+            )
+            self.annotation_info_label.setTextFormat(Qt.RichText)
+        else:
+            self.annotation_info_label.setText("")
+
+    def _update_location_info_display(self, current_index, is_deleted):
+        """位置情報表示の更新"""
+        if not hasattr(self, 'current_location_label'):
+            return
+
+        location_value = None
+        # アノテーションの位置情報を確認
+        if current_index in self.annotations and 'loc' in self.annotations[current_index]:
+            location_value = self.annotations[current_index]['loc']
+        # 位置情報専用の辞書を確認
+        elif current_index in self.location_annotations:
+            location_value = self.location_annotations[current_index]
+
+        # 位置情報ラベルの更新
+        if location_value is not None and not is_deleted:
+            # 位置情報ラベルの更新（self.current_locationは更新しない）
+            self.current_location_label.setText(f"現在の位置情報: {location_value}")
+
+            # 位置情報に基づいた色を取得
+            loc_color = get_location_color(location_value)
+            self.current_location_label.setStyleSheet(f"color: {loc_color.name()}; font-weight: bold;")
+
+            # ボタンの選択状態を更新
+            if hasattr(self, 'location_buttons'):
+                for button in self.location_buttons:
+                    button_value = button.property("location_value")
+                    button.setChecked(button_value == location_value)
+        else:
+            # 位置情報がない場合
+            self.current_location_label.setText("現在の位置情報: なし")
+            self.current_location_label.setStyleSheet("")
+
+            # すべてのボタンの選択を解除
+            if hasattr(self, 'location_buttons'):
+                for button in self.location_buttons:
+                    button.setChecked(False)
+
+    def _set_annotation_point_on_canvas(self):
+        """キャンバス上に運転アノテーションポイント（赤丸）を設定"""
+        if not hasattr(self, 'main_image_view'):
+            return
+
+        # アノテーションポイントの設定（画像読み込みの成功/失敗に関係なく実行）
+        if (self.current_index in self.annotations and
+            'x' in self.annotations[self.current_index] and
+            'y' in self.annotations[self.current_index]):
+            anno = self.annotations[self.current_index]
+            self.main_image_view.annotation_point = QPoint(anno['x'], anno['y'])
+        else:
+            self.main_image_view.annotation_point = None
+
+        # 削除済みの場合
+        is_deleted = hasattr(self, 'deleted_indexes') and self.current_index in self.deleted_indexes
+        if is_deleted:
+            # 削除済みフラグを設定
+            self.main_image_view.is_deleted = True
+        else:
+            self.main_image_view.is_deleted = False
+
+        # UIを更新（画像読み込みの成功/失敗に関係なく実行）
+        self.main_image_view.update()
+
+    def _set_inference_point_on_canvas(self):
+        """キャンバス上に推論結果ポイント（青丸）を設定"""
+        if not hasattr(self, 'main_image_view'):
+            return
+
+        # 推論ポイントの設定（画像読み込みの成功/失敗に関係なく実行）
+        if self.inference_checkbox.isChecked() and self.current_index in self.inference_results:
+            inference = self.inference_results[self.current_index]
+            self.main_image_view.inference_point = QPoint(inference['x'], inference['y'])
+        else:
+            self.main_image_view.inference_point = None
+
+        # UIを更新
+        self.main_image_view.update()
 
     def select_image(self, index):
         if 0 <= index < len(self.images):
@@ -13671,7 +14167,7 @@ class ImageAnnotationTool(QMainWindow):
 
     def yolo_auto_annotate(self):
         """YOLOを使用した物体検知・セグメンテーションのオートアノテーション"""
-        from yolo_utils import get_yolo_model, batch_detect_objects_and_segments
+        from utils.yolo_utils import get_yolo_model, batch_detect_objects_and_segments
         
         if not self.images:
             QMessageBox.warning(self, "警告", "画像が読み込まれていません。")
@@ -13871,7 +14367,7 @@ class ImageAnnotationTool(QMainWindow):
                     model_path = "yolov8n-seg.pt"
                     model_type = "segment"
                 
-                from yolo_utils import get_yolo_model
+                from utils.yolo_utils import get_yolo_model
                 model = get_yolo_model(model_path)
             
             if model is None:
@@ -13898,7 +14394,7 @@ class ImageAnnotationTool(QMainWindow):
             progress.setValue(15)
             QApplication.processEvents()
             
-            from yolo_utils import batch_detect_objects_and_segments
+            from utils.yolo_utils import batch_detect_objects_and_segments
             results = batch_detect_objects_and_segments(
                 images_to_process, model, conf_threshold, progress_callback
             )
