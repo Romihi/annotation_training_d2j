@@ -4,6 +4,30 @@
 
 このツールは、自動運転と物体検知データセットのためのアノテーションを作成・管理するためのグラフィカルインターフェースを提供します。DonkeycarやJetracerなどのAIミニカー向けに設計されており、直感的なGUIで効率的なデータセット作成が可能です。
 
+## 🏎️ 対応AIミニカープラットフォーム
+
+### Donkeycar
+![Donkeycar](https://github.com/autorope/donkeycar/raw/main/docs/assets/build_hardware/donkey2.jpg)
+
+**Donkeycar**は、オープンソースの自律運転ミニカープラットフォームです。Raspberry Piをベースとし、機械学習を使った自動運転の実験・学習に最適です。
+
+- **公式リポジトリ**: [https://github.com/autorope/donkeycar](https://github.com/autorope/donkeycar)
+- **公式ドキュメント**: [https://docs.donkeycar.com/](https://docs.donkeycar.com/)
+- **特徴**: RCカーベース、コミュニティ豊富、豊富なパーツオプション
+- **データ形式**: JSON Lines形式でのカタログファイル
+
+### Jetracer
+![Jetracer](https://github.com/NVIDIA-AI-IOT/jetracer/raw/master/assets/jetracer.jpg)
+
+**Jetracer**は、NVIDIA Jetson Nanoを使用した教育向け自律運転ロボットです。リアルタイム深層学習推論に特化した設計で、高性能な画像処理が可能です。
+
+- **公式リポジトリ**: [https://github.com/NVIDIA-AI-IOT/jetracer](https://github.com/NVIDIA-AI-IOT/jetracer)
+- **開発元**: NVIDIA AI-IOT
+- **特徴**: Jetson Nano搭載、GPU加速、教育向け設計
+- **データ形式**: ファイル名に座標情報を埋め込む形式
+
+本ツールは両プラットフォームのデータ形式に対応し、相互変換も可能です。
+
 ## 🚀 クイックスタート
 
 ### 3分で始める基本的な使い方
@@ -676,38 +700,38 @@ if __name__ == "__main__":
 - オペレーティングシステムとPythonバージョン
 
 ## ライセンス（License）
-This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the **GNU General Public License v3.0** - see the [LICENSE](LICENSE) file for details.
 
-**重要**: このプロジェクトはUltralytics YOLOv8/YOLOv11を使用しており、AGPL-3.0ライセンスの条件に従います。商用利用の場合は、Ultralyticsの商用ライセンスの取得を検討してください。
+### ライセンス選択の理由
+本プロジェクトはGPL v3.0を採用しています。これは以下の依存関係によるライセンス要件に基づきます：
+
+- **PyQt5 (GPL v3)**: GUI フレームワークとしてPyQt5を使用するため、プロジェクト全体がGPL v3の適用を受けます
+- **Ultralytics YOLO (AGPL-3.0)**: 物体検知・セグメンテーション機能で使用、GPL v3と互換性があります
+
+### 商用利用について
+- **オープンソース利用**: GPL v3の条件を満たす限り、商用プロジェクトでも利用可能
+- **プロプライエタリ利用**: PyQt5およびUltralyticsの商用ライセンスが必要
+  - PyQt5商用ライセンス: [Qt Company](https://www.qt.io/licensing/)
+  - Ultralytics商用ライセンス: [Ultralytics Licensing](https://ultralytics.com/license)
+
+## Related Projects
+本ツールは以下のオープンソースプロジェクトと連携します：
+
+- **Donkeycar**: [https://github.com/autorope/donkeycar](https://github.com/autorope/donkeycar) - MIT License
+  - RCカーベースの自律運転プラットフォーム
+  - このツールで作成したデータセットをDonkeycarで直接学習可能
+
+- **Jetracer**: [https://github.com/NVIDIA-AI-IOT/jetracer](https://github.com/NVIDIA-AI-IOT/jetracer) - MIT License
+  - NVIDIA Jetson Nano搭載の教育用自律運転ロボット
+  - このツールのJetracer形式エクスポートで互換データを作成
 
 ## Third-party Libraries
 - PyQt5: Licensed under GPL v3
 - Ultralytics YOLO (YOLOv8/YOLOv11): Licensed under AGPL-3.0 ([https://github.com/ultralytics/ultralytics](https://github.com/ultralytics/ultralytics))
 - PyTorch: Licensed under BSD-3-Clause ([https://github.com/pytorch/pytorch](https://github.com/pytorch/pytorch))
-- PIL/Pillow: Licensed under HPND ([https://github.com/python-pillow/Pillow](https://github.com/python-pillow/Pillow))
-- NumPy: Licensed under BSD-3-Clause ([https://github.com/numpy/numpy](https://github.com/numpy/numpy))
+- PIL/Pillow: Licensed under MIT-CMU ([https://github.com/python-pillow/Pillow](https://github.com/python-pillow/Pillow))
+- NumPy: Licensed under NumPy License (BSD-3-Clause style) ([https://github.com/numpy/numpy](https://github.com/numpy/numpy))
 - MLflow: Licensed under Apache-2.0 ([https://github.com/mlflow/mlflow](https://github.com/mlflow/mlflow))
-
-
-## 変更履歴
-
-### 2025-01-21 - v1.3.0
-#### 🔧 クリック処理の改善
-- **連続クリック防止機能を追加**
-  - 100ms以内の連続クリックを無視するデバウンス機能を実装
-  - 画像描画中のクリックを無効化して意図しないアノテーションを防止
-  - クリック無効時は視覚的フィードバック（禁止カーソル）を表示
-
-- **アノテーション表示問題を修復**
-  - 既存アノテーション（赤丸）が表示されない問題を解決
-  - 画像読み込みの成功/失敗に関係なくアノテーションポイントを適切に設定
-
-#### ⌨️ キーボード操作の改善
-- **左右矢印キーの動作を統一**
-  - 「クリック時自動スキップ枚数」設定に連動するように変更
-  - チェック有効時：設定されたスキップ枚数で移動（デフォルト10枚）
-  - チェック無効時：1枚ずつ移動
-  - クリック操作とキーボード操作で一貫した動作を実現
 
 ## 謝辞
 
