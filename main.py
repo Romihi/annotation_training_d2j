@@ -2226,6 +2226,12 @@ class ImageAnnotationTool(QMainWindow):
         
         # アノテーションのタイムスタンプを保存する辞書
         self.annotation_timestamps = {}
+
+        # スライダー推論デバウンス用タイマー
+        self.inference_debounce_timer = QTimer()
+        self.inference_debounce_timer.setSingleShot(True)
+        self.inference_debounce_timer.timeout.connect(self.execute_slider_inference)
+        self.inference_debounce_delay = 300  # 300ms後に推論実行
         
         # 推論結果のキャッシュ
         self.inference_results = {}
@@ -9620,32 +9626,41 @@ class ImageAnnotationTool(QMainWindow):
         if self.images and value != self.current_index:
             self.current_index = value
             self.display_current_image()
-            
-            # 推論表示チェックボックスがONの場合、自動的に現在の画像の推論を実行
-            if self.inference_checkbox.isChecked():
-                current_img_path = self.images[self.current_index]
-                # 推論結果がまだない場合のみ推論を実行
-                if current_img_path not in self.inference_results:
-                    self.run_inference_check(False)
-            
-            # 物体検知推論表示の更新
-            if self.detection_inference_checkbox.isChecked():
-                current_img_path = self.images[self.current_index]
-                # 推論結果がまだない場合のみ推論を実行
-                if current_img_path not in self.detection_inference_results:
-                    self.update_detection_info_panel()
-            
-            # セグメンテーション推論表示の更新
-            if hasattr(self, 'segmentation_inference_checkbox') and self.segmentation_inference_checkbox.isChecked():
-                current_img_path = self.images[self.current_index]
-                # 推論結果がまだない場合のみ推論を実行
-                if current_img_path not in self.segmentation_inference_results:
-                    self.run_single_yolo_segmentation_inference()
-                else:
-                    # 既にある結果の表示を更新
-                    self.update_segmentation_inference_display()
-            
+
+            # タイマーを再開して推論実行をデバウンス
+            self.inference_debounce_timer.stop()
+            self.inference_debounce_timer.start(self.inference_debounce_delay)
+
             self.update_ui()
+
+    def execute_slider_inference(self):
+        """スライダー変更後のデバウンス処理で推論を実行"""
+        if not self.images:
+            return
+
+        # 推論表示チェックボックスがONの場合、自動的に現在の画像の推論を実行
+        if self.inference_checkbox.isChecked():
+            current_img_path = self.images[self.current_index]
+            # 推論結果がまだない場合のみ推論を実行
+            if current_img_path not in self.inference_results:
+                self.run_inference_check(False)
+
+        # 物体検知推論表示の更新
+        if self.detection_inference_checkbox.isChecked():
+            current_img_path = self.images[self.current_index]
+            # 推論結果がまだない場合のみ推論を実行
+            if current_img_path not in self.detection_inference_results:
+                self.update_detection_info_panel()
+
+        # セグメンテーション推論表示の更新
+        if hasattr(self, 'segmentation_inference_checkbox') and self.segmentation_inference_checkbox.isChecked():
+            current_img_path = self.images[self.current_index]
+            # 推論結果がまだない場合のみ推論を実行
+            if current_img_path not in self.segmentation_inference_results:
+                self.run_single_yolo_segmentation_inference()
+            else:
+                # 既にある結果の表示を更新
+                self.update_segmentation_inference_display()
 
     def toggle_inference_display(self, state):
         """自動運転推論表示の切り替え"""
