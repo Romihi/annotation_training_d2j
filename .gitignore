@@ -187,8 +187,8 @@ cython_debug/
 #VSCode
 .vscode/
 
-#YOLO
-yolo*
+#YOLO models
+yolo*.pt
 
 #Claude
 .claude
