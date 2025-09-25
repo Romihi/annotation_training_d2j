@@ -523,7 +523,7 @@ class DonkeyModel(BaseModel):
     """Donkeycarで使用される標準的なモデル（カスタム実装）"""
     #def __init__(self, pretrained=False, input_size=(120, 160)):
     def __init__(self, pretrained=False, input_size=(224, 224)):
-        super(DonkeyModel, self).__init__(name="donkey")
+        super(DonkeyModel, self).__init__(name="donkeycar")
         
         # 入力サイズを保存（前処理と特徴計算で使用）
         self.input_size = input_size
@@ -959,7 +959,7 @@ class ResNet18LocationModel(BaseLocationModel):
 # 利用可能なすべてのモデルを登録する辞書
 MODEL_REGISTRY = {
     # Donkeycar model
-    "donkey": DonkeyModel,
+    "donkeycar": DonkeyModel,
     "donkey_fcn": DonkeyModel_FCN,
 
     # ResNet variants
@@ -1038,7 +1038,7 @@ def get_model(model_type, pretrained=False, input_size=None):
     model_class = MODEL_REGISTRY[model_type]
     
     # DonkeyModel系の場合、入力サイズを渡す
-    if model_type in ["donkey", "donkey_fcn"] and input_size is not None:
+    if model_type in ["donkeycar", "donkey_fcn"] and input_size is not None:
         return model_class(pretrained=pretrained, input_size=input_size)
     elif model_type == "donkey_location" and input_size is not None:
         # DonkeyLocationModelの場合、num_classesも必要（デフォルト8）
@@ -1048,7 +1048,16 @@ def get_model(model_type, pretrained=False, input_size=None):
     return model_class(pretrained=pretrained)
 
 def list_available_models():
-    """利用可能なモデル一覧を返す"""
+    """利用可能な走行モデル一覧を返す（位置推論モデルは除く）"""
+    # 位置推論モデルを除いたモデルのみを返す
+    return [model for model in MODEL_REGISTRY.keys() if not model.endswith('_location')]
+
+def list_available_location_models():
+    """利用可能な位置推論モデル一覧を返す"""
+    return [model for model in MODEL_REGISTRY.keys() if model.endswith('_location')]
+
+def list_all_available_models():
+    """利用可能な全モデル一覧を返す（走行モデル + 位置推論モデル）"""
     return list(MODEL_REGISTRY.keys())
 
 
