@@ -43,7 +43,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                             QGroupBox, QRadioButton, QTabWidget, QSizePolicy,QButtonGroup,
                             QListView, QTreeView, QAbstractItemView,QStyleOptionSlider,QStyle, QTextEdit, QPlainTextEdit,
                             QGraphicsOpacityEffect)
-from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont, QPolygon
+from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont, QPolygon, QCursor
 from PyQt5.QtCore import Qt, QRect, QPoint, QTimer, QEvent, QThread, pyqtSignal
 
 from PIL import Image, ImageDraw
@@ -937,7 +937,17 @@ class ImageLabel(QLabel):
                 painter.drawEllipse(screen_points[0].x() - 6, screen_points[0].y() - 6, 12, 12)
 
     def draw_waypoints(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
-        """waypointの描画（緑色の丸）"""
+        """waypointの描画（緑色の丸）とY軸ガイドライン"""
+
+        # waypointモードでY軸ガイドラインを描画
+        if (hasattr(self.main_window, 'current_mode') and
+            self.main_window.current_mode == 3 and
+            hasattr(self.main_window, 'waypoint_control_widget') and
+            self.main_window.waypoint_control_widget.isVisible()):
+
+            self.draw_waypoint_guidelines(pix_width, pix_height, painter, target_rect)
+
+        # 既存のwaypoint描画
         if not hasattr(self.main_window, 'waypoint_annotations'):
             return
 
@@ -969,6 +979,47 @@ class ImageLabel(QLabel):
 
             # 境界線を元に戻す
             painter.setPen(QPen(QColor(0, 128, 0), 2))
+
+    def draw_waypoint_guidelines(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
+        """waypointのY軸ガイドライン描画"""
+        if not hasattr(self.main_window, 'waypoint_count_spin'):
+            return
+
+        # 設定を取得
+        count = self.main_window.waypoint_count_spin.value()
+        start_y = self.main_window.waypoint_start_y_spin.value()
+        end_y = self.main_window.waypoint_end_y_spin.value()
+
+        # Y座標の範囲チェック
+        if start_y >= pix_height or end_y >= pix_height:
+            # 範囲外の場合は描画しない
+            return
+
+        # ガイドライン用の描画設定（点線）
+        pen = QPen(QColor(255, 255, 0, 150), 2, Qt.DashLine)  # 半透明の黄色点線
+        painter.setPen(pen)
+
+        # Y座標を計算して点線を描画
+        for i in range(count):
+            if count == 1:
+                y = (start_y + end_y) / 2  # Y座標の中央
+            else:
+                # Y座標を等間隔で配置
+                y = start_y + (end_y - start_y) * i / (count - 1)
+
+            # 画像座標をスクリーン座標に変換
+            screen_y = target_rect.y() + (y / pix_height) * target_rect.height()
+
+            # 画像の左端から右端まで点線を描画
+            painter.drawLine(target_rect.left(), int(screen_y), target_rect.right(), int(screen_y))
+
+            # ラベルを表示（左端に番号）
+            painter.setPen(QPen(QColor(255, 255, 0), 1))  # 黄色文字
+            painter.setFont(QFont("Arial", 12, QFont.Bold))
+            painter.drawText(target_rect.left() + 5, int(screen_y - 5), f"{i + 1}")
+
+            # 点線に戻す
+            painter.setPen(pen)
 
     def mousePressEvent(self, event):
         if self.pixmap() and self.main_window:
@@ -1213,16 +1264,57 @@ class ImageLabel(QLabel):
                 current_index = self.main_window.current_index
 
                 if event.button() == Qt.LeftButton:
-                    # 左クリック: waypoint座標を追加
+                    # 左クリック: X座標を取得し、対応するY座標をガイドラインから計算
                     if current_index not in self.main_window.waypoint_annotations:
                         self.main_window.waypoint_annotations[current_index] = []
 
-                    # waypoint座標をリストに追加
-                    self.main_window.waypoint_annotations[current_index].append((orig_x, orig_y))
+                    # 現在のwaypoint数を取得
+                    current_waypoints = self.main_window.waypoint_annotations[current_index]
+                    next_waypoint_index = len(current_waypoints)
+
+                    # 設定を取得
+                    count = self.main_window.waypoint_count_spin.value()
+                    start_y = self.main_window.waypoint_start_y_spin.value()
+                    end_y = self.main_window.waypoint_end_y_spin.value()
+
+                    # 打点数の上限チェック
+                    if next_waypoint_index >= count:
+                        if hasattr(self.main_window, 'statusBar'):
+                            self.main_window.statusBar().showMessage(f"設定された打点数({count})に達しています", 2000)
+                        return
+
+                    # 画像サイズ取得
+                    if not hasattr(self.main_window.main_image_view, 'pix_height'):
+                        if hasattr(self.main_window, 'statusBar'):
+                            self.main_window.statusBar().showMessage("画像が読み込まれていません", 2000)
+                        return
+
+                    img_height = self.main_window.main_image_view.pix_height
+
+                    # Y座標の範囲チェック
+                    if start_y >= img_height or end_y >= img_height:
+                        if hasattr(self.main_window, 'statusBar'):
+                            self.main_window.statusBar().showMessage(f"Y座標が画像サイズ({img_height})を超えています", 2000)
+                        return
+
+                    # 対応するY座標を計算
+                    if count == 1:
+                        waypoint_y = (start_y + end_y) / 2
+                    else:
+                        # 等間隔でY座標を配置
+                        waypoint_y = start_y + (end_y - start_y) * next_waypoint_index / (count - 1)
+
+                    waypoint_y = int(waypoint_y)
+
+                    # Y座標を画像範囲内に制限
+                    waypoint_y = max(0, min(waypoint_y, img_height - 1))
+
+                    # waypoint座標をリストに追加（X座標はクリック位置、Y座標は計算値）
+                    self.main_window.waypoint_annotations[current_index].append((orig_x, waypoint_y))
 
                     if hasattr(self.main_window, 'statusBar'):
                         waypoint_count = len(self.main_window.waypoint_annotations[current_index])
-                        self.main_window.statusBar().showMessage(f"waypoint追加: ({orig_x}, {orig_y}) - 総数: {waypoint_count}", 2000)
+                        self.main_window.statusBar().showMessage(f"waypoint{next_waypoint_index + 1}追加: ({orig_x}, {waypoint_y}) - 総数: {waypoint_count}/{count}", 2000)
 
                 elif event.button() == Qt.RightButton:
                     # 右クリック: 最後のwaypointを削除
@@ -1231,7 +1323,8 @@ class ImageLabel(QLabel):
 
                         if hasattr(self.main_window, 'statusBar'):
                             remaining_count = len(self.main_window.waypoint_annotations[current_index])
-                            self.main_window.statusBar().showMessage(f"waypoint削除: {removed_point} - 残り: {remaining_count}", 2000)
+                            count = self.main_window.waypoint_count_spin.value()
+                            self.main_window.statusBar().showMessage(f"waypoint削除: {removed_point} - 残り: {remaining_count}/{count}", 2000)
 
                 self.update()  # 画面を更新してwaypointを表示
 
@@ -3024,6 +3117,74 @@ class ImageAnnotationTool(QMainWindow):
 
         location_layout.addLayout(mode_layout)
 
+        # waypoint制御パネル
+        self.waypoint_control_widget = QWidget()
+        waypoint_control_layout = QVBoxLayout(self.waypoint_control_widget)
+        waypoint_control_layout.setContentsMargins(5, 5, 5, 5)
+
+        # waypoint制御ラベル
+        waypoint_label = QLabel("waypoint制御:")
+        waypoint_label.setStyleSheet("font-weight: bold; color: #333;")
+        waypoint_control_layout.addWidget(waypoint_label)
+
+        # 打点数制御
+        points_layout = QHBoxLayout()
+        points_layout.addWidget(QLabel("打点数:"))
+        self.waypoint_count_spin = QSpinBox()
+        self.waypoint_count_spin.setRange(1, 20)
+        self.waypoint_count_spin.setValue(4)  # デフォルト4
+        self.waypoint_count_spin.setToolTip("配置するwaypoint数")
+        self.waypoint_count_spin.valueChanged.connect(self.update_waypoint_guidelines)
+        points_layout.addWidget(self.waypoint_count_spin)
+        waypoint_control_layout.addLayout(points_layout)
+
+        # 縦方向位置制御
+        y_pos_layout = QVBoxLayout()
+
+        # 開始Y位置
+        start_y_layout = QHBoxLayout()
+        start_y_layout.addWidget(QLabel("開始Y位置:"))
+        self.waypoint_start_y_spin = QSpinBox()
+        self.waypoint_start_y_spin.setRange(0, 1000)
+        self.waypoint_start_y_spin.setValue(200)  # デフォルト値を200に変更
+        self.waypoint_start_y_spin.setToolTip("waypoint開始位置のY座標")
+        self.waypoint_start_y_spin.valueChanged.connect(self.update_waypoint_guidelines)
+        start_y_layout.addWidget(self.waypoint_start_y_spin)
+
+        start_y_current_btn = QPushButton("現在")
+        start_y_current_btn.clicked.connect(lambda: self.set_current_y_position('start'))
+        start_y_current_btn.setToolTip("現在のマウス位置のY座標を設定")
+        start_y_layout.addWidget(start_y_current_btn)
+        y_pos_layout.addLayout(start_y_layout)
+
+        # 終了Y位置
+        end_y_layout = QHBoxLayout()
+        end_y_layout.addWidget(QLabel("終了Y位置:"))
+        self.waypoint_end_y_spin = QSpinBox()
+        self.waypoint_end_y_spin.setRange(0, 1000)
+        self.waypoint_end_y_spin.setValue(50)  # デフォルト値を50に変更（開始位置より小さく）
+        self.waypoint_end_y_spin.setToolTip("waypoint終了位置のY座標")
+        self.waypoint_end_y_spin.valueChanged.connect(self.update_waypoint_guidelines)
+        end_y_layout.addWidget(self.waypoint_end_y_spin)
+
+        end_y_current_btn = QPushButton("現在")
+        end_y_current_btn.clicked.connect(lambda: self.set_current_y_position('end'))
+        end_y_current_btn.setToolTip("現在のマウス位置のY座標を設定")
+        end_y_layout.addWidget(end_y_current_btn)
+        y_pos_layout.addLayout(end_y_layout)
+
+        waypoint_control_layout.addLayout(y_pos_layout)
+
+        # ガイド説明ラベル
+        guide_label = QLabel("使い方: Y座標位置にガイドラインが表示されます。\n画像上をクリックしてX座標を指定してください。")
+        guide_label.setStyleSheet("color: #666; font-size: 10px; font-style: italic; padding: 5px;")
+        guide_label.setWordWrap(True)
+        waypoint_control_layout.addWidget(guide_label)
+
+        # 初期状態では非表示
+        self.waypoint_control_widget.setVisible(False)
+        location_layout.addWidget(self.waypoint_control_widget)
+
         # 現在のモードを表すヒントラベル
         self.mode_hint_label = QLabel("※Bキーを押すとモードが切り替わります")
         self.mode_hint_label.setStyleSheet("color: #666; font-style: italic;")
@@ -3692,6 +3853,42 @@ class ImageAnnotationTool(QMainWindow):
             self.statusBar().showMessage(f"waypoint {deleted_count}個を削除しました", 3000)
         else:
             self.statusBar().showMessage("削除するwaypointがありませんでした", 3000)
+
+    def set_current_y_position(self, position_type):
+        """現在のマウス位置のY座標を開始/終了位置に設定"""
+        # マウス位置を取得（相対位置をグローバル座標に変換）
+        cursor_pos = QCursor.pos()
+        # メイン画像ビューの位置を取得
+        if hasattr(self, 'main_image_view'):
+            local_pos = self.main_image_view.mapFromGlobal(cursor_pos)
+
+            # 画像内かチェック
+            if hasattr(self.main_image_view, 'target_rect') and self.main_image_view.target_rect.contains(local_pos):
+                # スクリーン座標を画像座標に変換
+                rel_x = (local_pos.x() - self.main_image_view.target_rect.x()) / self.main_image_view.target_rect.width()
+                rel_y = (local_pos.y() - self.main_image_view.target_rect.y()) / self.main_image_view.target_rect.height()
+
+                # 元の画像の座標に変換
+                if hasattr(self.main_image_view, 'pix_height'):
+                    orig_y = int(rel_y * self.main_image_view.pix_height)
+
+                    if position_type == 'start':
+                        self.waypoint_start_y_spin.setValue(orig_y)
+                        self.statusBar().showMessage(f"開始Y位置を{orig_y}に設定しました", 2000)
+                    else:  # end
+                        self.waypoint_end_y_spin.setValue(orig_y)
+                        self.statusBar().showMessage(f"終了Y位置を{orig_y}に設定しました", 2000)
+                else:
+                    self.statusBar().showMessage("画像が読み込まれていません", 2000)
+            else:
+                self.statusBar().showMessage("マウスが画像内にありません", 2000)
+        else:
+            self.statusBar().showMessage("画像ビューが初期化されていません", 2000)
+
+    def update_waypoint_guidelines(self):
+        """waypoint設定変更時にガイドラインを更新"""
+        if hasattr(self, 'main_image_view') and hasattr(self.main_image_view, 'update'):
+            self.main_image_view.update()
 
     def toggle_auto_apply_segmentation(self, state):
         """前回のセグメンテーションを自動適用するかどうかを設定"""
@@ -4558,6 +4755,7 @@ class ImageAnnotationTool(QMainWindow):
             self.detection_mode_button.setChecked(False)
             self.segmentation_mode_button.setChecked(False)
             self.waypoint_mode_button.setChecked(False)
+            self.waypoint_control_widget.setVisible(False)  # waypoint制御パネルを非表示
             self.statusBar().showMessage("自動運転アノテーションモードに切り替えました。", 3000)
         elif sender == self.detection_mode_button:
             self.current_mode = 1
@@ -4565,6 +4763,7 @@ class ImageAnnotationTool(QMainWindow):
             self.detection_mode_button.setChecked(True)
             self.segmentation_mode_button.setChecked(False)
             self.waypoint_mode_button.setChecked(False)
+            self.waypoint_control_widget.setVisible(False)  # waypoint制御パネルを非表示
             self.statusBar().showMessage("物体検知アノテーションモードに切り替えました。", 3000)
         elif sender == self.segmentation_mode_button:
             self.current_mode = 2  # 新規追加
@@ -4572,6 +4771,7 @@ class ImageAnnotationTool(QMainWindow):
             self.detection_mode_button.setChecked(False)
             self.segmentation_mode_button.setChecked(True)
             self.waypoint_mode_button.setChecked(False)
+            self.waypoint_control_widget.setVisible(False)  # waypoint制御パネルを非表示
             self.statusBar().showMessage("セグメンテーションアノテーションモードに切り替えました。", 3000)
         elif sender == self.waypoint_mode_button:
             self.current_mode = 3  # waypoint mode
@@ -4579,6 +4779,7 @@ class ImageAnnotationTool(QMainWindow):
             self.detection_mode_button.setChecked(False)
             self.segmentation_mode_button.setChecked(False)
             self.waypoint_mode_button.setChecked(True)
+            self.waypoint_control_widget.setVisible(True)  # waypoint制御パネルを表示
             self.statusBar().showMessage("waypointアノテーションモードに切り替えました。", 3000)
         else:
             # Bキーでの切り替え（4つのモードをサイクル）
@@ -4588,24 +4789,28 @@ class ImageAnnotationTool(QMainWindow):
                 self.detection_mode_button.setChecked(False)
                 self.segmentation_mode_button.setChecked(False)
                 self.waypoint_mode_button.setChecked(False)
+                self.waypoint_control_widget.setVisible(False)
                 self.statusBar().showMessage("自動運転アノテーションモードに切り替えました。", 3000)
             elif self.current_mode == 1:
                 self.auto_mode_button.setChecked(False)
                 self.detection_mode_button.setChecked(True)
                 self.segmentation_mode_button.setChecked(False)
                 self.waypoint_mode_button.setChecked(False)
+                self.waypoint_control_widget.setVisible(False)
                 self.statusBar().showMessage("物体検知アノテーションモードに切り替えました。", 3000)
             elif self.current_mode == 2:
                 self.auto_mode_button.setChecked(False)
                 self.detection_mode_button.setChecked(False)
                 self.segmentation_mode_button.setChecked(True)
                 self.waypoint_mode_button.setChecked(False)
+                self.waypoint_control_widget.setVisible(False)
                 self.statusBar().showMessage("セグメンテーションアノテーションモードに切り替えました。", 3000)
             else:  # current_mode == 3
                 self.auto_mode_button.setChecked(False)
                 self.detection_mode_button.setChecked(False)
                 self.segmentation_mode_button.setChecked(False)
                 self.waypoint_mode_button.setChecked(True)
+                self.waypoint_control_widget.setVisible(True)
                 self.statusBar().showMessage("waypointアノテーションモードに切り替えました。", 3000)
         
         self.main_image_view.update()
