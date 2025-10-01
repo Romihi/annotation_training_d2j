@@ -191,9 +191,9 @@ def export_to_donkey(
                 waypoint_data = waypoint_annotations[original_index]
 
             if waypoint_data:
-                # ウェイポイントデータを[[x,y],...]のnumpy配列形式で保存
+                # ウェイポイントデータを[[x,y],...]のリスト形式で保存（JSON対応）
                 waypoint_array = [[float(x), float(y)] for x, y in waypoint_data]
-                catalog_entry["waypoint/pos_array"] = np.array(waypoint_array)
+                catalog_entry["waypoint/pos_array"] = waypoint_array
                         
         # 各バリアントの画像をコピーしてエントリに追加
         for variant, img_path in variant_images.items():

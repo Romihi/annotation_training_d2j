@@ -818,6 +818,48 @@ class BaseLocationModel(BaseModel):
         """確定状態をリセットするヘルパー関数"""
         self.prediction_history = []
         self.confirmed_class = None
+
+
+class BaseWaypointModel(BaseModel):
+    """ウェイポイント推論モデル用のベースクラス"""
+    def __init__(self, name, num_waypoints=4):
+        super(BaseWaypointModel, self).__init__(name=name)
+        self.num_waypoints = num_waypoints
+
+    def run_regression(self, img_arr):
+        """ウェイポイント推論用の共通runメソッド - x,y座標のリストを返す"""
+        # 前処理パイプラインが初期化されていなければ作成
+        if self._preprocess is None:
+            self._preprocess = self.get_preprocess()
+
+        # PIL Imageに変換
+        if isinstance(img_arr, np.ndarray):
+            img = Image.fromarray(img_arr)
+        else:
+            img = img_arr
+
+        # 前処理を適用
+        img_tensor = self._preprocess(img).unsqueeze(0)
+
+        # デバイスにテンソルを移動
+        img_tensor = img_tensor.to(self.device)
+
+        # 推論実行（勾配計算無効）
+        self.eval()
+        with torch.no_grad():
+            output = self.forward(img_tensor)
+
+        # CPUに移動してnumpy配列に変換
+        output = output.cpu().numpy().squeeze()
+
+        # 出力をx,y座標のリストに変換
+        waypoints = []
+        for i in range(self.num_waypoints):
+            x = output[i * 2]
+            y = output[i * 2 + 1]
+            waypoints.append([x, y])
+
+        return waypoints
     
     def run_classification(self, img_arr):
         """位置推論用の共通runメソッド - 確率ベクトルを返す"""
@@ -846,6 +888,74 @@ class BaseLocationModel(BaseModel):
         self._update_prediction_history(pred_class)
         
         return probs_array
+
+class DonkeyWaypointModel(BaseWaypointModel):
+    """Donkeycarモデルをベースとしたウェイポイント回帰用モデル"""
+    def __init__(self, num_waypoints=4, pretrained=False, input_size=(224, 224)):
+        super(DonkeyWaypointModel, self).__init__(name="donkey_waypoint", num_waypoints=num_waypoints)
+
+        # 入力サイズを保存（前処理と特徴計算で使用）
+        self.input_size = input_size
+
+        # 特徴抽出部分（DonkeyModelと同じ）
+        drop = 0.2
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 24, kernel_size=5, stride=2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop),
+            nn.Conv2d(24, 32, kernel_size=5, stride=2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop),
+            nn.Conv2d(32, 64, kernel_size=5, stride=2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop),
+            nn.Flatten()
+        )
+
+        # 計算される特徴マップサイズに依存するため、ダミー入力を使って計算
+        dummy_input = torch.zeros(1, 3, input_size[0], input_size[1])
+        dummy_output = self.features(dummy_input)
+        feature_size = dummy_output.shape[1]
+
+        print(f"DonkeyWaypointModel feature size: {feature_size} for input {input_size}")
+
+        # 全結合層
+        self.dense_layers = nn.Sequential(
+            nn.Linear(feature_size, 100),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop),
+            nn.Linear(100, 50),
+            nn.ReLU(inplace=True),
+            nn.Dropout(drop),
+        )
+
+        # 回帰器（ウェイポイント座標の予測）
+        # 出力サイズは num_waypoints * 2 (x,y座標)
+        self.regressor = nn.Linear(50, num_waypoints * 2)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.dense_layers(x)
+        x = self.regressor(x)
+        return x
+
+    def get_preprocess(self):
+        """Donkeycar用の前処理 - 保存されている入力サイズを使用"""
+        return transforms.Compose([
+            transforms.Resize(self.input_size),
+            transforms.ToTensor()
+        ])
+
+    def run(self, img_arr):
+        """推論メソッド - BaseWaypointModelの共通メソッドを使用"""
+        return self.run_regression(img_arr)
+
 
 class DonkeyLocationModel(BaseLocationModel):
     """Donkeycarモデルをベースとした位置分類用モデル"""
@@ -912,6 +1022,60 @@ class DonkeyLocationModel(BaseLocationModel):
     def run(self, img_arr):
         """推論メソッド - BaseLocationModelの共通メソッドを使用"""
         return self.run_classification(img_arr)
+
+
+class ResNet18WaypointModel(BaseWaypointModel):
+    """ResNet18をベースとしたウェイポイント回帰用モデル"""
+    def __init__(self, num_waypoints=4, pretrained=True):
+        super(ResNet18WaypointModel, self).__init__(name="resnet18_waypoint", num_waypoints=num_waypoints)
+
+        # TIMMモデルのロード
+        self.base_model = timm.create_model("resnet18", pretrained=pretrained, num_classes=0)
+
+        # 特徴量の次元を取得
+        input_size = self._get_model_input_size()
+        dummy_input = torch.zeros(1, 3, input_size[0], input_size[1])
+        with torch.no_grad():
+            dummy_output = self.base_model(dummy_input)
+
+        feature_size = dummy_output.shape[1]
+        print(f"ResNet18WaypointModel feature size: {feature_size}")
+
+        # ウェイポイント回帰用のヘッド
+        # 出力サイズは num_waypoints * 2 (x,y座標)
+        self.waypoint_head = nn.Sequential(
+            nn.Linear(feature_size, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(128, num_waypoints * 2)
+        )
+
+    def forward(self, x):
+        # ResNet18で特徴抽出
+        x = self.base_model(x)
+        # ウェイポイント座標を回帰
+        x = self.waypoint_head(x)
+        return x
+
+    def _get_model_input_size(self):
+        """モデルの入力サイズを取得"""
+        # ResNet18の標準入力サイズ
+        return (224, 224)
+
+    def get_preprocess(self):
+        """ResNet18用の前処理"""
+        return transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+    def run(self, img_arr):
+        """推論メソッド - BaseWaypointModelの共通メソッドを使用"""
+        return self.run_regression(img_arr)
 
 
 class ResNet18LocationModel(BaseLocationModel):
@@ -1020,6 +1184,10 @@ MODEL_REGISTRY = {
     "donkey_location": DonkeyLocationModel,
     "resnet18_location": ResNet18LocationModel,
 
+    # ウェイポイント推論モデル
+    "donkey_waypoint": DonkeyWaypointModel,
+    "resnet18_waypoint": ResNet18WaypointModel,
+
 }
 
 
@@ -1042,6 +1210,13 @@ def get_model(model_type, pretrained=False, input_size=None):
         return model_class(pretrained=pretrained, input_size=input_size)
     elif model_type == "donkey_location" and input_size is not None:
         # DonkeyLocationModelの場合、num_classesも必要（デフォルト8）
+        return model_class(num_classes=8, pretrained=pretrained, input_size=input_size)
+    elif model_type == "donkey_waypoint" and input_size is not None:
+        # DonkeyWaypointModelの場合、num_waypointsも必要（デフォルト4）
+        return model_class(num_waypoints=4, pretrained=pretrained, input_size=input_size)
+    elif model_type == "resnet18_waypoint":
+        # ResNet18WaypointModelの場合、num_waypointsも必要（デフォルト4）
+        return model_class(num_waypoints=4, pretrained=pretrained)
         return model_class(num_classes=8, pretrained=pretrained, input_size=input_size)
     
     # その他のモデルの場合は通常通り初期化
