@@ -135,8 +135,14 @@ class ImageLabel(QLabel):
         self.seg_move_start_pos = None           
         self.hovering_segmentation_index = None 
         self.close_threshold = SEGMENTATION_CLOSE_THRESHOLD
-        self.selected_polygon_index = None    
+        self.selected_polygon_index = None
         self.selected_vertex_index = None
+
+        # ウェイポイントドラッグ関連
+        self.selected_waypoint_index = None
+        self.is_moving_waypoint = False
+        self.waypoint_move_start_pos = None
+        self.hovering_waypoint_index = None
         
         # 頂点編集関連
         self.is_moving_vertex = False
@@ -216,6 +222,72 @@ class ImageLabel(QLabel):
         
         # 点と垂線の足の距離
         return ((px - projection_x) ** 2 + (py - projection_y) ** 2) ** 0.5
+
+    def get_waypoint_at_position(self, pos):
+        """指定位置にあるウェイポイントのインデックスを取得"""
+        if not hasattr(self.main_window, 'waypoint_annotations'):
+            return None
+
+        current_index = self.main_window.current_index
+        if current_index not in self.main_window.waypoint_annotations:
+            return None
+
+        waypoints = self.main_window.waypoint_annotations[current_index]
+        if not waypoints:
+            return None
+
+        # 画像内の相対位置を計算
+        if not self.target_rect.contains(pos):
+            return None
+
+        click_threshold = 15  # ウェイポイントをクリックできる範囲（ピクセル）
+
+        for i, (orig_x, orig_y) in enumerate(waypoints):
+            # 元の画像座標をスクリーン座標に変換
+            screen_x = self.target_rect.x() + (orig_x / self.pix_width) * self.target_rect.width()
+            screen_y = self.target_rect.y() + (orig_y / self.pix_height) * self.target_rect.height()
+
+            # クリック位置との距離を計算
+            distance = ((pos.x() - screen_x) ** 2 + (pos.y() - screen_y) ** 2) ** 0.5
+            if distance <= click_threshold:
+                return i
+
+        return None
+
+    def handle_waypoint_drag(self, event):
+        """ウェイポイントドラッグ処理"""
+        if not hasattr(self.main_window, 'waypoint_annotations'):
+            return
+
+        current_index = self.main_window.current_index
+        if current_index not in self.main_window.waypoint_annotations:
+            return
+
+        waypoints = self.main_window.waypoint_annotations[current_index]
+        if (self.selected_waypoint_index is None or
+            self.selected_waypoint_index >= len(waypoints)):
+            return
+
+        # 新しい位置を取得
+        pos = event.pos()
+
+        # 画像内かチェック
+        if not self.target_rect.contains(pos):
+            return
+
+        # X座標のみ更新（Y座標は固定）
+        rel_x = (pos.x() - self.target_rect.x()) / self.target_rect.width()
+        new_x = int(rel_x * self.pix_width)
+
+        # 画像境界内にクランプ
+        new_x = max(0, min(new_x, self.pix_width - 1))
+
+        # ウェイポイントのX座標を更新（Y座標は維持）
+        old_x, old_y = waypoints[self.selected_waypoint_index]
+        waypoints[self.selected_waypoint_index] = (new_x, old_y)
+
+        # 画面を更新
+        self.update()
 
     #　paintEventはリファクタリング済 ~
     def paintEvent(self, event):
@@ -963,6 +1035,22 @@ class ImageLabel(QLabel):
         painter.setBrush(QBrush(QColor(0, 255, 0, 180)))  # 半透明の緑
         painter.setPen(QPen(QColor(0, 128, 0), 2))  # 濃い緑の境界線
 
+        # waypoint間を点線で繋ぐ
+        if len(waypoints) > 1:
+            painter.setPen(QPen(QColor(0, 255, 0), 2, Qt.DashLine))
+            for i in range(len(waypoints) - 1):
+                current_x, current_y = waypoints[i]
+                next_x, next_y = waypoints[i + 1]
+
+                # 座標をスクリーン座標に変換
+                screen_x1 = target_rect.x() + (current_x / pix_width) * target_rect.width()
+                screen_y1 = target_rect.y() + (current_y / pix_height) * target_rect.height()
+                screen_x2 = target_rect.x() + (next_x / pix_width) * target_rect.width()
+                screen_y2 = target_rect.y() + (next_y / pix_height) * target_rect.height()
+
+                # 点線を描画
+                painter.drawLine(int(screen_x1), int(screen_y1), int(screen_x2), int(screen_y2))
+
         # 各waypointを描画
         for i, (orig_x, orig_y) in enumerate(waypoints):
             # 元の画像座標をスクリーン座標に変換
@@ -970,6 +1058,8 @@ class ImageLabel(QLabel):
             screen_y = target_rect.y() + (orig_y / pix_height) * target_rect.height()
 
             # 緑色の丸を描画（半径8ピクセル）
+            painter.setBrush(QBrush(QColor(0, 255, 0, 180)))  # 半透明の緑
+            painter.setPen(QPen(QColor(0, 128, 0), 2))  # 濃い緑の境界線
             painter.drawEllipse(int(screen_x - 8), int(screen_y - 8), 16, 16)
 
             # waypoint番号を表示
@@ -977,8 +1067,11 @@ class ImageLabel(QLabel):
             painter.setFont(QFont("Arial", 10, QFont.Bold))
             painter.drawText(int(screen_x - 6), int(screen_y + 4), str(i + 1))
 
-            # 境界線を元に戻す
-            painter.setPen(QPen(QColor(0, 128, 0), 2))
+            # 座標(x,y)を表示
+            painter.setPen(QPen(QColor(0, 0, 0), 1))  # 黒文字
+            painter.setFont(QFont("Arial", 9))
+            coord_text = f"({int(orig_x)},{int(orig_y)})"
+            painter.drawText(int(screen_x + 12), int(screen_y - 5), coord_text)
 
     def draw_waypoint_guidelines(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
         """waypointのY軸ガイドライン描画"""
@@ -1264,6 +1357,15 @@ class ImageLabel(QLabel):
                 current_index = self.main_window.current_index
 
                 if event.button() == Qt.LeftButton:
+                    # 既存のウェイポイントをクリックしているかチェック
+                    clicked_waypoint_index = self.get_waypoint_at_position(pos)
+
+                    if clicked_waypoint_index is not None:
+                        # 既存のウェイポイントをクリック：ドラッグ開始
+                        self.selected_waypoint_index = clicked_waypoint_index
+                        self.is_moving_waypoint = True
+                        self.waypoint_move_start_pos = pos
+                        return
                     # 左クリック: X座標を取得し、対応するY座標をガイドラインから計算
                     if current_index not in self.main_window.waypoint_annotations:
                         self.main_window.waypoint_annotations[current_index] = []
@@ -1343,6 +1445,20 @@ class ImageLabel(QLabel):
                     self.main_window.skip_images(1)  # デフォルトは1枚
 
     def mouseReleaseEvent(self, event):
+        # ウェイポイントドラッグ完了処理
+        if self.is_moving_waypoint:
+            self.is_moving_waypoint = False
+            self.selected_waypoint_index = None
+            self.waypoint_move_start_pos = None
+
+            # ステータスバーに完了メッセージ
+            if hasattr(self.main_window, 'statusBar'):
+                self.main_window.statusBar().showMessage("ウェイポイントの位置を調整しました", 2000)
+
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+            return
+
         # 頂点移動完了処理を追加（既存のコードの前に追加）
         if self.is_moving_vertex:
             # 頂点移動が完了
@@ -1420,8 +1536,11 @@ class ImageLabel(QLabel):
 
     def mouseMoveEvent(self, event):
         """マウス移動時の処理 - ハンドルによるサイズ変更機能を追加"""
+        # ウェイポイントドラッグ中のカーソル設定
+        if self.is_moving_waypoint:
+            self.setCursor(Qt.ClosedHandCursor)  # つかんでいる状態
         # 物体検知モードでドラッグ中はカーソルを変更
-        if self.is_moving_bbox:
+        elif self.is_moving_bbox:
             self.setCursor(Qt.ClosedHandCursor)  # つかんでいる状態
         elif self.is_drawing_bbox:
             self.setCursor(Qt.CrossCursor)  # 描画中は十字
@@ -1431,7 +1550,12 @@ class ImageLabel(QLabel):
                 self.setCursor(Qt.SizeFDiagCursor)  # 左上-右下
             else:  # "tr", "bl"
                 self.setCursor(Qt.SizeBDiagCursor)  # 右上-左下
-        
+
+        # ウェイポイントドラッグ処理
+        if self.is_moving_waypoint and self.selected_waypoint_index is not None:
+            self.handle_waypoint_drag(event)
+            return
+
         # 既存の移動/描画/リサイズ処理
         if self.pixmap() and (self.is_drawing_bbox or self.is_moving_bbox or self.is_resizing_bbox):
             # クリック位置を取得
@@ -2384,6 +2508,7 @@ class ImageAnnotationTool(QMainWindow):
         # waypoint関連の初期化
         self.waypoint_annotations = {}  # waypointアノテーション用 {image_index: [(x, y), ...]}
         self.last_waypoints = []  # 前回の画像のwaypointを保存
+        self.auto_apply_last_waypoint = False  # 前回のwaypointを自動適用するかどうか
 
         # 削除インデックス
         self.deleted_indexes = []
@@ -3162,7 +3287,7 @@ class ImageAnnotationTool(QMainWindow):
         end_y_layout.addWidget(QLabel("終了Y位置:"))
         self.waypoint_end_y_spin = QSpinBox()
         self.waypoint_end_y_spin.setRange(0, 1000)
-        self.waypoint_end_y_spin.setValue(50)  # デフォルト値を50に変更（開始位置より小さく）
+        self.waypoint_end_y_spin.setValue(120)  # デフォルト値を120に変更
         self.waypoint_end_y_spin.setToolTip("waypoint終了位置のY座標")
         self.waypoint_end_y_spin.valueChanged.connect(self.update_waypoint_guidelines)
         end_y_layout.addWidget(self.waypoint_end_y_spin)
@@ -3174,6 +3299,13 @@ class ImageAnnotationTool(QMainWindow):
         y_pos_layout.addLayout(end_y_layout)
 
         waypoint_control_layout.addLayout(y_pos_layout)
+
+        # 前回waypoint自動適用チェックボックス
+        self.apply_last_waypoint_checkbox = QCheckBox("前回のwaypointを自動適用")
+        self.apply_last_waypoint_checkbox.setChecked(False)
+        self.apply_last_waypoint_checkbox.setToolTip("前回の画像のwaypointを次の画像に自動適用")
+        self.apply_last_waypoint_checkbox.stateChanged.connect(self.toggle_auto_apply_waypoint)
+        waypoint_control_layout.addWidget(self.apply_last_waypoint_checkbox)
 
         # ガイド説明ラベル
         guide_label = QLabel("使い方: Y座標位置にガイドラインが表示されます。\n画像上をクリックしてX座標を指定してください。")
@@ -3889,6 +4021,25 @@ class ImageAnnotationTool(QMainWindow):
         """waypoint設定変更時にガイドラインを更新"""
         if hasattr(self, 'main_image_view') and hasattr(self.main_image_view, 'update'):
             self.main_image_view.update()
+
+    def toggle_auto_apply_waypoint(self, state):
+        """前回のwaypointを自動適用するかどうかを設定"""
+        self.auto_apply_last_waypoint = (state == Qt.Checked)
+
+        # 現在の画像に対して、前回のwaypointを適用
+        if self.auto_apply_last_waypoint and self.last_waypoints:
+            current_index = self.current_index
+            if current_index is not None:
+                # 既存のwaypointがない場合のみ適用
+                if current_index not in self.waypoint_annotations or not self.waypoint_annotations[current_index]:
+                    self.waypoint_annotations[current_index] = self.last_waypoints.copy()
+
+                    # 画面を更新
+                    self.display_current_image()
+                    self.update_gallery()
+
+                    # ステータスメッセージ
+                    self.statusBar().showMessage(f"前回のwaypoint {len(self.last_waypoints)}個を適用しました", 2000)
 
     def toggle_auto_apply_segmentation(self, state):
         """前回のセグメンテーションを自動適用するかどうかを設定"""
@@ -9976,7 +10127,32 @@ class ImageAnnotationTool(QMainWindow):
     def slider_changed(self, value):
         """スライダーの値が変更されたときの処理"""
         if self.images and value != self.current_index:
+            # スライダー移動前に現在の画像のwaypoint情報を保存
+            old_index = self.current_index
+            if (old_index is not None and
+                old_index in self.waypoint_annotations and
+                self.waypoint_annotations[old_index]):
+                self.last_waypoints = self.waypoint_annotations[old_index].copy()
+
             self.current_index = value
+
+            # 前回waypoint自動適用機能
+            if (hasattr(self, 'auto_apply_last_waypoint') and
+                self.auto_apply_last_waypoint and
+                self.last_waypoints and
+                hasattr(self, 'current_mode') and
+                self.current_mode == 3):  # waypointモードの場合のみ
+
+                # 新しい画像にwaypointがない場合のみ適用
+                if (self.current_index not in self.waypoint_annotations or
+                    not self.waypoint_annotations[self.current_index]):
+
+                    self.waypoint_annotations[self.current_index] = self.last_waypoints.copy()
+
+                    # ステータスメッセージ
+                    if hasattr(self, 'statusBar'):
+                        self.statusBar().showMessage(f"前回のwaypoint {len(self.last_waypoints)}個を自動適用しました", 2000)
+
             self.display_current_image()
 
             # タイマーを再開して推論実行をデバウンス
@@ -12346,7 +12522,13 @@ class ImageAnnotationTool(QMainWindow):
             # インデックスが変わらない場合は何もしない
             if index == self.current_index:
                 return
-            
+
+            # 前回のwaypointを保存（変更前のインデックス用）
+            if (self.current_index is not None and
+                self.current_index in self.waypoint_annotations and
+                self.waypoint_annotations[self.current_index]):
+                self.last_waypoints = self.waypoint_annotations[self.current_index].copy()
+
             # 現在の画像に変更
             self.current_index = index
             
@@ -12356,14 +12538,34 @@ class ImageAnnotationTool(QMainWindow):
             
             # 画像表示を更新
             self.display_current_image()
-            
+
+            # 前回waypoint自動適用機能
+            if (hasattr(self, 'auto_apply_last_waypoint') and
+                self.auto_apply_last_waypoint and
+                self.last_waypoints and
+                hasattr(self, 'current_mode') and
+                self.current_mode == 3):  # waypointモードの場合のみ
+
+                # 新しい画像にwaypointがない場合のみ適用
+                if (self.current_index not in self.waypoint_annotations or
+                    not self.waypoint_annotations[self.current_index]):
+
+                    self.waypoint_annotations[self.current_index] = self.last_waypoints.copy()
+
+                    # ステータスメッセージ
+                    if hasattr(self, 'statusBar'):
+                        self.statusBar().showMessage(f"前回のwaypoint {len(self.last_waypoints)}個を自動適用しました", 2000)
+
+                    # 画面を再更新
+                    self.display_current_image()
+
             # 推論表示チェックボックスがONの場合、推論結果を表示
             if self.inference_checkbox.isChecked():
                 current_img_path = self.images[self.current_index]
                 # 推論結果がまだない場合のみ推論を実行
                 if current_img_path not in self.inference_results:
                     self.run_inference_check(False)
-            
+
             # ギャラリー更新
             self.update_gallery()
             
@@ -12383,7 +12585,14 @@ class ImageAnnotationTool(QMainWindow):
         # インデックスが変わらない場合は何もしない
         if new_index == self.current_index:
             return
-        
+
+        # スキップ前に現在の画像のwaypoint情報を保存
+        current_index = self.current_index
+        if (current_index is not None and
+            current_index in self.waypoint_annotations and
+            self.waypoint_annotations[current_index]):
+            self.last_waypoints = self.waypoint_annotations[current_index].copy()
+
         # スキップ前に現在の画像のバウンディングボックス情報を確認し、すべてのボックスを記録
         if hasattr(self, 'bbox_annotations') and len(self.images) > 0:
             # インデックスベースに変更
@@ -12481,6 +12690,23 @@ class ImageAnnotationTool(QMainWindow):
                     # 後方互換性のため、単一セグメンテーションの場合も処理
                     self.add_segmentation_annotation(self.last_segmentation.copy())
                     self.statusBar().showMessage(f"前回の '{self.last_segmentation['class']}' セグメンテーションを適用しました", 3000)
+
+        # 前回waypoint自動適用機能
+        if (hasattr(self, 'auto_apply_last_waypoint') and
+            self.auto_apply_last_waypoint and
+            self.last_waypoints and
+            hasattr(self, 'current_mode') and
+            self.current_mode == 3):  # waypointモードの場合のみ
+
+            # 新しい画像にwaypointがない場合のみ適用
+            if (new_index not in self.waypoint_annotations or
+                not self.waypoint_annotations[new_index]):
+
+                self.waypoint_annotations[new_index] = self.last_waypoints.copy()
+
+                # ステータスメッセージ
+                if hasattr(self, 'statusBar'):
+                    self.statusBar().showMessage(f"前回のwaypoint {len(self.last_waypoints)}個を自動適用しました", 2000)
 
         # 画像表示を更新
         self.display_current_image()
