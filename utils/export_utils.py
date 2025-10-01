@@ -14,14 +14,15 @@ from PIL import Image, ImageDraw
 from typing import Dict, Any, List, Callable, Optional, Union
 
 def export_to_donkey(
-    folder_path: str, 
-    annotations: Dict[Union[str, int], Dict[str, Any]], 
+    folder_path: str,
+    annotations: Dict[Union[str, int], Dict[str, Any]],
     inference_results: Optional[Dict[Union[str, int], Dict[str, Any]]] = None,
     deleted_indexes: Optional[List[int]] = None,
     images_list: Optional[List[str]] = None,  # 互換性のために残す
     image_map: Optional[Dict[int, Dict[str, str]]] = None,  # 新しいパラメータ：{index: {variant: image_path, ...}, ...}
     variant_keys: Optional[Dict[str, str]] = None,  # 新しいパラメータ：{variant: key_name, ...}
-    diff_vectors: Optional[Dict[Union[str, int], Dict[str, Any]]] = None  # 追加: 差分ベクトルデータ
+    diff_vectors: Optional[Dict[Union[str, int], Dict[str, Any]]] = None,  # 追加: 差分ベクトルデータ
+    waypoint_annotations: Optional[Dict[Union[str, int], List[tuple]]] = None  # 追加: ウェイポイントデータ
 ) -> str:
     
     """アノテーションをDonkeycar形式でエクスポートする（1000件ごとに分割） - 複数画像ソース対応
@@ -182,6 +183,19 @@ def export_to_donkey(
                 catalog_entry["diff/throttle"] = diff_data['throttle_diff']
                 catalog_entry["diff/magnitude"] = diff_data['vector_magnitude']
                 catalog_entry["diff/angle_rad"] = diff_data['vector_angle']
+
+        # 追加: ウェイポイント情報を追加
+        if waypoint_annotations:
+            waypoint_data = None
+            if isinstance(original_index, int) and original_index in waypoint_annotations:
+                waypoint_data = waypoint_annotations[original_index]
+
+            if waypoint_data:
+                # ウェイポイントデータを配列形式で保存
+                waypoint_array = []
+                for x, y in waypoint_data:
+                    waypoint_array.extend([float(x), float(y)])  # [x1, y1, x2, y2, ...]の形式
+                catalog_entry["waypoint/pos_array"] = waypoint_array
                         
         # 各バリアントの画像をコピーしてエントリに追加
         for variant, img_path in variant_images.items():
@@ -261,6 +275,7 @@ def export_to_donkey(
     has_loc = any('loc' in anno for anno in annotations.values())
     has_pilot = inference_results is not None and len(inference_results) > 0
     has_diff = diff_vectors is not None and len(diff_vectors) > 0  # 追加
+    has_waypoint = waypoint_annotations is not None and len(waypoint_annotations) > 0  # 追加
 
     if has_pilot:
         column_names.extend(["pilot/angle", "pilot/throttle"])
