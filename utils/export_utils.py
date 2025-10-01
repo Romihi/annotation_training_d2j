@@ -191,11 +191,9 @@ def export_to_donkey(
                 waypoint_data = waypoint_annotations[original_index]
 
             if waypoint_data:
-                # ウェイポイントデータを配列形式で保存
-                waypoint_array = []
-                for x, y in waypoint_data:
-                    waypoint_array.extend([float(x), float(y)])  # [x1, y1, x2, y2, ...]の形式
-                catalog_entry["waypoint/pos_array"] = waypoint_array
+                # ウェイポイントデータを[[x,y],...]のnumpy配列形式で保存
+                waypoint_array = [[float(x), float(y)] for x, y in waypoint_data]
+                catalog_entry["waypoint/pos_array"] = np.array(waypoint_array)
                         
         # 各バリアントの画像をコピーしてエントリに追加
         for variant, img_path in variant_images.items():
@@ -292,6 +290,11 @@ def export_to_donkey(
     if has_diff:
         column_names.extend(["diff/angle", "diff/throttle", "diff/magnitude", "diff/angle_rad"])
         column_types.extend(["float", "float", "float", "float"])
+
+    # 追加: ウェイポイントのカラムを追加
+    if has_waypoint:
+        column_names.append("waypoint/pos_array")
+        column_types.append("nparray")
 
     # manifest.json ファイルを作成
     manifest_data = [
