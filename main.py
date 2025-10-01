@@ -239,6 +239,7 @@ class ImageLabel(QLabel):
         # バウンディングボックス（YOLO推論結果含む）を先に描画
         self.draw_bbox(self.pix_width, self.pix_height, painter, self.target_rect)
         self.draw_segmentation(self.pix_width, self.pix_height, painter, self.target_rect)
+        self.draw_waypoints(self.pix_width, self.pix_height, painter, self.target_rect)
         # アノテーション点、推論点、差分ベクトルを最後に描画（上に表示）
         self.draw_control_points(painter, self.target_rect)
 
@@ -935,6 +936,40 @@ class ImageLabel(QLabel):
                 painter.setPen(QPen(QColor(255, 255, 0), 3))
                 painter.drawEllipse(screen_points[0].x() - 6, screen_points[0].y() - 6, 12, 12)
 
+    def draw_waypoints(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
+        """waypointの描画（緑色の丸）"""
+        if not hasattr(self.main_window, 'waypoint_annotations'):
+            return
+
+        current_index = self.main_window.current_index
+        if current_index not in self.main_window.waypoint_annotations:
+            return
+
+        waypoints = self.main_window.waypoint_annotations[current_index]
+        if not waypoints:
+            return
+
+        # 緑色で描画設定
+        painter.setBrush(QBrush(QColor(0, 255, 0, 180)))  # 半透明の緑
+        painter.setPen(QPen(QColor(0, 128, 0), 2))  # 濃い緑の境界線
+
+        # 各waypointを描画
+        for i, (orig_x, orig_y) in enumerate(waypoints):
+            # 元の画像座標をスクリーン座標に変換
+            screen_x = target_rect.x() + (orig_x / pix_width) * target_rect.width()
+            screen_y = target_rect.y() + (orig_y / pix_height) * target_rect.height()
+
+            # 緑色の丸を描画（半径8ピクセル）
+            painter.drawEllipse(int(screen_x - 8), int(screen_y - 8), 16, 16)
+
+            # waypoint番号を表示
+            painter.setPen(QPen(QColor(255, 255, 255), 1))  # 白文字
+            painter.setFont(QFont("Arial", 10, QFont.Bold))
+            painter.drawText(int(screen_x - 6), int(screen_y + 4), str(i + 1))
+
+            # 境界線を元に戻す
+            painter.setPen(QPen(QColor(0, 128, 0), 2))
+
     def mousePressEvent(self, event):
         if self.pixmap() and self.main_window:
             # デバウンス処理（連続クリック防止）
@@ -1173,13 +1208,40 @@ class ImageLabel(QLabel):
                         self.is_drawing_segmentation = False
                         self.update()
 
+            elif hasattr(self.main_window, 'current_mode') and self.main_window.current_mode == 3:
+                # waypointアノテーションモード
+                current_index = self.main_window.current_index
+
+                if event.button() == Qt.LeftButton:
+                    # 左クリック: waypoint座標を追加
+                    if current_index not in self.main_window.waypoint_annotations:
+                        self.main_window.waypoint_annotations[current_index] = []
+
+                    # waypoint座標をリストに追加
+                    self.main_window.waypoint_annotations[current_index].append((orig_x, orig_y))
+
+                    if hasattr(self.main_window, 'statusBar'):
+                        waypoint_count = len(self.main_window.waypoint_annotations[current_index])
+                        self.main_window.statusBar().showMessage(f"waypoint追加: ({orig_x}, {orig_y}) - 総数: {waypoint_count}", 2000)
+
+                elif event.button() == Qt.RightButton:
+                    # 右クリック: 最後のwaypointを削除
+                    if current_index in self.main_window.waypoint_annotations and self.main_window.waypoint_annotations[current_index]:
+                        removed_point = self.main_window.waypoint_annotations[current_index].pop()
+
+                        if hasattr(self.main_window, 'statusBar'):
+                            remaining_count = len(self.main_window.waypoint_annotations[current_index])
+                            self.main_window.statusBar().showMessage(f"waypoint削除: {removed_point} - 残り: {remaining_count}", 2000)
+
+                self.update()  # 画面を更新してwaypointを表示
+
             else:
                 # 自動運転アノテーションモード
                 self.annotation_point = QPoint(orig_x, orig_y)
-                
+
                 # メインウィンドウに通知
                 self.main_window.handle_annotation(orig_x, orig_y)
-                
+
                 # アノテーション後に自動的に次の画像に進む（スキップ枚数考慮）
                 if hasattr(self.main_window, 'skip_images_on_click') and self.main_window.skip_images_on_click.isChecked():
                     skip_count = self.main_window.skip_count_spin.value()
@@ -1812,7 +1874,7 @@ class ImageLabel(QLabel):
 class ThumbnailWidget(QWidget):
     def __init__(self, parent=None, img_path="", index=0, is_selected=False,
                  annotation=None, on_click=None, location_value=None, is_deleted=False,
-                 bbox_annotations=None, segmentation_annotations=None):
+                 bbox_annotations=None, segmentation_annotations=None, waypoint_annotations=None):
         super().__init__(parent)
         self.img_path = img_path
         self.index = index
@@ -1823,6 +1885,7 @@ class ThumbnailWidget(QWidget):
         self.is_deleted = is_deleted
         self.bbox_annotations = bbox_annotations
         self.segmentation_annotations = segmentation_annotations
+        self.waypoint_annotations = waypoint_annotations
 
         # サムネイル全体のサイズも調整
         self.setMinimumWidth(210)
@@ -2137,6 +2200,21 @@ class ThumbnailWidget(QWidget):
                     # テキスト描画
                     draw.text((x1+2, y1-text_size), label_text, fill=(255, 255, 255))
 
+            # waypointアノテーションがある場合は緑色の丸を描画
+            if self.waypoint_annotations and not self.is_deleted:
+                for i, (x, y) in enumerate(self.waypoint_annotations):
+                    # 緑色の丸を描画（サムネイル用に小さめ）
+                    circle_size = 5  # サムネイル用の丸のサイズ
+                    draw.ellipse((x-circle_size, y-circle_size, x+circle_size, y+circle_size),
+                                fill=(0, 255, 0, 180), outline=(0, 128, 0), width=1)
+
+                    # waypoint番号を表示
+                    label_text = str(i + 1)
+                    text_size = 8
+
+                    # テキスト描画（白文字）
+                    draw.text((x-2, y-4), label_text, fill=(255, 255, 255))
+
             # 画像をQImageに変換
             draw_img = draw_img.convert("RGBA")
             data = draw_img.tobytes("raw", "RGBA")
@@ -2209,6 +2287,10 @@ class ImageAnnotationTool(QMainWindow):
         self.yolo_seg_model = None  # YOLOセグメンテーションモデル
         self.last_segmentations = []
         self.show_segmentation_inference = False  # セグメンテーション推論表示フラグ
+
+        # waypoint関連の初期化
+        self.waypoint_annotations = {}  # waypointアノテーション用 {image_index: [(x, y), ...]}
+        self.last_waypoints = []  # 前回の画像のwaypointを保存
 
         # 削除インデックス
         self.deleted_indexes = []
@@ -2923,9 +3005,22 @@ class ImageAnnotationTool(QMainWindow):
             "・Escキー: 作成中のポリゴンをキャンセル"
         )
 
+        # 新規追加: waypointモードボタン
+        self.waypoint_mode_button = QPushButton("wp")
+        self.waypoint_mode_button.setCheckable(True)
+        self.waypoint_mode_button.clicked.connect(self.toggle_annotation_mode)
+        self.waypoint_mode_button.setToolTip(
+            "waypointアノテーションモード\n"
+            "・左クリック: waypoint座標を追加\n"
+            "・右クリック: 最後のwaypointを削除\n"
+            "・緑色の丸でwaypointが表示されます\n"
+            "・Deleteキー: 現在の画像のwaypointを全削除"
+        )
+
         mode_layout.addWidget(self.auto_mode_button)
         mode_layout.addWidget(self.detection_mode_button)
         mode_layout.addWidget(self.segmentation_mode_button)  # 追加
+        mode_layout.addWidget(self.waypoint_mode_button)  # 追加
 
         location_layout.addLayout(mode_layout)
 
@@ -3330,6 +3425,9 @@ class ImageAnnotationTool(QMainWindow):
                 elif self.current_mode == 2:  # セグメンテーションモードの場合
                     if self.main_image_view.selected_segmentation_index is not None:
                         self.delete_selected_segmentation()
+                elif self.current_mode == 3:  # waypointモードの場合
+                    # 現在の画像のwaypointアノテーションを全削除
+                    self.delete_current_waypoint_annotations()
                 return True
             
             # 数字キー（0-7）による位置アノテーション（自動運転モードのみ）
@@ -3564,6 +3662,36 @@ class ImageAnnotationTool(QMainWindow):
             self.statusBar().showMessage(f"自動運転アノテーション ({items_str}) を削除しました", 3000)
         else:
             self.statusBar().showMessage("削除するアノテーションがありませんでした", 3000)
+
+    def delete_current_waypoint_annotations(self):
+        """現在の画像のwaypointアノテーションを全削除する"""
+        if not self.images:
+            return
+
+        current_index = self.current_index
+        if current_index is None:
+            return
+
+        # waypointアノテーションを削除
+        deleted_count = 0
+        if current_index in self.waypoint_annotations:
+            deleted_count = len(self.waypoint_annotations[current_index])
+            del self.waypoint_annotations[current_index]
+
+        # 画面更新
+        self.display_current_image()
+
+        # 明示的にメイン画像ビューを更新
+        if hasattr(self.main_image_view, 'update'):
+            self.main_image_view.update()
+
+        self.update_gallery()
+
+        # 確認メッセージ
+        if deleted_count > 0:
+            self.statusBar().showMessage(f"waypoint {deleted_count}個を削除しました", 3000)
+        else:
+            self.statusBar().showMessage("削除するwaypointがありませんでした", 3000)
 
     def toggle_auto_apply_segmentation(self, state):
         """前回のセグメンテーションを自動適用するかどうかを設定"""
@@ -4429,37 +4557,56 @@ class ImageAnnotationTool(QMainWindow):
             self.auto_mode_button.setChecked(True)
             self.detection_mode_button.setChecked(False)
             self.segmentation_mode_button.setChecked(False)
+            self.waypoint_mode_button.setChecked(False)
             self.statusBar().showMessage("自動運転アノテーションモードに切り替えました。", 3000)
         elif sender == self.detection_mode_button:
             self.current_mode = 1
             self.auto_mode_button.setChecked(False)
             self.detection_mode_button.setChecked(True)
             self.segmentation_mode_button.setChecked(False)
+            self.waypoint_mode_button.setChecked(False)
             self.statusBar().showMessage("物体検知アノテーションモードに切り替えました。", 3000)
         elif sender == self.segmentation_mode_button:
             self.current_mode = 2  # 新規追加
             self.auto_mode_button.setChecked(False)
             self.detection_mode_button.setChecked(False)
             self.segmentation_mode_button.setChecked(True)
+            self.waypoint_mode_button.setChecked(False)
             self.statusBar().showMessage("セグメンテーションアノテーションモードに切り替えました。", 3000)
+        elif sender == self.waypoint_mode_button:
+            self.current_mode = 3  # waypoint mode
+            self.auto_mode_button.setChecked(False)
+            self.detection_mode_button.setChecked(False)
+            self.segmentation_mode_button.setChecked(False)
+            self.waypoint_mode_button.setChecked(True)
+            self.statusBar().showMessage("waypointアノテーションモードに切り替えました。", 3000)
         else:
-            # Bキーでの切り替え（3つのモードをサイクル）
-            self.current_mode = (self.current_mode + 1) % 3
+            # Bキーでの切り替え（4つのモードをサイクル）
+            self.current_mode = (self.current_mode + 1) % 4
             if self.current_mode == 0:
                 self.auto_mode_button.setChecked(True)
                 self.detection_mode_button.setChecked(False)
                 self.segmentation_mode_button.setChecked(False)
+                self.waypoint_mode_button.setChecked(False)
                 self.statusBar().showMessage("自動運転アノテーションモードに切り替えました。", 3000)
             elif self.current_mode == 1:
                 self.auto_mode_button.setChecked(False)
                 self.detection_mode_button.setChecked(True)
                 self.segmentation_mode_button.setChecked(False)
+                self.waypoint_mode_button.setChecked(False)
                 self.statusBar().showMessage("物体検知アノテーションモードに切り替えました。", 3000)
-            else:
+            elif self.current_mode == 2:
                 self.auto_mode_button.setChecked(False)
                 self.detection_mode_button.setChecked(False)
                 self.segmentation_mode_button.setChecked(True)
+                self.waypoint_mode_button.setChecked(False)
                 self.statusBar().showMessage("セグメンテーションアノテーションモードに切り替えました。", 3000)
+            else:  # current_mode == 3
+                self.auto_mode_button.setChecked(False)
+                self.detection_mode_button.setChecked(False)
+                self.segmentation_mode_button.setChecked(False)
+                self.waypoint_mode_button.setChecked(True)
+                self.statusBar().showMessage("waypointアノテーションモードに切り替えました。", 3000)
         
         self.main_image_view.update()
     
@@ -11774,6 +11921,12 @@ class ImageAnnotationTool(QMainWindow):
                     idx in self.segmentation_annotations):
                     segmentation_annotations = self.segmentation_annotations[idx]
 
+                # waypointアノテーションを取得
+                waypoint_annotations = None
+                if (hasattr(self, 'waypoint_annotations') and
+                    idx in self.waypoint_annotations):
+                    waypoint_annotations = self.waypoint_annotations[idx]
+
                 # 拡張サムネイルウィジェットを作成
                 thumb = ThumbnailWidget(
                     img_path=img_path,
@@ -11784,7 +11937,8 @@ class ImageAnnotationTool(QMainWindow):
                     location_value=location_value,
                     is_deleted=is_deleted,
                     bbox_annotations=bbox_annotations,
-                    segmentation_annotations=segmentation_annotations
+                    segmentation_annotations=segmentation_annotations,
+                    waypoint_annotations=waypoint_annotations
                 )
                 
                 # col_count列のグリッドで配置
