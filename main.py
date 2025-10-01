@@ -289,6 +289,26 @@ class ImageLabel(QLabel):
         # 画面を更新
         self.update()
 
+    def handle_waypoint_hover(self, event):
+        """ウェイポイントホバー検出処理"""
+        pos = event.pos()
+
+        # ホバー中のウェイポイントを検出
+        hovered_waypoint = self.get_waypoint_at_position(pos)
+
+        # ホバー状態が変わった場合のみ更新
+        if hovered_waypoint != self.hovering_waypoint_index:
+            self.hovering_waypoint_index = hovered_waypoint
+
+            # カーソルを変更
+            if self.hovering_waypoint_index is not None:
+                self.setCursor(Qt.OpenHandCursor)  # ドラッグ可能を示すカーソル
+            else:
+                self.setCursor(Qt.ArrowCursor)  # 通常のカーソル
+
+            # 画面を更新
+            self.update()
+
     #　paintEventはリファクタリング済 ~
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -1057,6 +1077,14 @@ class ImageLabel(QLabel):
             screen_x = target_rect.x() + (orig_x / pix_width) * target_rect.width()
             screen_y = target_rect.y() + (orig_y / pix_height) * target_rect.height()
 
+            # ホバー中のウェイポイントに外側の縁取りを追加
+            if (hasattr(self, 'hovering_waypoint_index') and
+                self.hovering_waypoint_index == i):
+                # 外側にオレンジの縁取りを描画
+                painter.setBrush(QBrush(Qt.transparent))
+                painter.setPen(QPen(QColor(255, 140, 0), 3))  # オレンジの太い線
+                painter.drawEllipse(int(screen_x - 11), int(screen_y - 11), 22, 22)
+
             # 緑色の丸を描画（半径8ピクセル）
             painter.setBrush(QBrush(QColor(0, 255, 0, 180)))  # 半透明の緑
             painter.setPen(QPen(QColor(0, 128, 0), 2))  # 濃い緑の境界線
@@ -1555,6 +1583,17 @@ class ImageLabel(QLabel):
         if self.is_moving_waypoint and self.selected_waypoint_index is not None:
             self.handle_waypoint_drag(event)
             return
+
+        # ウェイポイントホバー検出（ドラッグ中でない場合のみ）
+        if (hasattr(self.main_window, 'current_mode') and
+            self.main_window.current_mode == 3 and
+            not self.is_moving_waypoint):
+            self.handle_waypoint_hover(event)
+        else:
+            # ウェイポイントモード以外の場合はホバー状態をクリア
+            if hasattr(self, 'hovering_waypoint_index') and self.hovering_waypoint_index is not None:
+                self.hovering_waypoint_index = None
+                self.update()
 
         # 既存の移動/描画/リサイズ処理
         if self.pixmap() and (self.is_drawing_bbox or self.is_moving_bbox or self.is_resizing_bbox):
