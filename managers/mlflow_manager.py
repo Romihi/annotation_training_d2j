@@ -11,6 +11,7 @@ class ModelType(Enum):
     """モデルタイプの定義"""
     AUTONOMOUS_DRIVING = "autonomous_driving"
     POSITION_ESTIMATION = "position_estimation"
+    WAYPOINT_REGRESSION = "waypoint_regression"
     YOLO_DETECTION = "yolo_detection"
     YOLO_SEGMENTATION = "yolo_segmentation"
 
@@ -20,7 +21,8 @@ class MLflowManager:
     # 実験名の定義
     EXPERIMENT_NAMES = {
         ModelType.AUTONOMOUS_DRIVING: "autonomous_driving_models",
-        ModelType.POSITION_ESTIMATION: "position_estimation_models", 
+        ModelType.POSITION_ESTIMATION: "position_estimation_models",
+        ModelType.WAYPOINT_REGRESSION: "waypoint_regression_models",
         ModelType.YOLO_DETECTION: "yolo_detection_models",
         ModelType.YOLO_SEGMENTATION: "yolo_segmentation_models"
     }
@@ -663,3 +665,88 @@ class MLflowManager:
     def compare_models_by_type(self, parent_widget, model_type: ModelType):
         """指定されたモデルタイプの実験結果を比較"""
         self.open_ui(parent_widget, model_type)
+
+    def log_waypoint_regression_model(self, model_path, training_params, metrics, dataset_info):
+        """ウェイポイント回帰モデルの学習結果を記録"""
+
+        if not self.set_experiment(ModelType.WAYPOINT_REGRESSION):
+            return {"status": "error", "message": "実験の設定に失敗しました"}
+
+        # 基本パラメータ
+        params = {
+            "framework": "pytorch",
+            "model_type": training_params.get("model_type", "waypoint_regression"),
+            "data_folder": training_params.get("data_folder", "unknown"),
+            "task_type": "regression",
+            "epochs": training_params.get("num_epochs", 0),
+            "completed_epochs": training_params.get("completed_epochs", 0),
+            "learning_rate": training_params.get("learning_rate", 0.001),
+            "batch_size": training_params.get("batch_size", 8),
+            "early_stopping": "enabled" if training_params.get("use_early_stopping", False) else "disabled",
+            "patience": training_params.get("patience", 0),
+            "augmentation_enabled": training_params.get("use_augmentation", False),
+            "num_waypoints": training_params.get("num_waypoints", 4),
+            "output_format": "xy_coordinates",
+            "coordinate_system": "continuous"
+        }
+
+        # ウェイポイント回帰特有のメトリクス
+        run_metrics = {
+            "best_val_loss": metrics.get("best_val_loss", 0.0),
+            "final_train_loss": metrics.get("final_train_loss", 0.0),
+            "final_val_loss": metrics.get("final_val_loss", 0.0),
+            "total_training_time": metrics.get("total_training_time", 0.0),
+            "avg_epoch_time": metrics.get("avg_epoch_time", 0.0),
+            "completed_epochs": metrics.get("completed_epochs", 0)
+        }
+
+        # タグ
+        tags = {
+            "model_category": "waypoint_regression",
+            "task_type": "regression",
+            "framework": "pytorch",
+            "status": metrics.get("status", "completed"),
+            "waypoint_count": str(training_params.get("num_waypoints", 4))
+        }
+
+        # データセット情報の追加
+        if dataset_info:
+            params.update({
+                "train_samples": dataset_info.get("train_samples", 0),
+                "val_samples": dataset_info.get("val_samples", 0),
+                "total_samples": dataset_info.get("total_annotations", 0),
+                "used_samples": dataset_info.get("used_samples", 0)
+            })
+
+        run_name = f"waypoint_{training_params.get('model_type', 'unknown')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        try:
+            with mlflow.start_run(run_name=run_name):
+                # タグを設定
+                mlflow.set_tags(tags)
+
+                # パラメータを記録
+                mlflow.log_params(params)
+
+                # メトリクスを記録
+                mlflow.log_metrics(run_metrics)
+
+                # モデルファイルをアーティファクトとして記録
+                if model_path and os.path.exists(model_path):
+                    if sys.platform.startswith('win'):
+                        model_path = os.path.normpath(model_path)
+                    mlflow.log_artifact(model_path, "models")
+                    mlflow.log_param("model_file", os.path.basename(model_path))
+
+                # 実行情報を取得
+                run = mlflow.active_run()
+                run_id = run.info.run_id
+
+                print(f"ウェイポイント回帰モデルをMLflowに記録しました (Run ID: {run_id})")
+                return {"status": "success", "run_id": run_id}
+
+        except Exception as e:
+            print(f"MLflow記録エラー: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"status": "error", "message": str(e)}

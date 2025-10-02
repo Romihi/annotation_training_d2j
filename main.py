@@ -69,7 +69,7 @@ from model_catalog import get_model, list_available_models
 from utils.inference_utils import batch_inference
 from utils.export_utils import export_to_donkey, export_to_jetracer, export_to_video, export_to_video_multi_source
 from model_training import train_model, create_datasets
-from model_training import train_location_model, create_location_datasets, LocationModelManager
+from model_training import train_location_model, create_location_datasets, LocationModelManager, create_waypoint_datasets
 from model_training import generate_augmentation_samples
 # TODO:ボタンのスタイルを実装、他のUIの移植については後ほど検討
 from styles import get_location_color, apply_style, set_theme, get_current_theme, PRIMARY_STYLE, MODEL_STYLE, TRAINING_STYLE, EXPORT_STYLE, SPECIAL_STYLE, DESTRUCTIVE_STYLE, NAV_STYLE
@@ -1155,75 +1155,132 @@ class ImageLabel(QLabel):
             self.draw_waypoint_guidelines(pix_width, pix_height, painter, target_rect)
 
         # 既存のwaypoint描画
-        if not hasattr(self.main_window, 'waypoint_annotations'):
-            return
-
         current_index = self.main_window.current_index
-        if current_index not in self.main_window.waypoint_annotations:
-            return
 
-        waypoints = self.main_window.waypoint_annotations[current_index]
-        if not waypoints:
-            return
+        # アノテーションwaypointがある場合のみ描画
+        if (hasattr(self.main_window, 'waypoint_annotations') and
+            current_index in self.main_window.waypoint_annotations):
 
-        # 緑色で描画設定
-        painter.setBrush(QBrush(QColor(0, 255, 0, 180)))  # 半透明の緑
-        painter.setPen(QPen(QColor(0, 128, 0), 2))  # 濃い緑の境界線
+            waypoints = self.main_window.waypoint_annotations[current_index]
+            if not waypoints:
+                waypoints = None
+        else:
+            waypoints = None
 
-        # waypoint間を点線で繋ぐ
-        if len(waypoints) > 1:
-            painter.setPen(QPen(QColor(0, 255, 0), 2, Qt.DashLine))
-            for i in range(len(waypoints) - 1):
-                current_x, current_y = waypoints[i]
-                next_x, next_y = waypoints[i + 1]
-
-                # 座標をスクリーン座標に変換
-                screen_x1 = target_rect.x() + (current_x / pix_width) * target_rect.width()
-                screen_y1 = target_rect.y() + (current_y / pix_height) * target_rect.height()
-                screen_x2 = target_rect.x() + (next_x / pix_width) * target_rect.width()
-                screen_y2 = target_rect.y() + (next_y / pix_height) * target_rect.height()
-
-                # 点線を描画
-                painter.drawLine(int(screen_x1), int(screen_y1), int(screen_x2), int(screen_y2))
-
-        # 各waypointを描画
-        for i, (orig_x, orig_y) in enumerate(waypoints):
-            # 元の画像座標をスクリーン座標に変換
-            screen_x = target_rect.x() + (orig_x / pix_width) * target_rect.width()
-            screen_y = target_rect.y() + (orig_y / pix_height) * target_rect.height()
-
-            # ホバー中のウェイポイントに外側の縁取りを追加
-            if (hasattr(self, 'hovering_waypoint_index') and
-                self.hovering_waypoint_index == i):
-                # 外側にオレンジの縁取りを描画
-                painter.setBrush(QBrush(Qt.transparent))
-                painter.setPen(QPen(QColor(255, 140, 0), 3))  # オレンジの太い線
-                painter.drawEllipse(int(screen_x - 11), int(screen_y - 11), 22, 22)
-
-            # 緑色の丸を描画（半径8ピクセル）
+        # waypointsがある場合のみアノテーション描画
+        if waypoints:
+            # 緑色で描画設定
             painter.setBrush(QBrush(QColor(0, 255, 0, 180)))  # 半透明の緑
             painter.setPen(QPen(QColor(0, 128, 0), 2))  # 濃い緑の境界線
-            painter.drawEllipse(int(screen_x - 8), int(screen_y - 8), 16, 16)
 
-            # waypoint番号を表示
-            painter.setPen(QPen(QColor(255, 255, 255), 1))  # 白文字
-            painter.setFont(QFont("Arial", 10, QFont.Bold))
-            painter.drawText(int(screen_x - 6), int(screen_y + 4), str(i + 1))
+            # waypoint間を点線で繋ぐ
+            if len(waypoints) > 1:
+                painter.setPen(QPen(QColor(0, 255, 0), 2, Qt.DashLine))
+                for i in range(len(waypoints) - 1):
+                    current_x, current_y = waypoints[i]
+                    next_x, next_y = waypoints[i + 1]
 
-            # 座標(x,y)を表示
-            painter.setPen(QPen(QColor(0, 200, 0), 1))  # 緑文字
-            painter.setFont(QFont("Arial", 9))
-            coord_text = f"({int(orig_x)},{int(orig_y)})"
-            painter.drawText(int(screen_x + 12), int(screen_y - 5), coord_text)
+                    # 座標をスクリーン座標に変換
+                    screen_x1 = target_rect.x() + (current_x / pix_width) * target_rect.width()
+                    screen_y1 = target_rect.y() + (current_y / pix_height) * target_rect.height()
+                    screen_x2 = target_rect.x() + (next_x / pix_width) * target_rect.width()
+                    screen_y2 = target_rect.y() + (next_y / pix_height) * target_rect.height()
 
-        # 一筆書き中の軌跡を描画
-        if (self.is_drawing_waypoints and
-            len(self.drawing_waypoint_path) > 1):
-            painter.setPen(QPen(QColor(255, 255, 0), 2))  # 黄色の線
-            for i in range(len(self.drawing_waypoint_path) - 1):
-                start_point = self.drawing_waypoint_path[i]
-                end_point = self.drawing_waypoint_path[i + 1]
-                painter.drawLine(start_point, end_point)
+                    # 点線を描画
+                    painter.drawLine(int(screen_x1), int(screen_y1), int(screen_x2), int(screen_y2))
+
+            # 各waypointを描画
+            for i, (orig_x, orig_y) in enumerate(waypoints):
+                # 元の画像座標をスクリーン座標に変換
+                screen_x = target_rect.x() + (orig_x / pix_width) * target_rect.width()
+                screen_y = target_rect.y() + (orig_y / pix_height) * target_rect.height()
+
+                # ホバー中のウェイポイントに外側の縁取りを追加
+                if (hasattr(self, 'hovering_waypoint_index') and
+                    self.hovering_waypoint_index == i):
+                    # 外側にオレンジの縁取りを描画
+                    painter.setBrush(QBrush(Qt.transparent))
+                    painter.setPen(QPen(QColor(255, 140, 0), 3))  # オレンジの太い線
+                    painter.drawEllipse(int(screen_x - 11), int(screen_y - 11), 22, 22)
+
+                # 緑色の丸を描画（半径8ピクセル）
+                painter.setBrush(QBrush(QColor(0, 255, 0, 180)))  # 半透明の緑
+                painter.setPen(QPen(QColor(0, 128, 0), 2))  # 濃い緑の境界線
+                painter.drawEllipse(int(screen_x - 8), int(screen_y - 8), 16, 16)
+
+                # waypoint番号を表示
+                painter.setPen(QPen(QColor(255, 255, 255), 1))  # 白文字
+                painter.setFont(QFont("Arial", 10, QFont.Bold))
+                painter.drawText(int(screen_x - 6), int(screen_y + 4), str(i + 1))
+
+                # 座標(x,y)を表示
+                painter.setPen(QPen(QColor(0, 200, 0), 1))  # 緑文字
+                painter.setFont(QFont("Arial", 9))
+                coord_text = f"({int(orig_x)},{int(orig_y)})"
+                painter.drawText(int(screen_x + 12), int(screen_y - 5), coord_text)
+
+            # 一筆書き中の軌跡を描画
+            if (self.is_drawing_waypoints and
+                len(self.drawing_waypoint_path) > 1):
+                painter.setPen(QPen(QColor(255, 255, 0), 2))  # 黄色の線
+                for i in range(len(self.drawing_waypoint_path) - 1):
+                    start_point = self.drawing_waypoint_path[i]
+                    end_point = self.drawing_waypoint_path[i + 1]
+                    painter.drawLine(start_point, end_point)
+
+        # 推論結果の描画
+        if (self.main_window and
+            hasattr(self.main_window, 'waypoint_inference_checkbox') and
+            self.main_window.waypoint_inference_checkbox.isChecked() and
+            hasattr(self.main_window, 'waypoint_inference_results')):
+
+            current_index = self.main_window.current_index
+
+            if current_index in self.main_window.waypoint_inference_results:
+                inference_waypoints = self.main_window.waypoint_inference_results[current_index]
+
+                if inference_waypoints:
+                    # 推論waypoint間を点線で繋ぐ
+                    if len(inference_waypoints) > 1:
+                        painter.setPen(QPen(QColor(0, 255, 255), 2, Qt.DashLine))
+                        for i in range(len(inference_waypoints) - 1):
+                            current_x, current_y = inference_waypoints[i]
+                            next_x, next_y = inference_waypoints[i + 1]
+
+                            # 正規化座標を画面座標に変換
+                            screen_x1 = target_rect.x() + current_x * target_rect.width()
+                            screen_y1 = target_rect.y() + current_y * target_rect.height()
+                            screen_x2 = target_rect.x() + next_x * target_rect.width()
+                            screen_y2 = target_rect.y() + next_y * target_rect.height()
+
+                            # 点線を描画
+                            painter.drawLine(int(screen_x1), int(screen_y1), int(screen_x2), int(screen_y2))
+
+                    # 各推論waypointを描画 (明るい水色)
+                    for i, (wx, wy) in enumerate(inference_waypoints):
+                        # 正規化座標を画面座標に変換
+                        scaled_x = int(target_rect.x() + wx * target_rect.width())
+                        scaled_y = int(target_rect.y() + wy * target_rect.height())
+
+                        # 正規化座標を元画像のピクセル座標に変換
+                        pixel_x = int(wx * pix_width)
+                        pixel_y = int(wy * pix_height)
+
+                        # 推論waypointを描画 (明るい水色、位置推論と同じ色)
+                        painter.setBrush(QBrush(QColor(0, 255, 255, 150)))  # 半透明の水色
+                        painter.setPen(QPen(QColor(0, 180, 180), 2))  # 濃い水色の境界線
+                        painter.drawEllipse(scaled_x - 8, scaled_y - 8, 16, 16)
+
+                        # waypoint番号を表示
+                        painter.setPen(QPen(QColor(255, 255, 255), 1))  # 白文字
+                        painter.setFont(QFont("Arial", 10, QFont.Bold))
+                        painter.drawText(scaled_x - 6, scaled_y + 4, str(i + 1))
+
+                        # ピクセル座標を表示
+                        painter.setPen(QPen(QColor(0, 200, 255), 1))  # 明るい水色文字
+                        painter.setFont(QFont("Arial", 9))
+                        coord_text = f"({pixel_x},{pixel_y})"
+                        painter.drawText(scaled_x + 12, scaled_y - 5, coord_text)
 
     def draw_waypoint_guidelines(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
         """waypointのY軸ガイドライン描画"""
@@ -3096,7 +3153,10 @@ class ImageAnnotationTool(QMainWindow):
         
         # 位置推論モデル追加（left_layoutが確実に存在する段階で呼び出し）
         self.add_location_model_section()
-        
+
+        # ウェイポイントモデル追加
+        self.add_waypoint_model_section()
+
         # 物体検知コンテナを追加
         left_layout.addWidget(self.object_detection_container)
 
@@ -3427,7 +3487,7 @@ class ImageAnnotationTool(QMainWindow):
         )
 
         # 新規追加: waypointモードボタン
-        self.waypoint_mode_button = QPushButton("wp")
+        self.waypoint_mode_button = QPushButton("ウェイポイント")
         self.waypoint_mode_button.setCheckable(True)
         self.waypoint_mode_button.clicked.connect(self.toggle_annotation_mode)
         self.waypoint_mode_button.setToolTip(
@@ -3451,57 +3511,44 @@ class ImageAnnotationTool(QMainWindow):
         waypoint_control_layout.setContentsMargins(5, 5, 5, 5)
 
         # waypoint制御ラベル
-        waypoint_label = QLabel("waypoint制御:")
+        waypoint_label = QLabel("打点制御:")
         waypoint_label.setStyleSheet("font-weight: bold; color: #333;")
         waypoint_control_layout.addWidget(waypoint_label)
 
         # 打点数制御
-        points_layout = QHBoxLayout()
-        points_layout.addWidget(QLabel("打点数:"))
+        # 打点数と打点位置（横並び）
+        points_and_pos_layout = QHBoxLayout()
+
+        points_and_pos_layout.addWidget(QLabel("打点数:"))
         self.waypoint_count_spin = QSpinBox()
         self.waypoint_count_spin.setRange(1, 20)
         self.waypoint_count_spin.setValue(4)  # デフォルト4
         self.waypoint_count_spin.setToolTip("配置するwaypoint数")
         self.waypoint_count_spin.valueChanged.connect(self.update_waypoint_guidelines)
-        points_layout.addWidget(self.waypoint_count_spin)
-        waypoint_control_layout.addLayout(points_layout)
+        points_and_pos_layout.addWidget(self.waypoint_count_spin)
 
-        # 縦方向位置制御
-        y_pos_layout = QVBoxLayout()
+        points_and_pos_layout.addSpacing(20)
+        points_and_pos_layout.addWidget(QLabel("打点位置:"))
 
         # 開始Y位置
-        start_y_layout = QHBoxLayout()
-        start_y_layout.addWidget(QLabel("開始Y位置:"))
         self.waypoint_start_y_spin = QSpinBox()
         self.waypoint_start_y_spin.setRange(0, 1000)
         self.waypoint_start_y_spin.setValue(200)  # デフォルト値を200に変更
         self.waypoint_start_y_spin.setToolTip("waypoint開始位置のY座標")
         self.waypoint_start_y_spin.valueChanged.connect(self.update_waypoint_guidelines)
-        start_y_layout.addWidget(self.waypoint_start_y_spin)
+        points_and_pos_layout.addWidget(self.waypoint_start_y_spin)
 
-        start_y_current_btn = QPushButton("現在")
-        start_y_current_btn.clicked.connect(lambda: self.set_current_y_position('start'))
-        start_y_current_btn.setToolTip("現在のマウス位置のY座標を設定")
-        start_y_layout.addWidget(start_y_current_btn)
-        y_pos_layout.addLayout(start_y_layout)
+        points_and_pos_layout.addWidget(QLabel("~"))
 
         # 終了Y位置
-        end_y_layout = QHBoxLayout()
-        end_y_layout.addWidget(QLabel("終了Y位置:"))
         self.waypoint_end_y_spin = QSpinBox()
         self.waypoint_end_y_spin.setRange(0, 1000)
         self.waypoint_end_y_spin.setValue(120)  # デフォルト値を120に変更
         self.waypoint_end_y_spin.setToolTip("waypoint終了位置のY座標")
         self.waypoint_end_y_spin.valueChanged.connect(self.update_waypoint_guidelines)
-        end_y_layout.addWidget(self.waypoint_end_y_spin)
+        points_and_pos_layout.addWidget(self.waypoint_end_y_spin)
 
-        end_y_current_btn = QPushButton("現在")
-        end_y_current_btn.clicked.connect(lambda: self.set_current_y_position('end'))
-        end_y_current_btn.setToolTip("現在のマウス位置のY座標を設定")
-        end_y_layout.addWidget(end_y_current_btn)
-        y_pos_layout.addLayout(end_y_layout)
-
-        waypoint_control_layout.addLayout(y_pos_layout)
+        waypoint_control_layout.addLayout(points_and_pos_layout)
 
         # waypointモード選択ラジオボタン（横並び）
         waypoint_mode_layout = QHBoxLayout()
@@ -3509,18 +3556,18 @@ class ImageAnnotationTool(QMainWindow):
         # ラジオボタングループを作成
         self.waypoint_mode_button_group = QButtonGroup(self)
 
-        # 前回waypoint自動適用モード
-        self.apply_last_waypoint_radio = QRadioButton("前回のwaypointを自動適用")
-        self.apply_last_waypoint_radio.setToolTip("前回の画像のwaypointを次の画像に自動適用")
-        self.waypoint_mode_button_group.addButton(self.apply_last_waypoint_radio, 0)
-        waypoint_mode_layout.addWidget(self.apply_last_waypoint_radio)
-
         # waypoint配置完了時の自動遷移モード
-        self.auto_advance_waypoint_radio = QRadioButton("配置完了時に次の画像へ自動遷移")
+        self.auto_advance_waypoint_radio = QRadioButton("自動遷移")
         self.auto_advance_waypoint_radio.setChecked(True)  # デフォルトを自動遷移に変更
         self.auto_advance_waypoint_radio.setToolTip("最後のwaypointが配置されたら自動で次の画像に遷移")
         self.waypoint_mode_button_group.addButton(self.auto_advance_waypoint_radio, 1)
         waypoint_mode_layout.addWidget(self.auto_advance_waypoint_radio)
+
+        # 前回waypoint自動適用モード
+        self.apply_last_waypoint_radio = QRadioButton("前回のウエイポイントを適用")
+        self.apply_last_waypoint_radio.setToolTip("前回の画像のwaypointを次の画像に自動適用")
+        self.waypoint_mode_button_group.addButton(self.apply_last_waypoint_radio, 0)
+        waypoint_mode_layout.addWidget(self.apply_last_waypoint_radio)
 
         # ラジオボタンの変更を監視
         self.waypoint_mode_button_group.buttonClicked.connect(self.on_waypoint_mode_changed)
@@ -3839,11 +3886,7 @@ class ImageAnnotationTool(QMainWindow):
             if hasattr(self, 'distribution_label'):
                 self.distribution_label.setPixmap(pixmap)
                 self.distribution_label.setScaledContents(True)
-                
-                # グラフタイトルを更新（削除済み除外表示を追加）
-                if deleted_count > 0 and hasattr(self, 'graph_title') and isinstance(self.graph_title, QLabel):
-                    self.graph_title.setText(f"運転アノテーション分布 ({valid_count}件, 削除済み{deleted_count}件を除外)")
-            
+                            
             # 後始末
             plt.close(fig)
             
@@ -4200,6 +4243,50 @@ class ImageAnnotationTool(QMainWindow):
             self.statusBar().showMessage(f"waypoint {deleted_count}個を削除しました", 3000)
         else:
             self.statusBar().showMessage("削除するwaypointがありませんでした", 3000)
+
+    def _check_waypoint_count_before_transition(self):
+        """画像遷移前にwaypoint数をチェックする
+
+        Returns:
+            bool: 遷移可能な場合True、遷移を中止する場合False
+        """
+        # waypointモードでない場合は常にOK
+        if not hasattr(self, 'current_mode') or self.current_mode != 3:
+            return True
+
+        # waypointコントロールが表示されていない場合はOK
+        if not hasattr(self, 'waypoint_control_widget') or not self.waypoint_control_widget.isVisible():
+            return True
+
+        # 再生中の場合はチェックをスキップ
+        if hasattr(self, 'auto_play_timer') and self.auto_play_timer.isActive():
+            return True
+
+        # 現在の画像にwaypointアノテーションがない場合はOK（未アノテーション画像）
+        current_index = self.current_index
+        if current_index not in self.waypoint_annotations:
+            return True
+
+        # 必要なwaypoint数を取得
+        target_count = self.waypoint_count_spin.value() if hasattr(self, 'waypoint_count_spin') else 4
+
+        # 現在のwaypoint数を取得
+        current_waypoints = self.waypoint_annotations.get(current_index, [])
+        current_count = len(current_waypoints)
+
+        # waypoint数が不足している場合
+        if current_count > 0 and current_count < target_count:
+            QMessageBox.warning(
+                self,
+                "Waypoint不足",
+                f"現在の画像には{current_count}個のwaypointが配置されていますが、\n"
+                f"{target_count}個必要です。\n\n"
+                f"残り{target_count - current_count}個のwaypointを配置してから次の画像に進んでください。\n\n"
+                f"※配置を中止する場合は、Deleteキーで全てのwaypointを削除してください。"
+            )
+            return False
+
+        return True
 
     def set_current_y_position(self, position_type):
         """現在のマウス位置のY座標を開始/終了位置に設定"""
@@ -6906,7 +6993,7 @@ class ImageAnnotationTool(QMainWindow):
             
             progress.setValue(100)
             progress.close()
-            
+
             # 成功メッセージ
             model_name = os.path.basename(model_path)
             QMessageBox.information(
@@ -6916,11 +7003,15 @@ class ImageAnnotationTool(QMainWindow):
                 f"信頼度閾値: {confidence}\n\n"
                 f"画像送りごとに自動的に{task_type}推論が実行されます。"
             )
-            
+
             # 自動運転モデル読み込み完了後、オートアノテーションボタンを有効化
             if hasattr(self, 'auto_annotate_button'):
                 self.auto_annotate_button.setEnabled(True)
-            
+
+            # YOLOオートアノテーションボタンを有効化
+            if hasattr(self, 'yolo_auto_annotate_btn'):
+                self.yolo_auto_annotate_btn.setEnabled(True)
+
         except Exception as e:
             progress.close()
             QMessageBox.critical(
@@ -10361,6 +10452,13 @@ class ImageAnnotationTool(QMainWindow):
     def slider_changed(self, value):
         """スライダーの値が変更されたときの処理"""
         if self.images and value != self.current_index:
+            # waypointモードの場合、現在の画像のwaypoint数をチェック
+            if not self._check_waypoint_count_before_transition():
+                # チェックに失敗した場合、スライダーを元の位置に戻す
+                self.image_slider.blockSignals(True)
+                self.image_slider.setValue(self.current_index)
+                self.image_slider.blockSignals(False)
+                return
             # スライダー移動前に現在の画像のwaypoint情報を保存
             old_index = self.current_index
             if (old_index is not None and
@@ -12116,10 +12214,19 @@ class ImageAnnotationTool(QMainWindow):
                         ]
                         
                         for path in path_patterns:
-                            if os.path.exists(path) and path in self.images:
-                                img_path = path
-                                break
-                        
+                            if os.path.exists(path):
+                                # パスが存在する場合、self.imagesに含まれているか確認
+                                if path in self.images:
+                                    img_path = path
+                                    break
+                                # 含まれていない場合でも、カタログフォルダ内の画像なら使用
+                                elif path.startswith(catalog_folder) or path.startswith(images_folder):
+                                    img_path = path
+                                    # self.imagesに追加（後で使用できるように）
+                                    if path not in self.images:
+                                        self.images.append(path)
+                                    break
+
                         # 画像が見つからない場合、ファイル名のみで探す
                         if img_path is None:
                             basename = os.path.basename(img_name)
@@ -12808,14 +12915,18 @@ class ImageAnnotationTool(QMainWindow):
 
     def skip_images(self, count):
         """指定した数だけ画像をスキップする - 位置推論の自動実行も追加"""
+        # waypointモードの場合、現在の画像のwaypoint数をチェック
+        if not self._check_waypoint_count_before_transition():
+            return
+
         new_index = self.current_index + count
-        
+
         # Ensure the new index is within bounds
         if new_index < 0:
             new_index = 0
         elif new_index >= len(self.images):
             new_index = len(self.images) - 1
-        
+
         # インデックスが変わらない場合は何もしない
         if new_index == self.current_index:
             return
@@ -12952,7 +13063,12 @@ class ImageAnnotationTool(QMainWindow):
                 self.run_location_inference()
             # 表示を更新
             self.update_location_inference_display()
-        
+
+        # waypoint推論表示チェックボックスがONの場合、自動的に推論実行
+        if hasattr(self, 'waypoint_inference_checkbox') and self.waypoint_inference_checkbox.isChecked():
+            # 推論結果がまだない場合のみ推論を実行
+            self.update_waypoint_inference_display()
+
         # 推論表示チェックボックスがONの場合、推論結果がなければ実行
         if self.inference_checkbox.isChecked():
             if new_img_path not in self.inference_results:
@@ -15705,9 +15821,283 @@ class ImageAnnotationTool(QMainWindow):
         
         # モデルリストの取得は新しいマネージャーを使用
         self.refresh_location_model_list()
-        
+
         # 推論結果格納用の辞書を初期化
         self.location_inference_results = {}
+
+    def add_waypoint_model_section(self):
+        """ウェイポイントモデルのセクションを追加する"""
+        # ウェイポイントモデルマネージャーの初期化
+        self.waypoint_model_manager = LocationModelManager(APP_DIR_PATH, MODELS_DIR_NAME)
+
+        # left_layoutを取得
+        left_layout = self.get_left_layout()
+        if left_layout is None:
+            print("警告: left_layoutが見つかりません")
+            return
+
+        # ウェイポイントモデルコンテナを作成
+        self.waypoint_model_container = QWidget()
+        waypoint_model_layout = QVBoxLayout(self.waypoint_model_container)
+
+        # ヘッダータイトル
+        waypoint_model_label = QLabel("ウェイポイント推論モデル:")
+        waypoint_model_label.setStyleSheet("font-weight: bold")
+        waypoint_model_layout.addWidget(waypoint_model_label)
+
+        # モデル選択
+        model_type_layout = QHBoxLayout()
+        model_type_layout.addWidget(QLabel("モデルタイプ:"))
+        self.waypoint_model_combo = QComboBox()
+        self.waypoint_model_combo.addItems(["donkey_waypoint", "resnet18_waypoint"])
+        self.waypoint_model_combo.currentIndexChanged.connect(self.on_waypoint_model_type_changed)
+        model_type_layout.addWidget(self.waypoint_model_combo)
+        waypoint_model_layout.addLayout(model_type_layout)
+
+        # 事前学習済みモデル選択
+        self.waypoint_saved_model_combo = QComboBox()
+        self.waypoint_saved_model_combo.setMinimumWidth(180)
+        self.waypoint_saved_model_combo.setStyleSheet("combobox-popup: 0;")
+        waypoint_model_layout.addWidget(self.waypoint_saved_model_combo)
+
+        # モデル操作ボタン
+        waypoint_model_buttons_layout = QHBoxLayout()
+
+        # ウェイポイントモデル学習ボタン
+        train_waypoint_button = QPushButton("モデル学習・保存")
+        train_waypoint_button.clicked.connect(self.train_and_save_waypoint_model)
+        apply_style(train_waypoint_button, 'training')
+        waypoint_model_buttons_layout.addWidget(train_waypoint_button)
+
+        # モデル読み込みボタン
+        self.waypoint_load_button = QPushButton("モデル読込")
+        self.waypoint_load_button.setToolTip("modelsフォルダのモデルを読込む")
+        self.waypoint_load_button.clicked.connect(self.load_waypoint_model)
+        apply_style(self.waypoint_load_button, 'model')
+        waypoint_model_buttons_layout.addWidget(self.waypoint_load_button)
+
+        waypoint_model_layout.addLayout(waypoint_model_buttons_layout)
+
+        # ウェイポイント推論表示チェックボックス
+        waypoint_inference_layout = QHBoxLayout()
+        self.waypoint_inference_checkbox = QCheckBox("ウェイポイント推論結果表示")
+        self.waypoint_inference_checkbox.setChecked(False)
+        self.waypoint_inference_checkbox.setEnabled(False)  # 初期状態は無効
+        self.waypoint_inference_checkbox.setToolTip("ウェイポイントモデルが読み込まれていません")
+        self.waypoint_inference_checkbox.stateChanged.connect(self.toggle_waypoint_inference_display)
+        waypoint_inference_layout.addWidget(self.waypoint_inference_checkbox)
+        waypoint_model_layout.addLayout(waypoint_inference_layout)
+
+        # ウェイポイントモデルコンテナを追加
+        left_layout.addWidget(self.waypoint_model_container)
+
+        # 推論結果格納用の辞書を初期化
+        self.waypoint_inference_results = {}
+
+        # モデルリストの取得
+        self.refresh_waypoint_model_list()
+
+    def refresh_waypoint_model_list(self):
+        """保存されているウェイポイントモデルのリストを更新"""
+        self.waypoint_saved_model_combo.clear()
+
+        # 更新開始のメッセージを表示
+        self.statusBar().showMessage("ウェイポイントモデルリストを更新中...")
+
+        # 現在選択されているモデルタイプを取得
+        selected_model_type = self.waypoint_model_combo.currentText()
+
+        # モデルマネージャーからモデルリストを取得
+        model_files = self.waypoint_model_manager.get_model_list(model_type=selected_model_type)
+
+        if not model_files:
+            self.waypoint_saved_model_combo.addItem(f"{selected_model_type}のウェイポイントモデルが見つかりません")
+            self.statusBar().showMessage(f"{selected_model_type}のウェイポイントモデルが見つかりません。モデルを学習してください", 3000)
+            return
+
+        # モデルファイルをコンボボックスに追加
+        for model_file in model_files:
+            display_name = os.path.basename(model_file).replace('.pth', '')
+            self.waypoint_saved_model_combo.addItem(display_name, model_file)
+
+        self.statusBar().showMessage(f"{len(model_files)}個のウェイポイントモデルが見つかりました", 2000)
+
+    def on_waypoint_model_type_changed(self, index):
+        """ウェイポイントモデルタイプが変更された時の処理"""
+        # モデルリストを更新
+        self.refresh_waypoint_model_list()
+
+        # 現在のウェイポイントモデルをクリア
+        if hasattr(self, 'waypoint_model'):
+            del self.waypoint_model
+            self.waypoint_model = None
+
+        # ウェイポイント推論を無効化
+        if hasattr(self, 'waypoint_inference_checkbox'):
+            self.waypoint_inference_checkbox.setChecked(False)
+            self.waypoint_inference_checkbox.setEnabled(False)
+            self.waypoint_inference_checkbox.setToolTip("ウェイポイントモデルが読み込まれていません")
+
+    def load_waypoint_model(self):
+        """ウェイポイントモデルを読み込む"""
+        current_data = self.waypoint_saved_model_combo.currentData()
+        if not current_data:
+            QMessageBox.warning(self, "警告", "読み込むウェイポイントモデルが選択されていません。")
+            return
+
+        model_path = current_data
+        if not os.path.exists(model_path):
+            QMessageBox.warning(self, "エラー", f"ウェイポイントモデルファイルが見つかりません: {model_path}")
+            return
+
+        try:
+            # モデルタイプを取得
+            model_type = self.waypoint_model_combo.currentText()
+
+            print(f"\n{'='*60}")
+            print(f"[Waypointモデル読み込み] 開始")
+            print(f"{'='*60}")
+            print(f"モデルタイプ: {model_type}")
+            print(f"モデルパス: {model_path}")
+
+            # 既存のモデルがある場合はクリア
+            if hasattr(self, 'waypoint_model') and self.waypoint_model is not None:
+                print(f"既存のモデルをクリアします")
+                del self.waypoint_model
+                self.waypoint_model = None
+
+            # 既存の推論結果をクリア
+            old_results_count = len(self.waypoint_inference_results)
+            if old_results_count > 0:
+                print(f"既存の推論結果 {old_results_count}件をクリアします")
+                self.waypoint_inference_results.clear()
+
+            # ウェイポイントモデルをロード
+            from model_catalog import get_model
+
+            # チェックポイントをロード
+            print(f"チェックポイントを読み込み中...")
+            checkpoint = torch.load(model_path, map_location='cpu')
+            num_waypoints = checkpoint.get('num_waypoints', 4)
+            print(f"ウェイポイント数: {num_waypoints}")
+
+            # モデルを初期化
+            print(f"モデルを初期化中...")
+            self.waypoint_model = get_model(model_type, pretrained=False, input_size=(224, 224))
+            self.waypoint_model.num_waypoints = num_waypoints
+            self.waypoint_model.load_state_dict(checkpoint['model_state_dict'])
+            self.waypoint_model.eval()
+            print(f"モデルの評価モードに設定完了")
+
+            # 推論チェックボックスを有効化して自動でONにする
+            self.waypoint_inference_checkbox.setEnabled(True)
+            self.waypoint_inference_checkbox.setChecked(True)
+            self.waypoint_inference_checkbox.setToolTip(f"ウェイポイントモデル ({model_type}, {num_waypoints}ポイント) が読み込まれています")
+
+            print(f"推論チェックボックスを有効化しました")
+
+            # 現在の画像で推論を実行（チェックボックスがONの場合）
+            if self.waypoint_inference_checkbox.isChecked() and self.images and self.current_index is not None:
+                print(f"現在の画像(index={self.current_index})で推論を実行します")
+                self.update_waypoint_inference_display()
+
+            # 画面を再描画
+            if hasattr(self, 'main_image_view'):
+                self.main_image_view.update()
+                print(f"画面を再描画しました")
+
+            print(f"{'='*60}")
+            print(f"[Waypointモデル読み込み] 成功")
+            print(f"{'='*60}\n")
+
+            QMessageBox.information(self, "成功", f"ウェイポイントモデルを読み込みました\nモデル: {os.path.basename(model_path)}\nウェイポイント数: {num_waypoints}")
+
+        except Exception as e:
+            print(f"{'='*60}")
+            print(f"[Waypointモデル読み込み] エラー")
+            print(f"{'='*60}")
+            print(f"エラー内容: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            print(f"{'='*60}\n")
+            QMessageBox.critical(self, "エラー", f"ウェイポイントモデルの読み込みに失敗しました:\n{str(e)}")
+
+    def toggle_waypoint_inference_display(self):
+        """ウェイポイント推論表示のON/OFFを切り替える"""
+        if not hasattr(self, 'waypoint_model') or self.waypoint_model is None:
+            self.waypoint_inference_checkbox.setChecked(False)
+            QMessageBox.warning(self, "警告", "ウェイポイントモデルが読み込まれていません。")
+            return
+
+        if self.waypoint_inference_checkbox.isChecked():
+            # ウェイポイント推論を有効化
+            self.statusBar().showMessage("ウェイポイント推論表示を有効化しました", 2000)
+        else:
+            # ウェイポイント推論を無効化
+            self.statusBar().showMessage("ウェイポイント推論表示を無効化しました", 2000)
+
+        # 現在の画像の推論表示を更新
+        self.update_waypoint_inference_display()
+
+        # 画面更新
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def update_waypoint_inference_display(self):
+        """ウェイポイント推論表示を更新する"""
+        if not self.images:
+            return
+
+        current_index = self.current_index
+
+        if hasattr(self, 'waypoint_inference_checkbox') and self.waypoint_inference_checkbox.isChecked():
+            if current_index in self.waypoint_inference_results:
+                # 既に推論済みの結果がある場合は画面更新のみ
+                if hasattr(self, 'main_image_view'):
+                    self.main_image_view.update()
+                return
+
+            # ウェイポイント推論を実行
+            try:
+                if hasattr(self, 'waypoint_model') and self.waypoint_model is not None:
+                    # 現在の画像を取得
+                    img_path = self.images[current_index]
+                    img = Image.open(img_path).convert('RGB')
+
+                    # 推論実行（結果は正規化座標で返される）
+                    waypoint_coords_raw = self.waypoint_model.run(img)
+
+                    # 座標を0-1の範囲にクリップ
+                    waypoint_coords = []
+                    clipped_count = 0
+                    for wx, wy in waypoint_coords_raw:
+                        wx_clipped = max(0.0, min(1.0, wx))
+                        wy_clipped = max(0.0, min(1.0, wy))
+                        waypoint_coords.append([wx_clipped, wy_clipped])
+                        if wx != wx_clipped or wy != wy_clipped:
+                            clipped_count += 1
+
+                    # 結果を保存
+                    self.waypoint_inference_results[current_index] = waypoint_coords
+
+                    # 元の画像サイズを取得
+                    original_img = Image.open(img_path)
+                    img_width, img_height = original_img.size
+
+                    # 推論結果をターミナルに表示（簡潔版）
+                    pixel_coords = [(int(wx * img_width), int(wy * img_height)) for wx, wy in waypoint_coords]
+                    clip_info = f" ({clipped_count}個クリップ)" if clipped_count > 0 else ""
+                    print(f"[Waypoint推論] index={current_index}, waypoints={len(waypoint_coords)}個{clip_info}, pixel={pixel_coords}")
+
+            except Exception as e:
+                print(f"ウェイポイント推論エラー: {e}")
+                import traceback
+                traceback.print_exc()
+                self.waypoint_inference_results[current_index] = []
+
+        # 画面を更新（推論実行の有無に関わらず）
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
 
     def refresh_location_model_list(self):
         """保存されている位置モデルのリストを更新 - 選択したタイプでフィルタリング"""
@@ -16106,6 +16496,161 @@ class ImageAnnotationTool(QMainWindow):
         
         return training_settings
 
+    def _create_waypoint_training_dialog(self, most_common_waypoint_count, total_images, annotated_images, valid_waypoint_count, deleted_count):
+        """ウェイポイントモデル学習設定ダイアログを作成"""
+
+        training_settings = QDialog(self)
+        training_settings.setWindowTitle("ウェイポイントモデル学習設定")
+        training_settings.setMinimumWidth(500)
+
+        settings_layout = QVBoxLayout(training_settings)
+
+        # アノテーション統計情報を表示
+        stats_label = QLabel(f"<b>学習データ統計:</b><br>"
+                           f"総読み込み画像数: {total_images}枚<br>"
+                           f"ウェイポイントアノテーション済み画像数: {annotated_images}枚<br>"
+                           f"<b style='color: #2E7D32; font-size: 14px;'>実際の学習使用枚数: {valid_waypoint_count}枚</b><br>"
+                           f"({annotated_images}枚 - 削除済み{deleted_count}枚)<br>"
+                           f"<span style='color: #FF6600;'>※ 削除マークされた画像は学習対象から除外されます</span>")
+        stats_label.setStyleSheet("padding: 10px; background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 5px;")
+        settings_layout.addWidget(stats_label)
+
+        settings_layout.addWidget(QLabel(""))  # スペース追加
+
+        # ウェイポイント数設定
+        waypoint_layout = QHBoxLayout()
+        waypoint_layout.addWidget(QLabel("ウェイポイント数:"))
+        training_settings.waypoint_spin = QSpinBox()
+        training_settings.waypoint_spin.setRange(2, 10)
+        training_settings.waypoint_spin.setValue(most_common_waypoint_count)
+        waypoint_layout.addWidget(training_settings.waypoint_spin)
+        settings_layout.addLayout(waypoint_layout)
+
+        # エポック数設定
+        epoch_layout = QHBoxLayout()
+        epoch_layout.addWidget(QLabel("学習エポック数:"))
+        training_settings.epoch_spin = QSpinBox()
+        training_settings.epoch_spin.setRange(1, 1000)
+        training_settings.epoch_spin.setValue(50)
+        epoch_layout.addWidget(training_settings.epoch_spin)
+        settings_layout.addLayout(epoch_layout)
+
+        # バッチサイズ設定
+        batch_layout = QHBoxLayout()
+        batch_layout.addWidget(QLabel("バッチサイズ:"))
+        training_settings.batch_spin = QSpinBox()
+        training_settings.batch_spin.setRange(1, 128)
+        training_settings.batch_spin.setValue(8)
+        batch_layout.addWidget(training_settings.batch_spin)
+        settings_layout.addLayout(batch_layout)
+
+        # データオーグメンテーション設定
+        training_settings.aug_check = QCheckBox("データオーグメンテーションを有効にする")
+        training_settings.aug_check.setChecked(True)
+        settings_layout.addWidget(training_settings.aug_check)
+
+        # Early Stopping設定
+        training_settings.early_stopping_check = QCheckBox("Early Stopping を有効にする")
+        training_settings.early_stopping_check.setChecked(True)
+        settings_layout.addWidget(training_settings.early_stopping_check)
+
+        patience_layout = QHBoxLayout()
+        patience_layout.addWidget(QLabel("忍耐エポック数:"))
+        training_settings.patience_spin = QSpinBox()
+        training_settings.patience_spin.setRange(1, 20)
+        training_settings.patience_spin.setValue(10)
+        patience_layout.addWidget(training_settings.patience_spin)
+        settings_layout.addLayout(patience_layout)
+
+        # 学習率設定
+        lr_layout = QHBoxLayout()
+        lr_layout.addWidget(QLabel("学習率:"))
+        training_settings.lr_combo = QComboBox()
+        learning_rates = ["0.001", "0.0005", "0.0001", "0.00005", "0.00001"]
+        training_settings.lr_combo.addItems(learning_rates)
+        training_settings.lr_combo.setCurrentIndex(1)  # 0.0005をデフォルト
+        lr_layout.addWidget(training_settings.lr_combo)
+        settings_layout.addLayout(lr_layout)
+
+        # ボタンの配置
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(training_settings.accept)
+        button_box.rejected.connect(training_settings.reject)
+        settings_layout.addWidget(button_box)
+
+        return training_settings
+
+    def _get_waypoint_training_config(self, dialog):
+        """ウェイポイント学習設定ダイアログから設定値を取得"""
+
+        return {
+            'num_waypoints': dialog.waypoint_spin.value(),
+            'num_epochs': dialog.epoch_spin.value(),
+            'batch_size': dialog.batch_spin.value(),
+            'use_augmentation': dialog.aug_check.isChecked(),
+            'use_early_stopping': dialog.early_stopping_check.isChecked(),
+            'patience': dialog.patience_spin.value() if dialog.early_stopping_check.isChecked() else 0,
+            'learning_rate': float(dialog.lr_combo.currentText())
+        }
+
+    def _prepare_waypoint_training_data(self, num_waypoints):
+        """ウェイポイント学習データの準備"""
+
+        # データを準備
+        image_paths = []
+        waypoint_coordinates = []
+        skipped_images = []  # スキップされた画像情報
+
+        for idx, waypoints in self.waypoint_annotations.items():
+            # インデックスが有効範囲内かチェック
+            if isinstance(idx, int) and 0 <= idx < len(self.images):
+                # 削除マークされたアノテーションは学習データから除外
+                is_deleted = False
+
+                # deleted_indexesでマークされているかチェック
+                if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
+                    is_deleted = True
+
+                # original_indexがある場合もチェック
+                if (not is_deleted and idx in self.annotations and "original_index" in self.annotations[idx] and
+                    hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
+                    is_deleted = True
+
+                # 削除マークされていない場合のみ学習データに追加
+                if not is_deleted and waypoints:
+                    img_path = self.images[idx]
+
+                    if len(waypoints) == num_waypoints:
+                        # 正しいwaypoint数の場合、学習データに追加
+                        image_paths.append(img_path)
+
+                        # 画像サイズを取得して座標を正規化
+                        img = Image.open(img_path)
+                        img_width, img_height = img.size
+
+                        # ウェイポイント座標を正規化してフラットなリストに変換 [x1, y1, x2, y2, ...]
+                        flattened_coords = []
+                        for x, y in waypoints:
+                            # ピクセル座標を0-1の正規化座標に変換
+                            x_norm = float(x) / img_width
+                            y_norm = float(y) / img_height
+                            flattened_coords.extend([x_norm, y_norm])
+                        waypoint_coordinates.append(flattened_coords)
+                    else:
+                        # waypoint数が一致しない場合、スキップ情報を記録
+                        skipped_images.append({
+                            'index': idx,
+                            'path': img_path,
+                            'waypoint_count': len(waypoints),
+                            'reason': f'{len(waypoints)}点（必要: {num_waypoints}点）'
+                        })
+
+        return {
+            'image_paths': image_paths,
+            'waypoint_coordinates': waypoint_coordinates,
+            'skipped_images': skipped_images
+        }
+
     def _get_location_training_config(self, dialog):
         """学習設定ダイアログから設定値を取得"""
         
@@ -16191,6 +16736,7 @@ class ImageAnnotationTool(QMainWindow):
         stopped_epoch = 0
         
         # 保存ディレクトリとファイル名
+        models_dir = os.path.join(self.folder_path, "models")
         os.makedirs(models_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_path = os.path.join(models_dir, f'{model_type}_{timestamp}.pth')
@@ -16456,9 +17002,540 @@ class ImageAnnotationTool(QMainWindow):
             f"データオーグメンテーション: {'有効' if training_config['use_augmentation'] else '無効'}\n\n" +
             f"{mlflow_info}"
         )
-        
 
-    
+
+    def train_and_save_waypoint_model(self):
+        """ウェイポイント推論モデルの学習"""
+
+        if not self.images or not self.waypoint_annotations:
+            QMessageBox.warning(self, "警告", "ウェイポイントモデルを学習するにはウェイポイントアノテーションが必要です。")
+            return
+
+        # 有効なウェイポイントアノテーションをチェック
+        valid_waypoint_count = 0
+        waypoint_counts = []
+
+        for idx, waypoints in self.waypoint_annotations.items():
+            # 削除マークされていないかチェック
+            if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
+                continue
+            if (idx in self.annotations and "original_index" in self.annotations[idx] and
+                hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
+                continue
+
+            if waypoints and len(waypoints) > 0:
+                valid_waypoint_count += 1
+                waypoint_counts.append(len(waypoints))
+
+        if valid_waypoint_count < 5:
+            QMessageBox.warning(self, "警告", f"ウェイポイントモデルを学習するには少なくとも5枚のアノテーションが必要です。現在: {valid_waypoint_count}枚")
+            return
+
+        # ウェイポイント数の統計
+        if not waypoint_counts:
+            QMessageBox.warning(self, "警告", "有効なウェイポイントアノテーションがありません。")
+            return
+
+        most_common_waypoint_count = max(set(waypoint_counts), key=waypoint_counts.count)
+
+        # 選択されたモデル
+        model_type = self.waypoint_model_combo.currentText()
+
+        # アノテーション統計情報を収集（削除済みマークを考慮）
+        total_images = len(self.images)
+        annotated_images = len(self.waypoint_annotations)
+        deleted_count = len(getattr(self, 'deleted_indexes', []))
+
+        # 学習設定ダイアログを表示
+        training_settings = self._create_waypoint_training_dialog(
+            most_common_waypoint_count, total_images, annotated_images,
+            valid_waypoint_count, deleted_count
+        )
+
+        if not training_settings.exec_():
+            return
+
+        # 設定値の取得
+        training_config = self._get_waypoint_training_config(training_settings)
+
+        try:
+            # データの準備
+            image_data = self._prepare_waypoint_training_data(training_config['num_waypoints'])
+
+            if not image_data['image_paths']:
+                QMessageBox.warning(self, "警告", "有効なウェイポイントアノテーションがありません。")
+                return
+
+            # スキップされた画像がある場合、ユーザーに通知
+            if image_data['skipped_images']:
+                skipped_count = len(image_data['skipped_images'])
+                skipped_msg = f"以下の{skipped_count}枚の画像はwaypoint数が一致しないためスキップされます:\n\n"
+
+                # 最初の10件のみ表示
+                for i, skipped in enumerate(image_data['skipped_images'][:10]):
+                    img_name = os.path.basename(skipped['path'])
+                    skipped_msg += f"  {skipped['index']}: {img_name} - {skipped['reason']}\n"
+
+                if skipped_count > 10:
+                    skipped_msg += f"\n...他 {skipped_count - 10}件"
+
+                skipped_msg += f"\n\n学習に使用される画像: {len(image_data['image_paths'])}枚\n続行しますか？"
+
+                reply = QMessageBox.question(self, "確認", skipped_msg,
+                                            QMessageBox.Yes | QMessageBox.No,
+                                            QMessageBox.Yes)
+                if reply == QMessageBox.No:
+                    return
+
+            # 進捗ダイアログを表示
+            progress = QProgressDialog(
+                f"ウェイポイントモデル '{model_type}' の学習データを準備中...",
+                "キャンセル", 0, 100, self
+            )
+            progress.setWindowTitle("ウェイポイントモデル学習")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+            QApplication.processEvents()
+
+            # データセット作成
+            train_loader, val_loader, dataset_info = create_waypoint_datasets(
+                image_paths=image_data['image_paths'],
+                waypoint_labels=image_data['waypoint_coordinates'],
+                val_split=0.2,
+                model_name=model_type,
+                batch_size=training_config['batch_size'],
+                use_augmentation=training_config['use_augmentation'],
+                num_waypoints=training_config['num_waypoints']
+            )
+
+            progress.setValue(20)
+            progress.setLabelText(f"モデル '{model_type}' を初期化中... ({training_config['num_waypoints']}ウェイポイント)")
+            QApplication.processEvents()
+
+            # 進捗コールバック関数
+            def update_progress(current, total, message=None):
+                if message:
+                    progress.setLabelText(message)
+                progress.setValue(20 + int(current * 70 / total))
+                QApplication.processEvents()
+                return not progress.wasCanceled()
+
+            # モデル学習
+            training_results = self._train_waypoint_model_internal(
+                model_type=model_type,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                num_waypoints=training_config['num_waypoints'],
+                training_config=training_config,
+                progress_callback=update_progress
+            )
+
+            # モデルのメタデータ保存
+            self._save_waypoint_model_metadata(
+                training_results['best_model_path'],
+                training_config['num_waypoints']
+            )
+
+            # 学習曲線グラフを保存
+            progress.setValue(92)
+            progress.setLabelText("学習曲線を保存中...")
+            QApplication.processEvents()
+
+            self._save_waypoint_training_curve(
+                training_results['best_model_path'],
+                training_results['training_history']
+            )
+
+            progress.setValue(95)
+            progress.setLabelText("MLflowに学習結果を記録中...")
+            QApplication.processEvents()
+
+            # MLflowに結果を記録
+            mlflow_info = self._log_waypoint_training(
+                model_type=model_type,
+                training_results=training_results,
+                training_config=training_config,
+                dataset_info={
+                    "total_annotations": len(self.waypoint_annotations),
+                    "used_samples": len(image_data['image_paths']),
+                    "train_samples": dataset_info['train_samples'],
+                    "val_samples": dataset_info['val_samples'],
+                    "input_shape": dataset_info['actual_image_size'],
+                    "num_waypoints": training_config['num_waypoints']
+                }
+            )
+
+            # モデルリストを更新
+            self.refresh_waypoint_model_list()
+
+            progress.setValue(100)
+            progress.close()
+
+            # 学習完了メッセージ
+            self._show_waypoint_training_success(
+                model_type=model_type,
+                training_results=training_results,
+                training_config=training_config,
+                dataset_info={
+                    "image_paths_count": len(image_data['image_paths']),
+                    "num_waypoints": training_config['num_waypoints']
+                },
+                mlflow_info=mlflow_info
+            )
+
+        except Exception as e:
+            if 'progress' in locals():
+                progress.close()
+            traceback.print_exc()
+            QMessageBox.critical(self, "エラー", f"ウェイポイントモデルの学習中にエラーが発生しました:\n{str(e)}")
+
+    def _train_waypoint_model_internal(self, model_type, train_loader, val_loader, num_waypoints, training_config, progress_callback):
+        """ウェイポイントモデルの内部学習ロジック"""
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # モデル初期化
+        model = self._initialize_waypoint_model(model_type, num_waypoints, device)
+
+        # 学習パラメータ設定
+        criterion = nn.MSELoss()  # 回帰問題のMSE損失
+        optimizer = torch.optim.Adam(model.parameters(), lr=training_config['learning_rate'])
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        )
+
+        # Early Stopping設定
+        early_stopping = None
+        if training_config['use_early_stopping']:
+            from model_training import EarlyStopping
+            early_stopping = EarlyStopping(patience=training_config['patience'], min_delta=0.001)
+
+        # 学習ループ
+        best_val_loss = float('inf')
+        best_model_path = None
+        training_history = {
+            'train_loss': [],
+            'val_loss': [],
+            'waypoint_losses': []  # 各waypointごとのloss履歴
+        }
+
+        # 保存ディレクトリとタイムスタンプ
+        models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+        os.makedirs(models_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        import time
+        start_time = time.time()
+        epoch_times = []
+
+        for epoch in range(training_config['num_epochs']):
+            epoch_start_time = time.time()
+
+            # トレーニング
+            model.train()
+            train_loss = 0.0
+
+            for batch_idx, (images, targets) in enumerate(train_loader):
+                images, targets = images.to(device), targets.to(device)
+
+                optimizer.zero_grad()
+                outputs = model(images)
+                loss = criterion(outputs, targets)
+                loss.backward()
+                optimizer.step()
+
+                train_loss += loss.item()
+
+            train_loss /= len(train_loader)
+
+            # 検証
+            model.eval()
+            val_loss = 0.0
+            waypoint_losses = [0.0] * (num_waypoints * 2)  # 各x, y座標のloss
+
+            with torch.no_grad():
+                for images, targets in val_loader:
+                    images, targets = images.to(device), targets.to(device)
+                    outputs = model(images)
+                    loss = criterion(outputs, targets)
+                    val_loss += loss.item()
+
+                    # 各waypoint座標ごとのlossを計算
+                    for i in range(num_waypoints * 2):
+                        coord_loss = ((outputs[:, i] - targets[:, i]) ** 2).mean().item()
+                        waypoint_losses[i] += coord_loss
+
+            val_loss /= len(val_loader)
+            waypoint_losses = [wl / len(val_loader) for wl in waypoint_losses]
+
+            training_history['train_loss'].append(train_loss)
+            training_history['val_loss'].append(val_loss)
+            training_history['waypoint_losses'].append(waypoint_losses)
+
+            # 学習率スケジューラー更新
+            scheduler.step(val_loss)
+
+            # ベストモデル保存
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                # 最初のエポックで保存パスを設定（タイムスタンプを固定）
+                if best_model_path is None:
+                    model_filename = f"{model_type}_{timestamp}.pth"
+                    best_model_path = os.path.join(models_dir, model_filename)
+
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'model_type': model_type,
+                    'num_waypoints': num_waypoints,
+                    'epoch': epoch,
+                    'val_loss': val_loss
+                }, best_model_path)
+
+            # 進捗更新
+            epoch_time = time.time() - epoch_start_time
+            epoch_times.append(epoch_time)
+
+            message = f"Epoch {epoch+1}/{training_config['num_epochs']}: 訓練損失={train_loss:.6f}, 検証損失={val_loss:.6f}"
+            if not progress_callback(epoch + 1, training_config['num_epochs'], message):
+                break
+
+            # Early Stoppingチェック
+            if early_stopping and early_stopping(val_loss):
+                break
+
+        total_time = time.time() - start_time
+        avg_epoch_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0
+
+        return {
+            'best_model_path': best_model_path,
+            'best_val_loss': best_val_loss,
+            'completed_epochs': len(training_history['train_loss']),
+            'training_history': training_history,
+            'total_training_time': total_time,
+            'avg_epoch_time': avg_epoch_time,
+            'early_stopped': early_stopping.early_stop if early_stopping else False,
+            'stopped_epoch': len(training_history['train_loss']) if early_stopping and early_stopping.early_stop else None
+        }
+
+    def _initialize_waypoint_model(self, model_type, num_waypoints, device):
+        """ウェイポイントモデルを初期化"""
+        from model_catalog import get_model
+
+        # モデルのロード
+        model = get_model(model_type, pretrained=True, input_size=(224, 224))
+        model.num_waypoints = num_waypoints  # ウェイポイント数を設定
+        model.to(device)
+
+        return model
+
+    def _save_waypoint_model_metadata(self, model_path, num_waypoints):
+        """ウェイポイントモデルのメタデータを保存"""
+        checkpoint = torch.load(model_path, map_location='cpu')
+        checkpoint['num_waypoints'] = num_waypoints
+        torch.save(checkpoint, model_path)
+
+    def _save_waypoint_training_curve(self, model_path, training_history):
+        """ウェイポイントモデルの学習曲線をグラフとして保存"""
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+
+            # グラフのファイル名を生成
+            graph_path = model_path.replace('.pth', '_training_curve.png')
+
+            epochs = range(1, len(training_history['train_loss']) + 1)
+
+            # waypoint詳細lossがあるかチェック
+            has_waypoint_losses = 'waypoint_losses' in training_history and training_history['waypoint_losses']
+
+            if has_waypoint_losses:
+                # 3列のサブプロット: 全体loss、waypointごとのloss、座標ごとのloss
+                fig = plt.figure(figsize=(20, 6))
+                gs = fig.add_gridspec(1, 3, hspace=0.3, wspace=0.3)
+                ax1 = fig.add_subplot(gs[0, 0])
+                ax2 = fig.add_subplot(gs[0, 1])
+                ax3 = fig.add_subplot(gs[0, 2])
+            else:
+                # waypoint詳細lossがない場合は全体lossのみ
+                fig, ax1 = plt.subplots(1, 1, figsize=(10, 6))
+
+            # ===== グラフ1: 全体の学習曲線 =====
+            ax1.plot(epochs, training_history['train_loss'], 'b-', label='Training Loss', linewidth=2)
+            ax1.plot(epochs, training_history['val_loss'], 'r-', label='Validation Loss', linewidth=2)
+
+            # 最小検証損失のエポックをマーク
+            min_val_loss_epoch = training_history['val_loss'].index(min(training_history['val_loss'])) + 1
+            min_val_loss = min(training_history['val_loss'])
+            ax1.axvline(x=min_val_loss_epoch, color='g', linestyle='--', alpha=0.7,
+                       label=f'Best (Epoch {min_val_loss_epoch})')
+
+            ax1.set_title('Overall Training Curve', fontsize=14, fontweight='bold')
+            ax1.set_xlabel('Epoch', fontsize=11)
+            ax1.set_ylabel('Loss (MSE)', fontsize=11)
+            ax1.legend(fontsize=10, loc='upper right')
+            ax1.grid(True, alpha=0.3)
+
+            # ===== グラフ2 & 3: 各waypointごとの詳細loss =====
+            if has_waypoint_losses:
+                waypoint_losses_array = np.array(training_history['waypoint_losses'])
+                num_coords = waypoint_losses_array.shape[1]
+                num_waypoints = num_coords // 2
+
+                colors = plt.cm.tab10(np.linspace(0, 1, num_waypoints))
+
+                # グラフ2: 各waypointの合計loss (x + y)
+                for wp_idx in range(num_waypoints):
+                    x_idx = wp_idx * 2
+                    y_idx = wp_idx * 2 + 1
+                    waypoint_total_loss = waypoint_losses_array[:, x_idx] + waypoint_losses_array[:, y_idx]
+                    ax2.plot(epochs, waypoint_total_loss, color=colors[wp_idx],
+                            label=f'Waypoint {wp_idx + 1}', linewidth=2)
+
+                ax2.set_title('Loss per Waypoint (X + Y)', fontsize=14, fontweight='bold')
+                ax2.set_xlabel('Epoch', fontsize=11)
+                ax2.set_ylabel('Loss (MSE)', fontsize=11)
+                ax2.legend(fontsize=10, loc='upper right')
+                ax2.grid(True, alpha=0.3)
+
+                # グラフ3: 各座標(x, y)のloss
+                for wp_idx in range(num_waypoints):
+                    x_idx = wp_idx * 2
+                    y_idx = wp_idx * 2 + 1
+                    ax3.plot(epochs, waypoint_losses_array[:, x_idx], color=colors[wp_idx],
+                            linestyle='-', label=f'WP{wp_idx + 1}-X', linewidth=1.5, alpha=0.8)
+                    ax3.plot(epochs, waypoint_losses_array[:, y_idx], color=colors[wp_idx],
+                            linestyle='--', label=f'WP{wp_idx + 1}-Y', linewidth=1.5, alpha=0.8)
+
+                ax3.set_title('Loss per Coordinate (X: solid, Y: dashed)', fontsize=14, fontweight='bold')
+                ax3.set_xlabel('Epoch', fontsize=11)
+                ax3.set_ylabel('Loss (MSE)', fontsize=11)
+                ax3.legend(fontsize=9, loc='upper right', ncol=2)
+                ax3.grid(True, alpha=0.3)
+
+            # 全体のタイトル
+            fig.suptitle('Waypoint Model Training Analysis', fontsize=16, fontweight='bold', y=0.98)
+
+            # グラフを保存
+            plt.tight_layout(rect=[0, 0, 1, 0.96])
+            plt.savefig(graph_path, dpi=150, bbox_inches='tight')
+            plt.close()
+
+            print(f"学習曲線を保存しました: {graph_path}")
+
+        except Exception as e:
+            print(f"学習曲線の保存に失敗しました: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _log_waypoint_training(self, model_type, training_results, training_config, dataset_info):
+        """ウェイポイント推論モデルの学習結果をMLflowに記録"""
+
+        try:
+            # MLflowManagerが初期化されていない場合は初期化
+            if not hasattr(self, 'mlflow_manager'):
+                self.mlflow_manager = MLflowManager(self.folder_path)
+
+            # 学習パラメータを記録
+            params = {
+                'model_type': model_type,
+                'num_waypoints': training_config['num_waypoints'],
+                'learning_rate': training_config['learning_rate'],
+                'batch_size': training_config['batch_size'],
+                'num_epochs': training_config['num_epochs'],
+                'use_augmentation': training_config['use_augmentation'],
+                'use_early_stopping': training_config['use_early_stopping']
+            }
+
+            if training_config['use_early_stopping']:
+                params['patience'] = training_config['patience']
+
+            # メトリクスを記録
+            metrics = {
+                'best_val_loss': training_results['best_val_loss'],
+                'completed_epochs': training_results['completed_epochs'],
+                'total_training_time': training_results['total_training_time'],
+                'avg_epoch_time': training_results['avg_epoch_time'],
+                'train_samples': dataset_info['train_samples'],
+                'val_samples': dataset_info['val_samples'],
+                'total_annotations': dataset_info['total_annotations'],
+                'used_samples': dataset_info['used_samples']
+            }
+
+            # アーティファクトを記録
+            artifacts = {
+                'model_path': training_results['best_model_path']
+            }
+
+            # MLflowに記録 - ウェイポイント専用メソッドを使用
+            run_info = self.mlflow_manager.log_waypoint_regression_model(
+                model_path=training_results['best_model_path'],
+                training_params={
+                    'model_type': model_type,
+                    'num_waypoints': training_config['num_waypoints'],
+                    'learning_rate': training_config['learning_rate'],
+                    'batch_size': training_config['batch_size'],
+                    'num_epochs': training_config['num_epochs'],
+                    'completed_epochs': training_results['completed_epochs'],
+                    'use_early_stopping': training_config['use_early_stopping'],
+                    'patience': training_config['patience'] if training_config['use_early_stopping'] else 0,
+                    'use_augmentation': training_config['use_augmentation'],
+                    'data_folder': self.folder_path
+                },
+                metrics={
+                    'best_val_loss': training_results['best_val_loss'],
+                    'completed_epochs': training_results['completed_epochs'],
+                    'total_training_time': training_results['total_training_time'],
+                    'avg_epoch_time': training_results['avg_epoch_time'],
+                    'status': 'completed'
+                },
+                dataset_info={
+                    'train_samples': dataset_info['train_samples'],
+                    'val_samples': dataset_info['val_samples'],
+                    'total_annotations': dataset_info['total_annotations'],
+                    'used_samples': dataset_info['used_samples']
+                }
+            )
+
+            return f"MLflow Run ID: {run_info['run_id']}"
+
+        except Exception as e:
+            print(f"MLflow記録エラー: {e}")
+            return "MLflow記録に失敗しました"
+
+    def _show_waypoint_training_success(self, model_type, training_results, training_config, dataset_info, mlflow_info):
+        """ウェイポイントモデル学習成功メッセージを表示"""
+
+        # Early Stopping情報
+        early_stopping_info = ""
+        if training_config['use_early_stopping']:
+            if training_results.get('early_stopped', False):
+                early_stopping_info = f"Early Stopping: {training_results.get('stopped_epoch', 0)}エポックで停止\n"
+            else:
+                early_stopping_info = f"Early Stopping: 発動せず (忍耐値: {training_config['patience']})\n"
+
+        # 学習時間情報
+        time_info = ""
+        if 'total_training_time' in training_results:
+            from model_training import format_time
+            total_time_str = format_time(training_results['total_training_time'])
+            avg_epoch_time_str = format_time(training_results.get('avg_epoch_time', 0))
+            time_info = f"学習時間: {total_time_str} (平均エポック時間: {avg_epoch_time_str})\n"
+
+        # 学習完了メッセージ
+        QMessageBox.information(
+            self,
+            "学習完了",
+            f"{model_type} ウェイポイントモデルを学習し保存しました: {os.path.basename(training_results['best_model_path'])}\n" +
+            f"最良検証損失: {training_results['best_val_loss']:.6f}\n" +
+            f"実施エポック数: {training_results['completed_epochs']}/{training_config['num_epochs']}\n" +
+            early_stopping_info +
+            time_info +
+            f"ウェイポイント数: {dataset_info['num_waypoints']}\n" +
+            f"学習データ数: {dataset_info['image_paths_count']}枚\n" +
+            f"学習率: {training_config['learning_rate']}\n" +
+            f"バッチサイズ: {training_config['batch_size']}\n" +
+            f"データオーグメンテーション: {'有効' if training_config['use_augmentation'] else '無効'}\n\n" +
+            f"{mlflow_info}"
+        )
 
     def update_location_inference_display(self):
         """位置推論表示を更新する - 上位3クラスのみ表示"""
