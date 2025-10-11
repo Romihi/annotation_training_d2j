@@ -6367,10 +6367,11 @@ class ImageAnnotationTool(QMainWindow):
 
     def _show_yolo_training_success(self, task_name, model_type, results, device, pretrained_info, run_name, mlflow_info):
         """YOLO学習成功メッセージを表示"""
-        
-        QMessageBox.information(
-            self,
-            "学習完了",
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("学習完了")
+        msg_box.setIcon(QMessageBox.Information)
+        msg_box.setText(
             f"YOLO{task_name}モデルの学習が完了しました。\n"
             f"最終mAP: {results.maps}\n"
             f"使用デバイス: {device}\n"
@@ -6378,6 +6379,18 @@ class ImageAnnotationTool(QMainWindow):
             f"モデル保存先: {os.path.join(models_dir, run_name, 'weights')}\n"
             f"{mlflow_info}"
         )
+
+        # OKボタン
+        ok_button = msg_box.addButton(QMessageBox.Ok)
+
+        # MLflow を開くボタンを追加
+        mlflow_button = msg_box.addButton("MLflowを開く", QMessageBox.ActionRole)
+
+        msg_box.exec_()
+
+        # MLflowボタンがクリックされた場合
+        if msg_box.clickedButton() == mlflow_button:
+            self.mlflow_manager.open_ui()
 
     def _create_yolo_training_dialog(self, task_name, model_type, annotation_info):
         """YOLO学習設定ダイアログを作成"""
@@ -15044,22 +15057,35 @@ class ImageAnnotationTool(QMainWindow):
             time_info = f"学習時間: {total_time_str} (平均エポック時間: {avg_epoch_time_str})\n"
         
         # 成功メッセージを表示
-        QMessageBox.information(
-            self, 
-            "学習完了", 
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("学習完了")
+        msg_box.setIcon(QMessageBox.Information)
+        msg_box.setText(
             f"{model_type} モデルを学習し保存しました: {os.path.basename(training_results['model_path'])}\n" +
             f"最良検証損失: {training_results['best_val_loss']:.6f}\n" +
             f"実施エポック数: {training_results.get('completed_epochs', training_params['num_epochs'])}/{training_params['num_epochs']}\n" +
             early_stopping_info +
             time_info +
             f"学習データ数: {dataset_info['image_paths_count']}枚 {dataset_info['sampling_info']}\n" +
-            input_size_info + 
+            input_size_info +
             weights_info +
             f"学習率: {training_params['learning_rate']}\n" +
             f"バッチサイズ: {training_params['batch_size']}\n" +
             aug_details +
             f"\n{mlflow_info}"
         )
+
+        # OKボタン
+        ok_button = msg_box.addButton(QMessageBox.Ok)
+
+        # MLflow を開くボタンを追加
+        mlflow_button = msg_box.addButton("MLflowを開く", QMessageBox.ActionRole)
+
+        msg_box.exec_()
+
+        # MLflowボタンがクリックされた場合
+        if msg_box.clickedButton() == mlflow_button:
+            self.mlflow_manager.open_ui()
         
 
     ###
@@ -17250,9 +17276,10 @@ class ImageAnnotationTool(QMainWindow):
             time_info = f"学習時間: {total_time_str} (平均エポック時間: {avg_epoch_time_str})\n"
         
         # 学習完了メッセージ
-        QMessageBox.information(
-            self, 
-            "学習完了", 
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("学習完了")
+        msg_box.setIcon(QMessageBox.Information)
+        msg_box.setText(
             f"{model_type} 位置モデルを学習し保存しました: {os.path.basename(training_results['best_model_path'])}\n" +
             f"最良検証損失: {training_results['best_val_loss']:.6f}\n" +
             f"最良検証精度: {training_results['best_val_acc']:.2f}%\n" +
@@ -17266,6 +17293,12 @@ class ImageAnnotationTool(QMainWindow):
             f"データオーグメンテーション: {'有効' if training_config['use_augmentation'] else '無効'}\n\n" +
             f"{mlflow_info}"
         )
+        ok_button = msg_box.addButton(QMessageBox.Ok)
+        mlflow_button = msg_box.addButton("MLflowを開く", QMessageBox.ActionRole)
+        msg_box.exec_()
+
+        if msg_box.clickedButton() == mlflow_button:
+            self.mlflow_manager.open_ui()
 
 
     def train_and_save_waypoint_model(self):
@@ -17787,9 +17820,10 @@ class ImageAnnotationTool(QMainWindow):
             time_info = f"学習時間: {total_time_str} (平均エポック時間: {avg_epoch_time_str})\n"
 
         # 学習完了メッセージ
-        QMessageBox.information(
-            self,
-            "学習完了",
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("学習完了")
+        msg_box.setIcon(QMessageBox.Information)
+        msg_box.setText(
             f"{model_type} ウェイポイントモデルを学習し保存しました: {os.path.basename(training_results['best_model_path'])}\n" +
             f"最良検証損失: {training_results['best_val_loss']:.6f}\n" +
             f"実施エポック数: {training_results['completed_epochs']}/{training_config['num_epochs']}\n" +
@@ -17802,6 +17836,12 @@ class ImageAnnotationTool(QMainWindow):
             f"データオーグメンテーション: {'有効' if training_config['use_augmentation'] else '無効'}\n\n" +
             f"{mlflow_info}"
         )
+        ok_button = msg_box.addButton(QMessageBox.Ok)
+        mlflow_button = msg_box.addButton("MLflowを開く", QMessageBox.ActionRole)
+        msg_box.exec_()
+
+        if msg_box.clickedButton() == mlflow_button:
+            self.mlflow_manager.open_ui()
 
     def update_location_inference_display(self):
         """位置推論表示を更新する - 上位3クラスのみ表示"""
