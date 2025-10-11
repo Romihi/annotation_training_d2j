@@ -4814,9 +4814,12 @@ class ImageAnnotationTool(QMainWindow):
             self.auto_play_timer.stop()
             return
         
-        # スキップ枚数を取得
-        skip_count = self.skip_count_spin.value()
-        
+        # スキップ枚数を取得（チェックボックスがONの時のみ）
+        if self.skip_images_on_click.isChecked():
+            skip_count = self.skip_count_spin.value()
+        else:
+            skip_count = 1
+
         # 再生方向に基づいて、次の画像へ進むためのステップを決定
         step = skip_count if forward else -skip_count
         
@@ -4836,7 +4839,8 @@ class ImageAnnotationTool(QMainWindow):
         # 再生中であることをステータスバーに表示
         direction = "順方向" if forward else "逆方向"
         playback_speed = "低速" if self.inference_checkbox.isChecked() else "高速"
-        self.statusBar().showMessage(f"自動再生中 ({direction}, {skip_count}枚スキップ, {playback_speed}) - 停止するには再度ボタンをクリック")
+        skip_info = f"{skip_count}枚スキップ" if skip_count > 1 else "スキップなし"
+        self.statusBar().showMessage(f"自動再生中 ({direction}, {skip_info}, {playback_speed}) - 停止するには再度ボタンをクリック")
 
     def play_reverse(self):
         """自動再生（逆方向）"""
