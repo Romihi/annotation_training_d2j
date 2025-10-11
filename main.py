@@ -867,6 +867,11 @@ class ImageLabel(QLabel):
 
         # 赤：アノテーション点（教師データ）
         if self.annotation_point:
+            print(f"[DEBUG] draw_control_points: アノテーションポイントを描画 ({self.annotation_point.x()}, {self.annotation_point.y()})")
+        else:
+            print(f"[DEBUG] draw_control_points: アノテーションポイントなし")
+
+        if self.annotation_point:
             rel_x = self.annotation_point.x() / pix_width
             rel_y = self.annotation_point.y() / pix_height
             scaled_x = int(target_rect.x() + rel_x * target_rect.width())
@@ -11336,16 +11341,15 @@ class ImageAnnotationTool(QMainWindow):
             self.variant_images = {'unknown': images}
             self.current_variant = 'unknown'
         else:
-            # デフォルトキーを設定
-            if hasattr(self, 'current_variant') and self.current_variant in self.available_variants:
-                # 既に選択されているキーがある場合は保持
-                pass
-            elif 'cam' in self.available_variants:
-                # デフォルトはcam
+            # 新しいフォルダを読み込んだときは常にcamを優先
+            if 'cam' in self.available_variants:
+                # camが存在すれば最優先で選択
                 self.current_variant = 'cam'
+                print(f"[INFO] 新しいフォルダ読み込み: 'cam' バリアントを選択")
             else:
                 # camがなければ最初のキー
                 self.current_variant = self.available_variants[0]
+                print(f"[INFO] 新しいフォルダ読み込み: '{self.current_variant}' バリアントを選択 (cam なし)")
 
         # 現在のキーの画像を選択
         images = self.variant_images[self.current_variant]
@@ -11600,6 +11604,20 @@ class ImageAnnotationTool(QMainWindow):
             progress.close()
             
             if annotations_loaded:
+                # デバッグ出力: アノテーションが正しく読み込まれているか確認
+                print(f"\n=== アノテーション読み込み後のデバッグ情報 ===")
+                print(f"総アノテーション数: {len(self.annotations)}")
+                print(f"現在のインデックス: {self.current_index}")
+                print(f"総画像数: {len(self.images)}")
+                if self.current_index < len(self.images):
+                    print(f"現在の画像パス: {self.images[self.current_index]}")
+                if self.current_index in self.annotations:
+                    print(f"現在のインデックスのアノテーション: {self.annotations[self.current_index]}")
+                else:
+                    print(f"警告: 現在のインデックス {self.current_index} にアノテーションがありません")
+                    print(f"アノテーションがあるインデックス (最初の10個): {sorted(list(self.annotations.keys()))[:10]}")
+                print(f"=========================================\n")
+
                 # Update UI
                 self.display_current_image()
                 self.update_gallery()
@@ -12821,6 +12839,7 @@ class ImageAnnotationTool(QMainWindow):
     def _set_annotation_point_on_canvas(self):
         """キャンバス上に運転アノテーションポイント（赤丸）を設定"""
         if not hasattr(self, 'main_image_view'):
+            print(f"[DEBUG] _set_annotation_point_on_canvas: main_image_view がありません")
             return
 
         # アノテーションポイントの設定（画像読み込みの成功/失敗に関係なく実行）
@@ -12829,8 +12848,10 @@ class ImageAnnotationTool(QMainWindow):
             'y' in self.annotations[self.current_index]):
             anno = self.annotations[self.current_index]
             self.main_image_view.annotation_point = QPoint(anno['x'], anno['y'])
+            print(f"[DEBUG] _set_annotation_point_on_canvas: インデックス {self.current_index} にアノテーションポイントを設定 ({anno['x']}, {anno['y']})")
         else:
             self.main_image_view.annotation_point = None
+            print(f"[DEBUG] _set_annotation_point_on_canvas: インデックス {self.current_index} にアノテーションなし（アノテーションポイント = None）")
 
         # 削除済みの場合
         is_deleted = hasattr(self, 'deleted_indexes') and self.current_index in self.deleted_indexes
