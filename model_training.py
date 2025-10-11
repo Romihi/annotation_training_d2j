@@ -525,7 +525,8 @@ def train_model(
     pretrained: bool = True,
     model_path: Optional[str] = None,
     use_early_stopping: bool = False,
-    patience: int = 5
+    patience: int = 5,
+    custom_model_name: Optional[str] = None
 ) -> Dict[str, Any]:
     """モデルをトレーニングする
 
@@ -605,19 +606,22 @@ def train_model(
     val_steering_losses = []
     val_throttle_losses = []
     best_val_loss = float('inf')
-    
+
     # Early Stopping用の変数
     early_stopping_counter = 0
     early_stopped = False
     stopped_epoch = 0
-    
+
     # 保存ディレクトリの作成
     os.makedirs(save_dir, exist_ok=True)
-    
+
+    # ファイル名に使用する名前を決定（カスタム名が指定されていればそれを使用）
+    save_name = custom_model_name if custom_model_name else model_name
+
     # タイムスタンプを使用してファイル名を生成
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_path = os.path.join(save_dir, f'{model_name}_{timestamp}.pth')
-    best_model_path = os.path.join(save_dir, f'{model_name}_best_{timestamp}.pth')
+    model_path = os.path.join(save_dir, f'{save_name}.pth')
+    best_model_path = os.path.join(save_dir, f'{save_name}_best.pth')
     
     # 時間計測用の変数
     training_start_time = time.time()
@@ -1165,8 +1169,9 @@ class LocationModelManager:
                 if any(keyword in model_file.lower() for keyword in ['location', 'loc_model']):
                     model_files.append(os.path.join(models_dir, model_file))
 
-        # モデルファイルを日付順にソート（新しいものが上）
-        model_files.sort(reverse=True)
+        # モデルファイルを作成日時順にソート（新しいものが上）
+        # カスタムサフィックスが追加された場合でも正しくソートされるよう、mtimeを使用
+        model_files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
 
         return model_files
 
@@ -1436,7 +1441,8 @@ def train_location_model(
     pretrained: bool = True,
     model_path: Optional[str] = None,
     use_early_stopping: bool = False,
-    patience: int = 5
+    patience: int = 5,
+    custom_model_name: Optional[str] = None
 ) -> Dict[str, Any]:
     """位置分類モデルをトレーニングする
 
@@ -1518,19 +1524,22 @@ def train_location_model(
     val_accuracies = []
     best_val_loss = float('inf')
     best_val_acc = 0.0
-    
+
     # Early Stopping用の変数
     early_stopping_counter = 0
     early_stopped = False
     stopped_epoch = 0
-    
+
     # 保存ディレクトリの作成
     os.makedirs(save_dir, exist_ok=True)
-    
+
+    # ファイル名に使用する名前を決定（カスタム名が指定されていればそれを使用）
+    save_name = custom_model_name if custom_model_name else model_name
+
     # タイムスタンプを使用してファイル名を生成
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_path = os.path.join(save_dir, f'{model_name}_{timestamp}.pth')
-    best_model_path = os.path.join(save_dir, f'{model_name}_best_{timestamp}.pth')
+    model_path = os.path.join(save_dir, f'{save_name}.pth')
+    best_model_path = os.path.join(save_dir, f'{save_name}_best.pth')
     
     # 時間計測用の変数
     training_start_time = time.time()

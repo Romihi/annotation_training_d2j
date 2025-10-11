@@ -4774,9 +4774,10 @@ class ImageAnnotationTool(QMainWindow):
             self.model_combo.addItem(f"{current_arch}のモデルが見つかりません")
             self.statusBar().showMessage(f"{current_arch}のモデルが見つかりません。他のアーキを選択するか、モデルを学習してください", 3000)
             return
-        
-        # モデルファイルを日付順にソート（新しいものが上）
-        model_files.sort(reverse=True)
+
+        # モデルファイルを作成日時順にソート（新しいものが上）
+        # カスタムサフィックスが追加された場合でも正しくソートされるよう、mtimeを使用
+        model_files.sort(key=lambda f: os.path.getmtime(os.path.join(models_dir, f)), reverse=True)
         
         # コンボボックスに追加
         for model_file in model_files:
@@ -5612,13 +5613,16 @@ class ImageAnnotationTool(QMainWindow):
             # MLflow環境設定
             self._setup_yolo_mlflow_environment(task_type)
             
-            # トレーニング設定のカスタマイズ
-            run_name = f"{model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            
+            # トレーニング設定のカスタマイズ（カスタムモデル名があればそれを使用）
+            if training_config.get('model_name'):
+                run_name = training_config['model_name']
+            else:
+                run_name = f"{model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
             progress.setLabelText(f"{task_name}学習開始...")
             progress.setValue(20)
             QApplication.processEvents()
-            
+
             # 学習パラメータを準備
             training_params = {
                 'data': dataset_info['yaml_file'],
@@ -6323,7 +6327,9 @@ class ImageAnnotationTool(QMainWindow):
                 "translate": training_config['translate'],
                 "scale": training_config['scale'],
                 "erasing": training_config['erasing'],
-                "data_folder": os.path.basename(self.folder_path) if hasattr(self, 'folder_path') and self.folder_path else "unknown"
+                "data_folder": os.path.basename(self.folder_path) if hasattr(self, 'folder_path') and self.folder_path else "unknown",
+                "model_name": training_config.get('model_name', ''),
+                "comment": training_config.get('comment', '')
             }
             
             # タスクタイプに応じてMLflowに記録
@@ -6645,16 +6651,66 @@ class ImageAnnotationTool(QMainWindow):
         
         # タブに追加
         tabs.addTab(aug_tab, "データオーグメンテーション")
-        
+
         # タブをレイアウトに追加
         settings_layout.addWidget(tabs)
-        
+
+        # モデル名とコメント欄を追加
+        settings_layout.addWidget(QLabel(""))  # スペース追加
+
+        # モデル名編集欄
+        model_name_group = QGroupBox("モデル名設定")
+        model_name_layout = QVBoxLayout(model_name_group)
+
+        # プレフィックス（固定）とサフィックス（編集可能）を分離
+        # YOLOの場合はモデルタイプ（yolov8n, yolov8n-seg等）をプレフィックスとする
+        yolo_prefix = f"{model_type}_"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # プレフィックスとサフィックスを横並びで表示
+        name_input_layout = QHBoxLayout()
+        name_input_layout.addWidget(QLabel("モデル名:"))
+
+        # プレフィックス（固定、編集不可）
+        prefix_label = QLabel(yolo_prefix)
+        prefix_label.setStyleSheet("background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc; font-family: monospace;")
+        name_input_layout.addWidget(prefix_label)
+
+        # サフィックス（編集可能）
+        training_settings.model_name_suffix_input = QLineEdit()
+        training_settings.model_name_suffix_input.setText(timestamp)
+        training_settings.model_name_suffix_input.setPlaceholderText("カスタム名を入力")
+        name_input_layout.addWidget(training_settings.model_name_suffix_input)
+
+        model_name_layout.addLayout(name_input_layout)
+
+        # プレフィックスを保存（後で使用）
+        training_settings.model_name_prefix = yolo_prefix
+
+        model_name_note = QLabel(f"※ モデルタイプ ({model_type}) のプレフィックスは変更できません。.ptは自動的に付与されます")
+        model_name_note.setStyleSheet("color: #888; font-style: italic; font-size: 10px;")
+        model_name_layout.addWidget(model_name_note)
+
+        settings_layout.addWidget(model_name_group)
+
+        # コメント欄
+        comment_group = QGroupBox("学習コメント (MLflowに記録)")
+        comment_layout = QVBoxLayout(comment_group)
+
+        comment_layout.addWidget(QLabel("コメント:"))
+        training_settings.comment_input = QPlainTextEdit()
+        training_settings.comment_input.setPlaceholderText("この学習についてのメモやコメントを入力してください (任意)")
+        training_settings.comment_input.setMaximumHeight(80)
+        comment_layout.addWidget(training_settings.comment_input)
+
+        settings_layout.addWidget(comment_group)
+
         # ボタンの配置
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(training_settings.accept)
         button_box.rejected.connect(training_settings.reject)
         settings_layout.addWidget(button_box)
-        
+
         return training_settings
 
     def _get_yolo_training_config(self, task_name, model_type, annotation_info):
@@ -6683,9 +6739,11 @@ class ImageAnnotationTool(QMainWindow):
             'hsv_v': training_settings.aug_hsv_v.value() if training_settings.aug_hsv_checkbox.isChecked() and training_settings.aug_enable_check.isChecked() else 0.0,
             'translate': training_settings.aug_translate.value() if training_settings.aug_geometry_checkbox.isChecked() and training_settings.aug_enable_check.isChecked() else 0.0,
             'scale': training_settings.aug_scale.value() if training_settings.aug_geometry_checkbox.isChecked() and training_settings.aug_enable_check.isChecked() else 0.0,
-            'erasing': training_settings.aug_erase_proba.value() if training_settings.aug_erase_checkbox.isChecked() and training_settings.aug_enable_check.isChecked() else 0.0
+            'erasing': training_settings.aug_erase_proba.value() if training_settings.aug_erase_checkbox.isChecked() and training_settings.aug_enable_check.isChecked() else 0.0,
+            'model_name': training_settings.model_name_prefix + training_settings.model_name_suffix_input.text().strip(),
+            'comment': training_settings.comment_input.toPlainText().strip()
         }
-        
+
         return config
     #
 
@@ -6852,15 +6910,28 @@ class ImageAnnotationTool(QMainWindow):
             self.statusBar().showMessage(f"{selected_model_type}のYOLOモデルが見つかりません", 3000)
             return
         
-        # モデルファイルをソート（タスクタイプ順、その後日付順）
+        # モデルファイルをソート（ファイル作成日時順、新しいものが上）
+        # カスタムサフィックスが追加された場合でも正しくソートされるよう、mtimeを使用
         def sort_key(model_info):
-            task_priority = 0 if model_info['task'] == "物体検知" else 1  # 物体検知を優先
+            # ファイルの完全なパスを取得
             if model_info['parent'] == 'root':
-                return (task_priority, '0', '')
+                file_path = os.path.join(models_dir, model_info['path'])
             else:
-                return (task_priority, '1', model_info['date'])
-        
-        unified_model_files.sort(key=sort_key, reverse=False)
+                file_path = os.path.join(models_dir, model_info['path'])
+
+            # ファイルの作成日時を取得（存在しない場合は0）
+            try:
+                mtime = os.path.getmtime(file_path)
+            except:
+                mtime = 0
+
+            # タスクタイプの優先順位を設定（物体検知を優先）
+            task_priority = 0 if model_info['task'] == "物体検知" else 1
+
+            # タスクタイプ優先、その後新しいものが上に来るように負の値を返す
+            return (task_priority, -mtime)
+
+        unified_model_files.sort(key=sort_key)
         
         # コンボボックスに追加
         for model_info in unified_model_files:
@@ -8128,14 +8199,26 @@ class ImageAnnotationTool(QMainWindow):
             self.statusBar().showMessage(f"{selected_model_type}のYOLOモデルが見つかりません。学習を実行するか他のタイプを選択してください", 3000)
             return
         
-        # モデルファイルをソート - 直下のモデルを最初に、次に日付が新しいもの順にソート
+        # モデルファイルをソート - ファイル作成日時順、新しいものが上
+        # カスタムサフィックスが追加された場合でも正しくソートされるよう、mtimeを使用
         def sort_key(model_info):
+            # ファイルの完全なパスを取得
             if model_info['parent'] == 'root':
-                return ('0', '')  # 直下のファイルを最初に
+                file_path = os.path.join(models_dir, model_info['path'])
             else:
-                return ('1', model_info['date'])  # 次に日付の新しい順
-        
-        yolo_model_files.sort(key=sort_key, reverse=False)  # 直下のファイルを先頭に
+                file_path = os.path.join(models_dir, model_info['path'])
+
+            # ファイルの作成日時を取得（存在しない場合は0）
+            try:
+                mtime = os.path.getmtime(file_path)
+            except:
+                mtime = 0
+
+            # 直下のファイルを優先し、その後新しいものが上に来るように負の値を返す
+            priority = 0 if model_info['parent'] == 'root' else 1
+            return (priority, -mtime)
+
+        yolo_model_files.sort(key=sort_key)
         
         # コンボボックスに追加
         for model_info in yolo_model_files:
@@ -14471,10 +14554,57 @@ class ImageAnnotationTool(QMainWindow):
         
         # タブに追加
         tabs.addTab(aug_tab, "データオーグメンテーション")
-        
+
         # タブをレイアウトに追加
         settings_layout.addWidget(tabs)
-        
+
+        # モデル名とコメント欄を追加
+        settings_layout.addWidget(QLabel(""))  # スペース追加
+
+        # モデル名編集欄
+        model_name_group = QGroupBox("モデル名設定")
+        model_name_layout = QVBoxLayout(model_name_group)
+
+        # プレフィックス（固定）とサフィックス（編集可能）を分離
+        # 自動運転モデルの場合はmodel_typeをプレフィックスとする
+        autonomous_prefix = f"{model_type}_"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # プレフィックスとサフィックスを横並びで表示
+        name_input_layout = QHBoxLayout()
+        name_input_layout.addWidget(QLabel("モデル名:"))
+
+        # プレフィックス（固定、編集不可）
+        prefix_label = QLabel(autonomous_prefix)
+        prefix_label.setStyleSheet("background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc; font-family: monospace;")
+        name_input_layout.addWidget(prefix_label)
+
+        # サフィックス（編集可能）
+        model_name_suffix_input = QLineEdit()
+        model_name_suffix_input.setText(timestamp)
+        model_name_suffix_input.setPlaceholderText("カスタム名を入力")
+        name_input_layout.addWidget(model_name_suffix_input)
+
+        model_name_layout.addLayout(name_input_layout)
+
+        model_name_note = QLabel(f"※ モデルタイプ ({model_type}) のプレフィックスは変更できません。.pthは自動的に付与されます")
+        model_name_note.setStyleSheet("color: #888; font-style: italic; font-size: 10px;")
+        model_name_layout.addWidget(model_name_note)
+
+        settings_layout.addWidget(model_name_group)
+
+        # コメント欄
+        comment_group = QGroupBox("学習コメント (MLflowに記録)")
+        comment_layout = QVBoxLayout(comment_group)
+
+        comment_layout.addWidget(QLabel("コメント:"))
+        comment_input = QPlainTextEdit()
+        comment_input.setPlaceholderText("この学習についてのメモやコメントを入力してください (任意)")
+        comment_input.setMaximumHeight(80)
+        comment_layout.addWidget(comment_input)
+
+        settings_layout.addWidget(comment_group)
+
         # ボタンの配置
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(training_settings.accept)
@@ -14490,7 +14620,9 @@ class ImageAnnotationTool(QMainWindow):
         use_early_stopping = early_stopping_check.isChecked()
         patience = patience_spin.value() if use_early_stopping else 0
         learning_rate = float(lr_combo.currentText())
-        
+        model_name = autonomous_prefix + model_name_suffix_input.text().strip()
+        comment = comment_input.toPlainText().strip()
+
         # データ選択設定の取得
         use_all = data_radio_all.isChecked()
         use_skip = data_radio_skip.isChecked()
@@ -14710,7 +14842,8 @@ class ImageAnnotationTool(QMainWindow):
                 num_epochs=num_epochs,  # 指定されたエポック数
                 learning_rate=learning_rate,  # 指定された学習率
                 use_early_stopping=use_early_stopping,  # Early Stoppingの有効/無効
-                patience=patience  # 忍耐値
+                patience=patience,  # 忍耐値
+                custom_model_name=model_name if model_name else None  # カスタムモデル名
             )
             
             progress.close()
@@ -14732,7 +14865,9 @@ class ImageAnnotationTool(QMainWindow):
                     "augmentation_enabled": augmentation_params['enabled'],
                     "sampling_strategy": self._get_sampling_strategy_name(use_all, use_skip, use_range, skip_count),
                     "augmentation_params": augmentation_params,
-                    "data_folder": os.path.basename(self.folder_path) if hasattr(self, 'folder_path') and self.folder_path else "unknown"
+                    "data_folder": os.path.basename(self.folder_path) if hasattr(self, 'folder_path') and self.folder_path else "unknown",
+                    "model_name": model_name,
+                    "comment": comment
                 },
                 dataset_info={
                     "total_annotations": len(self.annotations),
@@ -16316,7 +16451,7 @@ class ImageAnnotationTool(QMainWindow):
         deleted_count = len(getattr(self, 'deleted_indexes', []))
         
         # 学習設定ダイアログを表示
-        training_settings = self._create_location_training_dialog(actual_classes, unique_locations, num_classes, total_images, annotated_images, valid_location_annotations, deleted_count)
+        training_settings = self._create_location_training_dialog(model_type, actual_classes, unique_locations, num_classes, total_images, annotated_images, valid_location_annotations, deleted_count)
         
         if not training_settings.exec_():
             return
@@ -16433,7 +16568,7 @@ class ImageAnnotationTool(QMainWindow):
                 f"位置モデル学習中にエラーが発生しました: {str(e)}"
             )
 
-    def _create_location_training_dialog(self, actual_classes, unique_locations, num_classes, total_images, annotated_images, valid_location_annotations, deleted_count):
+    def _create_location_training_dialog(self, model_type, actual_classes, unique_locations, num_classes, total_images, annotated_images, valid_location_annotations, deleted_count):
         """位置モデル学習設定ダイアログを作成"""
         
         training_settings = QDialog(self)
@@ -16508,16 +16643,66 @@ class ImageAnnotationTool(QMainWindow):
         training_settings.lr_combo.setCurrentIndex(0)
         lr_layout.addWidget(training_settings.lr_combo)
         settings_layout.addLayout(lr_layout)
-        
+
+        # モデル名とコメント欄を追加
+        settings_layout.addWidget(QLabel(""))  # スペース追加
+
+        # モデル名編集欄
+        model_name_group = QGroupBox("モデル名設定")
+        model_name_layout = QVBoxLayout(model_name_group)
+
+        # プレフィックス（固定）とサフィックス（編集可能）を分離
+        # 位置モデルの場合はmodel_typeをプレフィックスとする
+        location_prefix = f"{model_type}_"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # プレフィックスとサフィックスを横並びで表示
+        name_input_layout = QHBoxLayout()
+        name_input_layout.addWidget(QLabel("モデル名:"))
+
+        # プレフィックス（固定、編集不可）
+        prefix_label = QLabel(location_prefix)
+        prefix_label.setStyleSheet("background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc; font-family: monospace;")
+        name_input_layout.addWidget(prefix_label)
+
+        # サフィックス（編集可能）
+        training_settings.model_name_suffix_input = QLineEdit()
+        training_settings.model_name_suffix_input.setText(timestamp)
+        training_settings.model_name_suffix_input.setPlaceholderText("カスタム名を入力")
+        name_input_layout.addWidget(training_settings.model_name_suffix_input)
+
+        model_name_layout.addLayout(name_input_layout)
+
+        # プレフィックスを保存（後で使用）
+        training_settings.model_name_prefix = location_prefix
+
+        model_name_note = QLabel(f"※ モデルタイプ ({model_type}) のプレフィックスは変更できません。.pthは自動的に付与されます")
+        model_name_note.setStyleSheet("color: #888; font-style: italic; font-size: 10px;")
+        model_name_layout.addWidget(model_name_note)
+
+        settings_layout.addWidget(model_name_group)
+
+        # コメント欄
+        comment_group = QGroupBox("学習コメント (MLflowに記録)")
+        comment_layout = QVBoxLayout(comment_group)
+
+        comment_layout.addWidget(QLabel("コメント:"))
+        training_settings.comment_input = QPlainTextEdit()
+        training_settings.comment_input.setPlaceholderText("この学習についてのメモやコメントを入力してください (任意)")
+        training_settings.comment_input.setMaximumHeight(80)
+        comment_layout.addWidget(training_settings.comment_input)
+
+        settings_layout.addWidget(comment_group)
+
         # ボタンの配置
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(training_settings.accept)
         button_box.rejected.connect(training_settings.reject)
         settings_layout.addWidget(button_box)
-        
+
         return training_settings
 
-    def _create_waypoint_training_dialog(self, most_common_waypoint_count, total_images, annotated_images, valid_waypoint_count, deleted_count):
+    def _create_waypoint_training_dialog(self, model_type, most_common_waypoint_count, total_images, annotated_images, valid_waypoint_count, deleted_count):
         """ウェイポイントモデル学習設定ダイアログを作成"""
 
         training_settings = QDialog(self)
@@ -16593,6 +16778,56 @@ class ImageAnnotationTool(QMainWindow):
         lr_layout.addWidget(training_settings.lr_combo)
         settings_layout.addLayout(lr_layout)
 
+        # モデル名とコメント欄を追加
+        settings_layout.addWidget(QLabel(""))  # スペース追加
+
+        # モデル名編集欄
+        model_name_group = QGroupBox("モデル名設定")
+        model_name_layout = QVBoxLayout(model_name_group)
+
+        # プレフィックス（固定）とサフィックス（編集可能）を分離
+        # ウェイポイントモデルの場合はmodel_typeをプレフィックスとする
+        waypoint_prefix = f"{model_type}_"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # プレフィックスとサフィックスを横並びで表示
+        name_input_layout = QHBoxLayout()
+        name_input_layout.addWidget(QLabel("モデル名:"))
+
+        # プレフィックス（固定、編集不可）
+        prefix_label = QLabel(waypoint_prefix)
+        prefix_label.setStyleSheet("background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc; font-family: monospace;")
+        name_input_layout.addWidget(prefix_label)
+
+        # サフィックス（編集可能）
+        training_settings.model_name_suffix_input = QLineEdit()
+        training_settings.model_name_suffix_input.setText(timestamp)
+        training_settings.model_name_suffix_input.setPlaceholderText("カスタム名を入力")
+        name_input_layout.addWidget(training_settings.model_name_suffix_input)
+
+        model_name_layout.addLayout(name_input_layout)
+
+        # プレフィックスを保存（後で使用）
+        training_settings.model_name_prefix = waypoint_prefix
+
+        model_name_note = QLabel(f"※ モデルタイプ ({model_type}) のプレフィックスは変更できません。.pthは自動的に付与されます")
+        model_name_note.setStyleSheet("color: #888; font-style: italic; font-size: 10px;")
+        model_name_layout.addWidget(model_name_note)
+
+        settings_layout.addWidget(model_name_group)
+
+        # コメント欄
+        comment_group = QGroupBox("学習コメント (MLflowに記録)")
+        comment_layout = QVBoxLayout(comment_group)
+
+        comment_layout.addWidget(QLabel("コメント:"))
+        training_settings.comment_input = QPlainTextEdit()
+        training_settings.comment_input.setPlaceholderText("この学習についてのメモやコメントを入力してください (任意)")
+        training_settings.comment_input.setMaximumHeight(80)
+        comment_layout.addWidget(training_settings.comment_input)
+
+        settings_layout.addWidget(comment_group)
+
         # ボタンの配置
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(training_settings.accept)
@@ -16611,7 +16846,9 @@ class ImageAnnotationTool(QMainWindow):
             'use_augmentation': dialog.aug_check.isChecked(),
             'use_early_stopping': dialog.early_stopping_check.isChecked(),
             'patience': dialog.patience_spin.value() if dialog.early_stopping_check.isChecked() else 0,
-            'learning_rate': float(dialog.lr_combo.currentText())
+            'learning_rate': float(dialog.lr_combo.currentText()),
+            'model_name': dialog.model_name_prefix + dialog.model_name_suffix_input.text().strip(),
+            'comment': dialog.comment_input.toPlainText().strip()
         }
 
     def _prepare_waypoint_training_data(self, num_waypoints):
@@ -16674,14 +16911,16 @@ class ImageAnnotationTool(QMainWindow):
 
     def _get_location_training_config(self, dialog):
         """学習設定ダイアログから設定値を取得"""
-        
+
         return {
             'num_epochs': dialog.epoch_spin.value(),
             'batch_size': dialog.batch_spin.value(),
             'use_augmentation': dialog.aug_check.isChecked(),
             'use_early_stopping': dialog.early_stopping_check.isChecked(),
             'patience': dialog.patience_spin.value() if dialog.early_stopping_check.isChecked() else 0,
-            'learning_rate': float(dialog.lr_combo.currentText())
+            'learning_rate': float(dialog.lr_combo.currentText()),
+            'model_name': dialog.model_name_prefix + dialog.model_name_suffix_input.text().strip(),
+            'comment': dialog.comment_input.toPlainText().strip()
         }
 
     def _prepare_location_training_data(self, unique_locations):
@@ -16759,9 +16998,13 @@ class ImageAnnotationTool(QMainWindow):
         # 保存ディレクトリとファイル名
         models_dir = os.path.join(self.folder_path, "models")
         os.makedirs(models_dir, exist_ok=True)
+
+        # カスタムモデル名が指定されていればそれを使用
+        save_name = training_config.get('model_name', '') if training_config.get('model_name') else model_type
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_path = os.path.join(models_dir, f'{model_type}_{timestamp}.pth')
-        best_model_path = os.path.join(models_dir, f'{model_type}_best_{timestamp}.pth')
+        model_path = os.path.join(models_dir, f'{save_name}.pth')
+        best_model_path = os.path.join(models_dir, f'{save_name}_best.pth')
         
         completed_epochs = 0
         for epoch in range(training_config['num_epochs']):
@@ -17069,7 +17312,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # 学習設定ダイアログを表示
         training_settings = self._create_waypoint_training_dialog(
-            most_common_waypoint_count, total_images, annotated_images,
+            model_type, most_common_waypoint_count, total_images, annotated_images,
             valid_waypoint_count, deleted_count
         )
 
@@ -17300,7 +17543,9 @@ class ImageAnnotationTool(QMainWindow):
                 best_val_loss = val_loss
                 # 最初のエポックで保存パスを設定（タイムスタンプを固定）
                 if best_model_path is None:
-                    model_filename = f"{model_type}_{timestamp}.pth"
+                    # カスタムモデル名が指定されていればそれを使用
+                    save_name = training_config.get('model_name', '') if training_config.get('model_name') else model_type
+                    model_filename = f"{save_name}.pth"
                     best_model_path = os.path.join(models_dir, model_filename)
 
                 torch.save({

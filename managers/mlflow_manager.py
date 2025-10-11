@@ -165,6 +165,10 @@ class MLflowManager:
             "sampling_strategy": training_params.get("sampling_strategy", "all"),
             "augmentation_enabled": training_params.get("augmentation_enabled", False)
         }
+
+        # コメントがあれば追加
+        if training_params.get("comment"):
+            params["comment"] = training_params["comment"]
         
         # オーグメンテーション詳細パラメータ
         aug_params = training_params.get("augmentation_params", {})
@@ -208,8 +212,12 @@ class MLflowManager:
             "status": metrics.get("status", "completed")
         }
         
-        # MLflow実行名
-        run_name = f"autonomous_driving_{training_params.get('model_type', 'unknown')}_{dataset_info.get('used_samples', 0)}samples_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        # MLflow実行名（カスタムモデル名が指定されていればそれを使用）
+        custom_name = training_params.get('model_name', '')
+        if custom_name:
+            run_name = custom_name
+        else:
+            run_name = f"autonomous_driving_{training_params.get('model_type', 'unknown')}_{dataset_info.get('used_samples', 0)}samples_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
         try:
             with mlflow.start_run(run_name=run_name):
@@ -278,6 +286,10 @@ class MLflowManager:
             "fixed_classes": training_params.get("fixed_classes", 8),
             "actual_classes": training_params.get("actual_classes", 0)
         }
+
+        # コメントがあれば追加
+        if training_params.get("comment"):
+            params["comment"] = training_params["comment"]
         
         # 位置推論特有のメトリクス
         run_metrics = {
@@ -306,8 +318,12 @@ class MLflowManager:
             "coordinate_type": training_params.get("coordinate_system", "classification")
         }
         
-        # MLflow実行名
-        run_name = f"position_estimation_{training_params.get('model_type', 'unknown')}_{dataset_info.get('used_samples', 0)}samples_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        # MLflow実行名（カスタムモデル名が指定されていればそれを使用）
+        custom_name = training_params.get('model_name', '')
+        if custom_name:
+            run_name = custom_name
+        else:
+            run_name = f"position_estimation_{training_params.get('model_type', 'unknown')}_{dataset_info.get('used_samples', 0)}samples_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
         try:
             with mlflow.start_run(run_name=run_name):
@@ -384,6 +400,10 @@ class MLflowManager:
             "mosaic": training_params.get("mosaic", 0.0),
             "fliplr": training_params.get("fliplr", 0.0)
         }
+
+        # コメントがあれば追加
+        if training_params.get("comment"):
+            params["comment"] = training_params["comment"]
         
         # YOLO特有のメトリクス
         run_metrics = {}
@@ -492,6 +512,10 @@ class MLflowManager:
             "loss_function": training_params.get("loss_function", "yolo_segmentation_loss"),
             "task_type": "segmentation"
         }
+
+        # コメントがあれば追加
+        if training_params.get("comment"):
+            params["comment"] = training_params["comment"]
         
         # オーグメンテーションパラメータ（有効な場合のみ記録）
         if training_params.get("augmentation_enabled", False):
@@ -540,8 +564,12 @@ class MLflowManager:
             "status": "completed"
         }
         
-        # MLflow実行名
-        run_name = f"yolo_segmentation_{training_params.get('model_type', 'yolo')}_{dataset_info.get('train_samples', 0)}samples_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        # MLflow実行名（カスタムモデル名が指定されていればそれを使用）
+        custom_name = training_params.get('model_name', '')
+        if custom_name:
+            run_name = custom_name
+        else:
+            run_name = f"yolo_segmentation_{training_params.get('model_type', 'yolo')}_{dataset_info.get('train_samples', 0)}samples_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
         try:
             with mlflow.start_run(run_name=run_name):
@@ -690,6 +718,10 @@ class MLflowManager:
             "coordinate_system": "continuous"
         }
 
+        # コメントがあれば追加
+        if training_params.get("comment"):
+            params["comment"] = training_params["comment"]
+
         # ウェイポイント回帰特有のメトリクス
         run_metrics = {
             "best_val_loss": metrics.get("best_val_loss", 0.0),
@@ -718,7 +750,12 @@ class MLflowManager:
                 "used_samples": dataset_info.get("used_samples", 0)
             })
 
-        run_name = f"waypoint_{training_params.get('model_type', 'unknown')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        # MLflow実行名（カスタムモデル名が指定されていればそれを使用）
+        custom_name = training_params.get('model_name', '')
+        if custom_name:
+            run_name = custom_name
+        else:
+            run_name = f"waypoint_{training_params.get('model_type', 'unknown')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
         try:
             with mlflow.start_run(run_name=run_name):
