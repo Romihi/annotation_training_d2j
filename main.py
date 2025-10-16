@@ -107,7 +107,7 @@ class ImageLabel(QLabel):
         self.is_image_loading = False  # 画像読み込み中フラグ
         self.click_disabled = False  # クリック無効化フラグ
         self.last_click_time = 0  # 最後のクリック時間（デバウンス用）
-        self.debounce_delay = 100  # デバウンス時間（ミリ秒）
+        self.debounce_delay = 10 #100  # デバウンス時間（ミリ秒）
         self.original_cursor = None  # 元のカーソルを保存  
 
         # バウンディングボックス関連
