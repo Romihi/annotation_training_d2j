@@ -846,11 +846,11 @@ class ImageLabel(QLabel):
             elif i % 2 == 0:
                 painter.drawText(int(x_pos) - 15, target_rect.y() - 5, f"{value:.1f}")
 
-        painter.drawText(target_rect.x() - 35, target_rect.y() + 15, "-1")
-        painter.drawText(target_rect.x() - 35, target_rect.y() + target_rect.height(), "1")
+        painter.drawText(target_rect.x() - 35, target_rect.y() + 15, "1")
+        painter.drawText(target_rect.x() - 35, target_rect.y() + target_rect.height(), "-1")
 
         for i in range(1, grid_size):
-            value = -1 + (2.0 * i / grid_size)
+            value = 1 - (2.0 * i / grid_size)
             y_pos = target_rect.y() + i * step_y
             if abs(value) < 0.1:
                 painter.drawText(target_rect.x() - 35, int(y_pos) + 5, "0")
