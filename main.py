@@ -11275,117 +11275,101 @@ class ImageAnnotationTool(QMainWindow):
         progress.setModal(True)
         progress.show()
         
-        # 全画像フォルダの画像を集める
+        # 全画像フォルダの画像を集める（各フォルダごとにソートしてから連結）
         all_images = []
         image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.gif']
-        
+
         print(f"{len(image_folders)}個のimagesフォルダを検索中...")
         progress.setLabelText(f"{len(image_folders)}個のフォルダを検索中...")
         progress.setValue(10)
         QApplication.processEvents()
-        
-        # 各フォルダを順次処理
+
+        # 各フォルダを順次処理し、各フォルダ内でソートしてから連結
         for folder_idx, img_folder in enumerate(image_folders):
             if progress.wasCanceled():
                 return
-                
+
             folder_name = os.path.basename(os.path.dirname(img_folder))
             progress.setLabelText(f"フォルダ '{folder_name}' を読み込み中... ({folder_idx + 1}/{len(image_folders)})")
-            progress.setValue(10 + (folder_idx * 60 // len(image_folders)))
+            progress.setValue(10 + (folder_idx * 70 // len(image_folders)))
             QApplication.processEvents()
-            
+
             print(f"画像フォルダを検索中: {img_folder}")
-            
-            # imagesフォルダ内の画像を検索
+
+            # このフォルダの画像を集める
+            folder_images = []
             try:
                 files = os.listdir(img_folder)
                 for file_idx, file in enumerate(files):
                     if progress.wasCanceled():
                         return
-                        
+
                     if any(file.lower().endswith(ext) for ext in image_extensions):
-                        all_images.append(os.path.join(img_folder, file))
-                    
+                        folder_images.append(os.path.join(img_folder, file))
+
                     # ファイル処理の進捗を細かく更新
                     if file_idx % 10 == 0:  # 10ファイルごとに更新
-                        file_progress = 10 + (folder_idx * 60 // len(image_folders)) + (file_idx * 10 // len(files))
-                        progress.setValue(min(file_progress, 70))
+                        file_progress = 10 + (folder_idx * 70 // len(image_folders)) + (file_idx * 10 // len(files) if len(files) > 0 else 0)
+                        progress.setValue(min(file_progress, 80))
                         QApplication.processEvents()
-                        
+
             except Exception as e:
                 print(f"画像フォルダ {img_folder} の読み込みエラー: {e}")
-        
+                continue
+
+            # このフォルダの画像をファイル名のインデックスでソート
+            if folder_images:
+                print(f"フォルダ '{folder_name}': {len(folder_images)}枚の画像をソート中...")
+                folder_image_with_indices = []
+
+                for img_path in folder_images:
+                    basename = os.path.basename(img_path)
+                    # ファイル名からインデックスを抽出
+                    try:
+                        # Jetracer形式を優先的にチェック: x_y_index_cam_image_array_.jpg -> index
+                        # 例: 200_100_2_cam_image_array_.jpg -> 2
+                        jetracer_match = re.match(r'^\d+_\d+_(\d+)_', basename)
+                        if jetracer_match:
+                            index = int(jetracer_match.group(1))
+                            folder_image_with_indices.append((img_path, index))
+                        else:
+                            # 通常形式: 10900_cam_image_array_.jpg -> 10900
+                            normal_match = re.match(r'^(\d+)_', basename)
+                            if normal_match:
+                                index = int(normal_match.group(1))
+                                folder_image_with_indices.append((img_path, index))
+                            else:
+                                # インデックスが抽出できない場合は、ファイル名でソート
+                                folder_image_with_indices.append((img_path, basename))
+                    except Exception as e:
+                        print(f"ファイル名からインデックス抽出エラー: {basename} - {e}")
+                        # エラーの場合はファイル名でソート
+                        folder_image_with_indices.append((img_path, basename))
+
+                # このフォルダの画像をソート
+                folder_image_with_indices.sort(key=lambda x: x[1])
+                sorted_folder_images = [img_path for img_path, _ in folder_image_with_indices]
+
+                # フォルダの順番を維持して連結
+                all_images.extend(sorted_folder_images)
+                print(f"フォルダ '{folder_name}': ソート完了、全体に追加 (現在の合計: {len(all_images)}枚)")
+
         if progress.wasCanceled():
             return
-            
+
         progress.setLabelText("画像ファイルを確認中...")
-        progress.setValue(70)
+        progress.setValue(85)
         QApplication.processEvents()
-        
+
         if not all_images:
             progress.close()
             QMessageBox.warning(self, "エラー", "選択されたフォルダ内のimagesフォルダに画像ファイルがありません。")
             return
-        
-        print(f"{len(all_images)}枚の画像が見つかりました")
-        progress.setLabelText(f"{len(all_images)}枚の画像を処理中...")
-        progress.setValue(75)
-        QApplication.processEvents()
-        
-        # ファイル名からインデックスを抽出してソート（修正版）
-        progress.setLabelText("画像ファイルをソート中...")
-        progress.setValue(80)
-        QApplication.processEvents()
-        
-        image_with_indices = []
-        for img_idx, img_path in enumerate(all_images):
-            if progress.wasCanceled():
-                return
-                
-            basename = os.path.basename(img_path)
-            # ファイル名からインデックスを抽出
-            try:
-                # Jetracer形式を優先的にチェック: x_y_index_cam_image_array_.jpg -> index
-                # 例: 200_100_2_cam_image_array_.jpg -> 2
-                jetracer_match = re.match(r'^\d+_\d+_(\d+)_', basename)
-                if jetracer_match:
-                    index = int(jetracer_match.group(1))
-                    image_with_indices.append((img_path, index))
-                    print(f"Jetracer形式検出: {basename} -> インデックス {index}")
-                else:
-                    # 通常形式: 10900_cam_image_array_.jpg -> 10900
-                    normal_match = re.match(r'^(\d+)_', basename)
-                    if normal_match:
-                        index = int(normal_match.group(1))
-                        image_with_indices.append((img_path, index))
-                        print(f"通常形式検出: {basename} -> インデックス {index}")
-                    else:
-                        # インデックスが抽出できない場合は、高い値（後ろに配置）
-                        image_with_indices.append((img_path, float('inf')))
-                        print(f"インデックス抽出失敗: {basename} -> 末尾に配置")
-            except Exception as e:
-                print(f"ファイル名からインデックス抽出エラー: {basename} - {e}")
-                # エラーの場合も高い値で後ろに配置
-                image_with_indices.append((img_path, float('inf')))
-            
-            # ソート進捗の更新（100ファイルごと）
-            if img_idx % 100 == 0:
-                sort_progress = 80 + (img_idx * 5 // len(all_images))
-                progress.setValue(min(sort_progress, 85))
-                QApplication.processEvents()
-        
-        if progress.wasCanceled():
-            return
-            
-        # インデックスでソート
-        progress.setLabelText("画像ファイルの並び替え中...")
-        progress.setValue(85)
-        QApplication.processEvents()
-        
-        image_with_indices.sort(key=lambda x: x[1])
-        
-        # ソート後の画像パスリストを作成
-        images = [img_path for img_path, _ in image_with_indices]
+
+        print(f"全{len(image_folders)}フォルダから合計{len(all_images)}枚の画像を読み込みました（フォルダ順序維持）")
+
+        # ソート済みの画像パスリストを作成（既に各フォルダ内でソート済み＋フォルダ順で連結済み）
+        images = all_images
 
         # --- 画像グルーピング（インデックス＆キー単位） ---
         progress.setLabelText("画像データを整理中...")
@@ -12449,12 +12433,10 @@ class ImageAnnotationTool(QMainWindow):
                             print(f"画像 {img_path} の処理中にエラー: {e}")
                             continue
             
-            # 削除されたインデックスを設定（実際の画像インデックスとオリジナルのエントリインデックスの両方を含む）
+            # 削除されたインデックスを設定（実際の画像インデックスのみを使用）
             if deleted_actual_indexes:
                 # 実際の画像インデックスを設定
                 self.deleted_indexes.extend(deleted_actual_indexes)
-                # オリジナルのエントリインデックスも追加（既に読み込んだものに加えて）
-                self.deleted_indexes.extend(deleted_indexes)
                 # 重複を削除してソート
                 self.deleted_indexes = sorted(list(set(self.deleted_indexes)))
                 print(f"削除済みインデックスを設定: 実際の画像インデックス {len(deleted_actual_indexes)}個、総計 {len(self.deleted_indexes)}個")
