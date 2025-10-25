@@ -6331,7 +6331,7 @@ class ImageAnnotationTool(QMainWindow):
                 "translate": training_config['translate'],
                 "scale": training_config['scale'],
                 "erasing": training_config['erasing'],
-                "data_folder": os.path.basename(self.folder_path) if hasattr(self, 'folder_path') and self.folder_path else "unknown",
+                "data_folder": self.folder_path if hasattr(self, 'folder_path') and self.folder_path else "unknown",
                 "model_name": training_config.get('model_name', ''),
                 "comment": training_config.get('comment', '')
             }
@@ -14861,10 +14861,11 @@ class ImageAnnotationTool(QMainWindow):
                     "patience": patience if use_early_stopping else 0,
                     "early_stopped": training_results.get('early_stopped', False),
                     "initial_weights": "fine-tuned" if load_weights else "pretrained",
+                    "pretrained_model_name": selected_model if load_weights else None,
                     "augmentation_enabled": augmentation_params['enabled'],
                     "sampling_strategy": self._get_sampling_strategy_name(use_all, use_skip, use_range, skip_count),
                     "augmentation_params": augmentation_params,
-                    "data_folder": os.path.basename(self.folder_path) if hasattr(self, 'folder_path') and self.folder_path else "unknown",
+                    "data_folder": self.folder_path if hasattr(self, 'folder_path') and self.folder_path else "unknown",
                     "model_name": model_name,
                     "comment": comment
                 },
@@ -17220,9 +17221,9 @@ class ImageAnnotationTool(QMainWindow):
                 "estimation_method": "cnn_classification",  # 位置推論特有
                 "fixed_classes": dataset_info['num_classes'],
                 "actual_classes": dataset_info['actual_classes'],
-                "data_folder": os.path.basename(self.folder_path) if hasattr(self, 'folder_path') and self.folder_path else "unknown"
+                "data_folder": self.folder_path if hasattr(self, 'folder_path') and self.folder_path else "unknown"
             }
-            
+
             # MLflowに記録
             success = self.mlflow_manager.log_position_estimation_model(
                 model_path=training_results['best_model_path'],

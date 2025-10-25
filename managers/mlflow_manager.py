@@ -162,6 +162,7 @@ class MLflowManager:
             "early_stopping": "enabled" if training_params.get("use_early_stopping", False) else "disabled",
             "patience": training_params.get("patience", 0),
             "initial_weights": training_params.get("initial_weights", "pretrained"),
+            "pretrained_model_name": training_params.get("pretrained_model_name", None),
             "sampling_strategy": training_params.get("sampling_strategy", "all"),
             "augmentation_enabled": training_params.get("augmentation_enabled", False)
         }
@@ -224,9 +225,10 @@ class MLflowManager:
                 # タグを設定
                 mlflow.set_tags(tags)
                 
-                # パラメータをログ
+                # パラメータをログ（Noneは除外）
                 for key, value in params.items():
-                    mlflow.log_param(key, value)
+                    if value is not None:
+                        mlflow.log_param(key, value)
                 
                 # データセット情報をログ
                 for key, value in dataset_info.items():
@@ -330,9 +332,10 @@ class MLflowManager:
                 # タグを設定
                 mlflow.set_tags(tags)
                 
-                # パラメータをログ
+                # パラメータをログ（Noneは除外）
                 for key, value in params.items():
-                    mlflow.log_param(key, value)
+                    if value is not None:
+                        mlflow.log_param(key, value)
                 
                 # データセット情報をログ
                 for key, value in dataset_info.items():
@@ -576,9 +579,10 @@ class MLflowManager:
                 # タグを設定
                 mlflow.set_tags(tags)
                 
-                # パラメータをログ
+                # パラメータをログ（Noneは除外）
                 for key, value in params.items():
-                    mlflow.log_param(key, value)
+                    if value is not None:
+                        mlflow.log_param(key, value)
                 
                 # データセット情報をログ
                 for key, value in dataset_info.items():
@@ -647,9 +651,10 @@ class MLflowManager:
                 # タグを設定
                 mlflow.set_tags(tags)
                 
-                # パラメータをログ
+                # パラメータをログ（Noneは除外）
                 for key, value in params.items():
-                    mlflow.log_param(key, value)
+                    if value is not None:
+                        mlflow.log_param(key, value)
                 
                 # データセット情報をログ
                 for key, value in dataset_info.items():
