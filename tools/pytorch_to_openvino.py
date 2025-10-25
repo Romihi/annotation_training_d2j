@@ -411,18 +411,59 @@ def convert_pytorch_to_openvino(model_path, model_type, output_path=None, input_
                         output_shape = "動的形状"
                     print(f"  - 出力: {output_name}, 形状: {output_shape}")
                 
-                # テスト推論（CPU）
-                print("\nCPUでテスト推論を実行しています...")
+                # 変換前後の推論結果を比較
+                print("\n変換前後の推論結果を比較しています...")
+
+                # テスト入力の準備（固定のランダムシードで再現性を確保）
+                np.random.seed(42)
+                test_input = np.random.randn(1, 3, actual_input_size[0], actual_input_size[1]).astype(np.float32)
+
+                # PyTorchモデルで推論
+                print("  - PyTorchモデルで推論中...")
+                with torch.no_grad():
+                    torch_input = torch.from_numpy(test_input).to(device)
+                    pytorch_output = model(torch_input).cpu().numpy()
+                print(f"    PyTorch出力: 形状={pytorch_output.shape}, 範囲=[{pytorch_output.min():.6f}, {pytorch_output.max():.6f}]")
+
+                # OpenVINOモデルで推論
+                print("  - OpenVINOモデルで推論中...")
                 compiled_model = ie.compile_model(network, "CPU")
                 infer_request = compiled_model.create_infer_request()
-                
-                # テスト入力の準備
-                test_input = np.random.randn(1, 3, actual_input_size[0], actual_input_size[1]).astype(np.float32)
                 infer_request.infer({0: test_input})
-                
-                # 結果の取得
-                output = infer_request.get_output_tensor(0).data
-                print(f"テスト推論の結果: 形状={output.shape}")
+                openvino_output = infer_request.get_output_tensor(0).data
+                print(f"    OpenVINO出力: 形状={openvino_output.shape}, 範囲=[{openvino_output.min():.6f}, {openvino_output.max():.6f}]")
+
+                # 結果の比較
+                print("\n推論結果の比較:")
+                diff = np.abs(pytorch_output - openvino_output)
+                mse = np.mean((pytorch_output - openvino_output) ** 2)
+                mae = np.mean(diff)
+                max_diff = np.max(diff)
+
+                print(f"  - 平均二乗誤差 (MSE): {mse:.10f}")
+                print(f"  - 平均絶対誤差 (MAE): {mae:.10f}")
+                print(f"  - 最大絶対誤差: {max_diff:.10f}")
+
+                # 相対誤差も計算（ゼロ除算を避ける）
+                pytorch_abs = np.abs(pytorch_output)
+                nonzero_mask = pytorch_abs > 1e-10
+                if np.any(nonzero_mask):
+                    relative_diff = diff[nonzero_mask] / pytorch_abs[nonzero_mask]
+                    mean_relative_error = np.mean(relative_diff) * 100
+                    max_relative_error = np.max(relative_diff) * 100
+                    print(f"  - 平均相対誤差: {mean_relative_error:.6f}%")
+                    print(f"  - 最大相対誤差: {max_relative_error:.6f}%")
+
+                # 精度の評価
+                if max_diff < 1e-5:
+                    print("\n✓ 変換結果: 非常に高精度（誤差 < 1e-5）")
+                elif max_diff < 1e-4:
+                    print("\n✓ 変換結果: 高精度（誤差 < 1e-4）")
+                elif max_diff < 1e-3:
+                    print("\n✓ 変換結果: 良好（誤差 < 1e-3）")
+                else:
+                    print(f"\n⚠ 変換結果: 誤差が大きい可能性があります（最大誤差: {max_diff:.6f}）")
+
                 print("OpenVINO推論テストに成功しました")
                 
             except Exception as e:
