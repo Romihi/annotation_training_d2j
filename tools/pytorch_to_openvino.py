@@ -6,6 +6,7 @@ import argparse
 import torch
 import numpy as np
 from pathlib import Path
+import time
 
 def convert_onnx_to_openvino(onnx_path, output_path=None, precision='FP32', compress_to_fp16=False):
     """
@@ -487,21 +488,257 @@ def convert_pytorch_to_openvino(model_path, model_type, output_path=None, input_
         return None
 
 
+def convert_yolo_to_openvino(model_path, output_path=None, input_size=640,
+                             precision='FP32', compress_to_fp16=False, half=False):
+    """
+    YOLOモデル（Ultralytics）をOpenVINO形式に変換する
+
+    Args:
+        model_path: 変換するYOLOモデルのパス (.pt)
+        output_path: 出力ディレクトリパス (Noneの場合は自動生成)
+        input_size: 入力画像サイズ（デフォルト: 640）
+        precision: モデルの精度 (FP32, FP16, INT8)
+        compress_to_fp16: FP16に圧縮するかどうか
+        half: FP16モードで変換するかどうか
+
+    Returns:
+        変換されたOpenVINOモデルのパス
+    """
+    # 出力パスが指定されていない場合、元のファイル名を基に自動生成
+    if output_path is None:
+        base_path = os.path.splitext(model_path)[0]
+        output_path = f"{base_path}_openvino_model"
+
+    print(f"YOLOモデル '{model_path}' をOpenVINO形式に変換しています...")
+
+    try:
+        # Ultralyticsのインポート
+        try:
+            from ultralytics import YOLO
+        except ImportError:
+            print("Ultralyticsがインストールされていません。以下のコマンドでインストールしてください:")
+            print("pip install ultralytics")
+            return None
+
+        # YOLOモデルの読み込み
+        print("YOLOモデルを読み込んでいます...")
+        model = YOLO(model_path)
+
+        # モデル情報の表示
+        print(f"\nモデル情報:")
+        print(f"  - モデルタイプ: {model.model_name if hasattr(model, 'model_name') else 'YOLO'}")
+        print(f"  - 入力サイズ: {input_size}")
+
+        # テスト入力の準備（変換前の推論用）
+        print("\n変換前のPyTorchモデルで推論を実行...")
+        np.random.seed(42)
+        test_input = np.random.rand(input_size, input_size, 3).astype(np.uint8)
+
+        # PyTorchモデルで推論（時間計測）
+        start_time = time.time()
+        pytorch_results = model(test_input, verbose=False)
+        pytorch_time = time.time() - start_time
+
+        # PyTorch推論結果の取得
+        pytorch_boxes = pytorch_results[0].boxes
+        if pytorch_boxes is not None and len(pytorch_boxes) > 0:
+            pytorch_detections = {
+                'boxes': pytorch_boxes.xyxy.cpu().numpy() if pytorch_boxes.xyxy is not None else np.array([]),
+                'scores': pytorch_boxes.conf.cpu().numpy() if pytorch_boxes.conf is not None else np.array([]),
+                'classes': pytorch_boxes.cls.cpu().numpy() if pytorch_boxes.cls is not None else np.array([])
+            }
+            print(f"  - 検出数: {len(pytorch_detections['boxes'])}")
+            print(f"  - 推論時間: {pytorch_time*1000:.2f}ms")
+            if len(pytorch_detections['boxes']) > 0:
+                print(f"  - 信頼度範囲: [{pytorch_detections['scores'].min():.4f}, {pytorch_detections['scores'].max():.4f}]")
+        else:
+            pytorch_detections = {
+                'boxes': np.array([]),
+                'scores': np.array([]),
+                'classes': np.array([])
+            }
+            print(f"  - 検出数: 0")
+            print(f"  - 推論時間: {pytorch_time*1000:.2f}ms")
+
+        # OpenVINOへの変換
+        print("\nOpenVINO形式に変換しています...")
+        export_args = {
+            'format': 'openvino',
+            'imgsz': input_size,
+            'half': half or (precision == 'FP16') or compress_to_fp16,
+            'int8': precision == 'INT8'
+        }
+
+        # エクスポート実行
+        export_path = model.export(**export_args)
+
+        # エクスポートされたモデルのパスを確認
+        # Ultralyticsは通常 "model_name_openvino_model" というディレクトリを作成
+        if os.path.isdir(export_path):
+            openvino_dir = export_path
+        else:
+            # export_pathがファイルパスの場合、親ディレクトリを取得
+            openvino_dir = os.path.dirname(export_path)
+
+        # XMLファイルを探す
+        xml_files = list(Path(openvino_dir).glob("*.xml"))
+        if not xml_files:
+            print("エラー: OpenVINOモデルファイル(.xml)が見つかりません")
+            return None
+
+        xml_path = str(xml_files[0])
+        bin_path = xml_path.replace('.xml', '.bin')
+
+        if not os.path.exists(bin_path):
+            print("エラー: OpenVINOモデルファイル(.bin)が見つかりません")
+            return None
+
+        print(f"\n変換が完了しました！")
+        print(f"  - XMLファイル: {xml_path}")
+        print(f"  - BINファイル: {bin_path}")
+
+        # ファイルサイズの表示
+        model_size = os.path.getsize(model_path) / 1024 / 1024  # MB
+        openvino_size = (os.path.getsize(xml_path) + os.path.getsize(bin_path)) / 1024 / 1024  # MB
+
+        print(f"\nファイルサイズ:")
+        print(f"  - 元のYOLOモデル: {model_size:.1f} MB")
+        print(f"  - OpenVINOモデル: {openvino_size:.1f} MB")
+        if model_size > 0:
+            print(f"  - サイズ比率: {openvino_size/model_size*100:.1f}%")
+
+        # OpenVINOモデルでの推論テスト
+        try:
+            from openvino.runtime import Core
+
+            print("\n変換後のOpenVINOモデルで推論を実行...")
+            ie = Core()
+
+            # 利用可能なデバイスの表示
+            available_devices = ie.available_devices
+            print(f"利用可能なデバイス: {available_devices}")
+
+            # OpenVINOモデルの読み込みと推論（ディレクトリパスを指定）
+            openvino_model = YOLO(openvino_dir, task='detect')
+
+            # OpenVINOモデルで推論（時間計測）
+            start_time = time.time()
+            openvino_results = openvino_model(test_input, verbose=False)
+            openvino_time = time.time() - start_time
+
+            # OpenVINO推論結果の取得
+            openvino_boxes = openvino_results[0].boxes
+            if openvino_boxes is not None and len(openvino_boxes) > 0:
+                openvino_detections = {
+                    'boxes': openvino_boxes.xyxy.cpu().numpy() if openvino_boxes.xyxy is not None else np.array([]),
+                    'scores': openvino_boxes.conf.cpu().numpy() if openvino_boxes.conf is not None else np.array([]),
+                    'classes': openvino_boxes.cls.cpu().numpy() if openvino_boxes.cls is not None else np.array([])
+                }
+                print(f"  - 検出数: {len(openvino_detections['boxes'])}")
+                print(f"  - 推論時間: {openvino_time*1000:.2f}ms")
+                print(f"  - 高速化: {pytorch_time/openvino_time:.2f}x")
+                if len(openvino_detections['boxes']) > 0:
+                    print(f"  - 信頼度範囲: [{openvino_detections['scores'].min():.4f}, {openvino_detections['scores'].max():.4f}]")
+            else:
+                openvino_detections = {
+                    'boxes': np.array([]),
+                    'scores': np.array([]),
+                    'classes': np.array([])
+                }
+                print(f"  - 検出数: 0")
+                print(f"  - 推論時間: {openvino_time*1000:.2f}ms")
+                print(f"  - 高速化: {pytorch_time/openvino_time:.2f}x")
+
+            # 検出結果の比較
+            print("\n推論結果の比較:")
+            pytorch_count = len(pytorch_detections['boxes'])
+            openvino_count = len(openvino_detections['boxes'])
+
+            print(f"  - PyTorch検出数: {pytorch_count}")
+            print(f"  - OpenVINO検出数: {openvino_count}")
+
+            if pytorch_count > 0 and openvino_count > 0:
+                # 検出数が同じ場合は詳細比較
+                if pytorch_count == openvino_count:
+                    # バウンディングボックスの誤差
+                    box_diff = np.abs(pytorch_detections['boxes'] - openvino_detections['boxes'])
+                    max_box_diff = np.max(box_diff)
+                    mean_box_diff = np.mean(box_diff)
+
+                    # 信頼度の誤差
+                    score_diff = np.abs(pytorch_detections['scores'] - openvino_detections['scores'])
+                    max_score_diff = np.max(score_diff)
+                    mean_score_diff = np.mean(score_diff)
+
+                    # クラスの一致率
+                    class_match = np.sum(pytorch_detections['classes'] == openvino_detections['classes']) / pytorch_count * 100
+
+                    print(f"  - バウンディングボックス平均誤差: {mean_box_diff:.4f} ピクセル")
+                    print(f"  - バウンディングボックス最大誤差: {max_box_diff:.4f} ピクセル")
+                    print(f"  - 信頼度平均誤差: {mean_score_diff:.6f}")
+                    print(f"  - 信頼度最大誤差: {max_score_diff:.6f}")
+                    print(f"  - クラス一致率: {class_match:.1f}%")
+
+                    # 精度の評価
+                    if max_box_diff < 1.0 and max_score_diff < 0.01 and class_match == 100:
+                        print("\n✓ 変換結果: 非常に高精度")
+                    elif max_box_diff < 5.0 and max_score_diff < 0.05 and class_match >= 90:
+                        print("\n✓ 変換結果: 高精度")
+                    elif max_box_diff < 10.0 and max_score_diff < 0.1 and class_match >= 80:
+                        print("\n✓ 変換結果: 良好")
+                    else:
+                        print(f"\n⚠ 変換結果: 誤差が大きい可能性があります")
+                else:
+                    diff_count = abs(pytorch_count - openvino_count)
+                    diff_percent = diff_count / max(pytorch_count, openvino_count) * 100
+                    print(f"  - 検出数の差: {diff_count} ({diff_percent:.1f}%)")
+
+                    if diff_percent < 10:
+                        print("\n✓ 変換結果: 良好（検出数の差は小さい）")
+                    else:
+                        print(f"\n⚠ 検出数に差があります（{diff_percent:.1f}%）")
+            elif pytorch_count == 0 and openvino_count == 0:
+                print("\n✓ 変換結果: 一致（両方とも検出なし）")
+            else:
+                print("\n⚠ 検出結果が大きく異なります")
+
+            print("\nOpenVINO推論テストに成功しました")
+
+        except Exception as e:
+            print(f"OpenVINOモデルの検証中にエラーが発生しました: {e}")
+            import traceback
+            traceback.print_exc()
+
+        return xml_path
+
+    except Exception as e:
+        print(f"変換中にエラーが発生しました: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 def main():
-    parser = argparse.ArgumentParser(description='PyTorchまたはONNXモデルをOpenVINO形式に変換するスクリプト')
+    parser = argparse.ArgumentParser(description='PyTorch、YOLO、またはONNXモデルをOpenVINO形式に変換するスクリプト')
     parser.add_argument('--model_path', type=str, required=True, help='変換するモデルのパス（.pth, .pt, .onnx）')
-    parser.add_argument('--model_type', type=str, help='モデルタイプ (例: resnet18) - PyTorchモデルの場合は必須')
+    parser.add_argument('--model_type', type=str, help='モデルタイプ (例: resnet18, yolo) - PyTorchモデルの場合は必須')
     parser.add_argument('--output_path', type=str, default=None, help='出力OpenVINOモデルのパス（省略可）')
     parser.add_argument('--width', type=int, default=224, help='入力画像の幅（PyTorchモデルの場合）')
     parser.add_argument('--height', type=int, default=224, help='入力画像の高さ（PyTorchモデルの場合）')
+    parser.add_argument('--input_size', type=int, default=640, help='入力画像サイズ（YOLOモデルの場合）')
     parser.add_argument('--precision', type=str, default='FP32', choices=['FP32', 'FP16', 'INT8'], help='モデルの精度')
     parser.add_argument('--compress_to_fp16', action='store_true', help='FP32モデルをFP16に圧縮')
-    
+
     args = parser.parse_args()
-    
+
     # ファイル拡張子を確認
     file_ext = os.path.splitext(args.model_path)[1].lower()
-    
+
+    # パス全体からYOLOモデルかどうかを判定（ファイル名だけでなくディレクトリ名も含む）
+    model_path_lower = args.model_path.lower()
+    is_yolo = ('yolo' in model_path_lower or
+               (args.model_type and 'yolo' in args.model_type.lower()))
+
     if file_ext == '.onnx':
         # ONNXモデルをOpenVINO形式に変換
         print("ONNXモデルを検出しました。")
@@ -512,21 +749,33 @@ def main():
             compress_to_fp16=args.compress_to_fp16
         )
     elif file_ext in ['.pth', '.pt']:
-        # PyTorchモデルをOpenVINO形式に変換
-        print("PyTorchモデルを検出しました。")
-        if not args.model_type:
-            print("エラー: PyTorchモデルの場合は --model_type が必須です。")
-            parser.print_help()
-            return
-        
-        convert_pytorch_to_openvino(
-            model_path=args.model_path,
-            model_type=args.model_type,
-            output_path=args.output_path,
-            input_size=(args.height, args.width),
-            precision=args.precision,
-            compress_to_fp16=args.compress_to_fp16
-        )
+        if is_yolo:
+            # YOLOモデルをOpenVINO形式に変換
+            print("YOLOモデルを検出しました。")
+            convert_yolo_to_openvino(
+                model_path=args.model_path,
+                output_path=args.output_path,
+                input_size=args.input_size,
+                precision=args.precision,
+                compress_to_fp16=args.compress_to_fp16
+            )
+        else:
+            # PyTorchモデルをOpenVINO形式に変換
+            print("PyTorchモデルを検出しました。")
+            if not args.model_type:
+                print("エラー: PyTorchモデルの場合は --model_type が必須です。")
+                print("YOLOモデルの場合は --model_type yolo を指定するか、ファイル名に 'yolo' を含めてください。")
+                parser.print_help()
+                return
+
+            convert_pytorch_to_openvino(
+                model_path=args.model_path,
+                model_type=args.model_type,
+                output_path=args.output_path,
+                input_size=(args.height, args.width),
+                precision=args.precision,
+                compress_to_fp16=args.compress_to_fp16
+            )
     else:
         print(f"エラー: サポートされていないファイル形式です: {file_ext}")
         print("サポートされている形式: .pth, .pt, .onnx")

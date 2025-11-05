@@ -16271,26 +16271,27 @@ class ImageAnnotationTool(QMainWindow):
     def refresh_location_model_list(self):
         """保存されている位置モデルのリストを更新 - 選択したタイプでフィルタリング"""
         self.location_saved_model_combo.clear()
-        
+
         # 更新開始のメッセージを表示
         self.statusBar().showMessage("位置モデルリストを更新中...")
-        
+
         # 現在選択されているモデルタイプを取得
         selected_model_type = self.location_model_combo.currentText()
-        
+
         # モデルマネージャーからモデルリストを取得 - タイプ指定
         model_files = self.location_model_manager.get_model_list(model_type=selected_model_type)
-        
+
         if not model_files:
             # フィルタリングした結果がなければ、その旨を表示
             self.location_saved_model_combo.addItem(f"{selected_model_type}の位置モデルが見つかりません")
             self.statusBar().showMessage(f"{selected_model_type}の位置モデルが見つかりません。モデルを学習してください", 3000)
             return
-        
-        # コンボボックスに追加
+
+        # コンボボックスに追加（モデル名のみを表示、フルパスはユーザーデータとして保持）
         for model_file in model_files:
-            self.location_saved_model_combo.addItem(model_file)
-        
+            display_name = os.path.basename(model_file).replace('.pth', '')
+            self.location_saved_model_combo.addItem(display_name, model_file)
+
         # 更新完了メッセージ
         self.statusBar().showMessage(f"{len(model_files)}個の{selected_model_type}位置モデルを読み込みました", 3000)
 
@@ -16299,26 +16300,28 @@ class ImageAnnotationTool(QMainWindow):
         if not self.images:
             QMessageBox.warning(self, "警告", "画像が読み込まれていません。")
             return
-        
+
         # モデル情報を取得
         model_type = self.location_model_combo.currentText()
-        selected_model = self.location_saved_model_combo.currentText()
-        
-        if selected_model == "位置モデルが見つかりません" or selected_model == "フォルダを選択してください":
+        selected_model_path = self.location_saved_model_combo.currentData()
+
+        if not selected_model_path:
             QMessageBox.warning(self, "警告", "有効な位置モデルが選択されていません。")
             return
-        
-        # モデルのパスを取得
-        model_path = os.path.join(models_dir, selected_model)
+
+        # モデルのパスを取得（フルパスがユーザーデータに保存されている）
+        model_path = selected_model_path
         
         # モデルが存在するか確認
         if not os.path.exists(model_path):
-            QMessageBox.warning(self, "警告", f"選択されたモデルが見つかりません: {selected_model}")
+            model_name = os.path.basename(model_path)
+            QMessageBox.warning(self, "警告", f"選択されたモデルが見つかりません: {model_name}")
             return
-        
+
         # 進捗ダイアログを表示
+        model_name = os.path.basename(model_path).replace('.pth', '')
         progress = QProgressDialog(
-            f"位置モデル '{model_type} ({selected_model})' を読み込み中...", 
+            f"位置モデル '{model_type} ({model_name})' を読み込み中...", 
             "キャンセル", 0, 100, self
         )
         progress.setWindowTitle("モデル読み込み")
@@ -16383,9 +16386,9 @@ class ImageAnnotationTool(QMainWindow):
             
             update_progress(100)
             progress.close()
-            
+
             # 成功メッセージ
-            self.statusBar().showMessage(f"位置モデル '{model_type} ({selected_model})' を読み込みました (クラス数: {num_classes})", 5000)
+            self.statusBar().showMessage(f"位置モデル '{model_type} ({model_name})' を読み込みました (クラス数: {num_classes})", 5000)
             
         except Exception as e:
             progress.close()
@@ -17009,11 +17012,17 @@ class ImageAnnotationTool(QMainWindow):
         stopped_epoch = 0
         
         # 保存ディレクトリとファイル名
-        models_dir = os.path.join(self.folder_path, "models")
+        models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
         os.makedirs(models_dir, exist_ok=True)
 
-        # カスタムモデル名が指定されていればそれを使用
-        save_name = training_config.get('model_name', '') if training_config.get('model_name') else model_type
+        # カスタムモデル名が指定されていればそれを使用、ただしモデルタイプを必ず含める
+        custom_name = training_config.get('model_name', '').strip()
+        if custom_name:
+            # カスタム名がある場合: モデルタイプ_カスタム名 の形式
+            save_name = f"{model_type}_{custom_name}"
+        else:
+            # カスタム名がない場合: モデルタイプのみ
+            save_name = model_type
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         model_path = os.path.join(models_dir, f'{save_name}.pth')
@@ -17563,8 +17572,14 @@ class ImageAnnotationTool(QMainWindow):
                 best_val_loss = val_loss
                 # 最初のエポックで保存パスを設定（タイムスタンプを固定）
                 if best_model_path is None:
-                    # カスタムモデル名が指定されていればそれを使用
-                    save_name = training_config.get('model_name', '') if training_config.get('model_name') else model_type
+                    # カスタムモデル名が指定されていればそれを使用、ただしモデルタイプを必ず含める
+                    custom_name = training_config.get('model_name', '').strip()
+                    if custom_name:
+                        # カスタム名がある場合: モデルタイプ_カスタム名 の形式
+                        save_name = f"{model_type}_{custom_name}"
+                    else:
+                        # カスタム名がない場合: モデルタイプのみ
+                        save_name = model_type
                     model_filename = f"{save_name}.pth"
                     best_model_path = os.path.join(models_dir, model_filename)
 
