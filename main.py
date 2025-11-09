@@ -154,6 +154,10 @@ class ImageLabel(QLabel):
         self.hovering_polygon_index = None
         self.hovering_vertex_index = None
         self.vertex_radius = SEGMENTATION_VERTEX_RADIUS
+
+        # マウス座標表示関連
+        self.current_mouse_pos = None  # 現在のマウス位置
+        self.normalized_coords = None  # 正規化座標 (x, y) -1～1の範囲
     
     def add_point_to_polygon(self, polygon_index, x, y):
         """指定されたポリゴンに新しい点を追加する"""
@@ -449,6 +453,9 @@ class ImageLabel(QLabel):
         self.draw_waypoints(self.pix_width, self.pix_height, painter, self.target_rect)
         # アノテーション点、推論点、差分ベクトルを最後に描画（上に表示）
         self.draw_control_points(painter, self.target_rect)
+
+        # マウス座標表示（最後に描画して常に最前面に）
+        self.draw_mouse_coordinates(painter)
 
         painter.end()
 
@@ -946,6 +953,63 @@ class ImageLabel(QLabel):
         
         arrow_polygon = QPolygon(arrow_points)
         painter.drawPolygon(arrow_polygon)
+
+    def draw_mouse_coordinates(self, painter: QPainter):
+        """マウスカーソルの右上に正規化座標を表示"""
+        if self.current_mouse_pos is None or self.normalized_coords is None:
+            return
+
+        x_norm, y_norm = self.normalized_coords
+        pos = self.current_mouse_pos
+
+        # 表示テキストを作成
+        text_lines = [
+            f"x: {x_norm:+.3f}",
+            f"y: {y_norm:+.3f}"
+        ]
+
+        # フォントとサイズ設定
+        font = QFont("Arial", 10, QFont.Bold)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+
+        # テキストの幅と高さを計算
+        max_width = max(metrics.horizontalAdvance(line) for line in text_lines)
+        line_height = metrics.height()
+        total_height = line_height * len(text_lines)
+
+        # 表示位置（カーソルの右上）
+        offset_x = 15
+        offset_y = -10
+        text_x = pos.x() + offset_x
+        text_y = pos.y() + offset_y
+
+        # ウィンドウの端を超えないように調整
+        if text_x + max_width + 10 > self.width():
+            text_x = pos.x() - offset_x - max_width - 10  # 左側に表示
+        if text_y - total_height - 10 < 0:
+            text_y = pos.y() + offset_y + total_height + 20  # 下側に表示
+
+        # 背景矩形を描画（半透明の黒背景）
+        padding = 5
+        bg_rect = QRect(
+            text_x - padding,
+            text_y - total_height - padding,
+            max_width + padding * 2,
+            total_height + padding * 2
+        )
+        bg_color = QColor(0, 0, 0, 180)
+        painter.fillRect(bg_rect, bg_color)
+
+        # 枠線を描画
+        painter.setPen(QPen(QColor(100, 200, 255), 2))
+        painter.drawRect(bg_rect)
+
+        # テキストを描画
+        painter.setPen(QPen(Qt.white))
+        for i, line in enumerate(text_lines):
+            y_position = text_y - total_height + line_height * (i + 1) - 3
+            painter.drawText(text_x, y_position, line)
 
     def draw_segmentation_inference_results(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
         """セグメンテーション推論結果の描画"""
@@ -2130,19 +2194,26 @@ class ImageLabel(QLabel):
                     self.setCursor(Qt.OpenHandCursor)
                 else:
                     self.setCursor(Qt.ArrowCursor)
-                
+
                 self.update()
+
+        # マウス座標表示の更新（mouseMoveEventの最後で全モード共通）
+        self._update_mouse_coordinates(event.pos())
 
     def leaveEvent(self, event):
         """マウスがウィジェットから離れた時の処理"""
-        self.setCursor(Qt.ArrowCursor)  
+        self.setCursor(Qt.ArrowCursor)
         self.hovering_bbox_index = None
-        
+
         # セグメンテーション関連のホバー状態もクリア
         self.hovering_segmentation_index = None
         self.hovering_polygon_index = None
         self.hovering_vertex_index = None
-        
+
+        # マウス座標表示もクリア
+        self.current_mouse_pos = None
+        self.normalized_coords = None
+
         self.update()  # 画面を更新してホバー効果を消す
         super().leaveEvent(event)
     
@@ -2296,14 +2367,52 @@ class ImageLabel(QLabel):
         # ホバー状態が変わった場合は再描画
         if hover_index != self.hovering_bbox_index:
             self.hovering_bbox_index = hover_index
-            
+
             # カーソルを更新
             if hover_index is not None:
                 self.setCursor(Qt.OpenHandCursor)  # バウンディングボックス上では手の形
             else:
                 self.setCursor(Qt.ArrowCursor)  # 通常は矢印
-            
+
             self.update()  # 再描画
+
+    def _update_mouse_coordinates(self, pos):
+        """マウス座標を更新して正規化座標を計算"""
+        if not self.pixmap():
+            self.current_mouse_pos = None
+            self.normalized_coords = None
+            self.update()
+            return
+
+        # 画像の表示領域を取得
+        if not hasattr(self, 'target_rect') or not self.target_rect.contains(pos):
+            # 画像外の場合はクリア
+            self.current_mouse_pos = None
+            self.normalized_coords = None
+            self.update()
+            return
+
+        # 画像内の相対位置を計算
+        rel_x = (pos.x() - self.target_rect.x()) / self.target_rect.width()
+        rel_y = (pos.y() - self.target_rect.y()) / self.target_rect.height()
+
+        # 元の画像の座標に変換
+        orig_x = int(rel_x * self.pix_width)
+        orig_y = int(rel_y * self.pix_height)
+
+        # 正規化座標を計算 (x: -1～1, y: -1～1)
+        # X座標を-1（左）から1（右）に変換
+        x_norm = (rel_x * 2) - 1
+
+        # Y座標を1（上）から-1（下）に変換
+        y_norm = -((rel_y * 2) - 1)
+
+        # 座標を保存
+        self.current_mouse_pos = pos
+        self.normalized_coords = (x_norm, y_norm)
+
+        # 再描画をトリガー
+        self.update()
 
     def complete_segmentation_polygon(self):
         """ポリゴンを完了してクラス選択を行う"""
@@ -2792,6 +2901,21 @@ class ImageAnnotationTool(QMainWindow):
         self.inference_debounce_timer.setSingleShot(True)
         self.inference_debounce_timer.timeout.connect(self.execute_slider_inference)
         self.inference_debounce_delay = 300  # 300ms後に推論実行
+
+        # 分布グラフ更新デバウンス用タイマー
+        self.graph_update_timer = QTimer()
+        self.graph_update_timer.setSingleShot(True)
+        self.graph_update_timer.timeout.connect(self._execute_distribution_graph_update)
+        self.graph_update_delay = 500  # 500ms後にグラフ更新
+
+        # ギャラリー更新デバウンス用タイマー
+        self.gallery_update_timer = QTimer()
+        self.gallery_update_timer.setSingleShot(True)
+        self.gallery_update_timer.timeout.connect(self._execute_gallery_update)
+        self.gallery_update_delay = 150  # 150ms後にギャラリー更新
+
+        # 画像サイズキャッシュ（パフォーマンス改善）
+        self.image_size_cache = {}  # {image_path: (width, height)}
         
         # 推論結果のキャッシュ
         self.inference_results = {}
@@ -3894,6 +4018,28 @@ class ImageAnnotationTool(QMainWindow):
             print(f"分布グラフ作成中にエラー: {str(e)}")
             traceback.print_exc()
             self.distribution_label.setText(f"グラフ作成エラー: {str(e)}")
+
+    def _schedule_distribution_graph_update(self):
+        """分布グラフ更新をスケジュール（デバウンス処理）"""
+        # 既存のタイマーをリセットして新たにスケジュール
+        if hasattr(self, 'graph_update_timer'):
+            self.graph_update_timer.stop()
+            self.graph_update_timer.start(self.graph_update_delay)
+
+    def _execute_distribution_graph_update(self):
+        """分布グラフ更新を実際に実行（タイマーから呼ばれる）"""
+        self.update_distribution_graph()
+
+    def _schedule_gallery_update(self):
+        """ギャラリー更新をスケジュール（デバウンス処理）"""
+        # 既存のタイマーをリセットして新たにスケジュール
+        if hasattr(self, 'gallery_update_timer'):
+            self.gallery_update_timer.stop()
+            self.gallery_update_timer.start(self.gallery_update_delay)
+
+    def _execute_gallery_update(self):
+        """ギャラリー更新を実際に実行（タイマーから呼ばれる）"""
+        self.update_gallery()
 
     def update_segmentation_stats(self):
         """セグメンテーションアノテーションの統計情報を更新"""
@@ -10339,13 +10485,13 @@ class ImageAnnotationTool(QMainWindow):
             
         # 削除したインデックスをソートして保持（重複を排除）
         self.deleted_indexes = sorted(list(set(self.deleted_indexes)))
-                
-        # UI更新
+
+        # UI更新 - 重い処理は遅延実行
         self.display_current_image()
-        self.update_gallery()
+        self._schedule_gallery_update()  # 遅延更新
         if hasattr(self, 'update_location_button_counts'):
             self.update_location_button_counts()
-        self.update_distribution_graph()
+        self._schedule_distribution_graph_update()  # 遅延更新
         self.update_slider_deleted_indexes()
         
         QMessageBox.information(
@@ -10421,15 +10567,15 @@ class ImageAnnotationTool(QMainWindow):
 
         # 削除したインデックスをソートして重複を排除
         self.deleted_indexes = sorted(list(set(self.deleted_indexes)))
-        
+
         # アノテーション数を更新
         self.annotated_count = len(self.annotations)
-        
-        # UI更新
+
+        # UI更新 - 重い処理は遅延実行
         self.display_current_image()
-        self.update_gallery()
+        self._schedule_gallery_update()  # 遅延更新
         self.update_location_button_counts()
-        self.update_distribution_graph()
+        self._schedule_distribution_graph_update()  # 遅延更新
         self.update_slider_deleted_indexes()
         
         QMessageBox.information(
@@ -13128,45 +13274,49 @@ class ImageAnnotationTool(QMainWindow):
                 # 既にある結果の表示を更新
                 self.update_segmentation_inference_display()
 
-        # 画面を更新
-        self.update_gallery()
+        # 画面を更新 - ギャラリーは遅延更新でパフォーマンス改善
+        self._schedule_gallery_update()  # デバウンスで遅延更新
         self.update_inference_display()
-        
+
         # 位置アノテーション数の表示を更新
         self.update_location_button_counts()
 
     def handle_annotation(self, x, y):
-        """画像のアノテーションを処理する - 削除済み画像への再アノテーションをサポート"""
+        """画像のアノテーションを処理する - 削除済み画像への再アノテーションをサポート（パフォーマンス最適化版）"""
         if not self.images:
             return
-        
+
         current_img_path = self.images[self.current_index]
-        
-        # Get image dimensions
-        img = Image.open(current_img_path)
-        width, height = img.size
-        
+
+        # Get image dimensions (キャッシュを使用してImage.open()を削減)
+        if current_img_path in self.image_size_cache:
+            width, height = self.image_size_cache[current_img_path]
+        else:
+            img = Image.open(current_img_path)
+            width, height = img.size
+            self.image_size_cache[current_img_path] = (width, height)
+
         # Get normalized coordinates
         angle, throttle = normalize_coordinates(x, y, width, height)
-        
+
         # Store current state in history before changing
         if current_img_path in self.annotations:
             previous = self.annotations.copy()
             self.annotation_history.append(previous)
-        
+
         # 削除済みインデックスの場合、削除リストから削除
         if hasattr(self, 'deleted_indexes') and self.current_index in self.deleted_indexes:
             # 現在のインデックスを削除済みリストから除外
             self.deleted_indexes.remove(self.current_index)
-        
+
         # Update annotation for this image
         if self.current_index not in self.annotations:
             self.annotated_count += 1
-        
+
         # アノテーション時のタイムスタンプを保存（ミリ秒）
         current_timestamp = int(time.time() * 1000)
         self.annotation_timestamps[self.current_index] = current_timestamp
-        
+
         self.annotations[self.current_index] = {
             "angle": angle,
             "throttle": throttle,
@@ -13178,49 +13328,50 @@ class ImageAnnotationTool(QMainWindow):
         if self.current_location is not None:
             self.annotations[self.current_index]["loc"] = self.current_location
             # 位置情報アノテーションも更新
-            self.location_annotations[self.current_index] = self.current_location 
+            self.location_annotations[self.current_index] = self.current_location
 
-        # 位置ボタンのカウント表示を更新
+        # 位置ボタンのカウント表示を更新（軽い処理なので同期実行）
         self.update_location_button_counts()
 
-        # Update UI
-        ###
-        self.update_ui()
-        self.display_current_image()
-        self.update_gallery()
-        self.update_distribution_graph()
-        self.update_slider_deleted_indexes()
+        # Update UI - 軽い処理は即座に実行、重い処理は非同期化
+        self.update_ui()  # 軽量なので即座に実行
+        self.display_current_image()  # 現在の画像表示は即座に更新（重要）
+
+        # 重い処理はデバウンスタイマーで遅延実行（連打対応）
+        self._schedule_gallery_update()  # ギャラリー更新を遅延
+        self._schedule_distribution_graph_update()  # グラフ更新を遅延
+        self.update_slider_deleted_indexes()  # スライダーは即座に更新（軽量）
 
     def restore_deleted_annotation(self):
         """現在表示中の削除済みの画像を復元する（削除状態を解除する）"""
         if not self.images or not hasattr(self, 'deleted_indexes'):
             return
-                
+
         # 削除済みリストから削除
         self.deleted_indexes.remove(self.current_index)
-        
-        # UI更新
+
+        # UI更新 - 重い処理は遅延実行
         self.display_current_image()
-        self.update_gallery()
-        self.update_distribution_graph()
+        self._schedule_gallery_update()  # 遅延更新
+        self._schedule_distribution_graph_update()  # 遅延更新
 
     def restore_all_deleted_annotations(self):
         """全ての削除済みアノテーションの状態を復元する"""
         if not self.images or not hasattr(self, 'deleted_indexes') or not self.deleted_indexes:
             QMessageBox.information(
-                self, 
-                "情報", 
+                self,
+                "情報",
                 "復元する削除済みのアノテーションがありません。"
             )
             return
-                        
+
         # 削除済みリストをクリア
         self.deleted_indexes = []
-        
-        # UI更新
+
+        # UI更新 - 重い処理は遅延実行
         self.display_current_image()
-        self.update_gallery()
-        self.update_distribution_graph()
+        self._schedule_gallery_update()  # 遅延更新
+        self._schedule_distribution_graph_update()  # 遅延更新
         self.update_slider_deleted_indexes()
     
 
