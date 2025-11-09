@@ -106,10 +106,24 @@ def export_to_donkey(
         original_index = entry["index"]
         annotation = entry["annotation"]
         assigned_index = i  # 連番を割り当て
-        
+
         # 画像マップからこのインデックスの画像パスを取得
+        # image_mapのキーはactual_indexなので、annotationsのキーから検索
         variant_images = {}
-        if image_map and original_index in image_map:
+
+        # annotationsの元のキーを取得（actual_indexの可能性がある）
+        actual_index = None
+        for key, anno in annotations.items():
+            if anno == annotation:
+                if isinstance(key, int):
+                    actual_index = key
+                break
+
+        # actual_indexでimage_mapを検索
+        if image_map and actual_index is not None and actual_index in image_map:
+            variant_images = image_map[actual_index]
+        # フォールバック: original_indexでも検索（後方互換性）
+        elif image_map and original_index in image_map:
             variant_images = image_map[original_index]
         elif isinstance(original_index, int) and images_list and 0 <= original_index < len(images_list):
             # 後方互換性のため単一リストからも取得
@@ -123,9 +137,9 @@ def export_to_donkey(
             except:
                 pass
             variant_images[variant] = img_path
-        
+
         if not variant_images:
-            print(f"警告: インデックス {original_index} の画像が見つかりません。このエントリはスキップします。")
+            print(f"警告: インデックス {original_index} (actual: {actual_index}) の画像が見つかりません。このエントリはスキップします。")
             continue
         
         # タイムスタンプ

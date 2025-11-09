@@ -867,11 +867,6 @@ class ImageLabel(QLabel):
 
         # 赤：アノテーション点（教師データ）
         if self.annotation_point:
-            print(f"[DEBUG] draw_control_points: アノテーションポイントを描画 ({self.annotation_point.x()}, {self.annotation_point.y()})")
-        else:
-            print(f"[DEBUG] draw_control_points: アノテーションポイントなし")
-
-        if self.annotation_point:
             rel_x = self.annotation_point.x() / pix_width
             rel_y = self.annotation_point.y() / pix_height
             scaled_x = int(target_rect.x() + rel_x * target_rect.width())
@@ -6402,7 +6397,7 @@ class ImageAnnotationTool(QMainWindow):
         training_settings = QDialog(self)
         training_settings.setWindowTitle(f"YOLO{task_name}モデル学習設定")
         training_settings.setMinimumWidth(500)
-        training_settings.setMinimumHeight(600)
+        training_settings.setMinimumHeight(750)
         
         settings_layout = QVBoxLayout(training_settings)
         
@@ -7338,7 +7333,7 @@ class ImageAnnotationTool(QMainWindow):
         
         # 削除したインデックスの情報表示
         if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
-            deletion_info = QLabel(f"削除済みインデックス数: {len(self.deleted_indexes)}個（エクスポートから除外されます）")
+            deletion_info = QLabel(f"削除済みインデックス数: {len(self.deleted_indexes)}個（削除情報も併せてエクスポートされます）")
             deletion_info.setStyleSheet("color: #666; font-style: italic;")
             layout.addWidget(deletion_info)
         
@@ -7373,31 +7368,23 @@ class ImageAnnotationTool(QMainWindow):
                 QMessageBox.warning(self, "警告", "画像ソースが選択されていません。")
                 return None
             
-            # 画像マップを作成
+            # 画像マップを作成（actual_indexをキーとして使用）
             for variant in selected_variants:
                 variant_images = self.variant_images.get(variant, [])
                 if not variant_images:
                     continue
-                    
+
                 for img_path in variant_images:
                     try:
-                        basename = os.path.basename(img_path)
-                        # 通常形式とJetracer形式の両方に対応
-                        normal_match = re.match(r'^(\d+)_', basename)
-                        jetracer_match = re.match(r'^\d+_\d+_(\d+)_', basename)
-                        
-                        if normal_match:
-                            idx = int(normal_match.group(1))
-                        elif jetracer_match:
-                            idx = int(jetracer_match.group(1))
-                        else:
-                            continue
-                            
-                        if idx not in image_map:
-                            image_map[idx] = {}
-                        image_map[idx][variant] = img_path
+                        # self.imagesリストからactual_indexを取得
+                        if img_path in self.images:
+                            actual_idx = self.images.index(img_path)
+
+                            if actual_idx not in image_map:
+                                image_map[actual_idx] = {}
+                            image_map[actual_idx][variant] = img_path
                     except Exception as e:
-                        print(f"インデックス抽出エラー ({img_path}): {e}")
+                        print(f"画像マップ作成エラー ({img_path}): {e}")
         else:
             # 他のエクスポート形式の場合はデフォルト値を設定
             selected_variants = ["cam"]  # デフォルト
@@ -10347,13 +10334,8 @@ class ImageAnnotationTool(QMainWindow):
         if reply == QMessageBox.No:
             return
         
-        # 削除したインデックスを記録
-        # 元のインデックスがある場合はそれを使用
-        if self.current_index in self.annotations and "original_index" in self.annotations[self.current_index]:
-            original_index = self.annotations[self.current_index]["original_index"]
-            self.deleted_indexes.append(original_index)
-        else:
-            self.deleted_indexes.append(self.current_index)
+        # 削除したインデックスを記録（統合リスト上のactual_indexを使用）
+        self.deleted_indexes.append(self.current_index)
             
         # 削除したインデックスをソートして保持（重複を排除）
         self.deleted_indexes = sorted(list(set(self.deleted_indexes)))
@@ -10432,15 +10414,9 @@ class ImageAnnotationTool(QMainWindow):
             # すでに削除済みの場合はスキップ
             if idx in self.deleted_indexes:
                 continue
-                
-            # 削除したインデックスを記録
-            # 元のインデックスがある場合はそれを使用
-            if idx in self.annotations and "original_index" in self.annotations[idx]:
-                original_index = self.annotations[idx]["original_index"]
-                self.deleted_indexes.append(original_index)
-            else:
-                self.deleted_indexes.append(idx)
-            
+
+            # 削除したインデックスを記録（統合リスト上のactual_indexを使用）
+            self.deleted_indexes.append(idx)
             marked_as_deleted_count += 1
 
         # 削除したインデックスをソートして重複を排除
@@ -11465,7 +11441,7 @@ class ImageAnnotationTool(QMainWindow):
         self.annotation_timestamps = {}
         self.inference_results = {}
         self.location_annotations = {}
-        
+
         if hasattr(self, 'deleted_indexes'):
             self.deleted_indexes = []
 
@@ -11666,8 +11642,6 @@ class ImageAnnotationTool(QMainWindow):
                         loaded_in_dir = len(self.annotations) - annotations_before
                         annotations_by_dir[parent_dir] = loaded_in_dir
                         loaded_count += loaded_in_dir
-                        print(f"親ディレクトリ {parent_dir} から {loaded_in_dir} 個のアノテーションを読み込みました")
-                        print(f"  現在の合計アノテーション数: {len(self.annotations)}")
                 else:
                     # カタログファイルの確認（parent_dir直下のみ）
                     try:
@@ -11679,8 +11653,6 @@ class ImageAnnotationTool(QMainWindow):
                                 loaded_in_dir = len(self.annotations) - annotations_before
                                 annotations_by_dir[parent_dir] = loaded_in_dir
                                 loaded_count += loaded_in_dir
-                                print(f"親ディレクトリ {parent_dir} から {loaded_in_dir} 個のアノテーションを読み込みました")
-                        print(f"  現在の合計アノテーション数: {len(self.annotations)}")
                     except Exception as e:
                         print(f"カタログファイル検索エラー {parent_dir}: {e}")
                             
@@ -11688,20 +11660,6 @@ class ImageAnnotationTool(QMainWindow):
             progress.close()
             
             if annotations_loaded:
-                # デバッグ出力: アノテーションが正しく読み込まれているか確認
-                print(f"\n=== アノテーション読み込み後のデバッグ情報 ===")
-                print(f"総アノテーション数: {len(self.annotations)}")
-                print(f"現在のインデックス: {self.current_index}")
-                print(f"総画像数: {len(self.images)}")
-                if self.current_index < len(self.images):
-                    print(f"現在の画像パス: {self.images[self.current_index]}")
-                if self.current_index in self.annotations:
-                    print(f"現在のインデックスのアノテーション: {self.annotations[self.current_index]}")
-                else:
-                    print(f"警告: 現在のインデックス {self.current_index} にアノテーションがありません")
-                    print(f"アノテーションがあるインデックス (最初の10個): {sorted(list(self.annotations.keys()))[:10]}")
-                print(f"=========================================\n")
-
                 # Update UI
                 self.display_current_image()
                 self.update_gallery()
@@ -11722,15 +11680,7 @@ class ImageAnnotationTool(QMainWindow):
                         if count > 0:
                             dir_name = os.path.basename(dir_path)
                             details += f"• {dir_name}: {count}個\n"
-                
-                # デバッグ情報をコンソールに出力
-                print("\n=== アノテーション読み込み完了 ===")
-                print(f"読み込みフォルダ数: {len(self.folder_paths)}")
-                print(f"総画像数: {len(self.images)}")
-                print(f"総アノテーション数: {len(self.annotations)}")
-                for dir_path, count in annotations_by_dir.items():
-                    print(f"  {dir_path}: {count}個のアノテーション")
-                
+
                 QMessageBox.information(
                     self, 
                     "読み込み成功", 
@@ -11743,9 +11693,7 @@ class ImageAnnotationTool(QMainWindow):
                     "選択したフォルダからアノテーションデータが見つかりませんでした。"
                 )
                 return
-                
-            print(f"複数フォルダからのアノテーション読み込み完了: {loaded_count}個のアノテーション")
-            
+
         except Exception as e:
             if 'progress' in locals():
                 progress.close()
@@ -12375,7 +12323,7 @@ class ImageAnnotationTool(QMainWindow):
                                 "throttle": throttle,
                                 "x": x,
                                 "y": y,
-                                "original_index": entry_index  # 元のインデックスを保存
+                                "original_index": entry_index  # 元のインデックスを保存（保存時の復元用）
                             }
 
                             # 位置情報があれば追加
@@ -12392,10 +12340,7 @@ class ImageAnnotationTool(QMainWindow):
                             # 削除されたエントリの場合、削除インデックスリストに追加
                             if is_deleted:
                                 deleted_actual_indexes.append(actual_index)
-                                print(f"  削除エントリ読み込み: 画像インデックス {actual_index}, 元のエントリインデックス {entry_index}")
-                            else:
-                                print(f"  アノテーション追加: 画像インデックス {actual_index}, 元のエントリインデックス {entry_index}")
-                            
+
                             loaded_count += 1
                             
                             # 推論結果があれば保存（ユーザーアノテーションと異なる場合）
@@ -12477,9 +12422,6 @@ class ImageAnnotationTool(QMainWindow):
             
             # スライダーの削除インデックスを更新
             self.update_slider_deleted_indexes()
-            
-            print(f"読み込み完了: {loaded_count}個のアノテーションを読み込みました")
-            print(f"削除済みインデックス数: {len(self.deleted_indexes)}")
             return self.annotated_count > 0
                 
         except Exception as e:
@@ -12921,7 +12863,6 @@ class ImageAnnotationTool(QMainWindow):
     def _set_annotation_point_on_canvas(self):
         """キャンバス上に運転アノテーションポイント（赤丸）を設定"""
         if not hasattr(self, 'main_image_view'):
-            print(f"[DEBUG] _set_annotation_point_on_canvas: main_image_view がありません")
             return
 
         # アノテーションポイントの設定（画像読み込みの成功/失敗に関係なく実行）
@@ -12930,10 +12871,8 @@ class ImageAnnotationTool(QMainWindow):
             'y' in self.annotations[self.current_index]):
             anno = self.annotations[self.current_index]
             self.main_image_view.annotation_point = QPoint(anno['x'], anno['y'])
-            print(f"[DEBUG] _set_annotation_point_on_canvas: インデックス {self.current_index} にアノテーションポイントを設定 ({anno['x']}, {anno['y']})")
         else:
             self.main_image_view.annotation_point = None
-            print(f"[DEBUG] _set_annotation_point_on_canvas: インデックス {self.current_index} にアノテーションなし（アノテーションポイント = None）")
 
         # 削除済みの場合
         is_deleted = hasattr(self, 'deleted_indexes') and self.current_index in self.deleted_indexes
@@ -13298,12 +13237,36 @@ class ImageAnnotationTool(QMainWindow):
             return  # キャンセルされた場合
         
         try:
+            # deleted_indexesをactual_indexからoriginal_indexに変換
+            original_deleted_indexes = []
+            if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
+                for actual_idx in self.deleted_indexes:
+                    # アノテーションにoriginal_indexがある場合はそれを使用
+                    if actual_idx in self.annotations and "original_index" in self.annotations[actual_idx]:
+                        original_deleted_indexes.append(self.annotations[actual_idx]["original_index"])
+                    # アノテーションがない場合は、ファイル名から抽出
+                    elif 0 <= actual_idx < len(self.images):
+                        img_path = self.images[actual_idx]
+                        basename = os.path.basename(img_path)
+                        try:
+                            # Jetracer形式を優先的にチェック
+                            jetracer_match = re.match(r'^\d+_\d+_(\d+)_', basename)
+                            if jetracer_match:
+                                original_deleted_indexes.append(int(jetracer_match.group(1)))
+                            else:
+                                # 通常形式
+                                normal_match = re.match(r'^(\d+)_', basename)
+                                if normal_match:
+                                    original_deleted_indexes.append(int(normal_match.group(1)))
+                        except Exception as e:
+                            print(f"警告: 削除インデックス {actual_idx} の変換に失敗: {e}")
+
             # エクスポート実行
             catalog_path = export_to_donkey(
                 export_config['output_folder'],
                 self.annotations,
                 inference_results=self.inference_results,
-                deleted_indexes=self.deleted_indexes if hasattr(self, 'deleted_indexes') else [],
+                deleted_indexes=original_deleted_indexes,
                 image_map=export_config['image_map'],
                 variant_keys=export_config['variant_keys'],
                 diff_vectors=self.inference_diff_vectors if hasattr(self, 'inference_diff_vectors') else None,
@@ -14275,16 +14238,11 @@ class ImageAnnotationTool(QMainWindow):
                 # アノテーション総数と削除済み数を計算
                 total_annotations = len(self.annotations)
                 
-                # 削除済みアノテーションをカウント
-                excluded_annotations = []
+                # 削除済みアノテーションをカウント（actual_indexで判定）
+                excluded_count = 0
                 for idx in self.annotations.keys():
                     if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
-                        excluded_annotations.append(idx)
-                    elif (idx in self.annotations and "original_index" in self.annotations[idx] and
-                        hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
-                        excluded_annotations.append(idx)
-                
-                excluded_count = len(set(excluded_annotations))  # 重複を除去
+                        excluded_count += 1
                 sample_count = total_annotations - excluded_count  # 実際に使用される数
                 
                 data_sample_label.setText(f"<b>使用データ数: {sample_count}枚</b> (全{total_annotations}枚 - 削除済み{excluded_count}枚)")
@@ -14292,21 +14250,15 @@ class ImageAnnotationTool(QMainWindow):
             elif data_radio_skip.isChecked():
                 skip = custom_skip_spin.value()
                 # スキップ対象のアノテーションと削除済みを計算
-                total_skipped_annotations = []
-                excluded_in_skip = []
-                
+                total_skipped = 0
+                excluded_count = 0
+
                 for idx in self.annotations.keys():
                     if idx % skip == 0:  # スキップ対象のインデックス
-                        total_skipped_annotations.append(idx)
-                        # 削除済みチェック
+                        total_skipped += 1
+                        # 削除済みチェック（actual_indexで判定）
                         if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
-                            excluded_in_skip.append(idx)
-                        elif (idx in self.annotations and "original_index" in self.annotations[idx] and
-                            hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
-                            excluded_in_skip.append(idx)
-                
-                total_skipped = len(total_skipped_annotations)
-                excluded_count = len(set(excluded_in_skip))  # 重複を除去
+                            excluded_count += 1
                 sample_count = total_skipped - excluded_count  # 実際に使用される数
                 
                 data_sample_label.setText(f"<b>使用データ数: {sample_count}枚</b> ({skip}枚ごと、対象{total_skipped}枚 - 削除済み{excluded_count}枚)")
@@ -14315,21 +14267,15 @@ class ImageAnnotationTool(QMainWindow):
                 start = range_start_spin.value()
                 end = range_end_spin.value()
                 # インデックス範囲内のアノテーションと削除済みを計算
-                in_range_annotations = []
-                excluded_in_range = []
-                
+                total_in_range = 0
+                excluded_count = 0
+
                 for idx in self.annotations:
                     if start <= idx <= end:
-                        in_range_annotations.append(idx)
-                        # 削除済みチェック
+                        total_in_range += 1
+                        # 削除済みチェック（actual_indexで判定）
                         if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
-                            excluded_in_range.append(idx)
-                        elif (idx in self.annotations and "original_index" in self.annotations[idx] and
-                            hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
-                            excluded_in_range.append(idx)
-                
-                total_in_range = len(in_range_annotations)
-                excluded_count = len(set(excluded_in_range))  # 重複を除去
+                            excluded_count += 1
                 sample_count = total_in_range - excluded_count  # 実際に使用される数
                 
                 data_sample_label.setText(f"<b>使用データ数: {sample_count}枚</b> (範囲{start}-{end}、対象{total_in_range}枚 - 削除済み{excluded_count}枚)")
@@ -14739,13 +14685,8 @@ class ImageAnnotationTool(QMainWindow):
             # 学習データの準備（データ選択設定を適用）
             image_paths = []
             for idx in self.annotations.keys():
-                # 削除済みインデックスをスキップ（削除ボタン・範囲削除ボタンでマークされたもの）
+                # 削除済みインデックスをスキップ（actual_indexで判定）
                 if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
-                    continue
-                
-                # original_indexがある場合もチェック
-                if (idx in self.annotations and "original_index" in self.annotations[idx] and
-                    hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
                     continue
 
                 if isinstance(idx, int) and 0 <= idx < len(self.images):
@@ -16454,17 +16395,15 @@ class ImageAnnotationTool(QMainWindow):
         
         # 削除済みでない位置アノテーションをカウント
         valid_location_annotations = 0
+        deleted_count = 0
         for idx in self.location_annotations.keys():
-            # 削除マークされていないかチェック
+            # 削除マークされていないかチェック（actual_indexで判定）
             if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
-                continue
-            if (idx in self.annotations and "original_index" in self.annotations[idx] and
-                hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
+                deleted_count += 1
                 continue
             valid_location_annotations += 1
-        
+
         annotated_images = len(self.location_annotations)  # 全体数
-        deleted_count = len(getattr(self, 'deleted_indexes', []))
         
         # 学習設定ダイアログを表示
         training_settings = self._create_location_training_dialog(model_type, actual_classes, unique_locations, num_classes, total_images, annotated_images, valid_location_annotations, deleted_count)
@@ -16878,16 +16817,9 @@ class ImageAnnotationTool(QMainWindow):
         for idx, waypoints in self.waypoint_annotations.items():
             # インデックスが有効範囲内かチェック
             if isinstance(idx, int) and 0 <= idx < len(self.images):
-                # 削除マークされたアノテーションは学習データから除外
+                # 削除マークされたアノテーションは学習データから除外（actual_indexで判定）
                 is_deleted = False
-
-                # deleted_indexesでマークされているかチェック
                 if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
-                    is_deleted = True
-
-                # original_indexがある場合もチェック
-                if (not is_deleted and idx in self.annotations and "original_index" in self.annotations[idx] and
-                    hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
                     is_deleted = True
 
                 # 削除マークされていない場合のみ学習データに追加
@@ -16952,16 +16884,9 @@ class ImageAnnotationTool(QMainWindow):
         for idx, location in self.location_annotations.items():
             # インデックスが有効範囲内かチェック
             if isinstance(idx, int) and 0 <= idx < len(self.images):
-                # 削除マークされたアノテーションは学習データから除外（削除ボタン・範囲削除ボタン）
+                # 削除マークされたアノテーションは学習データから除外（actual_indexで判定）
                 is_deleted = False
-                
-                # deleted_indexesでマークされているかチェック
                 if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
-                    is_deleted = True
-                
-                # original_indexがある場合もチェック
-                if (not is_deleted and idx in self.annotations and "original_index" in self.annotations[idx] and
-                    hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
                     is_deleted = True
                 
                 # 削除マークされていない場合のみ学習データに追加
@@ -17307,13 +17232,12 @@ class ImageAnnotationTool(QMainWindow):
         # 有効なウェイポイントアノテーションをチェック
         valid_waypoint_count = 0
         waypoint_counts = []
+        deleted_count = 0
 
         for idx, waypoints in self.waypoint_annotations.items():
-            # 削除マークされていないかチェック
+            # 削除マークされていないかチェック（actual_indexで判定）
             if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
-                continue
-            if (idx in self.annotations and "original_index" in self.annotations[idx] and
-                hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
+                deleted_count += 1
                 continue
 
             if waypoints and len(waypoints) > 0:
@@ -17337,7 +17261,6 @@ class ImageAnnotationTool(QMainWindow):
         # アノテーション統計情報を収集（削除済みマークを考慮）
         total_images = len(self.images)
         annotated_images = len(self.waypoint_annotations)
-        deleted_count = len(getattr(self, 'deleted_indexes', []))
 
         # 学習設定ダイアログを表示
         training_settings = self._create_waypoint_training_dialog(
@@ -18129,12 +18052,8 @@ class ImageAnnotationTool(QMainWindow):
             excluded_count = 0
             
             for idx, boxes in self.bbox_annotations.items():
-                # 削除マークされていないかチェック
+                # 削除マークされていないかチェック（actual_indexで判定）
                 if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
-                    excluded_count += 1
-                    continue
-                if (idx in self.annotations and "original_index" in self.annotations[idx] and
-                    hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
                     excluded_count += 1
                     continue
                 
@@ -18160,12 +18079,8 @@ class ImageAnnotationTool(QMainWindow):
             excluded_count = 0
             
             for idx, segments in self.segmentation_annotations.items():
-                # 削除マークされていないかチェック
+                # 削除マークされていないかチェック（actual_indexで判定）
                 if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
-                    excluded_count += 1
-                    continue
-                if (idx in self.annotations and "original_index" in self.annotations[idx] and
-                    hasattr(self, 'deleted_indexes') and self.annotations[idx]["original_index"] in self.deleted_indexes):
                     excluded_count += 1
                     continue
                 
