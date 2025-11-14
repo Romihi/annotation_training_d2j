@@ -7515,16 +7515,22 @@ class ImageAnnotationTool(QMainWindow):
                 return None
             
             # 画像マップを作成（actual_indexをキーとして使用）
+            print(f"[DEBUG] エクスポート: self.images の長さ = {len(self.images)}")
+            print(f"[DEBUG] エクスポート: self.images の最初の3つ = {[os.path.basename(p) for p in self.images[:3]]}")
             for variant in selected_variants:
                 variant_images = self.variant_images.get(variant, [])
                 if not variant_images:
                     continue
+
+                print(f"[DEBUG] エクスポート: variant={variant}, variant_images の長さ = {len(variant_images)}")
+                print(f"[DEBUG] エクスポート: variant_images の最初の3つ = {[os.path.basename(p) for p in variant_images[:3]]}")
 
                 for img_path in variant_images:
                     try:
                         # self.imagesリストからactual_indexを取得
                         if img_path in self.images:
                             actual_idx = self.images.index(img_path)
+                            print(f"[DEBUG] エクスポート: img={os.path.basename(img_path)}, actual_idx={actual_idx}")
 
                             if actual_idx not in image_map:
                                 image_map[actual_idx] = {}
@@ -13287,6 +13293,7 @@ class ImageAnnotationTool(QMainWindow):
             return
 
         current_img_path = self.images[self.current_index]
+        print(f"[DEBUG] handle_annotation: current_index={self.current_index}, img_path={os.path.basename(current_img_path)}, x={x}, y={y}")
 
         # Get image dimensions (キャッシュを使用してImage.open()を削減)
         if current_img_path in self.image_size_cache:

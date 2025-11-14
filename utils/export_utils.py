@@ -60,7 +60,7 @@ def export_to_donkey(
     for key, annotation in annotations.items():
         if not annotation:
             continue
-        
+
         # キーの型に基づいて元のインデックスを取得
         if isinstance(key, int):
             original_index = key
@@ -75,11 +75,12 @@ def export_to_donkey(
                         original_index = int(match.group(1))
                 except:
                     pass
-            
-        # アノテーション情報とインデックスを保存
+
+        # アノテーション情報とインデックス、元のキーを保存
         indexed_annotations.append({
             "index": original_index,
-            "annotation": annotation
+            "annotation": annotation,
+            "key": key  # 元のキーを保存
         })
     
     # インデックスがないエントリに連番を割り当て
@@ -105,6 +106,7 @@ def export_to_donkey(
     for i, entry in enumerate(indexed_annotations):
         original_index = entry["index"]
         annotation = entry["annotation"]
+        original_key = entry["key"]  # 元のキーを取得
         assigned_index = i  # 連番を割り当て
 
         # 画像マップからこのインデックスの画像パスを取得
@@ -113,11 +115,8 @@ def export_to_donkey(
 
         # annotationsの元のキーを取得（actual_indexの可能性がある）
         actual_index = None
-        for key, anno in annotations.items():
-            if anno == annotation:
-                if isinstance(key, int):
-                    actual_index = key
-                break
+        if isinstance(original_key, int):
+            actual_index = original_key
 
         # actual_indexでimage_mapを検索
         if image_map and actual_index is not None and actual_index in image_map:
@@ -214,13 +213,14 @@ def export_to_donkey(
             if not os.path.exists(img_path):
                 print(f"警告: 画像ファイル {img_path} が存在しません。")
                 continue
-            
+
             # 画像ファイル名を作成
             new_img_name = f"{assigned_index}_{variant}_image_array_.jpg"
-            
+
             try:
                 # 画像をimagesフォルダにコピー
                 dest_path = os.path.join(images_folder, new_img_name)
+                print(f"[DEBUG] コピー: {os.path.basename(img_path)} -> {new_img_name} (assigned_index={assigned_index}, original_index={original_index}, actual_index={actual_index})")
                 shutil.copy2(img_path, dest_path)
                 
                 # カタログキー名を決定
