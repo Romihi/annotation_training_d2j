@@ -455,6 +455,9 @@ class ImageLabel(QLabel):
         # アノテーション点、推論点、差分ベクトルを最後に描画（上に表示）
         self.draw_control_points(painter, self.target_rect)
 
+        # セグメンテーション走行方向矢印を描画
+        self.draw_seg_driving_direction(self.pix_width, self.pix_height, painter, self.target_rect)
+
         # マウス座標表示（最後に描画して常に最前面に）
         self.draw_mouse_coordinates(painter)
 
@@ -963,6 +966,11 @@ class ImageLabel(QLabel):
         x_norm, y_norm = self.normalized_coords
         pos = self.current_mouse_pos
 
+        # painterの状態をリセット（セグメンテーション描画の影響を受けないように）
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        painter.setBrush(Qt.NoBrush)
+        painter.setOpacity(1.0)
+
         # 表示テキストを作成
         text_lines = [
             f"x: {x_norm:+.3f}",
@@ -1011,6 +1019,176 @@ class ImageLabel(QLabel):
         for i, line in enumerate(text_lines):
             y_position = text_y - total_height + line_height * (i + 1) - 3
             painter.drawText(text_x, y_position, line)
+
+    def draw_seg_driving_direction(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
+        """セグメンテーション推論結果から計算した走行軌跡（円弧）またはウェイポイントを描画"""
+        if not hasattr(self.main_window, 'show_seg_driving_direction'):
+            return
+
+        if not self.main_window.show_seg_driving_direction:
+            return
+
+        current_index = self.main_window.current_index
+        if current_index is None:
+            return
+
+        # Y座標の設定値を取得
+        target_y_image = self.main_window.seg_driving_direction_y
+
+        # Y座標のガイドラインを常に描画（太い黄色の点線）
+        screen_target_y = target_rect.y() + (target_y_image / pix_height) * target_rect.height()
+        painter.setPen(QPen(QColor(255, 255, 0, 150), 3, Qt.DashLine))
+        painter.drawLine(target_rect.x(), int(screen_target_y),
+                        target_rect.x() + target_rect.width(), int(screen_target_y))
+
+        # 走行方向の座標を計算
+        direction_coord = self.main_window.calculate_seg_driving_direction(current_index)
+        if direction_coord is None:
+            # 推論結果がない場合はY軸の点線だけ表示して終了
+            return
+
+        target_x, target_y = direction_coord
+
+        # 画像座標からスクリーン座標に変換
+        screen_target_x = target_rect.x() + (target_x / pix_width) * target_rect.width()
+        screen_target_y = target_rect.y() + (target_y / pix_height) * target_rect.height()
+
+        # 開始位置（画像下部中央）
+        start_x = target_rect.x() + target_rect.width() // 2
+        start_y = target_rect.y() + target_rect.height()
+
+        # painterの状態をリセット
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        painter.setOpacity(1.0)
+
+        # 表示モードに応じて描画
+        display_mode = getattr(self.main_window, 'seg_display_mode', 'trajectory')
+
+        if display_mode == 'waypoint':
+            # ウェイポイントモード：画像下部中央から目標Y座標まで4点を等間隔配置
+            # 画像下部のY座標
+            start_y_image = pix_height
+            # 目標Y座標
+            end_y_image = target_y
+
+            # 4点を等間隔配置（開始点と終了点を含む）
+            waypoint_count = 4
+            waypoints = []
+            for i in range(waypoint_count):
+                # Y座標を等間隔で計算
+                ratio = i / (waypoint_count - 1)
+                wp_y_image = start_y_image - (start_y_image - end_y_image) * ratio
+
+                # X座標を計算
+                if i == 0:
+                    # 最初の点：画像下端中央
+                    wp_x_image = pix_width / 2
+                else:
+                    # 中間点と最終点：各Y座標におけるセグメンテーションエリアの中央値
+                    wp_x = self.main_window.calculate_seg_x_at_y(current_index, wp_y_image)
+                    if wp_x is None:
+                        # セグメンテーションエリアがない場合は画像中央を使用
+                        wp_x_image = pix_width / 2
+                    else:
+                        wp_x_image = wp_x
+
+                # スクリーン座標に変換
+                wp_screen_x = target_rect.x() + (wp_x_image / pix_width) * target_rect.width()
+                wp_screen_y = target_rect.y() + (wp_y_image / pix_height) * target_rect.height()
+
+                waypoints.append((wp_screen_x, wp_screen_y, wp_x_image, wp_y_image))
+
+            # ウェイポイント間を線で結ぶ
+            painter.setPen(QPen(QColor(0, 255, 0), 3))
+            for i in range(len(waypoints) - 1):
+                x1, y1, _, _ = waypoints[i]
+                x2, y2, _, _ = waypoints[i + 1]
+                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+
+            # ウェイポイントを描画
+            for i, (wp_x, wp_y, img_x, img_y) in enumerate(waypoints):
+                # ウェイポイントマーカー（緑色の丸）
+                painter.setPen(QPen(QColor(0, 200, 0), 2))
+                painter.setBrush(QBrush(QColor(0, 255, 0, 180)))
+                painter.drawEllipse(int(wp_x - 6), int(wp_y - 6), 12, 12)
+
+                # すべてのウェイポイントに座標情報を表示
+                painter.setPen(QPen(QColor(255, 255, 255)))
+                painter.setFont(QFont("Arial", 9, QFont.Bold))
+                info_text = f"({int(img_x)}, {int(img_y)})"
+                painter.drawText(int(wp_x + 10), int(wp_y - 5), info_text)
+
+        else:
+            # 軌跡モード：従来の円弧描画
+            # 円弧パラメータを計算（スクリーン座標系で）
+            arc_params = self.main_window.calculate_steering_arc_params(
+                start_x, start_y,
+                screen_target_x, screen_target_y,
+                self.main_window.seg_max_steering_angle
+            )
+
+            if arc_params is None:
+                # 直線の場合（舵角が小さい）
+                painter.setPen(QPen(QColor(0, 255, 0), 4))
+                painter.drawLine(int(start_x), int(start_y), int(screen_target_x), int(screen_target_y))
+            else:
+                # 円弧を描画
+                center_x = arc_params['center_x']
+                center_y = arc_params['center_y']
+                radius = arc_params['radius']
+                start_angle = arc_params['start_angle']
+                end_angle = arc_params['end_angle']
+                direction = arc_params['direction']
+
+                # QPainterのdrawArcは角度を1/16度単位で指定
+                # また、0度は3時方向、反時計回りが正
+                # atan2の角度をQt用に変換
+                qt_start_angle = -math.degrees(start_angle) * 16
+
+                # 角度差を計算
+                angle_diff = end_angle - start_angle
+
+                # 角度差を-π～πの範囲に正規化
+                while angle_diff > math.pi:
+                    angle_diff -= 2 * math.pi
+                while angle_diff < -math.pi:
+                    angle_diff += 2 * math.pi
+
+                # directionに応じて描画方向を決定
+                # direction > 0 (右旋回): 時計回り（負のspan）
+                # direction < 0 (左旋回): 反時計回り（正のspan）
+                qt_span_angle = -math.degrees(angle_diff) * 16
+
+                print(f"[円弧描画] start={math.degrees(start_angle):.1f}°, end={math.degrees(end_angle):.1f}°")
+                print(f"[円弧描画] angle_diff={math.degrees(angle_diff):.1f}°, direction={direction}")
+                print(f"[円弧描画] qt_start={qt_start_angle/16:.1f}°, qt_span={qt_span_angle/16:.1f}°")
+
+                # 円弧の外接矩形を計算
+                arc_rect = QRect(
+                    int(center_x - radius),
+                    int(center_y - radius),
+                    int(radius * 2),
+                    int(radius * 2)
+                )
+
+                # 円弧を描画（太い緑色の線）
+                painter.setPen(QPen(QColor(0, 255, 0), 4))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawArc(arc_rect, int(qt_start_angle), int(qt_span_angle))
+
+            # 目標点にマーカーを描画（濃い黄色）
+            painter.setPen(QPen(QColor(200, 200, 0), 2))
+            painter.setBrush(QBrush(QColor(200, 200, 0, 180)))
+            painter.drawEllipse(int(screen_target_x - 8), int(screen_target_y - 8), 16, 16)
+
+            # 座標と舵角情報を表示
+            painter.setPen(QPen(QColor(255, 255, 255)))
+            painter.setFont(QFont("Arial", 10, QFont.Bold))
+            if arc_params:
+                info_text = f"({target_x}, {target_y}) {arc_params['actual_steering_deg']:.1f}°"
+            else:
+                info_text = f"({target_x}, {target_y}) 直進"
+            painter.drawText(int(screen_target_x + 12), int(screen_target_y - 5), info_text)
 
     def draw_segmentation_inference_results(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
         """セグメンテーション推論結果の描画"""
@@ -2873,6 +3051,11 @@ class ImageAnnotationTool(QMainWindow):
         self.yolo_seg_model = None  # YOLOセグメンテーションモデル
         self.last_segmentations = []
         self.show_segmentation_inference = False  # セグメンテーション推論表示フラグ
+        self.seg_driving_direction_class_id = 0  # 走行方向計算に使用するセグメンテーションクラスID
+        self.seg_driving_direction_y = 100  # 走行方向計算のY座標（固定値、ユーザーが変更可能）
+        self.show_seg_driving_direction = False  # 走行方向矢印の表示フラグ
+        self.seg_max_steering_angle = 30.0  # 最大舵角（度）
+        self.seg_display_mode = 'trajectory'  # 表示モード: 'trajectory' or 'waypoint'
 
         # waypoint関連の初期化
         self.waypoint_annotations = {}  # waypointアノテーション用 {image_index: [(x, y), ...]}
@@ -3224,14 +3407,14 @@ class ImageAnnotationTool(QMainWindow):
         model_type_layout = QHBoxLayout()
         model_type_layout.addWidget(QLabel("YOLOモデル:"))
         self.yolo_model_combo = QComboBox()
-        self.yolo_model_combo.addItems(["yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x", "yolo11n", "yolo11s", "yolo11m", "yolo11l", "yolo11x"])
+        self.yolo_model_combo.addItems(["yolo11n", "yolo11s", "yolo11m", "yolo11l", "yolo11x", "yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x"])
         self.yolo_model_combo.currentIndexChanged.connect(self.on_yolo_model_type_changed)
         model_type_layout.addWidget(self.yolo_model_combo)
         obj_detection_layout.addLayout(model_type_layout)
 
         self.yolo_unified_model_combo = QComboBox()
         self.yolo_unified_model_combo.setMinimumWidth(180)
-        self.yolo_unified_model_combo.setStyleSheet("combobox-popup: 0;")
+        self.yolo_unified_model_combo.setStyleSheet("combobox-popup: 0; font-size: 10px;")
         obj_detection_layout.addWidget(self.yolo_unified_model_combo)
 
         # YOLOモデル操作ボタン
@@ -3709,6 +3892,89 @@ class ImageAnnotationTool(QMainWindow):
         # 初期状態では非表示
         self.waypoint_control_widget.setVisible(False)
         location_layout.addWidget(self.waypoint_control_widget)
+
+        # セグメンテーション制御パネル
+        self.segmentation_control_widget = QWidget()
+        segmentation_control_layout = QVBoxLayout(self.segmentation_control_widget)
+        segmentation_control_layout.setContentsMargins(5, 5, 5, 5)
+
+        # セグメンテーション制御ラベル
+        segmentation_label = QLabel("走行方向計算:")
+        segmentation_label.setStyleSheet("font-weight: bold; color: #333;")
+        segmentation_control_layout.addWidget(segmentation_label)
+
+        # 走行方向矢印表示チェックボックス
+        self.show_seg_driving_direction_checkbox = QCheckBox("走行方向を表示")
+        self.show_seg_driving_direction_checkbox.setChecked(False)
+        self.show_seg_driving_direction_checkbox.setToolTip("セグメンテーション推論結果から走行方向を計算して矢印で表示")
+        self.show_seg_driving_direction_checkbox.stateChanged.connect(self.toggle_seg_driving_direction)
+        segmentation_control_layout.addWidget(self.show_seg_driving_direction_checkbox)
+
+        # クラスIDとY座標の設定（横並び）
+        seg_params_layout = QHBoxLayout()
+
+        seg_params_layout.addWidget(QLabel("クラスID:"))
+        self.seg_class_id_spin = QSpinBox()
+        self.seg_class_id_spin.setRange(0, 99)
+        self.seg_class_id_spin.setValue(0)  # デフォルト0
+        self.seg_class_id_spin.setToolTip("走行可能エリアのセグメンテーションクラスID")
+        self.seg_class_id_spin.valueChanged.connect(self.update_seg_driving_direction_class)
+        seg_params_layout.addWidget(self.seg_class_id_spin)
+
+        seg_params_layout.addSpacing(20)
+        seg_params_layout.addWidget(QLabel("Y座標:"))
+        self.seg_direction_y_spin = QSpinBox()
+        self.seg_direction_y_spin.setRange(0, 1000)
+        self.seg_direction_y_spin.setValue(100)  # デフォルト100
+        self.seg_direction_y_spin.setToolTip("走行方向計算に使用するY座標（画像上からのピクセル）")
+        self.seg_direction_y_spin.valueChanged.connect(self.update_seg_driving_direction_y)
+        seg_params_layout.addWidget(self.seg_direction_y_spin)
+
+        segmentation_control_layout.addLayout(seg_params_layout)
+
+        # 最大舵角の設定
+        steering_layout = QHBoxLayout()
+        steering_layout.addWidget(QLabel("最大舵角:"))
+        self.seg_max_steering_spin = QDoubleSpinBox()
+        self.seg_max_steering_spin.setRange(0.1, 90.0)
+        self.seg_max_steering_spin.setValue(30.0)  # デフォルト30度
+        self.seg_max_steering_spin.setSuffix("°")
+        self.seg_max_steering_spin.setDecimals(1)
+        self.seg_max_steering_spin.setToolTip("走行軌跡計算に使用する最大舵角（度）")
+        self.seg_max_steering_spin.valueChanged.connect(self.update_seg_max_steering_angle)
+        steering_layout.addWidget(self.seg_max_steering_spin)
+        steering_layout.addStretch()
+        segmentation_control_layout.addLayout(steering_layout)
+
+        # 表示モード選択
+        display_mode_layout = QHBoxLayout()
+        display_mode_layout.addWidget(QLabel("表示モード:"))
+
+        # ラジオボタングループを作成
+        self.seg_display_mode_button_group = QButtonGroup(self)
+
+        # 軌跡表示モード
+        self.seg_trajectory_mode_radio = QRadioButton("軌跡")
+        self.seg_trajectory_mode_radio.setChecked(True)
+        self.seg_trajectory_mode_radio.setToolTip("走行軌跡を円弧で表示")
+        self.seg_display_mode_button_group.addButton(self.seg_trajectory_mode_radio, 0)
+        display_mode_layout.addWidget(self.seg_trajectory_mode_radio)
+
+        # ウェイポイント表示モード
+        self.seg_waypoint_mode_radio = QRadioButton("ウェイポイント")
+        self.seg_waypoint_mode_radio.setToolTip("目標Y座標までのウェイポイント（4点等間隔）を表示")
+        self.seg_display_mode_button_group.addButton(self.seg_waypoint_mode_radio, 1)
+        display_mode_layout.addWidget(self.seg_waypoint_mode_radio)
+
+        display_mode_layout.addStretch()
+        segmentation_control_layout.addLayout(display_mode_layout)
+
+        # ラジオボタンの変更を監視
+        self.seg_display_mode_button_group.buttonClicked.connect(self.on_seg_display_mode_changed)
+
+        # 初期状態では非表示
+        self.segmentation_control_widget.setVisible(False)
+        location_layout.addWidget(self.segmentation_control_widget)
 
         # 現在のモードを表すヒントラベル
         self.mode_hint_label = QLabel("※Bキーを押すとモードが切り替わります")
@@ -4533,16 +4799,257 @@ class ImageAnnotationTool(QMainWindow):
             if hasattr(self, 'statusBar'):
                 self.statusBar().showMessage("配置完了時自動遷移モードに切り替えました", 2000)
 
+    def toggle_seg_driving_direction(self, state):
+        """走行方向矢印の表示/非表示を切り替え"""
+        self.show_seg_driving_direction = (state == Qt.Checked)
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def update_seg_driving_direction_class(self, value):
+        """走行方向計算に使用するクラスIDを更新"""
+        self.seg_driving_direction_class_id = value
+        if hasattr(self, 'main_image_view') and self.show_seg_driving_direction:
+            self.main_image_view.update()
+
+    def update_seg_driving_direction_y(self, value):
+        """走行方向計算に使用するY座標を更新"""
+        self.seg_driving_direction_y = value
+        if hasattr(self, 'main_image_view') and self.show_seg_driving_direction:
+            self.main_image_view.update()
+
+    def update_seg_max_steering_angle(self, value):
+        """最大舵角を更新"""
+        self.seg_max_steering_angle = value
+        if hasattr(self, 'main_image_view') and self.show_seg_driving_direction:
+            self.main_image_view.update()
+
+    def on_seg_display_mode_changed(self):
+        """セグメンテーション走行方向の表示モード変更"""
+        if self.seg_trajectory_mode_radio.isChecked():
+            self.seg_display_mode = 'trajectory'
+        else:
+            self.seg_display_mode = 'waypoint'
+
+        if hasattr(self, 'main_image_view') and self.show_seg_driving_direction:
+            self.main_image_view.update()
+
+    def calculate_steering_arc_params(self, start_x, start_y, target_x, target_y, max_steering_angle_deg):
+        """舵角制約下での走行軌跡の円弧パラメータを計算
+
+        Args:
+            start_x, start_y: 開始位置（画像座標）
+            target_x, target_y: 目標位置（画像座標）
+            max_steering_angle_deg: 最大舵角（度）
+
+        Returns:
+            dict: 円弧パラメータ {'center_x', 'center_y', 'radius', 'start_angle', 'end_angle', 'direction'}
+                  計算できない場合はNone
+        """
+        # 目標点への直線距離と角度を計算
+        dx = target_x - start_x
+        dy = target_y - start_y  # 画像座標系ではY軸が下向きに増加
+
+        if abs(dx) < 1 and abs(dy) < 1:
+            return None  # 距離が近すぎる
+
+        # 最大舵角から最小回転半径を計算
+        max_steering_rad = math.radians(max_steering_angle_deg)
+
+        # 目標点への横方向のオフセット
+        lateral_offset = dx
+        longitudinal_distance = abs(dy)
+
+        if longitudinal_distance < 1:
+            return None
+
+        # 舵角がほぼ0の場合は直線
+        if abs(lateral_offset) < 1:
+            return None
+
+        # 左右どちらに曲がるかを決定
+        turn_direction = 1 if lateral_offset > 0 else -1
+
+        # 2点を通り、開始点での接線が垂直（Y軸方向）な円を求める
+        # 開始点: (start_x, start_y), 接線方向: (0, -1)（上向き）
+        # 円の中心: (start_x + R * turn_direction, start_y)
+
+        # 目標点が円周上にある条件:
+        # (target_x - center_x)^2 + (target_y - center_y)^2 = R^2
+        # center_x = start_x + R * turn_direction
+        # center_y = start_y
+
+        # (target_x - start_x - R*turn_direction)^2 + (target_y - start_y)^2 = R^2
+        # dx^2 - 2*dx*R*turn_direction + R^2 + dy^2 = R^2
+        # dx^2 + dy^2 = 2*dx*R*turn_direction
+        # R = (dx^2 + dy^2) / (2*dx*turn_direction)
+
+        turn_radius = (dx*dx + dy*dy) / (2.0 * dx * turn_direction)
+
+        # 半径が負になる場合は逆方向
+        if turn_radius < 0:
+            turn_radius = -turn_radius
+            turn_direction = -turn_direction
+
+        # 最大舵角による最小回転半径の制約をチェック
+        # 最小回転半径 ≈ 進行距離 / tan(max_steering)
+        min_radius = longitudinal_distance / math.tan(max_steering_rad)
+
+        if turn_radius < min_radius:
+            # 舵角が大きすぎる場合は制限
+            turn_radius = min_radius
+            actual_steering_rad = math.atan(longitudinal_distance / turn_radius)
+        else:
+            # 実際の舵角を計算
+            actual_steering_rad = math.atan(longitudinal_distance / turn_radius)
+
+        # 円の中心を計算
+        center_x = start_x + turn_direction * turn_radius
+        center_y = start_y
+
+        # 開始角度と終了角度を計算（標準的なatan2、X軸から反時計回り）
+        start_angle_rad = math.atan2(start_y - center_y, start_x - center_x)
+        end_angle_rad = math.atan2(target_y - center_y, target_x - center_x)
+
+        print(f"[円弧計算] dx={dx:.1f}, dy={dy:.1f}, 方向={turn_direction}")
+        print(f"[円弧計算] 回転半径={turn_radius:.1f}, 中心=({center_x:.1f}, {center_y:.1f})")
+        print(f"[円弧計算] 開始角度={math.degrees(start_angle_rad):.1f}°, 終了角度={math.degrees(end_angle_rad):.1f}°")
+
+        return {
+            'center_x': center_x,
+            'center_y': center_y,
+            'radius': abs(turn_radius),
+            'start_angle': start_angle_rad,
+            'end_angle': end_angle_rad,
+            'direction': turn_direction,
+            'actual_steering_deg': math.degrees(actual_steering_rad) * turn_direction
+        }
+
+    def calculate_seg_x_at_y(self, current_index, y_coord):
+        """指定されたY座標におけるセグメンテーションエリアのX中央値を計算
+
+        Args:
+            current_index: 現在の画像インデックス
+            y_coord: Y座標
+
+        Returns:
+            int: X座標の中央値、計算できない場合はNone
+        """
+        if not hasattr(self, 'segmentation_inference_results'):
+            return None
+
+        if current_index not in self.segmentation_inference_results:
+            return None
+
+        seg_results = self.segmentation_inference_results[current_index]
+        if not seg_results:
+            return None
+
+        if 'masks' not in seg_results or 'classes' not in seg_results:
+            return None
+
+        # 指定されたクラスIDのマスクを探す
+        target_mask = None
+        for i, class_id in enumerate(seg_results['classes']):
+            if class_id == self.seg_driving_direction_class_id:
+                target_mask = seg_results['masks'][i]
+                break
+
+        if target_mask is None:
+            return None
+
+        # マスクから指定Y座標における走行可能エリアのX座標範囲を取得
+        if y_coord < 0 or y_coord >= target_mask.shape[0]:
+            return None
+
+        # Y座標ラインのマスク値を取得
+        line_mask = target_mask[int(y_coord), :]
+
+        # True（走行可能エリア）のX座標を取得
+        x_indices = np.where(line_mask > 0.5)[0]
+
+        if len(x_indices) == 0:
+            return None
+
+        # X座標の中央値を計算
+        x_center = int(np.median(x_indices))
+        return x_center
+
+    def calculate_seg_driving_direction(self, current_index):
+        """セグメンテーション推論結果から走行方向を計算
+
+        Args:
+            current_index: 現在の画像インデックス
+
+        Returns:
+            tuple: (target_x, target_y) 走行方向の座標、計算できない場合はNone
+        """
+        if not hasattr(self, 'segmentation_inference_results'):
+            print("[走行方向計算] segmentation_inference_resultsが存在しません")
+            return None
+
+        if current_index not in self.segmentation_inference_results:
+            print(f"[走行方向計算] インデックス {current_index} の推論結果が存在しません")
+            print(f"[走行方向計算] 利用可能なキー: {list(self.segmentation_inference_results.keys())}")
+            return None
+
+        seg_results = self.segmentation_inference_results[current_index]
+        if not seg_results:
+            print("[走行方向計算] 推論結果が空です")
+            return None
+
+        if 'masks' not in seg_results or 'classes' not in seg_results:
+            print(f"[走行方向計算] masksまたはclassesキーが存在しません。利用可能なキー: {seg_results.keys()}")
+            return None
+
+        print(f"[走行方向計算] 検出されたクラス: {seg_results['classes']}, マスク数: {len(seg_results['masks'])}")
+        print(f"[走行方向計算] 検索対象クラスID: {self.seg_driving_direction_class_id}")
+
+        # 指定されたクラスIDのマスクを探す
+        target_mask = None
+        for i, class_id in enumerate(seg_results['classes']):
+            if class_id == self.seg_driving_direction_class_id:
+                target_mask = seg_results['masks'][i]
+                print(f"[走行方向計算] クラスID {class_id} のマスクを発見 (インデックス {i})")
+                break
+
+        if target_mask is None:
+            print(f"[走行方向計算] クラスID {self.seg_driving_direction_class_id} のマスクが見つかりません")
+            return None
+
+        # マスクから指定Y座標における走行可能エリアのX座標範囲を取得
+        y = self.seg_driving_direction_y
+        print(f"[走行方向計算] マスクサイズ: {target_mask.shape}, Y座標: {y}")
+
+        if y < 0 or y >= target_mask.shape[0]:
+            print(f"[走行方向計算] Y座標 {y} がマスクの範囲外です (0-{target_mask.shape[0]-1})")
+            return None
+
+        # Y座標ラインのマスク値を取得
+        line_mask = target_mask[y, :]
+
+        # True（走行可能エリア）のX座標を取得
+        x_indices = np.where(line_mask > 0.5)[0]  # 閾値0.5を追加
+
+        if len(x_indices) == 0:
+            print(f"[走行方向計算] Y座標 {y} に走行可能エリアが存在しません")
+            return None
+
+        # X座標の中央値を計算
+        x_center = int(np.median(x_indices))
+        print(f"[走行方向計算] 計算成功: ({x_center}, {y}), X範囲: [{x_indices[0]}, {x_indices[-1]}]")
+
+        return (x_center, y)
+
     def toggle_auto_apply_segmentation(self, state):
         """前回のセグメンテーションを自動適用するかどうかを設定"""
         self.auto_apply_last_segmentation = (state == Qt.Checked)
-        
+
         # 現在の画像に対して、前回のセグメンテーションを適用
-        if (self.auto_apply_last_segmentation and 
-            hasattr(self, 'last_segmentation') and 
-            self.last_segmentation and 
+        if (self.auto_apply_last_segmentation and
+            hasattr(self, 'last_segmentation') and
+            self.last_segmentation and
             self.images):
-            
+
             # インデックスベースに変更
             current_index = self.current_index
             
@@ -5404,6 +5911,7 @@ class ImageAnnotationTool(QMainWindow):
             self.segmentation_mode_button.setChecked(False)
             self.waypoint_mode_button.setChecked(False)
             self.waypoint_control_widget.setVisible(False)  # waypoint制御パネルを非表示
+            self.segmentation_control_widget.setVisible(False)  # セグメンテーション制御パネルを非表示
             self.statusBar().showMessage("自動運転アノテーションモードに切り替えました。", 3000)
         elif sender == self.detection_mode_button:
             self.current_mode = 1
@@ -5412,6 +5920,7 @@ class ImageAnnotationTool(QMainWindow):
             self.segmentation_mode_button.setChecked(False)
             self.waypoint_mode_button.setChecked(False)
             self.waypoint_control_widget.setVisible(False)  # waypoint制御パネルを非表示
+            self.segmentation_control_widget.setVisible(False)  # セグメンテーション制御パネルを非表示
             self.statusBar().showMessage("物体検知アノテーションモードに切り替えました。", 3000)
         elif sender == self.segmentation_mode_button:
             self.current_mode = 2  # 新規追加
@@ -5420,6 +5929,7 @@ class ImageAnnotationTool(QMainWindow):
             self.segmentation_mode_button.setChecked(True)
             self.waypoint_mode_button.setChecked(False)
             self.waypoint_control_widget.setVisible(False)  # waypoint制御パネルを非表示
+            self.segmentation_control_widget.setVisible(True)  # セグメンテーション制御パネルを表示
             self.statusBar().showMessage("セグメンテーションアノテーションモードに切り替えました。", 3000)
         elif sender == self.waypoint_mode_button:
             self.current_mode = 3  # waypoint mode
@@ -5428,6 +5938,7 @@ class ImageAnnotationTool(QMainWindow):
             self.segmentation_mode_button.setChecked(False)
             self.waypoint_mode_button.setChecked(True)
             self.waypoint_control_widget.setVisible(True)  # waypoint制御パネルを表示
+            self.segmentation_control_widget.setVisible(False)  # セグメンテーション制御パネルを非表示
             self.statusBar().showMessage("waypointアノテーションモードに切り替えました。", 3000)
         else:
             # Bキーでの切り替え（4つのモードをサイクル）
@@ -5438,6 +5949,7 @@ class ImageAnnotationTool(QMainWindow):
                 self.segmentation_mode_button.setChecked(False)
                 self.waypoint_mode_button.setChecked(False)
                 self.waypoint_control_widget.setVisible(False)
+                self.segmentation_control_widget.setVisible(False)
                 self.statusBar().showMessage("自動運転アノテーションモードに切り替えました。", 3000)
             elif self.current_mode == 1:
                 self.auto_mode_button.setChecked(False)
@@ -5445,6 +5957,7 @@ class ImageAnnotationTool(QMainWindow):
                 self.segmentation_mode_button.setChecked(False)
                 self.waypoint_mode_button.setChecked(False)
                 self.waypoint_control_widget.setVisible(False)
+                self.segmentation_control_widget.setVisible(False)
                 self.statusBar().showMessage("物体検知アノテーションモードに切り替えました。", 3000)
             elif self.current_mode == 2:
                 self.auto_mode_button.setChecked(False)
@@ -5452,6 +5965,7 @@ class ImageAnnotationTool(QMainWindow):
                 self.segmentation_mode_button.setChecked(True)
                 self.waypoint_mode_button.setChecked(False)
                 self.waypoint_control_widget.setVisible(False)
+                self.segmentation_control_widget.setVisible(True)
                 self.statusBar().showMessage("セグメンテーションアノテーションモードに切り替えました。", 3000)
             else:  # current_mode == 3
                 self.auto_mode_button.setChecked(False)
@@ -5459,6 +5973,7 @@ class ImageAnnotationTool(QMainWindow):
                 self.segmentation_mode_button.setChecked(False)
                 self.waypoint_mode_button.setChecked(True)
                 self.waypoint_control_widget.setVisible(True)
+                self.segmentation_control_widget.setVisible(False)
                 self.statusBar().showMessage("waypointアノテーションモードに切り替えました。", 3000)
         
         self.main_image_view.update()
@@ -7119,11 +7634,14 @@ class ImageAnnotationTool(QMainWindow):
         
         # コンボボックスに追加
         for model_info in unified_model_files:
+            # タスクタイプを短縮表示
+            task_label = "物検" if model_info['task'] == "物体検知" else "セグ"
+
             if model_info['parent'] == 'root':
-                display_name = f"[{model_info['task']}] {model_info['path']}"
+                display_name = f"[{task_label}] {model_info['path']}"
             else:
-                display_name = f"[{model_info['task']}] {model_info['parent'].split('_')[0]} [{model_info['date']}] ({model_info['type']})"
-            
+                display_name = f"[{task_label}] {model_info['parent'].split('_')[0]} [{model_info['date']}] ({model_info['type']})"
+
             self.yolo_unified_model_combo.addItem(display_name, model_info['path'])
 
 
@@ -7152,7 +7670,7 @@ class ImageAnnotationTool(QMainWindow):
             return
         
         # タスクタイプを判定
-        is_segmentation = "[セグメンテーション]" in selected_model_display
+        is_segmentation = "[セグ]" in selected_model_display
         task_type = "セグメンテーション" if is_segmentation else "物体検知"
         
         # モデルパスを構築
@@ -7194,16 +7712,35 @@ class ImageAnnotationTool(QMainWindow):
             
             # モデルを読み込み
             yolo_model = YOLO(model_path)
-            
+
             progress.setValue(50)
+            progress.setLabelText("クラス情報を取得中...")
             QApplication.processEvents()
-            
+
+            # モデルのクラス名情報を取得して反映
+            if hasattr(yolo_model, 'names') and yolo_model.names:
+                # クラス名を取得（辞書形式 {0: 'person', 1: 'car', ...}）
+                class_names = list(yolo_model.names.values())
+                # クラス名をカンマ区切りで結合
+                class_names_str = ','.join(class_names)
+                # UIのクラス入力欄に反映
+                if hasattr(self, 'classes_input'):
+                    self.classes_input.setText(class_names_str)
+                # クラス色を初期化して実際に反映
+                self._apply_class_changes(class_names)
+                print(f"[モデル読み込み] クラス情報を取得: {len(class_names)}個のクラス")
+                print(f"[モデル読み込み] クラス名: {class_names_str}")
+                print(f"[モデル読み込み] クラス色を初期化しました")
+
+            progress.setValue(60)
+            QApplication.processEvents()
+
             # 新しいモデルを読み込む前に、既存のYOLOモデルをクリア
             if hasattr(self, 'yolo_model'):
                 self.yolo_model = None
             if hasattr(self, 'yolo_seg_model'):
                 self.yolo_seg_model = None
-            
+
             # タスクタイプに応じてモデルを適切な変数に設定
             if is_segmentation:
                 self.yolo_seg_model = yolo_model
@@ -9346,11 +9883,13 @@ class ImageAnnotationTool(QMainWindow):
             # セグメンテーション結果を保存
             segments = []
             bboxes = []
-            
+            masks = []  # マスク配列を保存
+            class_ids = []  # クラスIDを保存
+
             # 画像サイズを取得
             img = Image.open(current_img_path)
             img_width, img_height = img.size
-            
+
             for result in results:
                 # バウンディングボックス処理
                 if hasattr(result, 'boxes') and result.boxes is not None:
@@ -9371,64 +9910,83 @@ class ImageAnnotationTool(QMainWindow):
                 if hasattr(result, 'masks') and result.masks is not None:
                     import cv2
                     import numpy as np
-                    
+
                     for i, mask in enumerate(result.masks.data):
                         # マスクを numpy 配列に変換
                         mask_array = mask.cpu().numpy()
-                        
+
                         # マスクサイズを取得
                         mask_height, mask_width = mask_array.shape
-                        
+
+                        # マスクを元画像サイズにリサイズ
+                        mask_resized = cv2.resize(mask_array, (img_width, img_height), interpolation=cv2.INTER_NEAREST)
+
                         # マスクから輪郭ポイントを抽出
                         mask_uint8 = (mask_array * 255).astype(np.uint8)
                         contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        
+
                         if contours:
                             # 最大の輪郭を取得
                             largest_contour = max(contours, key=cv2.contourArea)
-                            
+
                             # 輪郭を簡略化
                             epsilon = 0.02 * cv2.arcLength(largest_contour, True)
                             approx = cv2.approxPolyDP(largest_contour, epsilon, True)
-                            
+
                             # ポイントリストに変換（正規化座標に変換）
                             points = []
                             for point in approx:
                                 x, y = point[0]
-                                
+
                                 # マスク座標を元画像座標にスケール
                                 scaled_x = float(x) * img_width / mask_width
                                 scaled_y = float(y) * img_height / mask_height
-                                
+
                                 # スケール後の座標を0-1の正規化座標に変換
                                 normalized_x = scaled_x / img_width
                                 normalized_y = scaled_y / img_height
-                                
+
                                 # 0-1の範囲内にクリップ
                                 normalized_x = max(0.0, min(1.0, normalized_x))
                                 normalized_y = max(0.0, min(1.0, normalized_y))
-                                
+
                                 points.append([normalized_x, normalized_y])
-                            
+
                             if len(points) >= 3:
                                 # 対応するクラス情報を取得
                                 class_name = "unknown"
                                 confidence = 0.0
+                                class_id = 0
                                 if i < len(bboxes):
                                     class_name = bboxes[i]['class']
                                     confidence = bboxes[i]['confidence']
-                                
+                                    # クラス名からクラスIDを取得
+                                    if hasattr(result, 'names'):
+                                        for cid, cname in result.names.items():
+                                            if cname == class_name:
+                                                class_id = int(cid)
+                                                break
+
                                 segments.append({
                                     'class': class_name,
                                     'points': points,
                                     'confidence': confidence
                                 })
+
+                                # マスク配列とクラスIDを保存
+                                masks.append(mask_resized)
+                                class_ids.append(class_id)
             
-            # 結果を保存
-            self.segmentation_inference_results[current_img_path] = {
+            # 結果を保存（パスとインデックスの両方で保存）
+            result_data = {
                 'segments': segments,
-                'bboxes': bboxes
+                'bboxes': bboxes,
+                'masks': masks,  # マスク配列を追加
+                'classes': class_ids  # クラスIDを追加
             }
+            self.segmentation_inference_results[current_img_path] = result_data
+            # インデックスでもアクセスできるように保存
+            self.segmentation_inference_results[self.current_index] = result_data
             
             print(f"セグメンテーション推論完了: {len(segments)}個のセグメント, {len(bboxes)}個のボックス")
             print(f"使用した信頼度閾値: {self.yolo_seg_confidence_threshold}")
@@ -15210,12 +15768,99 @@ class ImageAnnotationTool(QMainWindow):
         if not self.annotations:
             QMessageBox.warning(self, "警告", "オートアノテーションを実行するには、まず数枚の画像に手動でアノテーションを行ってください。")
             return
-        
-        # アノテーションされていない画像を取得
-        unannotated_images = [img for img in self.images if img not in self.annotations]
-        
+
+        # 範囲指定ダイアログを表示
+        range_dialog = QDialog(self)
+        range_dialog.setWindowTitle("オートアノテーション範囲指定")
+        range_dialog.setMinimumWidth(400)
+
+        layout = QVBoxLayout(range_dialog)
+
+        # 説明ラベル
+        info_label = QLabel("オートアノテーションを実行する範囲を指定してください。")
+        layout.addWidget(info_label)
+
+        # 範囲選択
+        range_group = QGroupBox("範囲")
+        range_layout = QVBoxLayout(range_group)
+
+        # ラジオボタン
+        all_radio = QRadioButton("すべてのアノテーションされていない画像")
+        all_radio.setChecked(True)
+        range_radio = QRadioButton("インデックス範囲を指定")
+
+        range_layout.addWidget(all_radio)
+        range_layout.addWidget(range_radio)
+
+        # インデックス範囲入力
+        index_layout = QHBoxLayout()
+        index_layout.addWidget(QLabel("開始:"))
+        start_spin = QSpinBox()
+        start_spin.setRange(0, len(self.images) - 1)
+        start_spin.setValue(0)
+        start_spin.setEnabled(False)
+        index_layout.addWidget(start_spin)
+
+        # 現在位置ボタン（開始）
+        start_current_button = QPushButton("現在位置")
+        start_current_button.setEnabled(False)
+        start_current_button.setToolTip("現在表示中の画像インデックスを設定")
+        start_current_button.clicked.connect(lambda: start_spin.setValue(self.current_index))
+        index_layout.addWidget(start_current_button)
+
+        index_layout.addWidget(QLabel("終了:"))
+        end_spin = QSpinBox()
+        end_spin.setRange(0, len(self.images) - 1)
+        end_spin.setValue(len(self.images) - 1)
+        end_spin.setEnabled(False)
+        index_layout.addWidget(end_spin)
+
+        # 現在位置ボタン（終了）
+        end_current_button = QPushButton("現在位置")
+        end_current_button.setEnabled(False)
+        end_current_button.setToolTip("現在表示中の画像インデックスを設定")
+        end_current_button.clicked.connect(lambda: end_spin.setValue(self.current_index))
+        index_layout.addWidget(end_current_button)
+
+        range_layout.addLayout(index_layout)
+        layout.addWidget(range_group)
+
+        # ラジオボタンの状態変化でスピンボックスとボタンを有効/無効化
+        def on_range_radio_toggled(checked):
+            start_spin.setEnabled(checked)
+            end_spin.setEnabled(checked)
+            start_current_button.setEnabled(checked)
+            end_current_button.setEnabled(checked)
+
+        range_radio.toggled.connect(on_range_radio_toggled)
+
+        # OK/キャンセルボタン
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(range_dialog.accept)
+        button_box.rejected.connect(range_dialog.reject)
+        layout.addWidget(button_box)
+
+        # ダイアログ実行
+        if range_dialog.exec_() != QDialog.Accepted:
+            return
+
+        # 範囲に基づいてアノテーション対象画像を取得
+        if all_radio.isChecked():
+            # すべてのアノテーションされていない画像
+            unannotated_images = [img for img in self.images if img not in self.annotations]
+        else:
+            # 指定範囲のアノテーションされていない画像
+            start_idx = start_spin.value()
+            end_idx = end_spin.value()
+            if start_idx > end_idx:
+                QMessageBox.warning(self, "警告", "開始インデックスは終了インデックス以下である必要があります。")
+                return
+
+            range_images = self.images[start_idx:end_idx + 1]
+            unannotated_images = [img for img in range_images if img not in self.annotations]
+
         if not unannotated_images:
-            QMessageBox.information(self, "情報", "すべての画像がすでにアノテーションされています。")
+            QMessageBox.information(self, "情報", "指定範囲にアノテーションされていない画像がありません。")
             return
         
         # 選択された学習方法（モデル）を取得
@@ -15415,18 +16060,18 @@ class ImageAnnotationTool(QMainWindow):
     def yolo_auto_annotate(self):
         """YOLOを使用した物体検知・セグメンテーションのオートアノテーション"""
         from utils.yolo_utils import get_yolo_model, batch_detect_objects_and_segments
-        
+
         if not self.images:
             QMessageBox.warning(self, "警告", "画像が読み込まれていません。")
             return
-        
+
         # モデルタイプを先に判定
         model_type = "detect"
         if hasattr(self, 'yolo_seg_model') and self.yolo_seg_model is not None:
             model_type = "segment"
         elif hasattr(self, 'yolo_model') and self.yolo_model is not None:
             model_type = "detect"
-        
+
         # 既存のアノテーションがある場合は確認（モデルタイプに応じて）
         if model_type == "segment":
             existing_count = len(self.segmentation_annotations) if hasattr(self, 'segmentation_annotations') else 0
@@ -15440,18 +16085,18 @@ class ImageAnnotationTool(QMainWindow):
                 msg = f"既存のバウンディングボックスアノテーションがあります:\n"
                 msg += f"・{existing_count}個の画像\n"
                 msg += "\nどのように処理しますか？"
-        
+
         if 'msg' in locals():
-            
+
             msgBox = QMessageBox()
             msgBox.setWindowTitle("既存アノテーションの処理")
             msgBox.setText(msg)
             msgBox.addButton("上書き", QMessageBox.AcceptRole)
             msgBox.addButton("追加", QMessageBox.AcceptRole)
             msgBox.addButton("キャンセル", QMessageBox.RejectRole)
-            
+
             result = msgBox.exec_()
-            
+
             if result == 2:  # キャンセル
                 return
             elif result == 0:  # 上書き
@@ -15462,6 +16107,99 @@ class ImageAnnotationTool(QMainWindow):
                 else:
                     if hasattr(self, 'bbox_annotations'):
                         self.bbox_annotations.clear()
+
+        # 範囲指定ダイアログを表示
+        range_dialog = QDialog(self)
+        range_dialog.setWindowTitle("YOLOオートアノテーション範囲指定")
+        range_dialog.setMinimumWidth(400)
+
+        layout = QVBoxLayout(range_dialog)
+
+        # 説明ラベル
+        info_label = QLabel(f"YOLO{model_type}のオートアノテーションを実行する範囲を指定してください。")
+        layout.addWidget(info_label)
+
+        # 範囲選択
+        range_group = QGroupBox("範囲")
+        range_layout = QVBoxLayout(range_group)
+
+        # ラジオボタン
+        all_radio = QRadioButton("すべての画像")
+        all_radio.setChecked(True)
+        range_radio = QRadioButton("インデックス範囲を指定")
+
+        range_layout.addWidget(all_radio)
+        range_layout.addWidget(range_radio)
+
+        # インデックス範囲入力
+        index_layout = QHBoxLayout()
+        index_layout.addWidget(QLabel("開始:"))
+        start_spin = QSpinBox()
+        start_spin.setRange(0, len(self.images) - 1)
+        start_spin.setValue(0)
+        start_spin.setEnabled(False)
+        index_layout.addWidget(start_spin)
+
+        # 現在位置ボタン（開始）
+        start_current_button = QPushButton("現在位置")
+        start_current_button.setEnabled(False)
+        start_current_button.setToolTip("現在表示中の画像インデックスを設定")
+        start_current_button.clicked.connect(lambda: start_spin.setValue(self.current_index))
+        index_layout.addWidget(start_current_button)
+
+        index_layout.addWidget(QLabel("終了:"))
+        end_spin = QSpinBox()
+        end_spin.setRange(0, len(self.images) - 1)
+        end_spin.setValue(len(self.images) - 1)
+        end_spin.setEnabled(False)
+        index_layout.addWidget(end_spin)
+
+        # 現在位置ボタン（終了）
+        end_current_button = QPushButton("現在位置")
+        end_current_button.setEnabled(False)
+        end_current_button.setToolTip("現在表示中の画像インデックスを設定")
+        end_current_button.clicked.connect(lambda: end_spin.setValue(self.current_index))
+        index_layout.addWidget(end_current_button)
+
+        range_layout.addLayout(index_layout)
+        layout.addWidget(range_group)
+
+        # ラジオボタンの状態変化でスピンボックスとボタンを有効/無効化
+        def on_range_radio_toggled(checked):
+            start_spin.setEnabled(checked)
+            end_spin.setEnabled(checked)
+            start_current_button.setEnabled(checked)
+            end_current_button.setEnabled(checked)
+
+        range_radio.toggled.connect(on_range_radio_toggled)
+
+        # OK/キャンセルボタン
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(range_dialog.accept)
+        button_box.rejected.connect(range_dialog.reject)
+        layout.addWidget(button_box)
+
+        # ダイアログ実行
+        if range_dialog.exec_() != QDialog.Accepted:
+            return
+
+        # 範囲に基づいて処理対象画像を取得
+        if all_radio.isChecked():
+            # すべての画像
+            target_images = self.images[:]
+        else:
+            # 指定範囲の画像
+            start_idx = start_spin.value()
+            end_idx = end_spin.value()
+            if start_idx > end_idx:
+                QMessageBox.warning(self, "警告", "開始インデックスは終了インデックス以下である必要があります。")
+                return
+
+            target_images = self.images[start_idx:end_idx + 1]
+
+        if not target_images:
+            QMessageBox.information(self, "情報", "処理対象の画像がありません。")
+            return
         
         # 信頼度の設定を取得
         conf_threshold = 0.25
@@ -15478,7 +16216,7 @@ class ImageAnnotationTool(QMainWindow):
         dialog.setWindowTitle("オートアノテーション設定")
         dialog.setModal(True)
         layout = QVBoxLayout(dialog)
-        
+
         # 説明ラベル
         info_label = QLabel("オートアノテーションの実行方法を選択してください")
         layout.addWidget(info_label)
@@ -15516,33 +16254,20 @@ class ImageAnnotationTool(QMainWindow):
         
         # スキップラジオボタンが選択されたときにスピンボックスを有効化
         skip_radio.toggled.connect(skip_spinbox.setEnabled)
-        
-        # 現在の画像から開始オプション
-        from_current_checkbox = QCheckBox("現在の画像から開始")
-        from_current_checkbox.setChecked(False)
-        layout.addWidget(from_current_checkbox)
-        
+
         # 処理枚数の見積もり表示
         estimate_label = QLabel()
         def update_estimate():
             if all_radio.isChecked():
-                if from_current_checkbox.isChecked():
-                    count = len(self.images) - self.current_index
-                else:
-                    count = len(self.images)
+                count = len(target_images)
                 estimate_label.setText(f"処理予定: {count}枚")
             else:
                 skip = skip_spinbox.value()
-                if from_current_checkbox.isChecked():
-                    remaining = len(self.images) - self.current_index
-                    count = (remaining + skip - 1) // skip
-                else:
-                    count = (len(self.images) + skip - 1) // skip
+                count = (len(target_images) + skip - 1) // skip
                 estimate_label.setText(f"処理予定: 約{count}枚（{skip}枚ごと）")
-        
+
         all_radio.toggled.connect(update_estimate)
         skip_spinbox.valueChanged.connect(update_estimate)
-        from_current_checkbox.toggled.connect(update_estimate)
         update_estimate()
         layout.addWidget(estimate_label)
         
@@ -15558,18 +16283,12 @@ class ImageAnnotationTool(QMainWindow):
         # 設定を取得
         process_all = all_radio.isChecked()
         skip_count = skip_spinbox.value() if not process_all else 1
-        from_current = from_current_checkbox.isChecked()
-        
-        # 処理する画像リストを作成
-        if from_current:
-            start_index = self.current_index
-        else:
-            start_index = 0
-        
+
+        # 処理する画像リストを作成（範囲指定されたtarget_imagesに対してスキップ処理を適用）
         if process_all:
-            images_to_process = self.images[start_index:]
+            images_to_process = target_images
         else:
-            images_to_process = self.images[start_index::skip_count]
+            images_to_process = target_images[::skip_count]
         
         # 進捗ダイアログを表示
         progress = QProgressDialog(
