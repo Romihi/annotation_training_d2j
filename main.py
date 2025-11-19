@@ -458,8 +458,9 @@ class ImageLabel(QLabel):
         # セグメンテーション走行方向矢印を描画
         self.draw_seg_driving_direction(self.pix_width, self.pix_height, painter, self.target_rect)
 
-        # マウス座標表示（最後に描画して常に最前面に）
-        self.draw_mouse_coordinates(painter)
+        # マウス座標表示（自動運転モードのみ、最後に描画して常に最前面に）
+        if self.main_window and self.main_window.current_mode == 0:
+            self.draw_mouse_coordinates(painter)
 
         painter.end()
 
@@ -1112,10 +1113,13 @@ class ImageLabel(QLabel):
                 painter.setBrush(QBrush(QColor(0, 255, 0, 180)))
                 painter.drawEllipse(int(wp_x - 6), int(wp_y - 6), 12, 12)
 
-                # すべてのウェイポイントに座標情報を表示
+                # すべてのウェイポイントに座標情報を表示（正規化: -1～1）
                 painter.setPen(QPen(QColor(255, 255, 255)))
                 painter.setFont(QFont("Arial", 9, QFont.Bold))
-                info_text = f"({int(img_x)}, {int(img_y)})"
+                # 座標を正規化: X軸は中央を0、左端を-1、右端を1、Y軸は下端を-1、上端を1
+                norm_x = (img_x - pix_width / 2) / (pix_width / 2)
+                norm_y = (pix_height - img_y) / (pix_height / 2) - 1
+                info_text = f"({norm_x:.2f}, {norm_y:.2f})"
                 painter.drawText(int(wp_x + 10), int(wp_y - 5), info_text)
 
         else:
@@ -1181,13 +1185,16 @@ class ImageLabel(QLabel):
             painter.setBrush(QBrush(QColor(200, 200, 0, 180)))
             painter.drawEllipse(int(screen_target_x - 8), int(screen_target_y - 8), 16, 16)
 
-            # 座標と舵角情報を表示
+            # 座標と舵角情報を表示（正規化: -1～1）
             painter.setPen(QPen(QColor(255, 255, 255)))
             painter.setFont(QFont("Arial", 10, QFont.Bold))
+            # 座標を正規化: X軸は中央を0、左端を-1、右端を1、Y軸は下端を-1、上端を1
+            norm_x = (target_x - pix_width / 2) / (pix_width / 2)
+            norm_y = (pix_height - target_y) / (pix_height / 2) - 1
             if arc_params:
-                info_text = f"({target_x}, {target_y}) {arc_params['actual_steering_deg']:.1f}°"
+                info_text = f"({norm_x:.2f}, {norm_y:.2f}) {arc_params['actual_steering_deg']:.1f}°"
             else:
-                info_text = f"({target_x}, {target_y}) 直進"
+                info_text = f"({norm_x:.2f}, {norm_y:.2f}) 直進"
             painter.drawText(int(screen_target_x + 12), int(screen_target_y - 5), info_text)
 
     def draw_segmentation_inference_results(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
@@ -3045,8 +3052,6 @@ class ImageAnnotationTool(QMainWindow):
 
         # セグメンテーション関連の初期化
         self.segmentation_annotations = {}  # セグメンテーションアノテーション用
-        self.current_polygon = []  # 現在描画中のポリゴン
-        self.is_drawing_polygon = False  # ポリゴン描画中フラグ
         self.segmentation_inference_results = {}  # セグメンテーション推論結果
         self.yolo_seg_model = None  # YOLOセグメンテーションモデル
         self.last_segmentations = []
@@ -3414,7 +3419,7 @@ class ImageAnnotationTool(QMainWindow):
 
         self.yolo_unified_model_combo = QComboBox()
         self.yolo_unified_model_combo.setMinimumWidth(180)
-        self.yolo_unified_model_combo.setStyleSheet("combobox-popup: 0; font-size: 10px;")
+        self.yolo_unified_model_combo.setStyleSheet("combobox-popup: 0; font-size: 12px;")
         obj_detection_layout.addWidget(self.yolo_unified_model_combo)
 
         # YOLOモデル操作ボタン
@@ -4411,7 +4416,12 @@ class ImageAnnotationTool(QMainWindow):
                     if self.main_image_view.selected_bbox_index is not None:
                         self.delete_selected_bbox()
                 elif self.current_mode == 2:  # セグメンテーションモードの場合
-                    if self.main_image_view.selected_segmentation_index is not None:
+                    # 頂点が選択されている場合は頂点のみを削除
+                    if (self.main_image_view.selected_polygon_index is not None and
+                        self.main_image_view.selected_vertex_index is not None):
+                        self.delete_selected_vertex()
+                    # セグメンテーション全体が選択されている場合はセグメンテーションを削除
+                    elif self.main_image_view.selected_segmentation_index is not None:
                         self.delete_selected_segmentation()
                 elif self.current_mode == 3:  # waypointモードの場合
                     # 現在の画像のwaypointアノテーションを全削除
@@ -4482,36 +4492,90 @@ class ImageAnnotationTool(QMainWindow):
                 # 確認メッセージ
                 self.statusBar().showMessage(f"'{class_name}' のバウンディングボックスを削除しました", 3000)
 
+    def delete_selected_vertex(self):
+        """選択されたセグメンテーションの頂点を削除する"""
+        if not self.images or not hasattr(self, 'segmentation_annotations'):
+            return
+
+        current_index = self.current_index
+        if current_index is None or not isinstance(current_index, int):
+            return
+
+        polygon_index = self.main_image_view.selected_polygon_index
+        vertex_index = self.main_image_view.selected_vertex_index
+
+        if polygon_index is None or vertex_index is None:
+            return
+
+        if current_index not in self.segmentation_annotations:
+            return
+
+        segmentations = self.segmentation_annotations[current_index]
+        if not (0 <= polygon_index < len(segmentations)):
+            return
+
+        seg_data = segmentations[polygon_index]
+        points = seg_data.get('points', [])
+
+        # 頂点が3つ以下の場合は削除できない（ポリゴンとして成立しない）
+        if len(points) <= 3:
+            QMessageBox.warning(
+                self,
+                "警告",
+                "ポリゴンは最低3つの頂点が必要です。\n頂点を削除できません。"
+            )
+            return
+
+        if not (0 <= vertex_index < len(points)):
+            return
+
+        # 頂点を削除
+        class_name = seg_data.get('class', 'unknown')
+        del points[vertex_index]
+
+        # 選択状態をクリア
+        self.main_image_view.selected_vertex_index = None
+        self.main_image_view.selected_polygon_index = None
+
+        # 画面を更新
+        self.display_current_image()
+
+        # ステータスバーに情報表示
+        self.statusBar().showMessage(
+            f"'{class_name}' の頂点を削除しました（残り{len(points)}個の頂点）",
+            3000
+        )
+
     def delete_selected_segmentation(self, index=None):
         """選択されたセグメンテーションを削除する"""
         if not self.images or not hasattr(self, 'segmentation_annotations'):
             return
-        
+
         # インデックスベースに変更
         current_index = self.current_index
-        
+
         # current_indexの有効性をチェック
         if current_index is None or not isinstance(current_index, int):
             return
-        
+
         if index is None:
             index = self.main_image_view.selected_segmentation_index
-        
-        if (current_index in self.segmentation_annotations and 
+
+        if (current_index in self.segmentation_annotations and
             index is not None):
             segmentations = self.segmentation_annotations[current_index]
             if 0 <= index < len(segmentations):
                 # 現在情報を取得
                 seg = segmentations[index]
                 class_name = seg.get('class', 'unknown')
-                
+
                 # 削除実行
                 del segmentations[index]
-                
+
                 # もしこの画像のセグメンテーションが全てなくなった場合、辞書のキーを削除
                 if not segmentations:  # リストが空になった場合
                     del self.segmentation_annotations[current_index]
-                
+
                 # 選択をクリア
                 self.main_image_view.selected_segmentation_index = None
 
@@ -4973,6 +5037,151 @@ class ImageAnnotationTool(QMainWindow):
         # X座標の中央値を計算
         x_center = int(np.median(x_indices))
         return x_center
+
+    def calculate_polygon_iou(self, poly1_points, poly2_points, img_width, img_height):
+        """2つのポリゴンのIoU (Intersection over Union) を計算
+
+        Args:
+            poly1_points: ポリゴン1の頂点リスト [(x1, y1), (x2, y2), ...]
+            poly2_points: ポリゴン2の頂点リスト
+            img_width: 画像の幅
+            img_height: 画像の高さ
+
+        Returns:
+            float: IoU値 (0.0~1.0)
+        """
+        from shapely.geometry import Polygon
+        from shapely.validation import make_valid
+
+        try:
+            # Shapely Polygonオブジェクトを作成
+            poly1 = Polygon(poly1_points)
+            poly2 = Polygon(poly2_points)
+
+            # ポリゴンが無効な場合は修正を試みる
+            if not poly1.is_valid:
+                poly1 = make_valid(poly1)
+            if not poly2.is_valid:
+                poly2 = make_valid(poly2)
+
+            # 交差エリアを計算
+            if not poly1.intersects(poly2):
+                return 0.0
+
+            intersection_area = poly1.intersection(poly2).area
+
+            # 和集合エリアを計算
+            union_area = poly1.area + poly2.area - intersection_area
+
+            # IoUを計算
+            if union_area == 0:
+                return 0.0
+
+            iou = intersection_area / union_area
+            return iou
+
+        except Exception as e:
+            # エラーが発生した場合は重なりなしとみなす
+            print(f"IoU計算エラー: {e}")
+            return 0.0
+
+    def calculate_bbox_iou(self, bbox1, bbox2):
+        """2つのバウンディングボックスのIoU (Intersection over Union) を計算
+
+        Args:
+            bbox1: バウンディングボックス1 {'x1': float, 'y1': float, 'x2': float, 'y2': float}
+            bbox2: バウンディングボックス2
+
+        Returns:
+            float: IoU値 (0.0~1.0)
+        """
+        # 交差領域の座標を計算
+        x1_inter = max(bbox1['x1'], bbox2['x1'])
+        y1_inter = max(bbox1['y1'], bbox2['y1'])
+        x2_inter = min(bbox1['x2'], bbox2['x2'])
+        y2_inter = min(bbox1['y2'], bbox2['y2'])
+
+        # 交差領域がない場合
+        if x1_inter >= x2_inter or y1_inter >= y2_inter:
+            return 0.0
+
+        # 交差領域の面積
+        inter_area = (x2_inter - x1_inter) * (y2_inter - y1_inter)
+
+        # 各バウンディングボックスの面積
+        bbox1_area = (bbox1['x2'] - bbox1['x1']) * (bbox1['y2'] - bbox1['y1'])
+        bbox2_area = (bbox2['x2'] - bbox2['x1']) * (bbox2['y2'] - bbox2['y1'])
+
+        # 和集合の面積
+        union_area = bbox1_area + bbox2_area - inter_area
+
+        # IoUを計算
+        if union_area == 0:
+            return 0.0
+
+        iou = inter_area / union_area
+        return iou
+
+    def check_bbox_overlap(self, new_bbox, existing_bboxes, iou_threshold=0.5):
+        """新しいバウンディングボックスが既存のバウンディングボックスと重複しているか確認
+
+        Args:
+            new_bbox: 新しいバウンディングボックス {'x1': float, 'y1': float, 'x2': float, 'y2': float, 'class': str, ...}
+            existing_bboxes: 既存のバウンディングボックスリスト
+            iou_threshold: 重複と判定するIoUの閾値 (デフォルト: 0.5)
+
+        Returns:
+            bool: True = 重複あり（追加すべきでない）, False = 重複なし（追加可能）
+        """
+        new_class = new_bbox['class']
+
+        # 同じクラスの既存バウンディングボックスとの重なりをチェック
+        for existing_bbox in existing_bboxes:
+            if existing_bbox['class'] != new_class:
+                # 異なるクラスの場合はスキップ
+                continue
+
+            # IoUを計算
+            iou = self.calculate_bbox_iou(new_bbox, existing_bbox)
+
+            # 閾値以上の重なりがある場合は重複と判定
+            if iou >= iou_threshold:
+                return True
+
+        return False
+
+    def check_segmentation_overlap(self, new_seg, existing_segs, img_width, img_height, iou_threshold=0.5):
+        """新しいセグメンテーションが既存のセグメンテーションと重複しているか確認
+
+        Args:
+            new_seg: 新しいセグメンテーション {'class': str, 'points': [(x, y), ...], ...}
+            existing_segs: 既存のセグメンテーションリスト
+            img_width: 画像の幅
+            img_height: 画像の高さ
+            iou_threshold: 重複と判定するIoUの閾値 (デフォルト: 0.5)
+
+        Returns:
+            bool: True = 重複あり（追加すべきでない）, False = 重複なし（追加可能）
+        """
+        new_class = new_seg['class']
+        new_points = new_seg['points']
+
+        # 同じクラスの既存セグメンテーションとの重なりをチェック
+        for existing_seg in existing_segs:
+            if existing_seg['class'] != new_class:
+                # 異なるクラスの場合はスキップ
+                continue
+
+            existing_points = existing_seg['points']
+
+            # IoUを計算
+            iou = self.calculate_polygon_iou(new_points, existing_points, img_width, img_height)
+
+            # 閾値以上の重なりがある場合は重複と判定
+            if iou >= iou_threshold:
+                return True
+
+        return False
 
     def calculate_seg_driving_direction(self, current_index):
         """セグメンテーション推論結果から走行方向を計算
@@ -5995,12 +6204,6 @@ class ImageAnnotationTool(QMainWindow):
             self.main_image_view.hovering_polygon_index = None
             
         # セグメンテーション描画状態をクリア
-        if hasattr(self.main_image_view, 'current_polygon'):
-            self.main_image_view.current_polygon = []
-        if hasattr(self.main_image_view, 'is_drawing_polygon'):
-            self.main_image_view.is_drawing_polygon = False
-            
-        # 一時的なセグメンテーション描画状態をクリア（黄色い線を消去）
         if hasattr(self.main_image_view, 'current_segmentation_polygon'):
             self.main_image_view.current_segmentation_polygon = []
         if hasattr(self.main_image_view, 'is_drawing_segmentation'):
@@ -6951,35 +7154,50 @@ class ImageAnnotationTool(QMainWindow):
 
     def _prepare_yolo_model(self, model_type, training_config, progress):
         """YOLOモデルの準備"""
-        
+
         pretrained_model_path = None
         model_path = None
-        
+
         if training_config['use_pretrained']:
             # 事前学習済みモデルをダウンロード
             progress.setLabelText(f"事前学習済み {model_type} モデルをダウンロードしています...")
             progress.setValue(5)
             QApplication.processEvents()
-            
+
             pretrained_model_path = self.download_pretrained_yolo_model(model_type)
             if not pretrained_model_path:
                 progress.close()
                 QMessageBox.critical(self, "エラー", f"事前学習済み {model_type} モデルの準備に失敗しました。")
                 return None, None
-            
+
             model = YOLO(pretrained_model_path)
             pretrained_info = f"事前学習済みの重み (ダウンロード済み: {os.path.basename(pretrained_model_path)})"
         else:
             # 現在ロードされているモデルを使用
-            if hasattr(self, 'yolo_model_file') and os.path.exists(self.yolo_model_file):
-                model_path = self.yolo_model_file
-                model = YOLO(model_path)
-                pretrained_info = f"現在のモデル重み: {os.path.basename(model_path)}"
+            # セグメンテーションモデルか物体検知モデルかを判定
+            is_segmentation = 'seg' in model_type.lower()
+
+            if is_segmentation:
+                # セグメンテーションモデル
+                if hasattr(self, 'yolo_seg_model_file') and os.path.exists(self.yolo_seg_model_file):
+                    model_path = self.yolo_seg_model_file
+                    model = YOLO(model_path)
+                    pretrained_info = f"現在のモデル重み: {os.path.basename(model_path)}"
+                else:
+                    progress.close()
+                    QMessageBox.critical(self, "エラー", "現在のセグメンテーションモデルが読み込まれていません。事前学習済みモデルを使用するか、モデルを読み込んでから再試行してください。")
+                    return None, None
             else:
-                progress.close()
-                QMessageBox.critical(self, "エラー", "現在のモデルが読み込まれていません。事前学習済みモデルを使用するか、モデルを読み込んでから再試行してください。")
-                return None, None
-        
+                # 物体検知モデル
+                if hasattr(self, 'yolo_model_file') and os.path.exists(self.yolo_model_file):
+                    model_path = self.yolo_model_file
+                    model = YOLO(model_path)
+                    pretrained_info = f"現在のモデル重み: {os.path.basename(model_path)}"
+                else:
+                    progress.close()
+                    QMessageBox.critical(self, "エラー", "現在の物体検知モデルが読み込まれていません。事前学習済みモデルを使用するか、モデルを読み込んでから再試行してください。")
+                    return None, None
+
         return model, pretrained_info
 
     def _setup_yolo_mlflow_environment(self, task_type):
@@ -7134,8 +7352,20 @@ class ImageAnnotationTool(QMainWindow):
         
         # 現在読み込まれているモデルの情報を表示
         current_model_info = QLabel("現在のモデル: なし")
-        if hasattr(self, 'yolo_model') and hasattr(self, 'yolo_model_file'):
-            model_name = os.path.basename(self.yolo_model_file) if hasattr(self, 'yolo_model_file') else "Unknown"
+        model_loaded = False
+        model_name = "Unknown"
+
+        # 物体検知モデルまたはセグメンテーションモデルがロードされているかチェック
+        if task_name == "物体検知":
+            if hasattr(self, 'yolo_model') and hasattr(self, 'yolo_model_file'):
+                model_name = os.path.basename(self.yolo_model_file)
+                model_loaded = True
+        else:  # セグメンテーション
+            if hasattr(self, 'yolo_seg_model') and hasattr(self, 'yolo_seg_model_file'):
+                model_name = os.path.basename(self.yolo_seg_model_file)
+                model_loaded = True
+
+        if model_loaded:
             current_model_info.setText(f"現在のモデル: {model_name}")
             training_settings.weights_radio_current.setEnabled(True)
         else:
@@ -11270,6 +11500,10 @@ class ImageAnnotationTool(QMainWindow):
                 self.image_slider.setValue(self.current_index)
                 self.image_slider.blockSignals(False)
                 return
+
+            # 画像を移動する前に、作成途中のアノテーション頂点をクリア
+            self.clear_incomplete_annotations(show_message=True)
+
             # スライダー移動前に現在の画像のwaypoint情報を保存
             old_index = self.current_index
             if (old_index is not None and
@@ -13638,6 +13872,9 @@ class ImageAnnotationTool(QMainWindow):
             if index == self.current_index:
                 return
 
+            # 画像を移動する前に、作成途中のアノテーション頂点をクリア
+            self.clear_incomplete_annotations(show_message=True)
+
             # 前回のwaypointを保存（変更前のインデックス用）
             if (self.current_index is not None and
                 self.current_index in self.waypoint_annotations and
@@ -13685,6 +13922,41 @@ class ImageAnnotationTool(QMainWindow):
             # サムネイルクリック時は自動スキップしない（ユーザーが明示的に選択した画像で停止）
             # 自動スキップ機能は矢印キーなどの他の操作でのみ有効
 
+    def clear_incomplete_annotations(self, show_message=True):
+        """作成途中のアノテーションをクリアする共通関数"""
+        cleared = False
+        message_parts = []
+
+        # セグメンテーションの作成途中の頂点をクリア
+        if hasattr(self.main_image_view, 'current_segmentation_polygon') and self.main_image_view.current_segmentation_polygon:
+            vertex_count = len(self.main_image_view.current_segmentation_polygon)
+            self.main_image_view.current_segmentation_polygon = []
+            if hasattr(self.main_image_view, 'is_drawing_segmentation'):
+                self.main_image_view.is_drawing_segmentation = False
+            message_parts.append(f"セグメンテーション（{vertex_count}個の頂点）")
+            cleared = True
+
+        # 選択状態をクリア
+        if hasattr(self.main_image_view, 'selected_polygon_index') and self.main_image_view.selected_polygon_index is not None:
+            self.main_image_view.selected_polygon_index = None
+            self.main_image_view.selected_vertex_index = None
+            cleared = True
+
+        if hasattr(self.main_image_view, 'selected_segmentation_index') and self.main_image_view.selected_segmentation_index is not None:
+            self.main_image_view.selected_segmentation_index = None
+            cleared = True
+
+        # 画面を更新
+        if cleared and hasattr(self.main_image_view, 'update'):
+            self.main_image_view.update()
+
+        # ステータスバーに通知
+        if cleared and show_message and message_parts:
+            message = "作成途中の" + "、".join(message_parts) + "をクリアしました"
+            self.statusBar().showMessage(message, 2000)
+
+        return cleared
+
     def skip_images(self, count):
         """指定した数だけ画像をスキップする - 位置推論の自動実行も追加"""
         # waypointモードの場合、現在の画像のwaypoint数をチェック
@@ -13702,6 +13974,9 @@ class ImageAnnotationTool(QMainWindow):
         # インデックスが変わらない場合は何もしない
         if new_index == self.current_index:
             return
+
+        # 画像を移動する前に、作成途中のアノテーション頂点をクリア
+        self.clear_incomplete_annotations(show_message=True)
 
         # スキップ前に現在の画像のwaypoint情報を保存
         current_index = self.current_index
@@ -16403,38 +16678,60 @@ class ImageAnnotationTool(QMainWindow):
                         filtered_detections = result['detections']
                     
                     if filtered_detections:
+                        # 既存のアノテーションを取得（重複チェック用）
+                        existing_bboxes = self.bbox_annotations.get(img_index, [])
+
                         # 手動アノテーションと同じ形式に変換（既に正規化座標）
                         bbox_annotations = []
+                        skipped_bbox_count = 0
                         for det in filtered_detections:
                             # bboxは既に正規化座標（0-1）で受け取り、型の一貫性を確保
                             x1 = float(det['bbox'][0])
                             y1 = float(det['bbox'][1])
                             x2 = float(det['bbox'][2])
                             y2 = float(det['bbox'][3])
-                            
+
                             # 範囲チェック（0-1の間に収まることを確認）し、明示的にfloat型で保存
                             x1 = float(max(0.0, min(1.0, x1)))
                             y1 = float(max(0.0, min(1.0, y1)))
                             x2 = float(max(0.0, min(1.0, x2)))
                             y2 = float(max(0.0, min(1.0, y2)))
-                            
-                            bbox_annotations.append({
+
+                            new_bbox = {
                                 'x1': x1,
                                 'y1': y1,
                                 'x2': x2,
                                 'y2': y2,
                                 'class': det['class'],
                                 'confidence': float(det.get('confidence', 1.0))
-                            })
-                        
-                        # 既存のアノテーションがある場合は確認
-                        if img_index in self.bbox_annotations:
-                            # 既存のアノテーションに追加（重複チェックなし）
-                            self.bbox_annotations[img_index].extend(bbox_annotations)
-                        else:
-                            self.bbox_annotations[img_index] = bbox_annotations
-                        
-                        detection_count += len(bbox_annotations)
+                            }
+
+                            # 既存のアノテーションとの重複チェック
+                            if existing_bboxes:
+                                is_overlap = self.check_bbox_overlap(
+                                    new_bbox, existing_bboxes, iou_threshold=0.5
+                                )
+                                if is_overlap:
+                                    # 重複している場合はスキップ
+                                    skipped_bbox_count += 1
+                                    continue
+
+                            # 重複していない場合のみ追加
+                            bbox_annotations.append(new_bbox)
+
+                        # アノテーションを統合
+                        if bbox_annotations:
+                            if img_index in self.bbox_annotations:
+                                # 既存のアノテーションに追加
+                                self.bbox_annotations[img_index].extend(bbox_annotations)
+                            else:
+                                self.bbox_annotations[img_index] = bbox_annotations
+
+                            detection_count += len(bbox_annotations)
+
+                        # スキップした数をログ出力
+                        if skipped_bbox_count > 0:
+                            print(f"画像 {img_index}: {skipped_bbox_count}個の重複バウンディングボックスをスキップしました")
                 
                 # セグメンテーション処理（セグメンテーションモデルの場合のみ）
                 if model_type == "segment" and result['segments']:
@@ -16460,6 +16757,10 @@ class ImageAnnotationTool(QMainWindow):
                             print(f"画像サイズ取得エラー {current_img_path}: {e}")
                             continue
                         
+                        # 既存のアノテーションを取得（重複チェック用）
+                        existing_segs = self.segmentation_annotations.get(img_index, [])
+
+                        skipped_count = 0
                         for seg in filtered_segments:
                             # 正規化座標をピクセル座標に変換（手動セグメンテーションと同じ形式）
                             pixel_points = []
@@ -16467,30 +16768,48 @@ class ImageAnnotationTool(QMainWindow):
                                 # 正規化座標からピクセル座標へ変換
                                 norm_x = float(max(0.0, min(1.0, float(point[0]))))
                                 norm_y = float(max(0.0, min(1.0, float(point[1]))))
-                                
+
                                 pixel_x = int(norm_x * img_width)
                                 pixel_y = int(norm_y * img_height)
-                                
+
                                 # ピクセル座標を画像境界内に制限
                                 pixel_x = max(0, min(img_width - 1, pixel_x))
                                 pixel_y = max(0, min(img_height - 1, pixel_y))
-                                
+
                                 pixel_points.append((pixel_x, pixel_y))
-                            
-                            seg_annotations.append({
+
+                            new_seg = {
                                 'class': seg['class'],
                                 'points': pixel_points,  # ピクセル座標で保存
                                 'confidence': float(seg.get('confidence', 1.0))
-                            })
-                        
-                        # 既存のアノテーションがある場合は確認
-                        if img_index in self.segmentation_annotations:
-                            # 既存のアノテーションに追加
-                            self.segmentation_annotations[img_index].extend(seg_annotations)
-                        else:
-                            self.segmentation_annotations[img_index] = seg_annotations
-                        
-                        segmentation_count += len(seg_annotations)
+                            }
+
+                            # 既存のアノテーションとの重複チェック
+                            if existing_segs:
+                                is_overlap = self.check_segmentation_overlap(
+                                    new_seg, existing_segs, img_width, img_height, iou_threshold=0.5
+                                )
+                                if is_overlap:
+                                    # 重複している場合はスキップ
+                                    skipped_count += 1
+                                    continue
+
+                            # 重複していない場合のみ追加
+                            seg_annotations.append(new_seg)
+
+                        # アノテーションを統合
+                        if seg_annotations:
+                            if img_index in self.segmentation_annotations:
+                                # 既存のアノテーションに追加
+                                self.segmentation_annotations[img_index].extend(seg_annotations)
+                            else:
+                                self.segmentation_annotations[img_index] = seg_annotations
+
+                            segmentation_count += len(seg_annotations)
+
+                        # スキップした数をログ出力
+                        if skipped_count > 0:
+                            print(f"画像 {img_index}: {skipped_count}個の重複セグメンテーションをスキップしました")
             
             # UI更新
             progress.setLabelText("表示を更新中...")
