@@ -220,7 +220,6 @@ def export_to_donkey(
             try:
                 # 画像をimagesフォルダにコピー
                 dest_path = os.path.join(images_folder, new_img_name)
-                print(f"[DEBUG] コピー: {os.path.basename(img_path)} -> {new_img_name} (assigned_index={assigned_index}, original_index={original_index}, actual_index={actual_index})")
                 shutil.copy2(img_path, dest_path)
                 
                 # カタログキー名を決定

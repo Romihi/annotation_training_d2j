@@ -10,6 +10,7 @@ import random
 import subprocess
 from datetime import datetime
 import math
+from copy import deepcopy
 
 import matplotlib
 matplotlib.use('Agg')  # GUIバックエンドを使用しない設定
@@ -2914,6 +2915,12 @@ class ImageAnnotationTool(QMainWindow):
         self.gallery_update_timer.timeout.connect(self._execute_gallery_update)
         self.gallery_update_delay = 150  # 150ms後にギャラリー更新
 
+        # 推論実行デバウンス用タイマー
+        self.inference_timer = QTimer()
+        self.inference_timer.setSingleShot(True)
+        self.inference_timer.timeout.connect(self._execute_deferred_inference)
+        self.inference_delay = 50  # 50ms後に推論実行
+
         # 画像サイズキャッシュ（パフォーマンス改善）
         self.image_size_cache = {}  # {image_path: (width, height)}
         
@@ -4041,6 +4048,24 @@ class ImageAnnotationTool(QMainWindow):
         """ギャラリー更新を実際に実行（タイマーから呼ばれる）"""
         self.update_gallery()
 
+    def _schedule_inference(self):
+        """推論実行をスケジュール（デバウンス処理）"""
+        # 既存のタイマーをリセットして新たにスケジュール
+        if hasattr(self, 'inference_timer'):
+            self.inference_timer.stop()
+            self.inference_timer.start(self.inference_delay)
+
+    def _execute_deferred_inference(self):
+        """推論を実際に実行（タイマーから呼ばれる）"""
+        if not self.images or not hasattr(self, 'inference_checkbox'):
+            return
+
+        if self.inference_checkbox.isChecked():
+            current_img_path = self.images[self.current_index]
+            # 推論結果がまだない場合のみ推論を実行
+            if self.current_index not in self.inference_results:
+                self.run_inference_check(False)
+
     def update_segmentation_stats(self):
         """セグメンテーションアノテーションの統計情報を更新"""
         seg_count = len(self.segmentation_annotations) if hasattr(self, 'segmentation_annotations') else 0
@@ -4534,8 +4559,8 @@ class ImageAnnotationTool(QMainWindow):
                 self.segmentation_annotations[current_index]):
                 return
             
-            # 前回のセグメンテーションを適用
-            self.add_segmentation_annotation(self.last_segmentation.copy())
+            # 前回のセグメンテーションを適用（ディープコピーで完全に独立させる）
+            self.add_segmentation_annotation(deepcopy(self.last_segmentation))
             
     def calculate_and_store_diff_vector(self, index_or_path):
         """教師データと推論結果の差分ベクトルを計算して保存する"""
@@ -5545,26 +5570,27 @@ class ImageAnnotationTool(QMainWindow):
         """セグメンテーションアノテーションを追加"""
         if not self.images or not polygon_data:
             return
-        
+
         # インデックスベースに変更
         current_index = self.current_index
-        
+
         if current_index not in self.segmentation_annotations:
             self.segmentation_annotations[current_index] = []
-        
-        self.segmentation_annotations[current_index].append(polygon_data)
-        
-        # 前回のセグメンテーションとして保存
-        self.last_segmentation = polygon_data.copy()
-        
+
+        # polygon_dataをディープコピーしてから追加（参照の共有を防ぐ）
+        self.segmentation_annotations[current_index].append(deepcopy(polygon_data))
+
+        # 前回のセグメンテーションとして保存（ディープコピーで完全に独立させる）
+        self.last_segmentation = deepcopy(polygon_data)
+
         # データクリーンアップ: Noneエントリを削除
         self.segmentation_annotations[current_index] = [
             seg for seg in self.segmentation_annotations[current_index] if seg is not None
         ]
-        
-        # 現在のすべてのセグメンテーションを保存
-        self.last_segmentations = [seg.copy() for seg in self.segmentation_annotations[current_index]]
-        
+
+        # 現在のすべてのセグメンテーションを保存（ディープコピーで完全に独立させる）
+        self.last_segmentations = [deepcopy(seg) for seg in self.segmentation_annotations[current_index]]
+
         # UI更新
         self.main_image_view.update()
         self.update_gallery()
@@ -7515,22 +7541,16 @@ class ImageAnnotationTool(QMainWindow):
                 return None
             
             # 画像マップを作成（actual_indexをキーとして使用）
-            print(f"[DEBUG] エクスポート: self.images の長さ = {len(self.images)}")
-            print(f"[DEBUG] エクスポート: self.images の最初の3つ = {[os.path.basename(p) for p in self.images[:3]]}")
             for variant in selected_variants:
                 variant_images = self.variant_images.get(variant, [])
                 if not variant_images:
                     continue
-
-                print(f"[DEBUG] エクスポート: variant={variant}, variant_images の長さ = {len(variant_images)}")
-                print(f"[DEBUG] エクスポート: variant_images の最初の3つ = {[os.path.basename(p) for p in variant_images[:3]]}")
 
                 for img_path in variant_images:
                     try:
                         # self.imagesリストからactual_indexを取得
                         if img_path in self.images:
                             actual_idx = self.images.index(img_path)
-                            print(f"[DEBUG] エクスポート: img={os.path.basename(img_path)}, actual_idx={actual_idx}")
 
                             if actual_idx not in image_map:
                                 image_map[actual_idx] = {}
@@ -12768,9 +12788,11 @@ class ImageAnnotationTool(QMainWindow):
 
     def update_gallery(self):
         """ギャラリー表示を更新する - 位置情報の問題を根本的に修正"""
-        # Clear current gallery
-        for i in reversed(range(self.gallery_layout.count())): 
-            self.gallery_layout.itemAt(i).widget().deleteLater()
+        # Clear current gallery - メモリリーク防止のため即座に削除
+        while self.gallery_layout.count():
+            item = self.gallery_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
         
         if not self.images:
             return
@@ -13095,11 +13117,9 @@ class ImageAnnotationTool(QMainWindow):
                     self.display_current_image()
 
             # 推論表示チェックボックスがONの場合、推論結果を表示
+            # デバウンス処理により遅延実行（連打対応）
             if self.inference_checkbox.isChecked():
-                current_img_path = self.images[self.current_index]
-                # 推論結果がまだない場合のみ推論を実行
-                if current_img_path not in self.inference_results:
-                    self.run_inference_check(False)
+                self._schedule_inference()
 
             # ギャラリー更新
             self.update_gallery()
@@ -13264,9 +13284,9 @@ class ImageAnnotationTool(QMainWindow):
             self.update_waypoint_inference_display()
 
         # 推論表示チェックボックスがONの場合、推論結果がなければ実行
+        # デバウンス処理により遅延実行（連打対応）
         if self.inference_checkbox.isChecked():
-            if new_img_path not in self.inference_results:
-                self.run_inference_check(False)
+            self._schedule_inference()
 
         # 物体検知推論表示の更新
         self.update_detection_info_panel()
@@ -13293,7 +13313,6 @@ class ImageAnnotationTool(QMainWindow):
             return
 
         current_img_path = self.images[self.current_index]
-        print(f"[DEBUG] handle_annotation: current_index={self.current_index}, img_path={os.path.basename(current_img_path)}, x={x}, y={y}")
 
         # Get image dimensions (キャッシュを使用してImage.open()を削減)
         if current_img_path in self.image_size_cache:
@@ -13307,9 +13326,17 @@ class ImageAnnotationTool(QMainWindow):
         angle, throttle = normalize_coordinates(x, y, width, height)
 
         # Store current state in history before changing
-        if current_img_path in self.annotations:
-            previous = self.annotations.copy()
-            self.annotation_history.append(previous)
+        # 履歴のサイズ制限を追加してメモリリークを防止
+        if self.current_index in self.annotations:
+            # 変更前の状態のみを保存（辞書全体ではなく）
+            previous_annotation = self.annotations[self.current_index].copy()
+            self.annotation_history.append({
+                'index': self.current_index,
+                'annotation': previous_annotation
+            })
+            # 履歴を最新100件に制限
+            if len(self.annotation_history) > 100:
+                self.annotation_history = self.annotation_history[-100:]
 
         # 削除済みインデックスの場合、削除リストから削除
         if hasattr(self, 'deleted_indexes') and self.current_index in self.deleted_indexes:
@@ -13345,7 +13372,8 @@ class ImageAnnotationTool(QMainWindow):
         self.display_current_image()  # 現在の画像表示は即座に更新（重要）
 
         # 重い処理はデバウンスタイマーで遅延実行（連打対応）
-        self._schedule_gallery_update()  # ギャラリー更新を遅延
+        # Note: ギャラリー更新はskip_images内で呼ばれるため、ここでは呼ばない
+        # self._schedule_gallery_update()  # ギャラリー更新を遅延
         self._schedule_distribution_graph_update()  # グラフ更新を遅延
         self.update_slider_deleted_indexes()  # スライダーは即座に更新（軽量）
 
