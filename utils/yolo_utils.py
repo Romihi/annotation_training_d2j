@@ -44,121 +44,7 @@ class YOLOTrainingWorker(QThread):
     def run(self):
         """学習を実行し、出力をキャプチャ"""
         try:
-            # シンプルなカスタムストリームクラス
-            class OutputCapture:
-                def __init__(self, worker, original_stream):
-                    self.worker = worker
-                    self.original_stream = original_stream
-                    self.buffer = ""
-
-                def write(self, text):
-                    # 元のストリームにも出力（ターミナルに表示）
-                    self.original_stream.write(text)
-                    self.original_stream.flush()
-
-                    # UIに出力を送信
-                    if text:
-                        # すべてのテキストを送信（改行を待たない）
-                        self.worker.output_received.emit(text)
-                        self.buffer += text
-
-                        # バッファが大きくなったら処理
-                        if len(self.buffer) > 200 or '\n' in self.buffer:
-                            lines = self.buffer.split('\n')
-
-                            # 各行を処理
-                            for line in lines[:-1] if '\n' in self.buffer else lines:
-                                if not line.strip():
-                                    continue
-
-                                # 重要な情報を含む行を処理
-                                # if any(key in line for key in ['Epoch', 'loss', 'mAP', 'metrics']):
-                                #     pass  # デバッグ出力を削除
-
-                                # エポックの進捗を解析（複数のパターンに対応）
-                                epoch_patterns = [
-                                    r'Epoch\s+(\d+)/(\d+)',  # 標準パターン
-                                    r'(\d+)/(\d+)\s+epochs?',  # 別のパターン
-                                    r'epoch\s+(\d+)/(\d+)',  # 小文字パターン
-                                ]
-
-                                for pattern in epoch_patterns:
-                                    match = re.search(pattern, line, re.IGNORECASE)
-                                    if match:
-                                        try:
-                                            current = int(match.group(1))
-                                            total = int(match.group(2))
-                                            progress = int((current / total) * 100)
-                                            self.worker.progress_updated.emit(progress, f"エポック {current}/{total}")
-                                            break
-                                        except Exception as e:
-                                            pass  # エラーを無視
-
-                                # Loss値とメトリクスを解析
-                                metrics = {}
-
-                                # YOLOv8の出力形式に対応
-                                # 例: "      Epoch    GPU_mem   box_loss   cls_loss   dfl_loss  Instances       Size"
-                                # 例: "      1/100      3.52G     0.9834     2.312     1.234        128        640"
-
-                                # 数値の行を検出（複数の数値が連続している行）
-                                if re.search(r'\d+\.\d+.*\d+\.\d+', line):
-                                    # box_loss, cls_loss, dfl_lossを探す
-                                    numbers = re.findall(r'\d+\.\d+', line)
-                                    if len(numbers) >= 3:
-                                        # GPU_memの後の3つの数値がloss値
-                                        try:
-                                            # 最初の数値はGPU_memの可能性があるのでスキップ
-                                            if 'G' in line:  # GPU memory indicator
-                                                if len(numbers) >= 4:
-                                                    metrics['box_loss'] = float(numbers[1])
-                                                    metrics['cls_loss'] = float(numbers[2])
-                                                    metrics['dfl_loss'] = float(numbers[3])
-                                            else:
-                                                metrics['box_loss'] = float(numbers[0])
-                                                metrics['cls_loss'] = float(numbers[1])
-                                                metrics['dfl_loss'] = float(numbers[2])
-                                        except Exception as e:
-                                            pass  # エラーを無視
-
-                                # mAP値を探す（複数のパターンに対応）
-                                map_patterns = [
-                                    (r'mAP50\(B\)\s*([\d.]+)', 'mAP50'),
-                                    (r'mAP50-95\(B\)\s*([\d.]+)', 'mAP50-95'),
-                                    (r'all\s+\d+\s+\d+\s+([\d.]+)\s+([\d.]+)', ['mAP50', 'mAP50-95']),  # COCO形式
-                                    (r'metrics/mAP_0\.5:\s*([\d.]+)', 'mAP50'),
-                                    (r'metrics/mAP_0\.5:0\.95:\s*([\d.]+)', 'mAP50-95'),
-                                ]
-
-                                for pattern, keys in map_patterns:
-                                    match = re.search(pattern, line)
-                                    if match:
-                                        try:
-                                            if isinstance(keys, list):
-                                                # 複数の値を一度に取得
-                                                for i, key in enumerate(keys):
-                                                    metrics[key] = float(match.group(i + 1))
-                                            else:
-                                                metrics[keys] = float(match.group(1))
-                                        except Exception as e:
-                                            pass  # エラーを無視
-
-                                if metrics:
-                                    self.worker.metrics_updated.emit(metrics)
-
-                            # バッファを更新
-                            if '\n' in self.buffer:
-                                self.buffer = lines[-1]
-                            else:
-                                self.buffer = ''
-
-                def flush(self):
-                    self.original_stream.flush()
-
-                def fileno(self):
-                    return self.original_stream.fileno()
-
-            # シンプルな出力キャプチャクラス
+            # 出力キャプチャクラス
             class SimpleOutputCapture:
                 def __init__(self, worker, original_stream):
                     self.worker = worker
@@ -178,19 +64,22 @@ class YOLOTrainingWorker(QThread):
                         # バッファに蓄積
                         self.buffer += text
 
-                        # 改行があれば処理
-                        if '\n' in self.buffer:
-                            lines = self.buffer.split('\n')
+                        # 改行またはキャリッジリターンがあれば処理
+                        if '\n' in self.buffer or '\r' in self.buffer:
+                            # 改行とキャリッジリターンの両方で分割
+                            lines = re.split(r'[\r\n]+', self.buffer)
                             # 完全な行のみを処理
                             for line in lines[:-1]:
                                 if line.strip():
-                                    self._parse_line(line)
+                                    # ANSI エスケープシーケンスを除去
+                                    clean_line = re.sub(r'\x1b\[[0-9;]*m', '', line)
+                                    self._parse_line(clean_line.strip())
 
                             # 最後の不完全な行を保持
                             self.buffer = lines[-1] if lines else ""
 
                 def _parse_line(self, line):
-                    # エポック進捗の解析
+                    # エポック進捗の解析（複数パターン対応）
                     if 'Starting training for' in line:
                         match = re.search(r'Starting training for (\d+) epochs', line)
                         if match:
@@ -198,42 +87,93 @@ class YOLOTrainingWorker(QThread):
                             self.worker.progress_updated.emit(0, f"学習開始: {total_epochs}エポック")
                             return
 
-                    # エポック番号の解析
-                    epoch_match = re.search(r'Epoch\s+(\d+)/(\d+)', line, re.IGNORECASE)
-                    if epoch_match:
-                        current = int(epoch_match.group(1))
-                        total = int(epoch_match.group(2))
-                        progress = int((current / total) * 100)
-                        self.worker.progress_updated.emit(progress, f"エポック {current}/{total}")
-                        return
+                    # エポック番号の解析（複数パターン）
+                    # Pattern 1: "Epoch 1/100" or "epoch: 1/100"
+                    epoch_patterns = [
+                        r'Epoch[:\s]+(\d+)/(\d+)',
+                        r'(\d+)/(\d+)\s*epochs?',
+                        r'Epoch\((\d+)/(\d+)\)',
+                    ]
 
-                    # Loss値の解析（YOLOv8の数値行）
-                    if re.search(r'\d+/\d+.*\d+\.\d+G.*\d+\.\d+.*\d+\.\d+', line):
-                        # GPU_memを除く数値を抽出
-                        numbers = re.findall(r'\d+\.\d+(?!G)', line)
-                        if len(numbers) >= 3:
+                    for pattern in epoch_patterns:
+                        epoch_match = re.search(pattern, line, re.IGNORECASE)
+                        if epoch_match:
+                            current = int(epoch_match.group(1))
+                            total = int(epoch_match.group(2))
+                            progress = int((current / total) * 100)
+                            self.worker.progress_updated.emit(progress, f"エポック {current}/{total}")
+                            break
+
+                    # Loss値の解析（YOLOv8/v11の数値行）
+                    # パターン例: "      1/100      3.52G     0.9834     2.312     1.234        128        640"
+                    # または: "1/100  0.9834  2.312  1.234"
+                    if re.search(r'\d+/\d+', line) and re.search(r'\d+\.\d+', line):
+                        # GPU_memを含む行かチェック
+                        has_gpu_mem = bool(re.search(r'\d+\.\d+G', line))
+
+                        # 浮動小数点数を全て抽出（GPU memは除外）
+                        numbers = re.findall(r'(\d+\.\d+)(?!G)', line)
+
+                        if has_gpu_mem and len(numbers) >= 3:
+                            # GPU memがある場合、最初の数値をスキップして次の3つを使用
                             try:
                                 metrics = {
                                     'box_loss': float(numbers[0]),
                                     'cls_loss': float(numbers[1]),
                                     'dfl_loss': float(numbers[2])
                                 }
+                                # セグメンテーションの場合はseg_lossも追加
+                                if len(numbers) >= 4:
+                                    metrics['seg_loss'] = float(numbers[3])
+                                self.worker.metrics_updated.emit(metrics)
+                            except:
+                                pass
+                        elif not has_gpu_mem and len(numbers) >= 3:
+                            # GPU memがない場合、最初の3つを使用
+                            try:
+                                metrics = {
+                                    'box_loss': float(numbers[0]),
+                                    'cls_loss': float(numbers[1]),
+                                    'dfl_loss': float(numbers[2])
+                                }
+                                if len(numbers) >= 4:
+                                    metrics['seg_loss'] = float(numbers[3])
                                 self.worker.metrics_updated.emit(metrics)
                             except:
                                 pass
 
-                    # mAP値の解析
-                    if line.strip().startswith('all') and 'all' in line:
+                    # mAP値の解析（複数パターン対応）
+                    # パターン1: "all  100  100  0.95  0.85" (COCO形式)
+                    if line.strip().startswith('all'):
                         parts = line.split()
                         if len(parts) >= 5:
                             try:
+                                # mAP50は3番目または4番目の数値
+                                idx = 3 if len(parts) > 5 else 2
                                 metrics = {
-                                    'mAP50': float(parts[3]),
-                                    'mAP50-95': float(parts[4])
+                                    'mAP50': float(parts[idx]),
+                                    'mAP50-95': float(parts[idx + 1])
                                 }
                                 self.worker.metrics_updated.emit(metrics)
                             except:
                                 pass
+
+                    # パターン2: "metrics/mAP50(B): 0.95" 形式
+                    map_match = re.search(r'metrics/mAP_?0?\.?5[^:]*:\s*([\d.]+)', line)
+                    if map_match:
+                        try:
+                            metrics = {'mAP50': float(map_match.group(1))}
+                            self.worker.metrics_updated.emit(metrics)
+                        except:
+                            pass
+
+                    map5095_match = re.search(r'metrics/mAP_?0?\.?5:0?\.?95[^:]*:\s*([\d.]+)', line)
+                    if map5095_match:
+                        try:
+                            metrics = {'mAP50-95': float(map5095_match.group(1))}
+                            self.worker.metrics_updated.emit(metrics)
+                        except:
+                            pass
 
                 def flush(self):
                     self.original_stream.flush()

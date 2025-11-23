@@ -8,7 +8,7 @@ import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Dataset
 import torchvision.transforms as transforms
 import numpy as np
 import matplotlib.pyplot as plt
@@ -22,6 +22,52 @@ from model_catalog import get_model, AnnotationDataset
 
 import random
 from PIL import Image, ImageOps, ImageEnhance
+
+
+class EarlyStopping:
+    """Early Stopping の実装"""
+
+    def __init__(self, patience=5, min_delta=0, verbose=False):
+        """
+        Args:
+            patience: 改善が見られない連続エポック数
+            min_delta: 改善とみなす最小変化量
+            verbose: ログ出力するかどうか
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.verbose = verbose
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+
+    def __call__(self, val_loss):
+        """
+        検証損失をチェックして早期停止するかどうかを判定
+
+        Args:
+            val_loss: 現在の検証損失
+
+        Returns:
+            bool: 早期停止するかどうか
+        """
+        if self.best_loss is None:
+            self.best_loss = val_loss
+        elif val_loss < self.best_loss - self.min_delta:
+            # 損失が改善した場合
+            self.best_loss = val_loss
+            self.counter = 0
+        else:
+            # 損失が改善しなかった場合
+            self.counter += 1
+            if self.verbose:
+                print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+
+            if self.counter >= self.patience:
+                self.early_stop = True
+                return True
+
+        return False
 
 
 def format_time(seconds):
@@ -479,7 +525,8 @@ def train_model(
     pretrained: bool = True,
     model_path: Optional[str] = None,
     use_early_stopping: bool = False,
-    patience: int = 5
+    patience: int = 5,
+    custom_model_name: Optional[str] = None
 ) -> Dict[str, Any]:
     """モデルをトレーニングする
 
@@ -559,19 +606,22 @@ def train_model(
     val_steering_losses = []
     val_throttle_losses = []
     best_val_loss = float('inf')
-    
+
     # Early Stopping用の変数
     early_stopping_counter = 0
     early_stopped = False
     stopped_epoch = 0
-    
+
     # 保存ディレクトリの作成
     os.makedirs(save_dir, exist_ok=True)
-    
+
+    # ファイル名に使用する名前を決定（カスタム名が指定されていればそれを使用）
+    save_name = custom_model_name if custom_model_name else model_name
+
     # タイムスタンプを使用してファイル名を生成
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_path = os.path.join(save_dir, f'{model_name}_{timestamp}.pth')
-    best_model_path = os.path.join(save_dir, f'{model_name}_best_{timestamp}.pth')
+    model_path = os.path.join(save_dir, f'{save_name}.pth')
+    best_model_path = os.path.join(save_dir, f'{save_name}_best.pth')
     
     # 時間計測用の変数
     training_start_time = time.time()
@@ -1092,37 +1142,37 @@ class LocationModelManager:
         self.num_classes = 8  # 固定で8クラス
         
     def get_model_list(self, model_type=None):
-        """利用可能な位置モデルのリストを取得 - モデルタイプでフィルタリング
+        """利用可能な位置モデルまたはウェイポイントモデルのリストを取得 - モデルタイプでフィルタリング
 
         Args:
             model_type (str, optional): フィルタリングするモデルタイプ。指定しない場合はすべての位置モデルを返す。
 
         Returns:
-            list: 位置モデルのファイル名リスト（モデルタイプでフィルタリング済み）
+            list: モデルのファイルパスリスト（モデルタイプでフィルタリング済み）
         """
         models_dir = os.path.join(self.APP_DIR_PATH, self.MODELS_DIR_NAME)
         os.makedirs(models_dir, exist_ok=True)
-        
+
         # モデルファイルを検索
         all_model_files = [f for f in os.listdir(models_dir) if f.endswith('.pth')]
-        
-        # 位置モデルでフィルタリング
+
+        # モデルタイプが指定されている場合はそれでフィルタリング
         model_files = []
-        for model_file in all_model_files:
-            # まず位置モデルかどうかをチェック
-            if any(keyword in model_file.lower() for keyword in ['location', 'loc_model']):
-                # モデルタイプが指定されている場合はさらにフィルタリング
-                if model_type:
-                    # モデルタイプがファイル名に含まれているか確認
-                    if model_type.lower() in model_file.lower():
-                        model_files.append(model_file)
-                else:
-                    # モデルタイプが指定されていない場合はすべての位置モデルを追加
-                    model_files.append(model_file)
-        
-        # モデルファイルを日付順にソート（新しいものが上）
-        model_files.sort(reverse=True)
-        
+        if model_type:
+            # モデルタイプがファイル名に含まれているか確認
+            for model_file in all_model_files:
+                if model_type.lower() in model_file.lower():
+                    model_files.append(os.path.join(models_dir, model_file))
+        else:
+            # モデルタイプが指定されていない場合は位置モデルのみを返す
+            for model_file in all_model_files:
+                if any(keyword in model_file.lower() for keyword in ['location', 'loc_model']):
+                    model_files.append(os.path.join(models_dir, model_file))
+
+        # モデルファイルを作成日時順にソート（新しいものが上）
+        # カスタムサフィックスが追加された場合でも正しくソートされるよう、mtimeを使用
+        model_files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+
         return model_files
 
     def load_model(self, model_type, model_path, progress_callback=None):
@@ -1391,7 +1441,8 @@ def train_location_model(
     pretrained: bool = True,
     model_path: Optional[str] = None,
     use_early_stopping: bool = False,
-    patience: int = 5
+    patience: int = 5,
+    custom_model_name: Optional[str] = None
 ) -> Dict[str, Any]:
     """位置分類モデルをトレーニングする
 
@@ -1473,19 +1524,22 @@ def train_location_model(
     val_accuracies = []
     best_val_loss = float('inf')
     best_val_acc = 0.0
-    
+
     # Early Stopping用の変数
     early_stopping_counter = 0
     early_stopped = False
     stopped_epoch = 0
-    
+
     # 保存ディレクトリの作成
     os.makedirs(save_dir, exist_ok=True)
-    
+
+    # ファイル名に使用する名前を決定（カスタム名が指定されていればそれを使用）
+    save_name = custom_model_name if custom_model_name else model_name
+
     # タイムスタンプを使用してファイル名を生成
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_path = os.path.join(save_dir, f'{model_name}_{timestamp}.pth')
-    best_model_path = os.path.join(save_dir, f'{model_name}_best_{timestamp}.pth')
+    model_path = os.path.join(save_dir, f'{save_name}.pth')
+    best_model_path = os.path.join(save_dir, f'{save_name}_best.pth')
     
     # 時間計測用の変数
     training_start_time = time.time()
@@ -1791,6 +1845,123 @@ if __name__ == "__main__":
         )
         
         print(f"評価結果: {eval_results}")
-                
+
     except Exception as e:
         print(f"エラー: {str(e)}")
+
+
+class WaypointRegressionDataset(Dataset):
+    """ウェイポイント回帰用のカスタムデータセット"""
+
+    def __init__(self, image_paths, waypoint_coordinates, transform=None):
+        """
+        Args:
+            image_paths: 画像パスのリスト
+            waypoint_coordinates: ウェイポイント座標のリスト [[x1,y1,x2,y2,...], ...]
+            transform: 画像変換処理
+        """
+        self.image_paths = image_paths
+        self.waypoint_coordinates = waypoint_coordinates
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        # 画像をロード
+        try:
+            img = Image.open(self.image_paths[idx]).convert('RGB')
+        except Exception as e:
+            print(f"画像読み込みエラー {self.image_paths[idx]}: {e}")
+            # デフォルト画像を返す
+            img = Image.new('RGB', (224, 224), color='black')
+
+        # 変換を適用
+        if self.transform:
+            try:
+                img = self.transform(img)
+            except Exception as e:
+                img_np = np.array(img)
+                img = self.transform(img_np)
+
+        # ウェイポイント座標をターゲットとして使用
+        target = torch.tensor(self.waypoint_coordinates[idx], dtype=torch.float32)
+
+        return img, target
+
+
+def create_waypoint_datasets(
+    image_paths: List[str] = None,
+    waypoint_labels: List[List[float]] = None,
+    val_split: float = 0.2,
+    model_name: str = 'donkey_waypoint',
+    batch_size: int = 8,
+    num_workers: int = 4,
+    use_augmentation: bool = False,
+    num_waypoints: int = 4
+) -> Tuple[DataLoader, DataLoader, Dict[str, Any]]:
+    """ウェイポイント回帰用のデータセットを作成する
+
+    Args:
+        image_paths: 画像パスのリスト
+        waypoint_labels: ウェイポイント座標のリスト [[x1,y1,x2,y2,...], ...]
+        val_split: 検証用データの割合
+        model_name: モデル名
+        batch_size: バッチサイズ
+        num_workers: ワーカー数
+        use_augmentation: データ拡張を使用するかどうか
+        num_waypoints: ウェイポイント数
+
+    Returns:
+        トレーニング用DataLoader, 検証用DataLoader, データセット情報
+    """
+    if image_paths is None or waypoint_labels is None or len(image_paths) == 0 or len(waypoint_labels) == 0:
+        raise ValueError("有効な画像パスとウェイポイント座標が必要です。")
+
+    # 入力サイズを取得
+    sample_img = Image.open(image_paths[0]).convert('RGB')
+    actual_size = (sample_img.height, sample_img.width)
+    print(f"実際の画像サイズ: {actual_size}")
+
+    # モデルから前処理を取得
+    model = get_model(model_name, pretrained=False, input_size=actual_size)
+    base_transform = model.get_preprocess()
+
+    # データ拡張
+    if use_augmentation:
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            transforms.RandomAffine(degrees=5, translate=(0.1, 0.1))
+        ])
+    else:
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor()
+        ])
+
+    # データセット作成
+    dataset = WaypointRegressionDataset(image_paths, waypoint_labels, transform=transform)
+
+    # データ分割
+    val_size = int(len(dataset) * val_split)
+    train_size = len(dataset) - val_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+
+    # DataLoader作成
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+    dataset_info = {
+        'total_samples': len(dataset),
+        'train_samples': len(train_dataset),
+        'val_samples': len(val_dataset),
+        'batch_size': batch_size,
+        'num_waypoints': num_waypoints,
+        'use_augmentation': use_augmentation,
+        'actual_image_size': actual_size
+    }
+
+    return train_loader, val_loader, dataset_info

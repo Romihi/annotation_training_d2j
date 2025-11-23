@@ -14,14 +14,15 @@ from PIL import Image, ImageDraw
 from typing import Dict, Any, List, Callable, Optional, Union
 
 def export_to_donkey(
-    folder_path: str, 
-    annotations: Dict[Union[str, int], Dict[str, Any]], 
+    folder_path: str,
+    annotations: Dict[Union[str, int], Dict[str, Any]],
     inference_results: Optional[Dict[Union[str, int], Dict[str, Any]]] = None,
     deleted_indexes: Optional[List[int]] = None,
     images_list: Optional[List[str]] = None,  # 互換性のために残す
     image_map: Optional[Dict[int, Dict[str, str]]] = None,  # 新しいパラメータ：{index: {variant: image_path, ...}, ...}
     variant_keys: Optional[Dict[str, str]] = None,  # 新しいパラメータ：{variant: key_name, ...}
-    diff_vectors: Optional[Dict[Union[str, int], Dict[str, Any]]] = None  # 追加: 差分ベクトルデータ
+    diff_vectors: Optional[Dict[Union[str, int], Dict[str, Any]]] = None,  # 追加: 差分ベクトルデータ
+    waypoint_annotations: Optional[Dict[Union[str, int], List[tuple]]] = None  # 追加: ウェイポイントデータ
 ) -> str:
     
     """アノテーションをDonkeycar形式でエクスポートする（1000件ごとに分割） - 複数画像ソース対応
@@ -59,7 +60,7 @@ def export_to_donkey(
     for key, annotation in annotations.items():
         if not annotation:
             continue
-        
+
         # キーの型に基づいて元のインデックスを取得
         if isinstance(key, int):
             original_index = key
@@ -74,11 +75,12 @@ def export_to_donkey(
                         original_index = int(match.group(1))
                 except:
                     pass
-            
-        # アノテーション情報とインデックスを保存
+
+        # アノテーション情報とインデックス、元のキーを保存
         indexed_annotations.append({
             "index": original_index,
-            "annotation": annotation
+            "annotation": annotation,
+            "key": key  # 元のキーを保存
         })
     
     # インデックスがないエントリに連番を割り当て
@@ -104,11 +106,23 @@ def export_to_donkey(
     for i, entry in enumerate(indexed_annotations):
         original_index = entry["index"]
         annotation = entry["annotation"]
+        original_key = entry["key"]  # 元のキーを取得
         assigned_index = i  # 連番を割り当て
-        
+
         # 画像マップからこのインデックスの画像パスを取得
+        # image_mapのキーはactual_indexなので、annotationsのキーから検索
         variant_images = {}
-        if image_map and original_index in image_map:
+
+        # annotationsの元のキーを取得（actual_indexの可能性がある）
+        actual_index = None
+        if isinstance(original_key, int):
+            actual_index = original_key
+
+        # actual_indexでimage_mapを検索
+        if image_map and actual_index is not None and actual_index in image_map:
+            variant_images = image_map[actual_index]
+        # フォールバック: original_indexでも検索（後方互換性）
+        elif image_map and original_index in image_map:
             variant_images = image_map[original_index]
         elif isinstance(original_index, int) and images_list and 0 <= original_index < len(images_list):
             # 後方互換性のため単一リストからも取得
@@ -122,9 +136,9 @@ def export_to_donkey(
             except:
                 pass
             variant_images[variant] = img_path
-        
+
         if not variant_images:
-            print(f"警告: インデックス {original_index} の画像が見つかりません。このエントリはスキップします。")
+            print(f"警告: インデックス {original_index} (actual: {actual_index}) の画像が見つかりません。このエントリはスキップします。")
             continue
         
         # タイムスタンプ
@@ -182,16 +196,27 @@ def export_to_donkey(
                 catalog_entry["diff/throttle"] = diff_data['throttle_diff']
                 catalog_entry["diff/magnitude"] = diff_data['vector_magnitude']
                 catalog_entry["diff/angle_rad"] = diff_data['vector_angle']
+
+        # 追加: ウェイポイント情報を追加
+        if waypoint_annotations:
+            waypoint_data = None
+            if isinstance(original_index, int) and original_index in waypoint_annotations:
+                waypoint_data = waypoint_annotations[original_index]
+
+            if waypoint_data:
+                # ウェイポイントデータを[[x,y],...]のリスト形式で保存（JSON対応）
+                waypoint_array = [[float(x), float(y)] for x, y in waypoint_data]
+                catalog_entry["waypoint/pos_array"] = waypoint_array
                         
         # 各バリアントの画像をコピーしてエントリに追加
         for variant, img_path in variant_images.items():
             if not os.path.exists(img_path):
                 print(f"警告: 画像ファイル {img_path} が存在しません。")
                 continue
-            
+
             # 画像ファイル名を作成
             new_img_name = f"{assigned_index}_{variant}_image_array_.jpg"
-            
+
             try:
                 # 画像をimagesフォルダにコピー
                 dest_path = os.path.join(images_folder, new_img_name)
@@ -261,6 +286,7 @@ def export_to_donkey(
     has_loc = any('loc' in anno for anno in annotations.values())
     has_pilot = inference_results is not None and len(inference_results) > 0
     has_diff = diff_vectors is not None and len(diff_vectors) > 0  # 追加
+    has_waypoint = waypoint_annotations is not None and len(waypoint_annotations) > 0  # 追加
 
     if has_pilot:
         column_names.extend(["pilot/angle", "pilot/throttle"])
@@ -277,6 +303,11 @@ def export_to_donkey(
     if has_diff:
         column_names.extend(["diff/angle", "diff/throttle", "diff/magnitude", "diff/angle_rad"])
         column_types.extend(["float", "float", "float", "float"])
+
+    # 追加: ウェイポイントのカラムを追加
+    if has_waypoint:
+        column_names.append("waypoint/pos_array")
+        column_types.append("nparray")
 
     # manifest.json ファイルを作成
     manifest_data = [

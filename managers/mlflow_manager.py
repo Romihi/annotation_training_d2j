@@ -11,6 +11,7 @@ class ModelType(Enum):
     """モデルタイプの定義"""
     AUTONOMOUS_DRIVING = "autonomous_driving"
     POSITION_ESTIMATION = "position_estimation"
+    WAYPOINT_REGRESSION = "waypoint_regression"
     YOLO_DETECTION = "yolo_detection"
     YOLO_SEGMENTATION = "yolo_segmentation"
 
@@ -20,7 +21,8 @@ class MLflowManager:
     # 実験名の定義
     EXPERIMENT_NAMES = {
         ModelType.AUTONOMOUS_DRIVING: "autonomous_driving_models",
-        ModelType.POSITION_ESTIMATION: "position_estimation_models", 
+        ModelType.POSITION_ESTIMATION: "position_estimation_models",
+        ModelType.WAYPOINT_REGRESSION: "waypoint_regression_models",
         ModelType.YOLO_DETECTION: "yolo_detection_models",
         ModelType.YOLO_SEGMENTATION: "yolo_segmentation_models"
     }
@@ -160,9 +162,14 @@ class MLflowManager:
             "early_stopping": "enabled" if training_params.get("use_early_stopping", False) else "disabled",
             "patience": training_params.get("patience", 0),
             "initial_weights": training_params.get("initial_weights", "pretrained"),
+            "pretrained_model_name": training_params.get("pretrained_model_name", None),
             "sampling_strategy": training_params.get("sampling_strategy", "all"),
             "augmentation_enabled": training_params.get("augmentation_enabled", False)
         }
+
+        # コメントがあれば追加
+        if training_params.get("comment"):
+            params["comment"] = training_params["comment"]
         
         # オーグメンテーション詳細パラメータ
         aug_params = training_params.get("augmentation_params", {})
@@ -206,17 +213,22 @@ class MLflowManager:
             "status": metrics.get("status", "completed")
         }
         
-        # MLflow実行名
-        run_name = f"autonomous_driving_{training_params.get('model_type', 'unknown')}_{dataset_info.get('used_samples', 0)}samples_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        # MLflow実行名（カスタムモデル名が指定されていればそれを使用）
+        custom_name = training_params.get('model_name', '')
+        if custom_name:
+            run_name = custom_name
+        else:
+            run_name = f"autonomous_driving_{training_params.get('model_type', 'unknown')}_{dataset_info.get('used_samples', 0)}samples_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
         try:
             with mlflow.start_run(run_name=run_name):
                 # タグを設定
                 mlflow.set_tags(tags)
                 
-                # パラメータをログ
+                # パラメータをログ（Noneは除外）
                 for key, value in params.items():
-                    mlflow.log_param(key, value)
+                    if value is not None:
+                        mlflow.log_param(key, value)
                 
                 # データセット情報をログ
                 for key, value in dataset_info.items():
@@ -276,6 +288,10 @@ class MLflowManager:
             "fixed_classes": training_params.get("fixed_classes", 8),
             "actual_classes": training_params.get("actual_classes", 0)
         }
+
+        # コメントがあれば追加
+        if training_params.get("comment"):
+            params["comment"] = training_params["comment"]
         
         # 位置推論特有のメトリクス
         run_metrics = {
@@ -304,17 +320,22 @@ class MLflowManager:
             "coordinate_type": training_params.get("coordinate_system", "classification")
         }
         
-        # MLflow実行名
-        run_name = f"position_estimation_{training_params.get('model_type', 'unknown')}_{dataset_info.get('used_samples', 0)}samples_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        # MLflow実行名（カスタムモデル名が指定されていればそれを使用）
+        custom_name = training_params.get('model_name', '')
+        if custom_name:
+            run_name = custom_name
+        else:
+            run_name = f"position_estimation_{training_params.get('model_type', 'unknown')}_{dataset_info.get('used_samples', 0)}samples_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
         try:
             with mlflow.start_run(run_name=run_name):
                 # タグを設定
                 mlflow.set_tags(tags)
                 
-                # パラメータをログ
+                # パラメータをログ（Noneは除外）
                 for key, value in params.items():
-                    mlflow.log_param(key, value)
+                    if value is not None:
+                        mlflow.log_param(key, value)
                 
                 # データセット情報をログ
                 for key, value in dataset_info.items():
@@ -382,6 +403,10 @@ class MLflowManager:
             "mosaic": training_params.get("mosaic", 0.0),
             "fliplr": training_params.get("fliplr", 0.0)
         }
+
+        # コメントがあれば追加
+        if training_params.get("comment"):
+            params["comment"] = training_params["comment"]
         
         # YOLO特有のメトリクス
         run_metrics = {}
@@ -490,6 +515,10 @@ class MLflowManager:
             "loss_function": training_params.get("loss_function", "yolo_segmentation_loss"),
             "task_type": "segmentation"
         }
+
+        # コメントがあれば追加
+        if training_params.get("comment"):
+            params["comment"] = training_params["comment"]
         
         # オーグメンテーションパラメータ（有効な場合のみ記録）
         if training_params.get("augmentation_enabled", False):
@@ -538,17 +567,22 @@ class MLflowManager:
             "status": "completed"
         }
         
-        # MLflow実行名
-        run_name = f"yolo_segmentation_{training_params.get('model_type', 'yolo')}_{dataset_info.get('train_samples', 0)}samples_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        # MLflow実行名（カスタムモデル名が指定されていればそれを使用）
+        custom_name = training_params.get('model_name', '')
+        if custom_name:
+            run_name = custom_name
+        else:
+            run_name = f"yolo_segmentation_{training_params.get('model_type', 'yolo')}_{dataset_info.get('train_samples', 0)}samples_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
         try:
             with mlflow.start_run(run_name=run_name):
                 # タグを設定
                 mlflow.set_tags(tags)
                 
-                # パラメータをログ
+                # パラメータをログ（Noneは除外）
                 for key, value in params.items():
-                    mlflow.log_param(key, value)
+                    if value is not None:
+                        mlflow.log_param(key, value)
                 
                 # データセット情報をログ
                 for key, value in dataset_info.items():
@@ -617,9 +651,10 @@ class MLflowManager:
                 # タグを設定
                 mlflow.set_tags(tags)
                 
-                # パラメータをログ
+                # パラメータをログ（Noneは除外）
                 for key, value in params.items():
-                    mlflow.log_param(key, value)
+                    if value is not None:
+                        mlflow.log_param(key, value)
                 
                 # データセット情報をログ
                 for key, value in dataset_info.items():
@@ -663,3 +698,97 @@ class MLflowManager:
     def compare_models_by_type(self, parent_widget, model_type: ModelType):
         """指定されたモデルタイプの実験結果を比較"""
         self.open_ui(parent_widget, model_type)
+
+    def log_waypoint_regression_model(self, model_path, training_params, metrics, dataset_info):
+        """ウェイポイント回帰モデルの学習結果を記録"""
+
+        if not self.set_experiment(ModelType.WAYPOINT_REGRESSION):
+            return {"status": "error", "message": "実験の設定に失敗しました"}
+
+        # 基本パラメータ
+        params = {
+            "framework": "pytorch",
+            "model_type": training_params.get("model_type", "waypoint_regression"),
+            "data_folder": training_params.get("data_folder", "unknown"),
+            "task_type": "regression",
+            "epochs": training_params.get("num_epochs", 0),
+            "completed_epochs": training_params.get("completed_epochs", 0),
+            "learning_rate": training_params.get("learning_rate", 0.001),
+            "batch_size": training_params.get("batch_size", 8),
+            "early_stopping": "enabled" if training_params.get("use_early_stopping", False) else "disabled",
+            "patience": training_params.get("patience", 0),
+            "augmentation_enabled": training_params.get("use_augmentation", False),
+            "num_waypoints": training_params.get("num_waypoints", 4),
+            "output_format": "xy_coordinates",
+            "coordinate_system": "continuous"
+        }
+
+        # コメントがあれば追加
+        if training_params.get("comment"):
+            params["comment"] = training_params["comment"]
+
+        # ウェイポイント回帰特有のメトリクス
+        run_metrics = {
+            "best_val_loss": metrics.get("best_val_loss", 0.0),
+            "final_train_loss": metrics.get("final_train_loss", 0.0),
+            "final_val_loss": metrics.get("final_val_loss", 0.0),
+            "total_training_time": metrics.get("total_training_time", 0.0),
+            "avg_epoch_time": metrics.get("avg_epoch_time", 0.0),
+            "completed_epochs": metrics.get("completed_epochs", 0)
+        }
+
+        # タグ
+        tags = {
+            "model_category": "waypoint_regression",
+            "task_type": "regression",
+            "framework": "pytorch",
+            "status": metrics.get("status", "completed"),
+            "waypoint_count": str(training_params.get("num_waypoints", 4))
+        }
+
+        # データセット情報の追加
+        if dataset_info:
+            params.update({
+                "train_samples": dataset_info.get("train_samples", 0),
+                "val_samples": dataset_info.get("val_samples", 0),
+                "total_samples": dataset_info.get("total_annotations", 0),
+                "used_samples": dataset_info.get("used_samples", 0)
+            })
+
+        # MLflow実行名（カスタムモデル名が指定されていればそれを使用）
+        custom_name = training_params.get('model_name', '')
+        if custom_name:
+            run_name = custom_name
+        else:
+            run_name = f"waypoint_{training_params.get('model_type', 'unknown')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        try:
+            with mlflow.start_run(run_name=run_name):
+                # タグを設定
+                mlflow.set_tags(tags)
+
+                # パラメータを記録
+                mlflow.log_params(params)
+
+                # メトリクスを記録
+                mlflow.log_metrics(run_metrics)
+
+                # モデルファイルをアーティファクトとして記録
+                if model_path and os.path.exists(model_path):
+                    if sys.platform.startswith('win'):
+                        model_path = os.path.normpath(model_path)
+                    mlflow.log_artifact(model_path, "models")
+                    mlflow.log_param("model_file", os.path.basename(model_path))
+
+                # 実行情報を取得
+                run = mlflow.active_run()
+                run_id = run.info.run_id
+
+                print(f"ウェイポイント回帰モデルをMLflowに記録しました (Run ID: {run_id})")
+                return {"status": "success", "run_id": run_id}
+
+        except Exception as e:
+            print(f"MLflow記録エラー: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"status": "error", "message": str(e)}
