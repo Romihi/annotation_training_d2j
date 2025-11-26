@@ -360,6 +360,17 @@ class MobileNetV3LargeModel(TIMMBasedModel):
         )
 
 
+class MobileNetV4ConvSmallModel(TIMMBasedModel):
+    """TIMMベースのMobileNetV4 Conv Smallモデル"""
+    def __init__(self, pretrained=True, num_outputs=2):
+        super(MobileNetV4ConvSmallModel, self).__init__(
+            name="mobilenetv4_conv_small",
+            timm_model_name="mobilenetv4_conv_small.e2400_r224_in1k",
+            pretrained=pretrained,
+            num_outputs=num_outputs
+        )
+
+
 class EfficientNetLite0Model(TIMMBasedModel):
     """TIMMベースのEfficientNet Lite0モデル"""
     def __init__(self, pretrained=True):
@@ -378,6 +389,17 @@ class EfficientNetB0Model(TIMMBasedModel):
             name="efficientnet_b0",
             timm_model_name="efficientnet_b0",
             pretrained=pretrained
+        )
+
+
+class EfficientNetV2SModel(TIMMBasedModel):
+    """TIMMベースのEfficientNetV2 Smallモデル"""
+    def __init__(self, pretrained=True, num_outputs=2):
+        super(EfficientNetV2SModel, self).__init__(
+            name="efficientnetv2_s",
+            timm_model_name="tf_efficientnetv2_s",
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
@@ -1070,11 +1092,15 @@ MODEL_REGISTRY = {
     # MobileNetV3 variants
     "mobilenetv3_small_100": MobileNetV3SmallModel,
     "mobilenetv3_large_100": MobileNetV3LargeModel,
-    
+
+    # MobileNetV4 variants
+    "mobilenetv4_conv_small": MobileNetV4ConvSmallModel,
+
     # EfficientNet variants
     "efficientnet_lite0": EfficientNetLite0Model,
     "efficientnet_b0": EfficientNetB0Model,
-    
+    "efficientnetv2_s": EfficientNetV2SModel,
+
     # ConvNeXt variants
     "convnext_nano": ConvNextNanoModel,
     "convnext_tiny": ConvNextTinyModel,
@@ -1166,9 +1192,21 @@ def get_model(model_type, pretrained=False, input_size=None, num_outputs=2):
     return model_class(pretrained=pretrained)
 
 def list_available_models():
-    """利用可能な走行モデル一覧を返す（位置推論モデルは除く）"""
-    # 位置推論モデルを除いたモデルのみを返す
-    return [model for model in MODEL_REGISTRY.keys() if not model.endswith('_location')]
+    """利用可能な自動運転モデル一覧を返す（厳選されたモデルのみ）"""
+    # 自動運転学習用に厳選されたモデルのみを返す
+    # YOLO、位置推論、ウェイポイントモデルは除外
+    allowed_models = [
+        "donkeycar",
+        "resnet18",
+        "mobilevit_xxs",
+        "mobilenetv3_small_100",
+        "mobilenetv4_conv_small",
+        "efficientnet_b0",
+        "efficientnetv2_s",
+        "edgenext_xx_small",
+        "efficientformer_l1",
+    ]
+    return [model for model in allowed_models if model in MODEL_REGISTRY]
 
 def list_available_location_models():
     """利用可能な位置推論モデル一覧を返す"""
