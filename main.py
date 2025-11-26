@@ -929,6 +929,37 @@ class ImageLabel(QLabel):
                         painter.setBrush(QBrush())  # 塗りつぶしなし
                         painter.drawEllipse(future_scaled_x - size // 2, future_scaled_y - size // 2, size, size)
 
+        # 将来の推論点を描画（t+5, t+10）- 現在の推論点の下に描画
+        if self.show_inference and self.show_future_annotations and self.main_window:
+            current_index = self.main_window.current_index
+            if hasattr(self.main_window, 'inference_results') and current_index in self.main_window.inference_results:
+                inference_data = self.main_window.inference_results[current_index]
+                future_offsets = [10, 5]  # 先に遠い方を描画（後に描画されるものが上に来る）
+                future_sizes = {5: 22, 10: 14}  # インデックスごとのサイズ（現在は30）
+                # シアン系の色（アノテーションのオレンジ/黄色に対応）
+                future_colors = {5: QColor(0, 200, 200), 10: QColor(0, 150, 150)}  # 5:明るいシアン, 10:暗いシアン
+
+                for offset in future_offsets:
+                    future_key = f"future_{offset}"
+                    if future_key in inference_data:
+                        future_data = inference_data[future_key]
+                        future_x = future_data['x']
+                        future_y = future_data['y']
+                        # ピクセル座標から相対座標に変換
+                        future_rel_x = future_x / pix_width
+                        future_rel_y = future_y / pix_height
+                        future_scaled_x = int(target_rect.x() + future_rel_x * target_rect.width())
+                        future_scaled_y = int(target_rect.y() + future_rel_y * target_rect.height())
+
+                        # サイズと色を取得
+                        size = future_sizes.get(offset, 20)
+                        color = future_colors.get(offset, QColor(0, 200, 200))
+
+                        # シアン系の色で描画
+                        painter.setPen(QPen(color, 3))
+                        painter.setBrush(QBrush())  # 塗りつぶしなし
+                        painter.drawEllipse(future_scaled_x - size // 2, future_scaled_y - size // 2, size, size)
+
         # 明るい水色：推論点（推論結果）
         if self.show_inference and self.inference_point:
             rel_x = self.inference_point.x() / pix_width
@@ -1797,6 +1828,30 @@ class ImageLabel(QLabel):
             current_index in self.main_window.inference_results):
 
             inference = self.main_window.inference_results[current_index]
+
+            # 将来の推論speedバーを描画（t+5, t+10）- 現在の横線の下に描画
+            if self.show_future_annotations:
+                future_offsets = [10, 5]  # 先に遠い方を描画
+                future_line_widths = {5: 3, 10: 2}  # 線の太さ
+                future_colors = {5: QColor(0, 200, 200), 10: QColor(0, 150, 150)}  # シアン系
+
+                for offset in future_offsets:
+                    future_key = f"future_{offset}"
+                    if future_key in inference:
+                        future_data = inference[future_key]
+                        if 'speed' in future_data:
+                            future_infer_speed = future_data['speed']
+                            future_infer_speed_display = future_infer_speed * 10.0
+                            future_normalized = future_infer_speed_display / 10.0
+                            future_normalized = max(0, min(1, future_normalized))
+
+                            future_y = bar_y + bar_height - int(bar_height * future_normalized)
+                            future_color = future_colors.get(offset, QColor(0, 200, 200))
+                            future_line_width = future_line_widths.get(offset, 2)
+
+                            painter.setPen(QPen(future_color, future_line_width))
+                            painter.drawLine(bar_x, future_y, bar_x + bar_width, future_y)
+
             if 'speed' in inference:
                 infer_speed = inference['speed']
                 # 推論speed値を正規化（0～10 -> 0～1、学習時に10で正規化されているため10倍して戻す）
@@ -15550,6 +15605,26 @@ class ImageAnnotationTool(QMainWindow):
             speed_output_group.setLayout(speed_output_layout)
             basic_layout.addWidget(speed_output_group)
 
+        # 将来予測出力設定
+        future_output_group = QGroupBox("将来予測出力設定")
+        future_output_layout = QVBoxLayout()
+
+        future_output_check = QCheckBox("将来フレームの予測を出力に追加")
+        future_output_check.setChecked(False)
+        future_output_check.setToolTip("5, 10フレーム先のangle, throttle, speedを追加出力")
+        future_output_layout.addWidget(future_output_check)
+
+        future_info_label = QLabel("※ 5フレーム先と10フレーム先のangle, throttle, speedを追加出力します")
+        future_info_label.setStyleSheet("color: #666; font-size: 10px;")
+        future_output_layout.addWidget(future_info_label)
+
+        future_detail_label = QLabel("  出力: [angle, throttle, speed, t+5_angle, t+5_throttle, t+5_speed, t+10_angle, t+10_throttle, t+10_speed]")
+        future_detail_label.setStyleSheet("color: #888; font-size: 9px;")
+        future_output_layout.addWidget(future_detail_label)
+
+        future_output_group.setLayout(future_output_layout)
+        basic_layout.addWidget(future_output_group)
+
         # エポック数設定
         epoch_layout = QHBoxLayout()
         epoch_layout.addWidget(QLabel("学習エポック数:"))
@@ -15739,7 +15814,7 @@ class ImageAnnotationTool(QMainWindow):
         
         # データオーグメンテーション有効化チェックボックス
         aug_enable_check = QCheckBox("データオーグメンテーションを有効にする")
-        aug_enable_check.setChecked(True)
+        aug_enable_check.setChecked(False)  # デフォルトオフ
         aug_layout.addWidget(aug_enable_check)
         
         # オーグメンテーション設定のスクロールエリア
@@ -15989,6 +16064,9 @@ class ImageAnnotationTool(QMainWindow):
             if speed_normalize_spin is not None:
                 speed_normalize_value = speed_normalize_spin.value()
 
+        # 将来予測出力設定の取得
+        use_future_output = future_output_check.isChecked()
+
         # データ選択設定の取得
         use_all = data_radio_all.isChecked()
         use_skip = data_radio_skip.isChecked()
@@ -16181,8 +16259,19 @@ class ImageAnnotationTool(QMainWindow):
                 QApplication.processEvents()
                 return not progress.wasCanceled()
                         
-            # 出力数を決定（speedを使う場合は3、そうでない場合は2）
-            num_outputs = 3 if use_speed_output else 2
+            # 出力数を決定
+            # 基本: angle, throttle = 2
+            # speed追加: +1 = 3
+            # 将来予測追加: use_speed時は+6、use_speed無し時は+4
+            base_outputs = 3 if use_speed_output else 2
+            if use_future_output:
+                # 将来予測を含める場合
+                # use_speed=True: 5フレーム先(angle,throttle,speed) + 10フレーム先(angle,throttle,speed) = +6
+                # use_speed=False: 5フレーム先(angle,throttle) + 10フレーム先(angle,throttle) = +4
+                future_outputs_per_frame = 3 if use_speed_output else 2
+                num_outputs = base_outputs + (future_outputs_per_frame * 2)  # 2フレーム分（t+5, t+10）
+            else:
+                num_outputs = base_outputs
 
             # データセットの作成（バッチサイズと詳細オーグメンテーション設定を明示的に指定）
             train_loader, val_loader, dataset_info = create_datasets(
@@ -16192,6 +16281,7 @@ class ImageAnnotationTool(QMainWindow):
                 use_augmentation=augmentation_params if augmentation_params['enabled'] else False,
                 batch_size=batch_size,  # バッチサイズを追加
                 use_speed=use_speed_output,  # Speed出力を使用するかどうか
+                use_future=use_future_output,  # 将来予測出力を使用するかどうか
                 num_outputs=num_outputs  # 出力数を指定
             )
 

@@ -119,10 +119,34 @@ def create_unified_progress_message(epoch, num_epochs, elapsed_time, epoch_times
             if 'speed' in current_loss:
                 base_loss += f", Speed: {current_loss['speed']:.4f}"
             loss_line = base_loss + ")"
+
+            # 将来予測損失を個別に改行して表示
+            if 'future_5' in current_loss and isinstance(current_loss['future_5'], dict):
+                f5 = current_loss['future_5']
+                loss_line += f"\n  t+5  - Angle: {f5['angle']:.4f}, Throttle: {f5['throttle']:.4f}"
+                if 'speed' in f5:
+                    loss_line += f", Speed: {f5['speed']:.4f}"
+            if 'future_10' in current_loss and isinstance(current_loss['future_10'], dict):
+                f10 = current_loss['future_10']
+                loss_line += f"\n  t+10 - Angle: {f10['angle']:.4f}, Throttle: {f10['throttle']:.4f}"
+                if 'speed' in f10:
+                    loss_line += f", Speed: {f10['speed']:.4f}"
         elif isinstance(current_loss, dict) and 'steering' in current_loss and 'throttle' in current_loss:
             loss_line = f"損失 - Steering: {current_loss['steering']:.4f}, Throttle: {current_loss['throttle']:.4f}"
             if 'speed' in current_loss:
                 loss_line += f", Speed: {current_loss['speed']:.4f}"
+
+            # 将来予測損失を個別に改行して表示
+            if 'future_5' in current_loss and isinstance(current_loss['future_5'], dict):
+                f5 = current_loss['future_5']
+                loss_line += f"\n  t+5  - Angle: {f5['angle']:.4f}, Throttle: {f5['throttle']:.4f}"
+                if 'speed' in f5:
+                    loss_line += f", Speed: {f5['speed']:.4f}"
+            if 'future_10' in current_loss and isinstance(current_loss['future_10'], dict):
+                f10 = current_loss['future_10']
+                loss_line += f"\n  t+10 - Angle: {f10['angle']:.4f}, Throttle: {f10['throttle']:.4f}"
+                if 'speed' in f10:
+                    loss_line += f", Speed: {f10['speed']:.4f}"
         else:
             loss_line = f"現在の損失: {current_loss:.4f}"
     elif epoch_loss is not None and val_loss is not None:
@@ -175,8 +199,9 @@ def create_unified_progress_message(epoch, num_epochs, elapsed_time, epoch_times
 
 
 def calculate_individual_losses(outputs, targets, criterion):
-    """steering（角度）、throttle（スロットル）、speed（速度）の個別損失を計算"""
-    # outputs と targets の形状: [batch_size, 2 or 3] （0: steering, 1: throttle, 2: speed（オプション））
+    """steering（角度）、throttle（スロットル）、speed（速度）、将来予測の個別損失を計算"""
+    # outputs と targets の形状: [batch_size, 2 or 3 or 9] （0: angle, 1: throttle, 2: speed（オプション））
+    # 9出力の場合: [angle, throttle, speed, t+5_angle, t+5_throttle, t+5_speed, t+10_angle, t+10_throttle, t+10_speed]
     steering_outputs = outputs[:, 0:1]  # steering (angle)
     throttle_outputs = outputs[:, 1:2]  # throttle
 
@@ -193,7 +218,42 @@ def calculate_individual_losses(outputs, targets, criterion):
         speed_targets = targets[:, 2:3]
         speed_loss = criterion(speed_outputs, speed_targets).item()
 
-    return steering_loss, throttle_loss, speed_loss
+    # 将来予測の損失（個別にangle, throttle, speedを計算）
+    # 9出力の場合（speed有り）: [angle, throttle, speed, t+5_angle, t+5_throttle, t+5_speed, t+10_angle, t+10_throttle, t+10_speed]
+    # 6出力の場合（speed無し）: [angle, throttle, t+5_angle, t+5_throttle, t+10_angle, t+10_throttle]
+    future_5_losses = None  # {angle, throttle, speed}の辞書
+    future_10_losses = None  # {angle, throttle, speed}の辞書
+
+    if outputs.shape[1] >= 9 and targets.shape[1] >= 9:
+        # speed有りの将来予測（9出力）
+        # t+5の損失（インデックス3,4,5: angle, throttle, speed）
+        future_5_losses = {
+            'angle': criterion(outputs[:, 3:4], targets[:, 3:4]).item(),
+            'throttle': criterion(outputs[:, 4:5], targets[:, 4:5]).item(),
+            'speed': criterion(outputs[:, 5:6], targets[:, 5:6]).item()
+        }
+
+        # t+10の損失（インデックス6,7,8: angle, throttle, speed）
+        future_10_losses = {
+            'angle': criterion(outputs[:, 6:7], targets[:, 6:7]).item(),
+            'throttle': criterion(outputs[:, 7:8], targets[:, 7:8]).item(),
+            'speed': criterion(outputs[:, 8:9], targets[:, 8:9]).item()
+        }
+    elif outputs.shape[1] >= 6 and targets.shape[1] >= 6 and speed_loss is None:
+        # speed無しの将来予測（6出力）
+        # t+5の損失（インデックス2,3: angle, throttle）
+        future_5_losses = {
+            'angle': criterion(outputs[:, 2:3], targets[:, 2:3]).item(),
+            'throttle': criterion(outputs[:, 3:4], targets[:, 3:4]).item()
+        }
+
+        # t+10の損失（インデックス4,5: angle, throttle）
+        future_10_losses = {
+            'angle': criterion(outputs[:, 4:5], targets[:, 4:5]).item(),
+            'throttle': criterion(outputs[:, 5:6], targets[:, 5:6]).item()
+        }
+
+    return steering_loss, throttle_loss, speed_loss, future_5_losses, future_10_losses
 
 def create_augmentation_transform(
     use_flip=True,
@@ -404,6 +464,7 @@ def create_datasets(
     num_workers: int = 4,
     use_augmentation: bool = False,
     use_speed: bool = False,
+    use_future: bool = False,
     num_outputs: int = 2
 ) -> Tuple[DataLoader, DataLoader, Dict[str, Any]]:
     """トレーニングとバリデーション用のデータローダーを作成する"""
@@ -483,8 +544,8 @@ def create_datasets(
             transforms.ToTensor()
         ])
 
-    # データセットの作成（use_speedパラメータを追加）
-    dataset = AnnotationDataset(image_paths, annotations, transform=transform, use_speed=use_speed)
+    # データセットの作成（use_speed, use_futureパラメータを追加）
+    dataset = AnnotationDataset(image_paths, annotations, transform=transform, use_speed=use_speed, use_future=use_future)
 
     # バッチサイズが小さすぎる場合の対策
     if batch_size < 2:
@@ -525,9 +586,10 @@ def create_datasets(
         'train_samples': len(train_dataset),
         'val_samples': len(val_dataset),
         'batch_size': batch_size,
-        'num_classes': num_outputs,  # 2 (angle, throttle) or 3 (angle, throttle, speed)
+        'num_classes': num_outputs,  # 2 (angle, throttle) or 3 (angle, throttle, speed) or more with future
         'use_augmentation': use_augmentation,
         'use_speed': use_speed,
+        'use_future': use_future,
         'actual_image_size': actual_size
     }
 
@@ -692,7 +754,7 @@ def train_model(
             loss = criterion(outputs, targets)
 
             # 個別損失の計算
-            steering_loss, throttle_loss, speed_loss = calculate_individual_losses(outputs, targets, criterion)
+            steering_loss, throttle_loss, speed_loss, future_5_losses, future_10_losses = calculate_individual_losses(outputs, targets, criterion)
 
             # 逆伝播と最適化
             loss.backward()
@@ -704,7 +766,7 @@ def train_model(
             epoch_throttle_loss += throttle_loss * inputs.size(0)
             if speed_loss is not None:
                 epoch_speed_loss += speed_loss * inputs.size(0)
-            
+
             # バッチごとの進捗コールバック（10%ごと）
             if progress_callback and (i % max(1, len(train_loader) // 10) == 0):
                 batch_progress = i / len(train_loader)
@@ -720,6 +782,10 @@ def train_model(
                 }
                 if speed_loss is not None:
                     current_losses['speed'] = speed_loss
+                if future_5_losses is not None:
+                    current_losses['future_5'] = future_5_losses  # 辞書形式
+                if future_10_losses is not None:
+                    current_losses['future_10'] = future_10_losses  # 辞書形式
 
                 message = create_unified_progress_message(
                     epoch=epoch,
@@ -760,7 +826,7 @@ def train_model(
                 loss = criterion(outputs, targets)
 
                 # 検証時の個別損失計算
-                batch_steering_loss, batch_throttle_loss, batch_speed_loss = calculate_individual_losses(outputs, targets, criterion)
+                batch_steering_loss, batch_throttle_loss, batch_speed_loss, _, _ = calculate_individual_losses(outputs, targets, criterion)
 
                 val_loss += loss.item() * inputs.size(0)
                 val_steering_loss += batch_steering_loss * inputs.size(0)

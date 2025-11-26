@@ -128,12 +128,19 @@ def _infer_with_model(
                     output_values = output[0].cpu().numpy()
 
                     # 出力数に応じて値を取得
+                    # データセットの順序: [angle, throttle, ...]
+                    # 出力パターン:
+                    #   2出力: [angle, throttle]
+                    #   3出力: [angle, throttle, speed]
+                    #   6出力: [angle, throttle, t+5_angle, t+5_throttle, t+10_angle, t+10_throttle]
+                    #   9出力: [angle, throttle, speed, t+5_angle, t+5_throttle, t+5_speed, t+10_angle, t+10_throttle, t+10_speed]
+                    num_outputs = len(output_values)
                     angle = output_values[0]
                     throttle = output_values[1]
 
-                    # 3つ目の出力がある場合はspeedとして取得
+                    # speedの判定: 3出力または9出力の場合のみspeedが存在
                     speed = None
-                    if len(output_values) >= 3:
+                    if num_outputs == 3 or num_outputs >= 9:
                         speed = output_values[2]
 
                     # 座標に変換
@@ -155,6 +162,76 @@ def _infer_with_model(
                     # speedがある場合は追加
                     if speed is not None:
                         results[img_path]["speed"] = float(speed)
+
+                    # 将来予測の出力がある場合
+                    # 9出力モデル（speed有り）: [angle, throttle, speed, t+5_angle, t+5_throttle, t+5_speed, t+10_angle, t+10_throttle, t+10_speed]
+                    # 6出力モデル（speed無し）: [angle, throttle, t+5_angle, t+5_throttle, t+10_angle, t+10_throttle]
+                    if num_outputs >= 9:
+                        # speed有りの将来予測（9出力）
+                        # t+5の値（インデックス3,4,5: angle, throttle, speed）
+                        future_5_angle = output_values[3]
+                        future_5_throttle = output_values[4]
+                        future_5_speed = output_values[5]
+                        future_5_x = int((future_5_angle + 1) / 2 * img_width)
+                        future_5_y = int((1 - future_5_throttle) / 2 * img_height)
+                        future_5_x = max(0, min(future_5_x, img_width - 1))
+                        future_5_y = max(0, min(future_5_y, img_height - 1))
+
+                        results[img_path]["future_5"] = {
+                            "angle": float(future_5_angle),
+                            "throttle": float(future_5_throttle),
+                            "speed": float(future_5_speed),
+                            "x": future_5_x,
+                            "y": future_5_y
+                        }
+
+                        # t+10の値（インデックス6,7,8: angle, throttle, speed）
+                        future_10_angle = output_values[6]
+                        future_10_throttle = output_values[7]
+                        future_10_speed = output_values[8]
+                        future_10_x = int((future_10_angle + 1) / 2 * img_width)
+                        future_10_y = int((1 - future_10_throttle) / 2 * img_height)
+                        future_10_x = max(0, min(future_10_x, img_width - 1))
+                        future_10_y = max(0, min(future_10_y, img_height - 1))
+
+                        results[img_path]["future_10"] = {
+                            "angle": float(future_10_angle),
+                            "throttle": float(future_10_throttle),
+                            "speed": float(future_10_speed),
+                            "x": future_10_x,
+                            "y": future_10_y
+                        }
+                    elif num_outputs == 6:
+                        # speed無しの将来予測（6出力）
+                        # t+5の値（インデックス2,3: angle, throttle）
+                        future_5_angle = output_values[2]
+                        future_5_throttle = output_values[3]
+                        future_5_x = int((future_5_angle + 1) / 2 * img_width)
+                        future_5_y = int((1 - future_5_throttle) / 2 * img_height)
+                        future_5_x = max(0, min(future_5_x, img_width - 1))
+                        future_5_y = max(0, min(future_5_y, img_height - 1))
+
+                        results[img_path]["future_5"] = {
+                            "angle": float(future_5_angle),
+                            "throttle": float(future_5_throttle),
+                            "x": future_5_x,
+                            "y": future_5_y
+                        }
+
+                        # t+10の値（インデックス4,5: angle, throttle）
+                        future_10_angle = output_values[4]
+                        future_10_throttle = output_values[5]
+                        future_10_x = int((future_10_angle + 1) / 2 * img_width)
+                        future_10_y = int((1 - future_10_throttle) / 2 * img_height)
+                        future_10_x = max(0, min(future_10_x, img_width - 1))
+                        future_10_y = max(0, min(future_10_y, img_height - 1))
+
+                        results[img_path]["future_10"] = {
+                            "angle": float(future_10_angle),
+                            "throttle": float(future_10_throttle),
+                            "x": future_10_x,
+                            "y": future_10_y
+                        }
                     
                 except Exception as e:
                     print(f"画像 {img_path} の推論中にエラー: {e}")

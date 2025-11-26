@@ -1209,16 +1209,25 @@ def get_timm_model_groups():
     
 class AnnotationDataset(torch.utils.data.Dataset):
     """アノテーションデータのためのカスタムデータセット"""
-    def __init__(self, image_paths, annotations, transform=None, cache_images=False, use_speed=False):
+    def __init__(self, image_paths, annotations, transform=None, cache_images=False, use_speed=False, use_future=False):
         self.image_paths = image_paths
         self.annotations = annotations
         self.transform = transform
         self.cache_images = cache_images
         self.image_cache = {} if cache_images else None
         self.use_speed = use_speed
+        self.use_future = use_future
+        self.future_offsets = [5, 10]  # 5フレーム先と10フレーム先
 
     def __len__(self):
         return len(self.image_paths)
+
+    def _get_annotation_values(self, annotation):
+        """アノテーションからangle, throttle, speedを取得"""
+        angle = annotation.get("angle", 0.0)
+        throttle = annotation.get("throttle", 0.0)
+        speed = annotation.get("speed", annotation.get("user/speed", annotation.get("pilot/speed", 0.0)))
+        return angle, throttle, speed
 
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
@@ -1241,14 +1250,33 @@ class AnnotationDataset(torch.utils.data.Dataset):
                 img_np = np.array(img)
                 img = self.transform(img_np)
 
-        # angle, throttle, (speed)をターゲットとして使用
+        # 現在のアノテーション
         annotation = self.annotations[idx]
+        angle, throttle, speed = self._get_annotation_values(annotation)
+
+        # ターゲットテンソルを構築
+        target_values = [angle, throttle]
 
         if self.use_speed:
-            # speedデータを取得（存在しない場合は0.0）
-            speed = annotation.get("speed", annotation.get("user/speed", annotation.get("pilot/speed", 0.0)))
-            target = torch.tensor([annotation["angle"], annotation["throttle"], speed], dtype=torch.float)
-        else:
-            target = torch.tensor([annotation["angle"], annotation["throttle"]], dtype=torch.float)
+            target_values.append(speed)
+
+        if self.use_future:
+            # 将来フレームのアノテーションを追加
+            for offset in self.future_offsets:
+                future_idx = idx + offset
+                if future_idx < len(self.annotations):
+                    future_ann = self.annotations[future_idx]
+                    f_angle, f_throttle, f_speed = self._get_annotation_values(future_ann)
+                else:
+                    # 範囲外の場合は現在の値をコピー
+                    f_angle, f_throttle, f_speed = angle, throttle, speed
+
+                # use_speedの設定に応じて出力を調整
+                if self.use_speed:
+                    target_values.extend([f_angle, f_throttle, f_speed])
+                else:
+                    target_values.extend([f_angle, f_throttle])
+
+        target = torch.tensor(target_values, dtype=torch.float)
 
         return img, target
