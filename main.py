@@ -164,6 +164,9 @@ class ImageLabel(QLabel):
         self.is_adjusting_speed = False  # speedバー調整中フラグ
         self.hovering_speed_bar = False  # speedバーにホバー中フラグ
         self.speed_bar_hover_y = None  # speedバー上のホバーY座標
+
+        # 将来アノテーション表示
+        self.show_future_annotations = True  # デフォルトON
     
     def add_point_to_polygon(self, polygon_index, x, y):
         """指定されたポリゴンに新しい点を追加する"""
@@ -885,7 +888,7 @@ class ImageLabel(QLabel):
         pix_width = self.pixmap().width()
         pix_height = self.pixmap().height()
 
-        # 赤：アノテーション点（教師データ）
+        # 赤：アノテーション点（教師データ）- 現在のフレーム（最初に描画）
         if self.annotation_point:
             rel_x = self.annotation_point.x() / pix_width
             rel_y = self.annotation_point.y() / pix_height
@@ -895,6 +898,36 @@ class ImageLabel(QLabel):
             painter.setPen(QPen(QColor(255, 0, 0), 4))
             painter.setBrush(QBrush())  # 塗りつぶしなし（透明）
             painter.drawEllipse(scaled_x - 15, scaled_y - 15, 30, 30)
+
+        # 将来のアノテーション点を描画（5, 10フレーム先）- 現在の点の上に描画
+        if self.show_future_annotations and self.main_window and hasattr(self.main_window, 'annotations'):
+            current_index = self.main_window.current_index
+            future_offsets = [10, 5]  # 先に遠い方を描画（後に描画されるものが上に来る）
+            future_sizes = {5: 22, 10: 14}  # インデックスごとのサイズ（現在は30）
+            future_colors = {5: QColor(255, 165, 0), 10: QColor(200, 180, 0)}  # 5:オレンジ, 10:濃い黄色
+
+            for offset in future_offsets:
+                future_index = current_index + offset
+                if future_index in self.main_window.annotations:
+                    future_ann = self.main_window.annotations[future_index]
+                    if 'x' in future_ann and 'y' in future_ann:
+                        # 将来のアノテーション座標を取得（ピクセル座標）
+                        future_x = future_ann['x']
+                        future_y = future_ann['y']
+                        # ピクセル座標から相対座標に変換
+                        future_rel_x = future_x / pix_width
+                        future_rel_y = future_y / pix_height
+                        future_scaled_x = int(target_rect.x() + future_rel_x * target_rect.width())
+                        future_scaled_y = int(target_rect.y() + future_rel_y * target_rect.height())
+
+                        # サイズと色を取得
+                        size = future_sizes.get(offset, 20)
+                        color = future_colors.get(offset, QColor(255, 165, 0))
+
+                        # オレンジ/黄色で描画
+                        painter.setPen(QPen(color, 3))
+                        painter.setBrush(QBrush())  # 塗りつぶしなし
+                        painter.drawEllipse(future_scaled_x - size // 2, future_scaled_y - size // 2, size, size)
 
         # 明るい水色：推論点（推論結果）
         if self.show_inference and self.inference_point:
@@ -1692,11 +1725,39 @@ class ImageLabel(QLabel):
             painter.setPen(QPen(hatch_color.darker(120), 4))  # 外枠を太く
             painter.drawRect(bar_x, bar_y + bar_height - preview_height, bar_width, preview_height)
 
-        # 現在のspeedバーを描画（下から上に）
+        # 現在のspeedバーを描画（下から上に）- 最初に描画
         fill_height = int(bar_height * normalized_speed)
         painter.setBrush(QBrush(color))
         painter.setPen(QPen(color.darker(120), 1))
         painter.drawRect(bar_x, bar_y + bar_height - fill_height, bar_width, fill_height)
+
+        # 将来のspeedバーを描画（5, 10フレーム先）- 現在のバーの上に描画
+        if self.show_future_annotations:
+            future_offsets = [10, 5]  # 先に遠い方を描画（後に描画されるものが上に来る）
+            future_bar_widths = {5: 20, 10: 12}  # インデックスごとのバー幅（現在は30）
+            future_colors = {5: QColor(255, 165, 0), 10: QColor(200, 180, 0)}  # 5:オレンジ, 10:濃い黄色
+
+            for offset in future_offsets:
+                future_index = current_index + offset
+                if future_index in self.main_window.annotations:
+                    future_ann = self.main_window.annotations[future_index]
+                    if 'speed' in future_ann:
+                        future_speed = future_ann['speed']
+                        future_normalized = future_speed / 10.0
+                        future_normalized = max(0, min(1, future_normalized))
+
+                        # サイズと色を取得
+                        future_width = future_bar_widths.get(offset, 20)
+                        future_color = future_colors.get(offset, QColor(255, 165, 0))
+
+                        # バーを中央揃えで描画
+                        future_bar_x = bar_x + (bar_width - future_width) // 2
+                        future_fill_height = int(bar_height * future_normalized)
+
+                        # オレンジ/黄色で描画
+                        painter.setBrush(QBrush(future_color))
+                        painter.setPen(QPen(future_color.darker(120), 1))
+                        painter.drawRect(future_bar_x, bar_y + bar_height - future_fill_height, future_width, future_fill_height)
 
         # ダークモード判定
         is_dark = self.main_window.is_dark_mode if self.main_window else False
@@ -3530,6 +3591,16 @@ class ImageAnnotationTool(QMainWindow):
         self.auto_annotate_button.setEnabled(False)  # 初期状態で非アクティブ
         apply_style(self.auto_annotate_button, 'special')
         pilot_layout.addWidget(self.auto_annotate_button)
+
+        # 将来アノテーション表示オプション
+        future_layout = QHBoxLayout()
+        self.future_annotation_checkbox = QCheckBox("5,10個先のアノテーション表示（燈色）")
+        self.future_annotation_checkbox.setChecked(True)  # デフォルトON
+        self.future_annotation_checkbox.setToolTip("5フレーム先と10フレーム先のアノテーションを表示")
+        self.future_annotation_checkbox.stateChanged.connect(self.toggle_future_annotation_display)
+        future_layout.addWidget(self.future_annotation_checkbox)
+        future_layout.addStretch()
+        pilot_layout.addLayout(future_layout)
 
         # 推論結果表示オプション
         inference_layout = QHBoxLayout()
@@ -11795,6 +11866,17 @@ class ImageAnnotationTool(QMainWindow):
             else:
                 # 既にある結果の表示を更新
                 self.update_segmentation_inference_display()
+
+    def toggle_future_annotation_display(self, state):
+        """将来アノテーション表示の切り替え"""
+        show_future = (state == Qt.Checked)
+        self.main_image_view.show_future_annotations = show_future
+        self.main_image_view.update()
+
+        if show_future:
+            self.statusBar().showMessage("将来アノテーション表示をオンにしました", 3000)
+        else:
+            self.statusBar().showMessage("将来アノテーション表示をオフにしました", 3000)
 
     def toggle_inference_display(self, state):
         """自動運転推論表示の切り替え"""
