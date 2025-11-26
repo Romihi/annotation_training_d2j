@@ -35,15 +35,48 @@ from model_info import (
 #         print("Loaded state_dict format model")
 #     return model
 
+def detect_num_outputs_from_checkpoint(weights_path, device='cpu'):
+    """
+    チェックポイントファイルから出力数を検出する
+
+    Args:
+        weights_path: 重みファイルのパス
+        device: 読み込みに使用するデバイス
+
+    Returns:
+        int: 検出された出力数（検出できない場合は2）
+    """
+    num_outputs = 2  # デフォルト
+    try:
+        checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
+        if isinstance(checkpoint, dict):
+            state_dict = checkpoint.get('model_state_dict', checkpoint.get('state_dict', checkpoint))
+        else:
+            state_dict = checkpoint
+
+        # regressor.biasまたはregressor.weightから出力数を検出
+        if isinstance(state_dict, dict):
+            if 'regressor.bias' in state_dict:
+                num_outputs = state_dict['regressor.bias'].shape[0]
+                print(f"チェックポイントから出力数を検出 (regressor.bias): {num_outputs}")
+            elif 'regressor.weight' in state_dict:
+                num_outputs = state_dict['regressor.weight'].shape[0]
+                print(f"チェックポイントから出力数を検出 (regressor.weight): {num_outputs}")
+    except Exception as e:
+        print(f"出力数の検出に失敗: {e}")
+
+    return num_outputs
+
+
 def load_model_weights(model, weights_path, device):
     """
     モデルの重みを読み込み、指定されたデバイスに移動する
-    
+
     Args:
         model: PyTorchモデル
         weights_path: 重みファイルのパス
         device: 使用するデバイス (torch.device)
-        
+
     Returns:
         重みが読み込まれ、デバイスに移動されたモデル
     """
@@ -156,68 +189,72 @@ class BaseModel(nn.Module):
         :param other_arr:   numpy array of additional data to be used in the
                             pilot, like IMU array for the IMU model or a
                             state vector in the Behavioural model
-        :return:            tuple of (angle, throttle)
+        :return:            tuple of (angle, throttle) or (angle, throttle, speed)
         """
         # 前処理パイプラインが初期化されていなければ作成（最初の1回だけ）
         if self._preprocess is None:
             self._preprocess = self.get_preprocess()
-        
+
         # PILイメージに変換して前処理を適用
         pil_image = Image.fromarray(img_arr)
         tensor_image = self._preprocess(pil_image)
         tensor_image = tensor_image.unsqueeze(0)
-        
+
         # 初期化時に決定したデバイスに直接転送
         tensor_image = tensor_image.to(self.device)
-                
+
         # 勾配計算なしで推論を実行
         with torch.no_grad():
-            # 結果は (1, 2) の形状
+            # 結果は (1, num_outputs) の形状
             result = self(tensor_image)
-        
+
         # CPU上のNumPy配列に変換
         if result.device.type != 'cpu':
             result = result.cpu()
         result = result.numpy().reshape(-1)
-        
-        # 必要に応じて、出力を[-1, 1]の範囲に正規化
-        #if self.name != "donkey" and self.name != "donkey_fcn":
-        #result = result * 2 - 1
-        
-        return result[0], result[1]  # angle, throttle
+
+        # num_outputsに基づいて返り値を変える
+        num_outputs = getattr(self, 'num_outputs', 2)
+        if num_outputs == 2:
+            return result[0], result[1]  # angle, throttle
+        elif num_outputs == 3:
+            return result[0], result[1], result[2]  # angle, throttle, speed
+        else:
+            return tuple(result[:num_outputs])
 
 class TIMMBasedModel(BaseModel):
     """TIMMライブラリを使用するモデルのベースクラス"""
     def __init__(self, name, timm_model_name=None, pretrained=True, num_outputs=2):
         super(TIMMBasedModel, self).__init__(name=name)
-        
+
         # TIMMモデル名が指定されていない場合、モデル名をそのまま使用
         if timm_model_name is None:
             timm_model_name = name
-            
+
         self.timm_model_name = timm_model_name
-        
+        self.num_outputs = num_outputs
+
         # モデルの存在確認
         if timm_model_name not in timm.list_models():
             raise ValueError(f"Model '{timm_model_name}' not found in timm library")
-        
+
         # TIMMモデルのロード
         self.base_model = timm.create_model(timm_model_name, pretrained=pretrained, num_classes=0)
-        
+
         # 特徴量の次元を取得するためのダミー入力
         input_size = self._get_model_input_size()
         dummy_input = torch.zeros(1, 3, input_size[0], input_size[1])
         with torch.no_grad():
             dummy_output = self.base_model(dummy_input)
-        
+
         # 特徴量の次元
         if isinstance(dummy_output, torch.Tensor):
             feature_dim = dummy_output.shape[1]
         else:
             # 一部のモデルは辞書を返す場合があるので対応
             feature_dim = next(iter(dummy_output.values())).shape[1] if isinstance(dummy_output, dict) else 512
-        
-        # 回帰器（角度と速度の予測）
+
+        # 回帰器（角度と速度の予測、またはangle/throttle/speedの3出力）
         self.regressor = nn.Linear(feature_dim, num_outputs)
     
     def _get_model_input_size(self):
@@ -253,11 +290,12 @@ class TIMMBasedModel(BaseModel):
 
 class ResNet18Model(TIMMBasedModel):
     """TIMMベースのResNet18モデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(ResNet18Model, self).__init__(
             name="resnet18",
             timm_model_name="resnet18",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
@@ -273,11 +311,12 @@ class ResNet34Model(TIMMBasedModel):
 
 class MobileViTXXSModel(TIMMBasedModel):
     """TIMMベースのMobileViT XXSモデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(MobileViTXXSModel, self).__init__(
             name="mobilevit_xxs",
             timm_model_name="mobilevit_xxs",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
@@ -364,11 +403,12 @@ class ConvNextTinyModel(TIMMBasedModel):
 
 class EdgeNextXXSmallModel(TIMMBasedModel):
     """TIMMベースのEdgeNeXt XX-Smallモデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(EdgeNextXXSmallModel, self).__init__(
             name="edgenext_xx_small",
             timm_model_name="edgenext_xx_small",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
@@ -522,12 +562,13 @@ class YOLOv11xModel(TIMMBasedModel):
 class DonkeyModel(BaseModel):
     """Donkeycarで使用される標準的なモデル（カスタム実装）"""
     #def __init__(self, pretrained=False, input_size=(120, 160)):
-    def __init__(self, pretrained=False, input_size=(224, 224)):
+    def __init__(self, pretrained=False, input_size=(224, 224), num_outputs=2):
         super(DonkeyModel, self).__init__(name="donkeycar")
-        
+
         # 入力サイズを保存（前処理と特徴計算で使用）
         self.input_size = input_size
-        
+        self.num_outputs = num_outputs
+
         # 特徴抽出部分
         drop = 0.2
         self.features = nn.Sequential(
@@ -548,14 +589,14 @@ class DonkeyModel(BaseModel):
             nn.Dropout(drop),
             nn.Flatten()
         )
-        
+
         # 計算される特徴マップサイズに依存するため、ダミー入力を使って計算
         # 入力サイズに基づいてダミー入力を作成
         dummy_input = torch.zeros(1, 3, input_size[0], input_size[1])
         dummy_output = self.features(dummy_input)
         feature_size = dummy_output.shape[1]
-        
-        print(f"DonkeyModel feature size: {feature_size} for input {input_size}")
+
+        print(f"DonkeyModel feature size: {feature_size} for input {input_size}, num_outputs: {num_outputs}")
 
         # 全結合層（Dense層として分離）
         self.dense_layers = nn.Sequential(
@@ -565,23 +606,59 @@ class DonkeyModel(BaseModel):
             nn.Linear(100, 50),
             nn.ReLU(inplace=True),
             nn.Dropout(drop),
-        )        
+        )
 
-        # 回帰器（角度と速度の予測）
-        self.regressor = nn.Linear(50, 2)
-    
+        # 回帰器（角度と速度の予測、またはangle/throttle/speedの3出力）
+        self.regressor = nn.Linear(50, num_outputs)
+
     def forward(self, x):
         x = self.features(x)
         x = self.dense_layers(x)
         x = self.regressor(x)
         return x
-    
+
     def get_preprocess(self):
         """Donkeycar用の前処理 - 保存されている入力サイズを使用"""
         return transforms.Compose([
             transforms.Resize(self.input_size),  # 保存された入力サイズを使用
             transforms.ToTensor()
         ])
+
+    def run(self, img_arr: np.ndarray, other_arr: np.ndarray = None):
+        """
+        Donkeycar parts interface to run the part in the loop.
+
+        :param img_arr:     uint8 [0,255] numpy array with image data
+        :param other_arr:   numpy array of additional data to be used in the
+                            pilot, like IMU array for the IMU model or a
+                            state vector in the Behavioural model
+        :return:            tuple of (angle, throttle) or (angle, throttle, speed)
+        """
+        # 前処理パイプラインが初期化されていなければ作成（最初の1回だけ）
+        if self._preprocess is None:
+            self._preprocess = self.get_preprocess()
+
+        # PILイメージに変換して前処理を適用
+        pil_image = Image.fromarray(img_arr)
+        tensor_image = self._preprocess(pil_image)
+        tensor_image = tensor_image.unsqueeze(0)
+
+        # 初期化時に決定したデバイスに直接転送
+        tensor_image = tensor_image.to(self.device)
+
+        # 勾配計算なしで推論を実行
+        with torch.no_grad():
+            result = self(tensor_image)
+
+        # CPU上のNumPy配列に変換
+        if result.device.type != 'cpu':
+            result = result.cpu()
+        result = result.numpy().reshape(-1)
+
+        if self.num_outputs == 2:
+            return result[0], result[1]  # angle, throttle
+        else:
+            return result[0], result[1], result[2]  # angle, throttle, speed
 
 class DonkeyModel_FCN(BaseModel):
     """Donkeycarで使用される標準的なモデルのFCN版（カスタム実装）"""
@@ -1047,22 +1124,26 @@ MODEL_REGISTRY = {
 
 
 # モデルの利用に関する関数
-def get_model(model_type, pretrained=False, input_size=None):
+def get_model(model_type, pretrained=False, input_size=None, num_outputs=2):
     """モデルタイプに基づいて適切なモデルを返す
-    
+
     Args:
         model_type: モデルの種類
         pretrained: 事前学習済みの重みを使用するかどうか
         input_size: 入力サイズ（height, width）- Noneの場合はデフォルト値を使用
+        num_outputs: 出力数（2=angle/throttle, 3=angle/throttle/speed）
     """
     if model_type not in MODEL_REGISTRY:
         raise ValueError(f"未対応のモデルタイプ: {model_type}")
-    
+
     model_class = MODEL_REGISTRY[model_type]
-    
-    # DonkeyModel系の場合、入力サイズを渡す
-    if model_type in ["donkeycar", "donkey_fcn"] and input_size is not None:
-        return model_class(pretrained=pretrained, input_size=input_size)
+
+    # DonkeyModel系の場合、入力サイズとnum_outputsを渡す
+    if model_type in ["donkeycar", "donkey_fcn"]:
+        if input_size is not None:
+            return model_class(pretrained=pretrained, input_size=input_size, num_outputs=num_outputs)
+        else:
+            return model_class(pretrained=pretrained, num_outputs=num_outputs)
     elif model_type == "donkey_location" and input_size is not None:
         # DonkeyLocationModelの場合、num_classesも必要（デフォルト8）
         return model_class(num_classes=8, pretrained=pretrained, input_size=input_size)
@@ -1072,8 +1153,15 @@ def get_model(model_type, pretrained=False, input_size=None):
     elif model_type == "resnet18_waypoint":
         # ResNet18WaypointModelの場合、num_waypointsも必要（デフォルト4）
         return model_class(num_waypoints=4, pretrained=pretrained)
-        return model_class(num_classes=8, pretrained=pretrained, input_size=input_size)
-    
+    elif model_type.endswith('_location'):
+        # 位置推論モデルはnum_outputsを使わない
+        return model_class(pretrained=pretrained)
+
+    # TIMMベースのモデルの場合、num_outputsをサポート
+    # TIMMBasedModelを継承しているモデルかチェック
+    if issubclass(model_class, TIMMBasedModel):
+        return model_class(pretrained=pretrained, num_outputs=num_outputs)
+
     # その他のモデルの場合は通常通り初期化
     return model_class(pretrained=pretrained)
 
@@ -1121,19 +1209,20 @@ def get_timm_model_groups():
     
 class AnnotationDataset(torch.utils.data.Dataset):
     """アノテーションデータのためのカスタムデータセット"""
-    def __init__(self, image_paths, annotations, transform=None, cache_images=False):
+    def __init__(self, image_paths, annotations, transform=None, cache_images=False, use_speed=False):
         self.image_paths = image_paths
         self.annotations = annotations
         self.transform = transform
         self.cache_images = cache_images
         self.image_cache = {} if cache_images else None
-        
+        self.use_speed = use_speed
+
     def __len__(self):
         return len(self.image_paths)
-    
+
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
-        
+
         # キャッシュから画像を取得または読み込み
         if self.cache_images and idx in self.image_cache:
             img = self.image_cache[idx]
@@ -1142,7 +1231,7 @@ class AnnotationDataset(torch.utils.data.Dataset):
             img = Image.open(img_path).convert('RGB')
             if self.cache_images:
                 self.image_cache[idx] = img
-        
+
         # 変換を適用
         if self.transform:
             try:
@@ -1151,9 +1240,15 @@ class AnnotationDataset(torch.utils.data.Dataset):
                 # エラーが発生した場合、明示的にNumPy変換を挟む
                 img_np = np.array(img)
                 img = self.transform(img_np)
-        
-        # angle, throttleをターゲットとして使用
+
+        # angle, throttle, (speed)をターゲットとして使用
         annotation = self.annotations[idx]
-        target = torch.tensor([annotation["angle"], annotation["throttle"]], dtype=torch.float)
-        
+
+        if self.use_speed:
+            # speedデータを取得（存在しない場合は0.0）
+            speed = annotation.get("speed", annotation.get("user/speed", annotation.get("pilot/speed", 0.0)))
+            target = torch.tensor([annotation["angle"], annotation["throttle"], speed], dtype=torch.float)
+        else:
+            target = torch.tensor([annotation["angle"], annotation["throttle"]], dtype=torch.float)
+
         return img, target

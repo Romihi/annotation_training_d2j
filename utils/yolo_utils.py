@@ -29,6 +29,7 @@ class YOLOTrainingWorker(QThread):
     """YOLO学習をバックグラウンドで実行し、出力をリアルタイムで通知"""
     output_received = pyqtSignal(str)  # 出力テキストを通知
     progress_updated = pyqtSignal(int, str)  # 進捗(%)とメッセージを通知
+    epoch_updated = pyqtSignal(int, int)  # エポック進捗を通知 (current, total)
     metrics_updated = pyqtSignal(dict)  # メトリクス（loss等）を通知
     training_completed = pyqtSignal(object)  # 学習完了を通知
     error_occurred = pyqtSignal(str)  # エラーを通知
@@ -40,6 +41,8 @@ class YOLOTrainingWorker(QThread):
         self.process = None
         self._stop_requested = False
         self.results = None  # 学習結果を保存
+        self.total_epochs = training_params.get('epochs', 100)
+        self.current_epoch = 0
 
     def run(self):
         """学習を実行し、出力をキャプチャ"""
@@ -194,6 +197,75 @@ class YOLOTrainingWorker(QThread):
             try:
                 # YOLO学習を実行
                 self.progress_updated.emit(5, "学習を開始しています...")
+
+                # コールバック関数を設定してエポック毎の進捗を取得
+                worker_ref = self  # selfへの参照を保持
+
+                def on_train_epoch_end(trainer):
+                    """各トレーニングエポック終了時に呼ばれるコールバック"""
+                    current_epoch = trainer.epoch + 1  # 0-indexed -> 1-indexed
+                    total_epochs = trainer.epochs
+                    worker_ref.current_epoch = current_epoch
+
+                    # エポック進捗を通知
+                    worker_ref.epoch_updated.emit(current_epoch, total_epochs)
+
+                    # パーセント進捗も更新
+                    progress = int((current_epoch / total_epochs) * 100)
+                    worker_ref.progress_updated.emit(progress, f"エポック {current_epoch}/{total_epochs}")
+
+                def on_fit_epoch_end(trainer):
+                    """各エポック終了時（train + val後）に呼ばれるコールバック"""
+                    # trainer.metricsからmAP値を含むメトリクスを取得
+                    if hasattr(trainer, 'metrics') and trainer.metrics:
+                        metrics = {}
+                        try:
+                            # trainer.metricsは辞書形式
+                            trainer_metrics = trainer.metrics
+
+                            # mAP値の取得（複数のキー形式に対応）
+                            # YOLOv8/v11: 'metrics/mAP50(B)', 'metrics/mAP50-95(B)' など
+                            for key, value in trainer_metrics.items():
+                                if 'mAP50-95' in key or 'mAP_0.5:0.95' in key:
+                                    metrics['mAP50-95'] = float(value)
+                                elif 'mAP50' in key or 'mAP_0.5' in key:
+                                    metrics['mAP50'] = float(value)
+                                elif 'precision' in key.lower():
+                                    metrics['precision'] = float(value)
+                                elif 'recall' in key.lower():
+                                    metrics['recall'] = float(value)
+
+                            if metrics:
+                                worker_ref.metrics_updated.emit(metrics)
+                        except Exception as e:
+                            print(f"メトリクス取得エラー: {e}")
+
+                def on_train_batch_end(trainer):
+                    """各バッチ終了時に呼ばれるコールバック（Loss更新用）"""
+                    if hasattr(trainer, 'tloss') and trainer.tloss is not None:
+                        try:
+                            metrics = {}
+                            loss_tensor = trainer.tloss
+                            if hasattr(loss_tensor, 'cpu'):
+                                loss_values = loss_tensor.cpu().numpy()
+                            else:
+                                loss_values = loss_tensor
+
+                            loss_names = ['box_loss', 'cls_loss', 'dfl_loss']
+                            for i, name in enumerate(loss_names):
+                                if i < len(loss_values):
+                                    metrics[name] = float(loss_values[i])
+
+                            if metrics:
+                                worker_ref.metrics_updated.emit(metrics)
+                        except:
+                            pass
+
+                # コールバックを登録
+                self.model.add_callback('on_train_epoch_end', on_train_epoch_end)
+                self.model.add_callback('on_fit_epoch_end', on_fit_epoch_end)  # mAP取得用
+                self.model.add_callback('on_train_batch_end', on_train_batch_end)
+
                 self.results = self.model.train(**self.training_params)
                 self.training_completed.emit(self.results)
 
@@ -298,10 +370,10 @@ class TrainingOutputDialog(QDialog):
 
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(200)
+        self.log_text.setMinimumHeight(100)  # 最小高さのみ設定
         log_layout.addWidget(self.log_text)
 
-        layout.addWidget(log_group)
+        layout.addWidget(log_group, 1)  # stretch factor 1で残りスペースを埋める
 
         # ボタン
         button_layout = QHBoxLayout()
@@ -326,9 +398,16 @@ class TrainingOutputDialog(QDialog):
     def start_training(self, model, training_params):
         """学習を開始"""
         self.total_epochs = training_params.get('epochs', 100)
+        self.current_epoch = 0
+
+        # 初期エポック表示を更新
+        self.epoch_label.setText(f"0 / {self.total_epochs}")
+        self.progress_bar.setValue(0)
+
         self.worker = YOLOTrainingWorker(model, training_params)
         self.worker.output_received.connect(self.append_log)
         self.worker.progress_updated.connect(self.update_progress)
+        self.worker.epoch_updated.connect(self.update_epoch)  # エポック更新シグナルを接続
         self.worker.metrics_updated.connect(self.update_metrics)
         self.worker.training_completed.connect(self.on_training_completed)
         self.worker.error_occurred.connect(self.on_error)
@@ -368,6 +447,15 @@ class TrainingOutputDialog(QDialog):
                 self.current_epoch = int(match.group(1))
                 total = int(match.group(2))
                 self.epoch_label.setText(f"{self.current_epoch} / {total}")
+
+    def update_epoch(self, current, total):
+        """エポック進捗を直接更新"""
+        self.current_epoch = current
+        self.total_epochs = total
+        self.epoch_label.setText(f"{current} / {total}")
+        # プログレスバーも更新
+        progress = int((current / total) * 100) if total > 0 else 0
+        self.progress_bar.setValue(progress)
 
     def update_metrics(self, metrics):
         """メトリクスを更新"""
