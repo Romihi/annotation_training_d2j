@@ -167,7 +167,14 @@ class ImageLabel(QLabel):
 
         # 将来アノテーション表示
         self.show_future_annotations = True  # デフォルトON
-    
+
+        # GradCAM表示関連
+        self.show_gradcam = False  # GradCAM表示フラグ
+        self.gradcam_overlay = None  # GradCAMオーバーレイ画像 (QPixmap)
+        self.gradcam_alpha = 0.5  # GradCAMの透明度
+        self.gradcam_target = 'angle'  # GradCAM対象出力 ('angle', 'throttle', 'speed')
+        self.gradcam_method = 'gradcam'  # CAM手法 ('gradcam', 'gradcam++', 'eigencam', 'layercam')
+
     def add_point_to_polygon(self, polygon_index, x, y):
         """指定されたポリゴンに新しい点を追加する"""
         if not hasattr(self.main_window, 'segmentation_annotations'):
@@ -450,8 +457,11 @@ class ImageLabel(QLabel):
             return
 
         painter = QPainter(self)
-        
+
         self.draw_initial_frame(painter)
+
+        # GradCAMオーバーレイを描画（ベース画像の上、他のアノテーションの下）
+        self.draw_gradcam_overlay(painter, self.target_rect)
 
         # 各機能毎に描画（描画順序を調整）
         self.draw_grid(painter, self.target_rect)
@@ -491,6 +501,32 @@ class ImageLabel(QLabel):
         # 画像を拡大して描画
         self.target_rect = QRect(self.x, self.y, self.scaled_width, self.scaled_height)
         painter.drawPixmap(self.target_rect, self.pixmap())
+
+    def draw_gradcam_overlay(self, painter, target_rect):
+        """GradCAMヒートマップオーバーレイを描画"""
+        if not self.show_gradcam or self.gradcam_overlay is None:
+            return
+
+        # GradCAMオーバーレイをtarget_rectにスケーリングして描画
+        # アルファチャンネルは既に画像に含まれているのでそのまま描画
+        painter.drawPixmap(target_rect, self.gradcam_overlay)
+
+        # CAM手法と対象の表示ラベル
+        method_name = getattr(self, 'gradcam_method', 'gradcam').upper()
+        label_text = f"{method_name}: {self.gradcam_target}"
+        painter.setPen(QPen(Qt.white, 2))
+        painter.setFont(QFont("Arial", 10, QFont.Bold))
+
+        # ラベル背景
+        text_rect = painter.fontMetrics().boundingRect(label_text)
+        bg_rect = QRect(
+            target_rect.x() + 5,
+            target_rect.y() + 5,
+            text_rect.width() + 10,
+            text_rect.height() + 6
+        )
+        painter.fillRect(bg_rect, QColor(0, 0, 0, 180))
+        painter.drawText(bg_rect, Qt.AlignCenter, label_text)
 
     def draw_background_frame(self, painter, target_rect):
         """削除状態や位置番号などの背景フレームを描画する"""
@@ -3684,8 +3720,37 @@ class ImageAnnotationTool(QMainWindow):
         self.diff_vector_checkbox.setToolTip("自動運転モデルが読み込まれていません")
         self.diff_vector_checkbox.stateChanged.connect(self.toggle_diff_vector_display)
         diff_vector_layout.addWidget(self.diff_vector_checkbox)
-        
+
         pilot_layout.addLayout(diff_vector_layout)
+
+        # GradCAM表示オプション
+        gradcam_layout = QHBoxLayout()
+        self.gradcam_checkbox = QCheckBox("GradCAM表示")
+        self.gradcam_checkbox.setChecked(False)
+        self.gradcam_checkbox.setEnabled(False)  # 初期状態は無効
+        self.gradcam_checkbox.setToolTip("自動運転モデルが読み込まれていません")
+        self.gradcam_checkbox.stateChanged.connect(self.toggle_gradcam_display)
+        gradcam_layout.addWidget(self.gradcam_checkbox)
+
+        # GradCAM対象選択
+        self.gradcam_target_combo = QComboBox()
+        self.gradcam_target_combo.addItems(["angle", "throttle", "speed"])
+        self.gradcam_target_combo.setCurrentText("angle")
+        self.gradcam_target_combo.setEnabled(False)
+        self.gradcam_target_combo.setToolTip("GradCAMで可視化する出力を選択")
+        self.gradcam_target_combo.currentTextChanged.connect(self.change_gradcam_target)
+        gradcam_layout.addWidget(self.gradcam_target_combo)
+
+        # CAM手法選択
+        self.gradcam_method_combo = QComboBox()
+        self.gradcam_method_combo.addItems(["gradcam", "gradcam++", "eigencam", "layercam"])
+        self.gradcam_method_combo.setCurrentText("gradcam")
+        self.gradcam_method_combo.setEnabled(False)
+        self.gradcam_method_combo.setToolTip("CAM可視化手法を選択")
+        self.gradcam_method_combo.currentTextChanged.connect(self.change_gradcam_method)
+        gradcam_layout.addWidget(self.gradcam_method_combo)
+
+        pilot_layout.addLayout(gradcam_layout)
 
         left_layout.addWidget(self.pilot_container)
                     
@@ -6636,8 +6701,20 @@ class ImageAnnotationTool(QMainWindow):
             else:
                 self.batch_inference_button.setEnabled(False)
                 self.batch_inference_button.setToolTip("自動運転モデルが読み込まれていません")
-    
-   
+
+        # GradCAM表示（自動運転モデルに依存）
+        if hasattr(self, 'gradcam_checkbox'):
+            if hasattr(self, 'model') and self.model is not None:
+                self.gradcam_checkbox.setEnabled(True)
+                self.gradcam_checkbox.setToolTip("モデルの注目領域をヒートマップで表示")
+                self.gradcam_target_combo.setEnabled(True)
+                self.gradcam_method_combo.setEnabled(True)
+            else:
+                self.gradcam_checkbox.setEnabled(False)
+                self.gradcam_checkbox.setChecked(False)
+                self.gradcam_checkbox.setToolTip("自動運転モデルが読み込まれていません")
+                self.gradcam_target_combo.setEnabled(False)
+                self.gradcam_method_combo.setEnabled(False)
 
     def add_segmentation_annotation(self, polygon_data):
         """セグメンテーションアノテーションを追加"""
@@ -11933,6 +12010,113 @@ class ImageAnnotationTool(QMainWindow):
         else:
             self.statusBar().showMessage("将来アノテーション表示をオフにしました", 3000)
 
+    def toggle_gradcam_display(self, state):
+        """GradCAM表示の切り替え"""
+        show_gradcam = (state == Qt.Checked)
+        self.main_image_view.show_gradcam = show_gradcam
+
+        if show_gradcam:
+            # GradCAMを生成して表示
+            self.update_gradcam_visualization()
+            self.statusBar().showMessage("GradCAM表示をオンにしました", 3000)
+        else:
+            # GradCAMオーバーレイをクリア
+            self.main_image_view.gradcam_overlay = None
+            self.main_image_view.update()
+            self.statusBar().showMessage("GradCAM表示をオフにしました", 3000)
+
+    def change_gradcam_target(self, target):
+        """GradCAM対象出力の変更"""
+        self.main_image_view.gradcam_target = target
+
+        # GradCAM表示中なら更新
+        if self.main_image_view.show_gradcam:
+            self.update_gradcam_visualization()
+
+    def change_gradcam_method(self, method):
+        """CAM手法の変更"""
+        self.main_image_view.gradcam_method = method
+
+        # GradCAM表示中なら更新
+        if self.main_image_view.show_gradcam:
+            self.update_gradcam_visualization()
+
+    def update_gradcam_visualization(self):
+        """GradCAM可視化を更新"""
+        if not self.images or not hasattr(self, 'model') or self.model is None:
+            return
+
+        try:
+            from utils.gradcam_utils import GradCAM, overlay_heatmap
+            import cv2
+
+            # 現在の画像パス
+            img_path = self.images[self.current_index]
+
+            # 画像を読み込み
+            original_image = Image.open(img_path).convert('RGB')
+            original_np = np.array(original_image)
+
+            # 前処理
+            transform = self.model.get_preprocess()
+            input_tensor = transform(original_image).unsqueeze(0)
+
+            # デバイスに移動
+            device = self.model.device if hasattr(self.model, 'device') else torch.device('cpu')
+            input_tensor = input_tensor.to(device)
+
+            # GradCAMインスタンス作成
+            gradcam = GradCAM(self.model)
+
+            try:
+                from utils.gradcam_utils import apply_colormap
+
+                # 対象出力のインデックスを取得
+                target_map = {'angle': 0, 'throttle': 1, 'speed': 2}
+                target_idx = target_map.get(self.main_image_view.gradcam_target, 0)
+
+                # CAM手法を取得
+                cam_method = getattr(self.main_image_view, 'gradcam_method', 'gradcam')
+
+                # ヒートマップ生成
+                heatmap = gradcam.generate_cam(
+                    input_tensor,
+                    target_output_index=target_idx,
+                    method=cam_method
+                )
+
+                # ヒートマップを画像サイズにリサイズ
+                h, w = original_np.shape[:2]
+                heatmap_resized = cv2.resize(heatmap, (w, h))
+
+                # カラーマップを適用（BGRで返る）
+                heatmap_colored = apply_colormap(heatmap_resized, cv2.COLORMAP_JET)
+                # BGRからRGBAに変換（アルファチャンネル付き）
+                heatmap_rgba = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGBA)
+
+                # アルファチャンネルをヒートマップの強度に基づいて設定
+                # 強度が高い部分ほど不透明に
+                alpha_value = int(255 * self.main_image_view.gradcam_alpha)
+                heatmap_rgba[:, :, 3] = (heatmap_resized * alpha_value).astype(np.uint8)
+
+                # QPixmapに変換（RGBA）
+                bytes_per_line = 4 * w
+                q_image = QImage(heatmap_rgba.data, w, h, bytes_per_line, QImage.Format_RGBA8888)
+                self.main_image_view.gradcam_overlay = QPixmap.fromImage(q_image.copy())
+
+                # 画面を更新
+                self.main_image_view.update()
+
+            finally:
+                # フックを削除してメモリリークを防ぐ
+                gradcam.remove_hooks()
+
+        except Exception as e:
+            print(f"GradCAM生成エラー: {e}")
+            import traceback
+            traceback.print_exc()
+            self.statusBar().showMessage(f"GradCAM生成エラー: {e}", 5000)
+
     def toggle_inference_display(self, state):
         """自動運転推論表示の切り替え"""
         show_inference = (state == Qt.Checked)
@@ -13953,6 +14137,10 @@ class ImageAnnotationTool(QMainWindow):
                 # 推論結果ポイント（青丸）の設定
                 self._set_inference_point_on_canvas()
 
+                # GradCAM表示が有効な場合は更新
+                if hasattr(self, 'gradcam_checkbox') and self.gradcam_checkbox.isChecked():
+                    self.update_gradcam_visualization()
+
             # Enhanced annotations display processing - UI要素の更新
             self._update_enhanced_ui_elements()
 
@@ -15557,8 +15745,8 @@ class ImageAnnotationTool(QMainWindow):
         # 学習設定ダイアログを表示
         training_settings = QDialog(self)
         training_settings.setWindowTitle("学習設定")
-        training_settings.setMinimumWidth(550)
-        training_settings.setMinimumHeight(600)  # ダイアログサイズを大きくする
+        training_settings.setMinimumWidth(700)  # 横並び用に幅を広げる
+        training_settings.setMinimumHeight(600)
 
         settings_layout = QVBoxLayout(training_settings)
 
@@ -15569,61 +15757,64 @@ class ImageAnnotationTool(QMainWindow):
         basic_tab = QWidget()
         basic_layout = QVBoxLayout(basic_tab)
 
+        # 出力設定グループ（Speed出力と将来予測を統合）
+        output_settings_group = QGroupBox("出力設定")
+        output_settings_layout = QVBoxLayout()
+
         # Speed出力オプション（データにspeedがある場合のみ表示）
         speed_output_check = None
         speed_normalize_spin = None
         if has_speed_data:
-            speed_output_group = QGroupBox("出力設定")
-            speed_output_layout = QVBoxLayout()
+            # チェックボックスと正規化設定を横並びで配置
+            speed_row_layout = QHBoxLayout()
 
             speed_output_check = QCheckBox("Speed（速度）を出力に追加")
             speed_output_check.setChecked(False)
-            speed_output_layout.addWidget(speed_output_check)
+            speed_row_layout.addWidget(speed_output_check)
 
-            speed_info_label = QLabel(f"※ {speed_count}個のアノテーションにspeedデータが含まれています")
-            speed_info_label.setStyleSheet("color: #666; font-size: 10px;")
-            speed_output_layout.addWidget(speed_info_label)
-
-            # Speed正規化設定
-            speed_normalize_layout = QHBoxLayout()
-            speed_normalize_label = QLabel("Speed正規化値:")
-            speed_normalize_layout.addWidget(speed_normalize_label)
+            # 正規化設定（チェックボックスの右側）
+            speed_normalize_label = QLabel("正規化値:")
+            speed_row_layout.addWidget(speed_normalize_label)
             speed_normalize_spin = QDoubleSpinBox()
             speed_normalize_spin.setRange(0.1, 100.0)
-            speed_normalize_spin.setValue(10.0)  # デフォルト: 10.0
+            speed_normalize_spin.setValue(10.0)
             speed_normalize_spin.setDecimals(1)
             speed_normalize_spin.setSingleStep(1.0)
             speed_normalize_spin.setToolTip("Speed値を正規化する際の除数（デフォルト: 10.0）")
-            speed_normalize_layout.addWidget(speed_normalize_spin)
-            speed_normalize_layout.addStretch()
-            speed_output_layout.addLayout(speed_normalize_layout)
+            speed_normalize_spin.setFixedWidth(70)
+            speed_row_layout.addWidget(speed_normalize_spin)
 
-            speed_normalize_info = QLabel("※ Speed値はこの値で除算されて正規化されます")
-            speed_normalize_info.setStyleSheet("color: #666; font-size: 9px;")
-            speed_output_layout.addWidget(speed_normalize_info)
+            speed_normalize_info = QLabel("※ Speed値はこの値で除算されます")
+            speed_normalize_info.setStyleSheet("color: #666; font-size: 11px;")
+            speed_row_layout.addWidget(speed_normalize_info)
 
-            speed_output_group.setLayout(speed_output_layout)
-            basic_layout.addWidget(speed_output_group)
+            speed_row_layout.addStretch()
+            output_settings_layout.addLayout(speed_row_layout)
 
-        # 将来予測出力設定
-        future_output_group = QGroupBox("将来予測出力設定")
-        future_output_layout = QVBoxLayout()
+            speed_info_label = QLabel(f"※ {speed_count}個のアノテーションにspeedデータが含まれています")
+            speed_info_label.setStyleSheet("color: #666; font-size: 11px;")
+            output_settings_layout.addWidget(speed_info_label)
+
+            # セクション間のスペース
+            output_settings_layout.addSpacing(10)
 
         future_output_check = QCheckBox("将来フレームの予測を出力に追加")
         future_output_check.setChecked(False)
-        future_output_check.setToolTip("5, 10フレーム先のangle, throttle, speedを追加出力")
-        future_output_layout.addWidget(future_output_check)
+        future_output_check.setToolTip("5, 10フレーム先のangle, throttle(, speed)を追加出力")
+        output_settings_layout.addWidget(future_output_check)
 
-        future_info_label = QLabel("※ 5フレーム先と10フレーム先のangle, throttle, speedを追加出力します")
-        future_info_label.setStyleSheet("color: #666; font-size: 10px;")
-        future_output_layout.addWidget(future_info_label)
+        future_info_label = QLabel("※ 5フレーム先と10フレーム先のangle, throttle(, speed)を追加出力")
+        future_info_label.setStyleSheet("color: #666; font-size: 11px;")
+        output_settings_layout.addWidget(future_info_label)
 
-        future_detail_label = QLabel("  出力: [angle, throttle, speed, t+5_angle, t+5_throttle, t+5_speed, t+10_angle, t+10_throttle, t+10_speed]")
-        future_detail_label.setStyleSheet("color: #888; font-size: 9px;")
-        future_output_layout.addWidget(future_detail_label)
+        future_detail_label = QLabel("出力例（speed有）: [angle, throttle, speed, t+5_angle, t+5_throttle, t+5_speed, t+10_angle, t+10_throttle, t+10_speed]")
+        future_detail_label.setStyleSheet("color: #888; font-size: 11px;")
+        future_detail_label.setWordWrap(True)
+        output_settings_layout.addWidget(future_detail_label)
 
-        future_output_group.setLayout(future_output_layout)
-        basic_layout.addWidget(future_output_group)
+        output_settings_layout.addStretch()
+        output_settings_group.setLayout(output_settings_layout)
+        basic_layout.addWidget(output_settings_group)
 
         # エポック数設定
         epoch_layout = QHBoxLayout()

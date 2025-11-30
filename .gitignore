@@ -192,3 +192,7 @@ yolo*.pt
 
 #Claude
 .claude
+
+# Windows reserved names (prevent accidental creation)
+nul
+NUL

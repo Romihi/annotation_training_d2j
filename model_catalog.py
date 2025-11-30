@@ -234,9 +234,10 @@ class TIMMBasedModel(BaseModel):
         self.timm_model_name = timm_model_name
         self.num_outputs = num_outputs
 
-        # モデルの存在確認
-        if timm_model_name not in timm.list_models():
-            raise ValueError(f"Model '{timm_model_name}' not found in timm library")
+        # モデルの存在確認（ベースモデル名で確認、pretrained weight指定は除外）
+        base_model_name = timm_model_name.split('.')[0]
+        if base_model_name not in timm.list_models():
+            raise ValueError(f"Model '{base_model_name}' not found in timm library")
 
         # TIMMモデルのロード
         self.base_model = timm.create_model(timm_model_name, pretrained=pretrained, num_classes=0)
@@ -244,8 +245,11 @@ class TIMMBasedModel(BaseModel):
         # 特徴量の次元を取得するためのダミー入力
         input_size = self._get_model_input_size()
         dummy_input = torch.zeros(1, 3, input_size[0], input_size[1])
+        # BatchNormのためにevalモードで実行
+        self.base_model.eval()
         with torch.no_grad():
             dummy_output = self.base_model(dummy_input)
+        self.base_model.train()
 
         # 特徴量の次元
         if isinstance(dummy_output, torch.Tensor):
@@ -301,11 +305,12 @@ class ResNet18Model(TIMMBasedModel):
 
 class ResNet34Model(TIMMBasedModel):
     """TIMMベースのResNet34モデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(ResNet34Model, self).__init__(
             name="resnet34",
             timm_model_name="resnet34",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
@@ -322,41 +327,45 @@ class MobileViTXXSModel(TIMMBasedModel):
 
 class MobileViTXSModel(TIMMBasedModel):
     """TIMMベースのMobileViT XSモデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(MobileViTXSModel, self).__init__(
             name="mobilevit_xs",
             timm_model_name="mobilevit_xs",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
 class MobileViTSModel(TIMMBasedModel):
     """TIMMベースのMobileViT Sモデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(MobileViTSModel, self).__init__(
             name="mobilevit_s",
             timm_model_name="mobilevit_s",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
 class MobileNetV3SmallModel(TIMMBasedModel):
     """TIMMベースのMobileNetV3 Smallモデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(MobileNetV3SmallModel, self).__init__(
             name="mobilenetv3_small_100",
             timm_model_name="mobilenetv3_small_100",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
 class MobileNetV3LargeModel(TIMMBasedModel):
     """TIMMベースのMobileNetV3 Largeモデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(MobileNetV3LargeModel, self).__init__(
             name="mobilenetv3_large_100",
             timm_model_name="mobilenetv3_large_100",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
@@ -373,22 +382,24 @@ class MobileNetV4ConvSmallModel(TIMMBasedModel):
 
 class EfficientNetLite0Model(TIMMBasedModel):
     """TIMMベースのEfficientNet Lite0モデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         # TIMMではefficientnet_lite0ではなくefficientnet_lite0を使用
         super(EfficientNetLite0Model, self).__init__(
             name="efficientnet_lite0",
             timm_model_name="efficientnet_lite0",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
 class EfficientNetB0Model(TIMMBasedModel):
     """TIMMベースのEfficientNet B0モデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(EfficientNetB0Model, self).__init__(
             name="efficientnet_b0",
             timm_model_name="efficientnet_b0",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
@@ -405,21 +416,23 @@ class EfficientNetV2SModel(TIMMBasedModel):
 
 class ConvNextNanoModel(TIMMBasedModel):
     """TIMMベースのConvNeXt Nanoモデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(ConvNextNanoModel, self).__init__(
             name="convnext_nano",
             timm_model_name="convnext_nano",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
 class ConvNextTinyModel(TIMMBasedModel):
     """TIMMベースのConvNeXt Tinyモデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(ConvNextTinyModel, self).__init__(
             name="convnext_tiny",
             timm_model_name="convnext_tiny",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
@@ -436,149 +449,166 @@ class EdgeNextXXSmallModel(TIMMBasedModel):
 
 class EdgeNextXSmallModel(TIMMBasedModel):
     """TIMMベースのEdgeNeXt X-Smallモデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(EdgeNextXSmallModel, self).__init__(
             name="edgenext_x_small",
             timm_model_name="edgenext_x_small",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
 class MobileOneS0Model(TIMMBasedModel):
     """TIMMベースのMobileOne S0モデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(MobileOneS0Model, self).__init__(
             name="mobileone_s0",
             timm_model_name="mobileone_s0",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
 class MobileViTV2_050Model(TIMMBasedModel):
     """TIMMベースのMobileViT v2 050モデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(MobileViTV2_050Model, self).__init__(
             name="mobilevitv2_050",
             timm_model_name="mobilevitv2_050",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
 class GhostNet050Model(TIMMBasedModel):
     """TIMMベースのGhostNet 050モデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(GhostNet050Model, self).__init__(
             name="ghostnet_050",
             timm_model_name="ghostnet_050",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
 class ShuffleNetV2_x05Model(TIMMBasedModel):
     """TIMMベースのShuffleNetV2 x0.5モデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(ShuffleNetV2_x05Model, self).__init__(
             name="shufflenetv2_x0_5",
             timm_model_name="shufflenetv2_x0_5",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
 class SwinTinyModel(TIMMBasedModel):
     """TIMMベースのSwin Transformerモデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(SwinTinyModel, self).__init__(
             name="swin_tiny_patch4_window7_224",
             timm_model_name="swin_tiny_patch4_window7_224",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
 class SwinS3TinyModel(TIMMBasedModel):
     """TIMMベースのSwin S3 Tiny 224モデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(SwinS3TinyModel, self).__init__(
             name="swin_s3_tiny_224",
             timm_model_name="swin_s3_tiny_224",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
 class SwinV2CRTinyNSModel(TIMMBasedModel):
     """TIMMベースのSwin V2 CR Tiny NS 224モデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(SwinV2CRTinyNSModel, self).__init__(
             name="swinv2_cr_tiny_ns_224",
             timm_model_name="swinv2_cr_tiny_ns_224",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
+
 
 class SwinMoETinyModel(TIMMBasedModel):
     """TIMMベースのSwin MoE Tiny Patch4 Window7 224モデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(SwinMoETinyModel, self).__init__(
             name="swin_moe_tiny_patch4_window7_224",
             timm_model_name="swin_moe_tiny_patch4_window7_224",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
+
 
 class EfficientFormerL1Model(TIMMBasedModel):
     """TIMMベースのEfficientFormer L1モデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(EfficientFormerL1Model, self).__init__(
             name="efficientformer_l1",
             timm_model_name="efficientformer_l1",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
 class YOLOv11nModel(TIMMBasedModel):
     """YOLOv11 Nano モデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(YOLOv11nModel, self).__init__(
             name="yolo11n",
             timm_model_name="yolo11n",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
 class YOLOv11sModel(TIMMBasedModel):
     """YOLOv11 Small モデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(YOLOv11sModel, self).__init__(
             name="yolo11s",
             timm_model_name="yolo11s",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
 class YOLOv11mModel(TIMMBasedModel):
     """YOLOv11 Medium モデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(YOLOv11mModel, self).__init__(
             name="yolo11m",
             timm_model_name="yolo11m",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
 class YOLOv11lModel(TIMMBasedModel):
     """YOLOv11 Large モデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(YOLOv11lModel, self).__init__(
             name="yolo11l",
             timm_model_name="yolo11l",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 
 class YOLOv11xModel(TIMMBasedModel):
     """YOLOv11 Extra Large モデル"""
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, num_outputs=2):
         super(YOLOv11xModel, self).__init__(
             name="yolo11x",
             timm_model_name="yolo11x",
-            pretrained=pretrained
+            pretrained=pretrained,
+            num_outputs=num_outputs
         )
 
 class DonkeyModel(BaseModel):
