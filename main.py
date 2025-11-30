@@ -40,7 +40,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                             QLabel, QPushButton, QFileDialog, QMessageBox,
                             QScrollArea, QGridLayout, QFrame, QLineEdit, QProgressDialog,
                             QCheckBox, QSpinBox, QComboBox, QSlider, QInputDialog,
-                            QDoubleSpinBox, QDialog, QDialogButtonBox,
+                            QDoubleSpinBox, QDialog, QDialogButtonBox, QFormLayout,
                             QGroupBox, QRadioButton, QTabWidget, QSizePolicy,QButtonGroup,
                             QListView, QTreeView, QAbstractItemView,QStyleOptionSlider,QStyle, QTextEdit, QPlainTextEdit,
                             QGraphicsOpacityEffect)
@@ -3514,6 +3514,9 @@ class ImageAnnotationTool(QMainWindow):
         # セッション復元チェックを遅延実行（UIが完全に表示された後）
         QTimer.singleShot(500, self.add_session_check_to_init_ui)
 
+        # Databricks接続確認を遅延実行
+        QTimer.singleShot(1000, self._check_databricks_connection_on_startup)
+
         QApplication.instance().installEventFilter(self)
 
     def init_ui(self):
@@ -3890,22 +3893,72 @@ class ImageAnnotationTool(QMainWindow):
         # 物体検知コンテナを追加
         left_layout.addWidget(self.object_detection_container)
 
-        # --- MLflow関連ボタンを追加 ---
-        mlflow_layout = QVBoxLayout()
+        # --- モデル管理セクション ---
+        model_mgmt_layout = QVBoxLayout()
 
-        mlflow_label = QLabel("モデル管理（mlflow/databricks）:")
-        mlflow_label.setStyleSheet("font-weight: bold;") 
-        mlflow_layout.addWidget(mlflow_label)
+        model_mgmt_label = QLabel("モデル管理:")
+        model_mgmt_label.setStyleSheet("font-weight: bold;")
+        model_mgmt_layout.addWidget(model_mgmt_label)
 
-        # MLflow比較ボタン
-        mlflow_compare_button = QPushButton("Mlflowを開く")
-        apply_style(mlflow_compare_button, 'special')
+        # --- 1. MLflow（ローカル）セクション ---
+        mlflow_section_layout = QHBoxLayout()
 
-        mlflow_compare_button.clicked.connect(self.mlflow_manager.open_ui)
-        #mlflow_compare_button.clicked.connect(self.compare_models_mlflow)
-        mlflow_layout.addWidget(mlflow_compare_button)
+        mlflow_local_label = QLabel("MLflow（ローカル）:")
+        mlflow_section_layout.addWidget(mlflow_local_label)
 
-        left_layout.addLayout(mlflow_layout)
+        # MLflowを開くボタン
+        mlflow_open_button = QPushButton("MLflowを開く")
+        apply_style(mlflow_open_button, 'special')
+        mlflow_open_button.clicked.connect(self._open_local_mlflow_ui)
+        mlflow_open_button.setToolTip("ローカルMLflow UIを起動")
+        mlflow_section_layout.addWidget(mlflow_open_button)
+
+        mlflow_section_layout.addStretch()
+        model_mgmt_layout.addLayout(mlflow_section_layout)
+
+        # --- 2. Databricksセクション ---
+        # Databricks連携チェックボックスとステータス
+        databricks_header_layout = QHBoxLayout()
+
+        self.databricks_checkbox = QCheckBox("Databricks連携")
+        self.databricks_checkbox.setChecked(self.mlflow_manager.use_databricks)
+        self.databricks_checkbox.stateChanged.connect(self._on_databricks_toggle)
+        databricks_header_layout.addWidget(self.databricks_checkbox)
+
+        self.databricks_status_label = QLabel()
+        self._update_databricks_status_label()
+        databricks_header_layout.addWidget(self.databricks_status_label)
+
+        databricks_header_layout.addStretch()
+        model_mgmt_layout.addLayout(databricks_header_layout)
+
+        # Databricksボタン（開く、同期、設定を横並び）
+        databricks_buttons_layout = QHBoxLayout()
+
+        # Databricksを開くボタン
+        databricks_open_button = QPushButton("Databricksを開く")
+        apply_style(databricks_open_button, 'special')
+        databricks_open_button.clicked.connect(self._open_databricks_ui)
+        databricks_open_button.setToolTip("Databricks MLflow UIを開く")
+        databricks_buttons_layout.addWidget(databricks_open_button)
+
+        # 同期ボタン
+        self.databricks_sync_button = QPushButton("同期")
+        apply_style(self.databricks_sync_button, 'special')
+        self.databricks_sync_button.clicked.connect(self._sync_to_databricks)
+        self.databricks_sync_button.setToolTip("ローカルの学習記録をDatabricksにアップロード")
+        databricks_buttons_layout.addWidget(self.databricks_sync_button)
+
+        # 設定ボタン
+        databricks_settings_button = QPushButton("設定")
+        databricks_settings_button.setMaximumWidth(60)
+        apply_style(databricks_settings_button, 'special')
+        databricks_settings_button.clicked.connect(self._show_databricks_settings)
+        databricks_buttons_layout.addWidget(databricks_settings_button)
+
+        model_mgmt_layout.addLayout(databricks_buttons_layout)
+
+        left_layout.addLayout(model_mgmt_layout)
 
         # --- 表示設定ボタンを追加 ---
         settings_layout = QVBoxLayout()
@@ -11395,6 +11448,450 @@ class ImageAnnotationTool(QMainWindow):
                     
             except Exception as e:
                 print(f"表示設定の読み込みエラー: {e}")
+
+    # ===========================================
+    # Databricks連携機能
+    # ===========================================
+
+    def _check_databricks_connection_on_startup(self):
+        """起動時にDatabricks接続を確認"""
+        try:
+            # Databricks連携が有効な場合のみ接続確認
+            if self.mlflow_manager.use_databricks:
+                print("起動時Databricks接続確認中...")
+
+                # 接続を試みる（ダイアログなしでバックグラウンドで実行）
+                self.mlflow_manager.is_initialized = False
+                success = self.mlflow_manager.initialize(self.mlflow_manager.folder_path, parent_widget=None)
+
+                if self.mlflow_manager._databricks_connected:
+                    print("Databricks接続成功")
+                else:
+                    print("Databricks接続失敗 - ローカルモードで動作")
+
+                # ステータスラベルを更新
+                self._update_databricks_status_label()
+        except Exception as e:
+            print(f"起動時Databricks接続確認エラー: {e}")
+
+    def _on_databricks_toggle(self, state):
+        """Databricks連携のON/OFF切り替え"""
+        enabled = state == Qt.Checked
+
+        # MLflowManagerのモードを切り替え
+        self.mlflow_manager.set_databricks_mode(enabled)
+
+        # 有効にした場合は接続を試みる
+        if enabled:
+            self.mlflow_manager.is_initialized = False
+            success = self.mlflow_manager.initialize(self.mlflow_manager.folder_path, parent_widget=self)
+            if not success:
+                QMessageBox.warning(
+                    self,
+                    "Databricks接続エラー",
+                    "Databricksへの接続に失敗しました。\n\n"
+                    "環境変数の設定を確認してください：\n"
+                    "- DATABRICKS_HOST\n"
+                    "- DATABRICKS_TOKEN\n\n"
+                    "ローカルMLflowモードにフォールバックします。"
+                )
+                self.databricks_checkbox.setChecked(False)
+        else:
+            # ローカルモードに戻す
+            self.mlflow_manager.is_initialized = False
+            self.mlflow_manager.initialize(self.mlflow_manager.folder_path, parent_widget=self)
+
+        # 状態ラベルを更新
+        self._update_databricks_status_label()
+
+    def _update_databricks_status_label(self):
+        """Databricks状態ラベルを更新"""
+        backend_info = self.mlflow_manager.get_backend_info()
+
+        if backend_info["type"] == "databricks+local":
+            self.databricks_status_label.setText(f"✓ Databricks+ローカル併用")
+            self.databricks_status_label.setStyleSheet("color: green; font-size: 10px;")
+        elif backend_info["type"] == "databricks":
+            if backend_info["status"] == "未接続":
+                self.databricks_status_label.setText("✗ Databricks: 未接続")
+                self.databricks_status_label.setStyleSheet("color: orange; font-size: 10px;")
+            else:
+                self.databricks_status_label.setText(f"✓ Databricks: {backend_info['host'][:30]}...")
+                self.databricks_status_label.setStyleSheet("color: green; font-size: 10px;")
+        else:
+            self.databricks_status_label.setText("ローカルMLflow使用中")
+            self.databricks_status_label.setStyleSheet("color: gray; font-size: 10px;")
+
+    def _open_local_mlflow_ui(self):
+        """ローカルMLflow UIを開く"""
+        try:
+            import subprocess
+            import sys
+            from config import mlflow_dir
+
+            # パスの正規化
+            normalized_path = os.path.normpath(mlflow_dir).replace('\\', '/')
+            if sys.platform.startswith('win'):
+                tracking_uri = f"file:///{normalized_path}"
+            else:
+                tracking_uri = f"file://{normalized_path}"
+
+            # MLflow UIを起動
+            if sys.platform.startswith('win'):
+                cmd = f'start cmd /k "mlflow ui --backend-store-uri {tracking_uri}"'
+                subprocess.Popen(cmd, shell=True)
+            else:
+                cmd = f'mlflow ui --backend-store-uri {tracking_uri}'
+                subprocess.Popen(cmd, shell=True)
+
+            QMessageBox.information(
+                self,
+                "MLflow UI",
+                "ローカルMLflow UIを起動しました。\n\n"
+                "ブラウザで http://localhost:5000 にアクセスして実験結果を確認できます。\n\n"
+                "UIを終了するには、コマンドウィンドウを閉じてください。"
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "エラー",
+                f"MLflow UIの起動に失敗しました:\n\n{str(e)}\n\n"
+                "MLflowがインストールされているか確認してください: pip install mlflow"
+            )
+
+    def _open_databricks_ui(self):
+        """Databricks MLflow UIを開く"""
+        # Databricksモードが有効か確認
+        if not self.mlflow_manager.use_databricks:
+            QMessageBox.warning(
+                self,
+                "Databricks未有効",
+                "Databricks連携が有効になっていません。\n\n"
+                "「Databricks連携」チェックボックスをONにしてください。"
+            )
+            return
+
+        # 未接続の場合、接続を試みる
+        if not self.mlflow_manager._databricks_connected:
+            self.mlflow_manager.is_initialized = False
+            success = self.mlflow_manager.initialize(self.mlflow_manager.folder_path, parent_widget=self)
+
+            self._update_databricks_status_label()
+
+            if not self.mlflow_manager._databricks_connected:
+                QMessageBox.warning(
+                    self,
+                    "Databricks接続失敗",
+                    "Databricksへの接続に失敗しました。\n\n"
+                    "環境変数の設定を確認してください。"
+                )
+                return
+
+            QMessageBox.information(
+                self,
+                "Databricks接続成功",
+                "Databricksへの接続に成功しました。"
+            )
+
+        # Databricks UIを開く
+        self.mlflow_manager._open_databricks_ui(self)
+
+        self._update_databricks_status_label()
+
+    def _sync_to_databricks(self):
+        """ローカルの学習記録をDatabricksに同期"""
+        # Databricksモードが有効か確認
+        if not self.mlflow_manager.use_databricks:
+            QMessageBox.warning(
+                self,
+                "Databricks未有効",
+                "Databricks連携が有効になっていません。\n\n"
+                "「Databricks連携」チェックボックスをONにしてください。"
+            )
+            return
+
+        # 同期状態を取得
+        sync_status = self.mlflow_manager.get_sync_status()
+
+        # 孤立Run数を取得（ローカルで削除されたがDatabricksに残っているRun）
+        orphaned_count = self.mlflow_manager.get_orphaned_runs_count()
+
+        # 同期オプションダイアログを表示
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Databricks同期設定")
+        dialog.setMinimumWidth(450)
+
+        layout = QVBoxLayout(dialog)
+
+        # 状態表示
+        status_group = QGroupBox("現在の状態")
+        status_layout = QVBoxLayout()
+        status_layout.addWidget(QLabel(f"ローカルのRun数: {sync_status['local_runs']}"))
+        status_layout.addWidget(QLabel(f"DatabricksのRun数: {sync_status['databricks_runs']}"))
+        status_layout.addWidget(QLabel(f"推定未同期Run数: {sync_status['unsynced_runs']}"))
+        if orphaned_count > 0:
+            orphaned_label = QLabel(f"Databricksにのみ存在するRun数: {orphaned_count}")
+            orphaned_label.setStyleSheet("color: orange;")
+            status_layout.addWidget(orphaned_label)
+        status_group.setLayout(status_layout)
+        layout.addWidget(status_group)
+
+        # 同期オプション
+        options_group = QGroupBox("同期オプション")
+        options_layout = QVBoxLayout()
+
+        # アップロード同期
+        upload_check = QCheckBox("ローカル→Databricks（新規Runをアップロード）")
+        upload_check.setChecked(True)
+        upload_check.setToolTip("ローカルにあってDatabricksにないRunをアップロードします")
+        options_layout.addWidget(upload_check)
+
+        # 削除同期
+        delete_check = QCheckBox("ローカルで削除したRunをDatabricksからも削除")
+        delete_check.setChecked(False)
+        delete_check.setToolTip("ローカルに存在しないRunをDatabricksから削除します（注意: 元に戻せません）")
+        if orphaned_count > 0:
+            delete_check.setText(f"ローカルで削除したRunをDatabricksからも削除 ({orphaned_count}件)")
+        options_layout.addWidget(delete_check)
+
+        # 警告ラベル
+        warning_label = QLabel("※ 削除オプションを有効にすると、Databricks上のRunが削除されます。\n   この操作は元に戻せません。")
+        warning_label.setStyleSheet("color: red; font-size: 10px;")
+        options_layout.addWidget(warning_label)
+
+        options_group.setLayout(options_layout)
+        layout.addWidget(options_group)
+
+        # ボタン
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        # オプションを取得
+        do_upload = upload_check.isChecked()
+        do_delete = delete_check.isChecked()
+
+        if not do_upload and not do_delete:
+            QMessageBox.information(self, "同期", "同期オプションが選択されていません。")
+            return
+
+        # 削除確認
+        if do_delete and orphaned_count > 0:
+            confirm = QMessageBox.warning(
+                self,
+                "削除確認",
+                f"Databricksから{orphaned_count}件のRunを削除します。\n\n"
+                "この操作は元に戻せません。続行しますか？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if confirm != QMessageBox.Yes:
+                return
+
+        # 進捗ダイアログを作成
+        progress = QProgressDialog("Databricksに同期中...", "キャンセル", 0, 100, self)
+        progress.setWindowTitle("同期中")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+
+        # キャンセルフラグ
+        cancelled = [False]
+
+        def progress_callback(current, total, message):
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                cancelled[0] = True
+                return
+            percent = int((current / total) * 100) if total > 0 else 0
+            progress.setValue(percent)
+            progress.setLabelText(f"{message}\n({current}/{total})")
+            QApplication.processEvents()
+
+        def cancel_check():
+            QApplication.processEvents()
+            return progress.wasCanceled() or cancelled[0]
+
+        # 同期実行
+        try:
+            if do_upload or do_delete:
+                result = self.mlflow_manager.sync_local_to_databricks(
+                    parent_widget=self,
+                    progress_callback=progress_callback,
+                    cancel_check=cancel_check,
+                    delete_orphaned=do_delete
+                )
+            else:
+                result = {"synced": 0, "skipped": 0, "failed": 0, "deleted": 0, "errors": [], "cancelled": False}
+
+            progress.close()
+
+            # キャンセルされた場合
+            if result.get("cancelled"):
+                result_message = (
+                    f"同期がキャンセルされました。\n\n"
+                    f"キャンセル前に同期成功: {result['synced']} 件\n"
+                    f"スキップ（既存）: {result['skipped']} 件\n"
+                    f"削除: {result.get('deleted', 0)} 件"
+                )
+                QMessageBox.information(self, "同期キャンセル", result_message)
+            elif result.get("message"):
+                QMessageBox.information(self, "同期完了", result["message"])
+            else:
+                result_message = (
+                    f"同期が完了しました。\n\n"
+                    f"同期成功: {result['synced']} 件\n"
+                    f"スキップ（既存）: {result['skipped']} 件\n"
+                    f"失敗: {result['failed']} 件"
+                )
+                if result.get('deleted', 0) > 0:
+                    result_message += f"\n削除: {result['deleted']} 件"
+
+                if result['errors']:
+                    result_message += f"\n\nエラー詳細:\n" + "\n".join(result['errors'][:5])
+                    if len(result['errors']) > 5:
+                        result_message += f"\n... 他 {len(result['errors']) - 5} 件"
+
+                if result['failed'] > 0:
+                    QMessageBox.warning(self, "同期完了（一部エラー）", result_message)
+                else:
+                    QMessageBox.information(self, "同期完了", result_message)
+
+            # 状態を更新
+            self._update_databricks_status_label()
+
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(
+                self,
+                "同期エラー",
+                f"同期中にエラーが発生しました:\n\n{str(e)}"
+            )
+
+    def _show_databricks_settings(self):
+        """Databricks設定ダイアログを表示"""
+        try:
+            from config_databricks import (
+                DATABRICKS_ENABLED, DATABRICKS_HOST, DATABRICKS_TOKEN,
+                DATABRICKS_EXPERIMENT_PREFIX, get_databricks_status, get_env_template
+            )
+            config_available = True
+        except ImportError:
+            config_available = False
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Databricks設定")
+        dialog.setMinimumWidth(550)
+        layout = QVBoxLayout(dialog)
+
+        # 現在の状態を表示
+        status_group = QGroupBox("接続状態")
+        status_layout = QVBoxLayout()
+
+        if config_available:
+            status = get_databricks_status()
+            status_text = f"状態: {status['status']}\n{status['message']}"
+        else:
+            status_text = "config_databricks.py が見つかりません"
+
+        status_label = QLabel(status_text)
+        status_label.setWordWrap(True)
+        status_layout.addWidget(status_label)
+        status_group.setLayout(status_layout)
+        layout.addWidget(status_group)
+
+        # 環境変数の状態を表示
+        env_group = QGroupBox("環境変数の状態")
+        env_layout = QFormLayout()
+
+        env_enabled = os.environ.get("DATABRICKS_ENABLED", "")
+        env_host = os.environ.get("DATABRICKS_HOST", "")
+        env_token = os.environ.get("DATABRICKS_TOKEN", "")
+        env_prefix = os.environ.get("DATABRICKS_EXPERIMENT_PREFIX", "")
+
+        env_layout.addRow("DATABRICKS_ENABLED:", QLabel(env_enabled or "(未設定)"))
+        env_layout.addRow("DATABRICKS_HOST:", QLabel(env_host[:40] + "..." if len(env_host) > 40 else env_host or "(未設定)"))
+        env_layout.addRow("DATABRICKS_TOKEN:", QLabel("****" + env_token[-4:] if env_token else "(未設定)"))
+        env_layout.addRow("EXPERIMENT_PREFIX:", QLabel(env_prefix or "(デフォルト使用)"))
+
+        env_group.setLayout(env_layout)
+        layout.addWidget(env_group)
+
+        # 設定方法の説明
+        help_group = QGroupBox("環境変数の設定方法")
+        help_layout = QVBoxLayout()
+        help_text = QLabel(
+            "セキュリティのため、認証情報は環境変数で設定してください:\n\n"
+            "Windows (PowerShell):\n"
+            '  $env:DATABRICKS_ENABLED = "true"\n'
+            '  $env:DATABRICKS_HOST = "https://..."\n'
+            '  $env:DATABRICKS_TOKEN = "dapi..."\n\n'
+            "Linux/Mac:\n"
+            '  export DATABRICKS_ENABLED="true"\n'
+            '  export DATABRICKS_HOST="https://..."\n'
+            '  export DATABRICKS_TOKEN="dapi..."'
+        )
+        help_text.setWordWrap(True)
+        help_text.setStyleSheet("font-family: monospace;")
+        help_layout.addWidget(help_text)
+        help_group.setLayout(help_layout)
+        layout.addWidget(help_group)
+
+        # ボタンレイアウト
+        button_layout = QHBoxLayout()
+
+        # テンプレートをコピーボタン
+        if config_available:
+            copy_template_button = QPushButton("設定テンプレートをコピー")
+            copy_template_button.clicked.connect(lambda: self._copy_env_template(get_env_template()))
+            button_layout.addWidget(copy_template_button)
+
+        # READMEを開くボタン
+        open_readme_button = QPushButton("READMEを開く")
+        open_readme_button.clicked.connect(self._open_databricks_readme)
+        button_layout.addWidget(open_readme_button)
+
+        layout.addLayout(button_layout)
+
+        # 閉じるボタン
+        close_button = QPushButton("閉じる")
+        close_button.clicked.connect(dialog.accept)
+        layout.addWidget(close_button)
+
+        dialog.exec_()
+
+    def _copy_env_template(self, template: str):
+        """環境変数テンプレートをクリップボードにコピー"""
+        from PyQt5.QtWidgets import QApplication
+        clipboard = QApplication.clipboard()
+        clipboard.setText(template)
+        QMessageBox.information(self, "コピー完了", "環境変数設定テンプレートをクリップボードにコピーしました")
+
+    def _open_databricks_readme(self):
+        """README_DATABRICKS.md を開く"""
+        import subprocess
+        import sys
+
+        readme_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "README_DATABRICKS.md")
+
+        if not os.path.exists(readme_path):
+            QMessageBox.warning(self, "エラー", f"READMEが見つかりません:\n{readme_path}")
+            return
+
+        try:
+            if sys.platform.startswith('win'):
+                os.startfile(readme_path)
+            elif sys.platform.startswith('darwin'):
+                subprocess.Popen(['open', readme_path])
+            else:
+                subprocess.Popen(['xdg-open', readme_path])
+        except Exception as e:
+            QMessageBox.warning(self, "エラー", f"ファイルを開けませんでした:\n{e}")
 
     def toggle_dark_mode(self):
         """ダークモードを切り替える"""
