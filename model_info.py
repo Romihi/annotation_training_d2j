@@ -12,7 +12,10 @@ MODEL_ACCURACY_INFO = {
     # MobileNetV3 variants
     'mobilenetv3_small_100': {'top1': 67.4, 'top5': 87.4},
     'mobilenetv3_large_100': {'top1': 75.2, 'top5': 92.2},
-    
+
+    # MobileNetV4 variants
+    'mobilenetv4_conv_small': {'top1': 74.6, 'top5': 92.0},
+
     # EfficientNet variants
     'efficientnet_lite0': {'top1': 75.1, 'top5': 92.5},
     'efficientnet_b0': {'top1': 77.1, 'top5': 93.3},
@@ -69,6 +72,7 @@ MODEL_COMPUTE_INFO = {
     'mobilevit_s': 1.8,
     'mobilenetv3_small_100': 0.06,
     'mobilenetv3_large_100': 0.22,
+    'mobilenetv4_conv_small': 0.95,
     'efficientnet_lite0': 0.4,
     'efficientnet_b0': 0.4,
     'resnet18': 1.8,
@@ -95,6 +99,12 @@ MODEL_PAPER_INFO = {
         'authors': 'Andrew Howard, Mark Sandler, Grace Chu, Liang-Chieh Chen, Bo Chen, Mingxing Tan, Weijun Wang, Yukun Zhu, Ruoming Pang, Vijay Vasudevan, Quoc V. Le, Hartwig Adam',
         'year': 2019,
         'url': 'https://arxiv.org/abs/1905.02244'
+    },
+    'mobilenetv4': {
+        'title': 'MobileNetV4 - Universal Models for the Mobile Ecosystem',
+        'authors': 'Danfeng Qin, Chas Leichner, Manolis Delakis, Marco Fornoni, Shixin Luo, Fan Yang, Weijun Wang, Colby Banbury, Chengxi Ye, Berkin Akin, Vaibhav Aggarwal, Tenghui Zhu, Daniele Moro, Andrew Howard',
+        'year': 2024,
+        'url': 'https://arxiv.org/abs/2404.10518'
     },
     'swin': {
         'title': 'Swin Transformer: Hierarchical Vision Transformer using Shifted Windows',
@@ -129,6 +139,7 @@ MODEL_PARAM_COUNTS = {
     'mobilevit_s': 5.6,
     'mobilenetv3_small_100': 2.5,
     'mobilenetv3_large_100': 5.5,
+    'mobilenetv4_conv_small': 3.8,
     'efficientnet_lite0': 4.7,
     'efficientnet_b0': 5.3,
     'resnet18': 11.7,
@@ -177,7 +188,10 @@ MODEL_ACCURACY_INFO = {
     # MobileNetV3 variants
     'mobilenetv3_small_100': {'top1': 67.4, 'top5': 87.4},
     'mobilenetv3_large_100': {'top1': 75.2, 'top5': 92.2},
-    
+
+    # MobileNetV4 variants
+    'mobilenetv4_conv_small': {'top1': 74.6, 'top5': 92.0},
+
     # EfficientNet variants
     'efficientnet_lite0': {'top1': 75.1, 'top5': 92.5},
     'efficientnet_b0': {'top1': 77.1, 'top5': 93.3},  # 追加
@@ -223,6 +237,7 @@ MODEL_COMPUTE_INFO = {
     'mobilevit_s': 1.8,
     'mobilenetv3_small_100': 0.06,
     'mobilenetv3_large_100': 0.22,
+    'mobilenetv4_conv_small': 0.95,
     'efficientnet_lite0': 0.4,
     'efficientnet_b0': 0.4,  # 追加
     'resnet18': 1.8,  # 追加
@@ -249,6 +264,12 @@ MODEL_PAPER_INFO = {
         'authors': 'Andrew Howard, Mark Sandler, Grace Chu, Liang-Chieh Chen, Bo Chen, Mingxing Tan, Weijun Wang, Yukun Zhu, Ruoming Pang, Vijay Vasudevan, Quoc V. Le, Hartwig Adam',
         'year': 2019,
         'url': 'https://arxiv.org/abs/1905.02244'
+    },
+    'mobilenetv4': {
+        'title': 'MobileNetV4 - Universal Models for the Mobile Ecosystem',
+        'authors': 'Danfeng Qin, Chas Leichner, Manolis Delakis, Marco Fornoni, Shixin Luo, Fan Yang, Weijun Wang, Colby Banbury, Chengxi Ye, Berkin Akin, Vaibhav Aggarwal, Tenghui Zhu, Daniele Moro, Andrew Howard',
+        'year': 2024,
+        'url': 'https://arxiv.org/abs/2404.10518'
     },
     'swin': {
         'title': 'Swin Transformer: Hierarchical Vision Transformer using Shifted Windows',
@@ -283,6 +304,7 @@ MODEL_PARAM_COUNTS = {
     'mobilevit_s': 5.6,
     'mobilenetv3_small_100': 2.5,
     'mobilenetv3_large_100': 5.5,
+    'mobilenetv4_conv_small': 3.8,
     'efficientnet_lite0': 4.7,
     'efficientnet_b0': 5.3,
     'resnet18': 11.7,

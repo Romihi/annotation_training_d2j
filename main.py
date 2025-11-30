@@ -159,7 +159,22 @@ class ImageLabel(QLabel):
         # マウス座標表示関連
         self.current_mouse_pos = None  # 現在のマウス位置
         self.normalized_coords = None  # 正規化座標 (x, y) -1～1の範囲
-    
+
+        # Speedバー関連
+        self.is_adjusting_speed = False  # speedバー調整中フラグ
+        self.hovering_speed_bar = False  # speedバーにホバー中フラグ
+        self.speed_bar_hover_y = None  # speedバー上のホバーY座標
+
+        # 将来アノテーション表示
+        self.show_future_annotations = True  # デフォルトON
+
+        # GradCAM表示関連
+        self.show_gradcam = False  # GradCAM表示フラグ
+        self.gradcam_overlay = None  # GradCAMオーバーレイ画像 (QPixmap)
+        self.gradcam_alpha = 0.5  # GradCAMの透明度
+        self.gradcam_target = 'angle'  # GradCAM対象出力 ('angle', 'throttle', 'speed')
+        self.gradcam_method = 'gradcam'  # CAM手法 ('gradcam', 'gradcam++', 'eigencam', 'layercam')
+
     def add_point_to_polygon(self, polygon_index, x, y):
         """指定されたポリゴンに新しい点を追加する"""
         if not hasattr(self.main_window, 'segmentation_annotations'):
@@ -442,8 +457,11 @@ class ImageLabel(QLabel):
             return
 
         painter = QPainter(self)
-        
+
         self.draw_initial_frame(painter)
+
+        # GradCAMオーバーレイを描画（ベース画像の上、他のアノテーションの下）
+        self.draw_gradcam_overlay(painter, self.target_rect)
 
         # 各機能毎に描画（描画順序を調整）
         self.draw_grid(painter, self.target_rect)
@@ -457,6 +475,9 @@ class ImageLabel(QLabel):
 
         # セグメンテーション走行方向矢印を描画
         self.draw_seg_driving_direction(self.pix_width, self.pix_height, painter, self.target_rect)
+
+        # Speedバーを描画（画像の右側）
+        self.draw_speed_bar(self.pix_width, self.pix_height, painter, self.target_rect)
 
         # マウス座標表示（自動運転モードのみ、最後に描画して常に最前面に）
         if self.main_window and self.main_window.current_mode == 0:
@@ -480,6 +501,32 @@ class ImageLabel(QLabel):
         # 画像を拡大して描画
         self.target_rect = QRect(self.x, self.y, self.scaled_width, self.scaled_height)
         painter.drawPixmap(self.target_rect, self.pixmap())
+
+    def draw_gradcam_overlay(self, painter, target_rect):
+        """GradCAMヒートマップオーバーレイを描画"""
+        if not self.show_gradcam or self.gradcam_overlay is None:
+            return
+
+        # GradCAMオーバーレイをtarget_rectにスケーリングして描画
+        # アルファチャンネルは既に画像に含まれているのでそのまま描画
+        painter.drawPixmap(target_rect, self.gradcam_overlay)
+
+        # CAM手法と対象の表示ラベル
+        method_name = getattr(self, 'gradcam_method', 'gradcam').upper()
+        label_text = f"{method_name}: {self.gradcam_target}"
+        painter.setPen(QPen(Qt.white, 2))
+        painter.setFont(QFont("Arial", 10, QFont.Bold))
+
+        # ラベル背景
+        text_rect = painter.fontMetrics().boundingRect(label_text)
+        bg_rect = QRect(
+            target_rect.x() + 5,
+            target_rect.y() + 5,
+            text_rect.width() + 10,
+            text_rect.height() + 6
+        )
+        painter.fillRect(bg_rect, QColor(0, 0, 0, 180))
+        painter.drawText(bg_rect, Qt.AlignCenter, label_text)
 
     def draw_background_frame(self, painter, target_rect):
         """削除状態や位置番号などの背景フレームを描画する"""
@@ -877,7 +924,7 @@ class ImageLabel(QLabel):
         pix_width = self.pixmap().width()
         pix_height = self.pixmap().height()
 
-        # 赤：アノテーション点（教師データ）
+        # 赤：アノテーション点（教師データ）- 現在のフレーム（最初に描画）
         if self.annotation_point:
             rel_x = self.annotation_point.x() / pix_width
             rel_y = self.annotation_point.y() / pix_height
@@ -887,6 +934,67 @@ class ImageLabel(QLabel):
             painter.setPen(QPen(QColor(255, 0, 0), 4))
             painter.setBrush(QBrush())  # 塗りつぶしなし（透明）
             painter.drawEllipse(scaled_x - 15, scaled_y - 15, 30, 30)
+
+        # 将来のアノテーション点を描画（5, 10フレーム先）- 現在の点の上に描画
+        if self.show_future_annotations and self.main_window and hasattr(self.main_window, 'annotations'):
+            current_index = self.main_window.current_index
+            future_offsets = [10, 5]  # 先に遠い方を描画（後に描画されるものが上に来る）
+            future_sizes = {5: 22, 10: 14}  # インデックスごとのサイズ（現在は30）
+            future_colors = {5: QColor(255, 165, 0), 10: QColor(200, 180, 0)}  # 5:オレンジ, 10:濃い黄色
+
+            for offset in future_offsets:
+                future_index = current_index + offset
+                if future_index in self.main_window.annotations:
+                    future_ann = self.main_window.annotations[future_index]
+                    if 'x' in future_ann and 'y' in future_ann:
+                        # 将来のアノテーション座標を取得（ピクセル座標）
+                        future_x = future_ann['x']
+                        future_y = future_ann['y']
+                        # ピクセル座標から相対座標に変換
+                        future_rel_x = future_x / pix_width
+                        future_rel_y = future_y / pix_height
+                        future_scaled_x = int(target_rect.x() + future_rel_x * target_rect.width())
+                        future_scaled_y = int(target_rect.y() + future_rel_y * target_rect.height())
+
+                        # サイズと色を取得
+                        size = future_sizes.get(offset, 20)
+                        color = future_colors.get(offset, QColor(255, 165, 0))
+
+                        # オレンジ/黄色で描画
+                        painter.setPen(QPen(color, 3))
+                        painter.setBrush(QBrush())  # 塗りつぶしなし
+                        painter.drawEllipse(future_scaled_x - size // 2, future_scaled_y - size // 2, size, size)
+
+        # 将来の推論点を描画（t+5, t+10）- 現在の推論点の下に描画
+        if self.show_inference and self.show_future_annotations and self.main_window:
+            current_index = self.main_window.current_index
+            if hasattr(self.main_window, 'inference_results') and current_index in self.main_window.inference_results:
+                inference_data = self.main_window.inference_results[current_index]
+                future_offsets = [10, 5]  # 先に遠い方を描画（後に描画されるものが上に来る）
+                future_sizes = {5: 22, 10: 14}  # インデックスごとのサイズ（現在は30）
+                # シアン系の色（アノテーションのオレンジ/黄色に対応）
+                future_colors = {5: QColor(0, 200, 200), 10: QColor(0, 150, 150)}  # 5:明るいシアン, 10:暗いシアン
+
+                for offset in future_offsets:
+                    future_key = f"future_{offset}"
+                    if future_key in inference_data:
+                        future_data = inference_data[future_key]
+                        future_x = future_data['x']
+                        future_y = future_data['y']
+                        # ピクセル座標から相対座標に変換
+                        future_rel_x = future_x / pix_width
+                        future_rel_y = future_y / pix_height
+                        future_scaled_x = int(target_rect.x() + future_rel_x * target_rect.width())
+                        future_scaled_y = int(target_rect.y() + future_rel_y * target_rect.height())
+
+                        # サイズと色を取得
+                        size = future_sizes.get(offset, 20)
+                        color = future_colors.get(offset, QColor(0, 200, 200))
+
+                        # シアン系の色で描画
+                        painter.setPen(QPen(color, 3))
+                        painter.setBrush(QBrush())  # 塗りつぶしなし
+                        painter.drawEllipse(future_scaled_x - size // 2, future_scaled_y - size // 2, size, size)
 
         # 明るい水色：推論点（推論結果）
         if self.show_inference and self.inference_point:
@@ -1573,6 +1681,230 @@ class ImageLabel(QLabel):
             # 点線に戻す
             painter.setPen(pen)
 
+    def get_speed_bar_rect(self, target_rect: QRect):
+        """speedバーの描画領域を取得するヘルパーメソッド"""
+        bar_width = 30
+        bar_height = target_rect.height() - 40
+        bar_x = target_rect.right() + 20  # 少し右に移動
+        bar_y = target_rect.y() + 20
+        return QRect(bar_x, bar_y, bar_width, bar_height)
+
+    def is_point_in_speed_bar(self, pos, target_rect: QRect):
+        """指定された座標がspeedバー領域内にあるかチェック"""
+        if not hasattr(self, 'target_rect'):
+            return False
+
+        bar_rect = self.get_speed_bar_rect(target_rect)
+        # クリック可能領域を少し広げる（±5ピクセル）
+        expanded_rect = bar_rect.adjusted(-5, -5, 5, 5)
+        return expanded_rect.contains(pos)
+
+    def handle_speed_bar_click(self, pos):
+        """speedバーのクリック処理"""
+        if not self.main_window:
+            return
+
+        current_index = self.main_window.current_index
+        if current_index not in self.main_window.annotations:
+            return
+
+        annotation = self.main_window.annotations[current_index]
+        if 'speed' not in annotation:
+            return
+
+        # speedバーの描画領域を取得
+        bar_rect = self.get_speed_bar_rect(self.target_rect)
+
+        # クリック位置のY座標からspeed値を計算
+        # バーの下端が0、上端が10に対応
+        rel_y = (pos.y() - bar_rect.y()) / bar_rect.height()
+        rel_y = max(0, min(1, rel_y))  # 0-1にクランプ
+
+        # Y座標を反転してspeed値に変換（上が高速=10、下が低速=0）
+        new_speed = 10 - (rel_y * 10)  # 上端(0) -> 10、下端(1) -> 0
+
+        # speed値を更新
+        annotation['speed'] = new_speed
+
+        # 調整中フラグを立てる
+        self.is_adjusting_speed = True
+
+        # 画面を更新
+        self.update()
+
+        # ステータスバーに表示
+        if hasattr(self.main_window, 'statusBar'):
+            self.main_window.statusBar().showMessage(f"Speed値を更新: {new_speed:.2f}", 2000)
+
+    def draw_speed_bar(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
+        """画像の右側にspeed値を縦型バーで表示"""
+        if not self.main_window:
+            return
+
+        # 現在の画像のアノテーションを取得
+        current_index = self.main_window.current_index
+        if current_index not in self.main_window.annotations:
+            return
+
+        annotation = self.main_window.annotations[current_index]
+
+        # speedデータがあるかチェック
+        if 'speed' not in annotation:
+            return
+
+        speed = annotation['speed']
+
+        # speedバーの描画領域設定
+        bar_rect = self.get_speed_bar_rect(target_rect)
+        bar_x = bar_rect.x()
+        bar_y = bar_rect.y()
+        bar_width = bar_rect.width()
+        bar_height = bar_rect.height()
+
+        # 背景を描画（グレーの枠）
+        # ホバー中または調整中の場合は強調表示
+        if self.hovering_speed_bar or self.is_adjusting_speed:
+            painter.setPen(QPen(QColor(255, 200, 0), 3))  # オレンジの太い枠
+            painter.setBrush(QBrush(QColor(60, 60, 60, 220)))  # やや明るい背景
+        else:
+            painter.setPen(QPen(QColor(150, 150, 150), 2))
+            painter.setBrush(QBrush(QColor(40, 40, 40, 200)))  # 半透明の暗い背景
+        painter.drawRect(bar_x, bar_y, bar_width, bar_height)
+
+        # speed値を0-1の範囲に正規化（0～10の範囲を想定）
+        normalized_speed = speed / 10.0  # 0～10 -> 0～1
+        normalized_speed = max(0, min(1, normalized_speed))  # 0-1にクランプ
+
+        # speedバーの色を自動運転アノテーション（赤丸）と同じ色に
+        color = QColor(255, 0, 0, 200)  # 赤（アノテーション点と同色）
+
+        # ホバー中の場合、ホバー位置までのプレビューバーをハッチパターンで表示
+        if self.hovering_speed_bar and self.speed_bar_hover_y is not None:
+            # ホバー位置から正規化されたspeed値を計算
+            hover_normalized = 1.0 - (self.speed_bar_hover_y - bar_y) / bar_height
+            hover_normalized = max(0, min(1, hover_normalized))
+            preview_height = int(bar_height * hover_normalized)
+
+            # ハッチパターンでプレビューバーを描画
+            hatch_color = QColor(255, 100, 100, 150)  # 薄い赤
+            hatch_brush = QBrush(hatch_color, Qt.BDiagPattern)  # 斜線ハッチ
+            painter.setBrush(hatch_brush)
+            painter.setPen(QPen(hatch_color.darker(120), 4))  # 外枠を太く
+            painter.drawRect(bar_x, bar_y + bar_height - preview_height, bar_width, preview_height)
+
+        # 現在のspeedバーを描画（下から上に）- 最初に描画
+        fill_height = int(bar_height * normalized_speed)
+        painter.setBrush(QBrush(color))
+        painter.setPen(QPen(color.darker(120), 1))
+        painter.drawRect(bar_x, bar_y + bar_height - fill_height, bar_width, fill_height)
+
+        # 将来のspeedバーを描画（5, 10フレーム先）- 現在のバーの上に描画
+        if self.show_future_annotations:
+            future_offsets = [10, 5]  # 先に遠い方を描画（後に描画されるものが上に来る）
+            future_bar_widths = {5: 20, 10: 12}  # インデックスごとのバー幅（現在は30）
+            future_colors = {5: QColor(255, 165, 0), 10: QColor(200, 180, 0)}  # 5:オレンジ, 10:濃い黄色
+
+            for offset in future_offsets:
+                future_index = current_index + offset
+                if future_index in self.main_window.annotations:
+                    future_ann = self.main_window.annotations[future_index]
+                    if 'speed' in future_ann:
+                        future_speed = future_ann['speed']
+                        future_normalized = future_speed / 10.0
+                        future_normalized = max(0, min(1, future_normalized))
+
+                        # サイズと色を取得
+                        future_width = future_bar_widths.get(offset, 20)
+                        future_color = future_colors.get(offset, QColor(255, 165, 0))
+
+                        # バーを中央揃えで描画
+                        future_bar_x = bar_x + (bar_width - future_width) // 2
+                        future_fill_height = int(bar_height * future_normalized)
+
+                        # オレンジ/黄色で描画
+                        painter.setBrush(QBrush(future_color))
+                        painter.setPen(QPen(future_color.darker(120), 1))
+                        painter.drawRect(future_bar_x, bar_y + bar_height - future_fill_height, future_width, future_fill_height)
+
+        # ダークモード判定
+        is_dark = self.main_window.is_dark_mode if self.main_window else False
+        text_color = QColor(200, 200, 200) if is_dark else QColor(50, 50, 50)
+
+        # 目盛りを描画（0～10の範囲、11段階）- 右側に配置
+        painter.setFont(QFont("Arial", 8))
+        for i in range(11):  # 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+            tick_y = bar_y + bar_height - int(bar_height * i / 10)
+            # 目盛り線（バーの右側に描画）
+            painter.setPen(QPen(text_color, 1))
+            painter.drawLine(bar_x + bar_width, tick_y, bar_x + bar_width + 3, tick_y)
+            # 目盛り値（0～10の範囲で表示、バーの右側、2刻みで表示）
+            tick_value = i
+            if i % 2 == 0:  # 0, 2, 4, 6, 8, 10のみ表示
+                painter.drawText(bar_x + bar_width + 6, tick_y + 4, f"{tick_value}")
+
+        # 現在のspeed値をテキストで表示（バーの上部）
+        painter.setPen(QPen(text_color, 2))
+        painter.setFont(QFont("Arial", 10, QFont.Bold))
+        speed_text = f"{speed:.2f}"
+        text_rect = painter.fontMetrics().boundingRect(speed_text)
+        painter.drawText(
+            bar_x + bar_width // 2 - text_rect.width() // 2,
+            bar_y - 5,
+            speed_text
+        )
+
+        # ラベル "SPEED" を下部に表示
+        painter.setFont(QFont("Arial", 9, QFont.Bold))
+        painter.drawText(bar_x, bar_y + bar_height + 20, "SPEED")  # 少し下に移動
+
+        # 推論結果のspeedがある場合は太い横線で表示
+        if (hasattr(self.main_window, 'inference_checkbox') and
+            self.main_window.inference_checkbox.isChecked() and
+            hasattr(self.main_window, 'inference_results') and
+            current_index in self.main_window.inference_results):
+
+            inference = self.main_window.inference_results[current_index]
+
+            # 将来の推論speedバーを描画（t+5, t+10）- 現在の横線の下に描画
+            if self.show_future_annotations:
+                future_offsets = [10, 5]  # 先に遠い方を描画
+                future_line_widths = {5: 3, 10: 2}  # 線の太さ
+                future_colors = {5: QColor(0, 200, 200), 10: QColor(0, 150, 150)}  # シアン系
+
+                for offset in future_offsets:
+                    future_key = f"future_{offset}"
+                    if future_key in inference:
+                        future_data = inference[future_key]
+                        if 'speed' in future_data:
+                            future_infer_speed = future_data['speed']
+                            future_infer_speed_display = future_infer_speed * 10.0
+                            future_normalized = future_infer_speed_display / 10.0
+                            future_normalized = max(0, min(1, future_normalized))
+
+                            future_y = bar_y + bar_height - int(bar_height * future_normalized)
+                            future_color = future_colors.get(offset, QColor(0, 200, 200))
+                            future_line_width = future_line_widths.get(offset, 2)
+
+                            painter.setPen(QPen(future_color, future_line_width))
+                            painter.drawLine(bar_x, future_y, bar_x + bar_width, future_y)
+
+            if 'speed' in inference:
+                infer_speed = inference['speed']
+                # 推論speed値を正規化（0～10 -> 0～1、学習時に10で正規化されているため10倍して戻す）
+                infer_speed_display = infer_speed * 10.0  # 正規化を元に戻す
+                normalized_infer_speed = infer_speed_display / 10.0
+                normalized_infer_speed = max(0, min(1, normalized_infer_speed))
+
+                # 推論結果の位置にシアン色の太い横線を描画（推論点と同色）
+                infer_y = bar_y + bar_height - int(bar_height * normalized_infer_speed)
+                painter.setPen(QPen(QColor(0, 255, 255), 4))  # 明るい水色（推論点と同色）
+                painter.drawLine(bar_x - 2, infer_y, bar_x + bar_width + 2, infer_y)
+
+                # 推論speed値を横線の右側に表示（少し暗めの色）
+                painter.setPen(QPen(QColor(0, 200, 200), 1))  # 少し暗めのシアン
+                painter.setFont(QFont("Arial", 8, QFont.Bold))
+                painter.drawText(bar_x + bar_width + 25, infer_y + 4, f"({infer_speed_display:.2f})")
+
     def mousePressEvent(self, event):
         if self.pixmap() and self.main_window:
             # デバウンス処理（連続クリック防止）
@@ -1591,7 +1923,13 @@ class ImageLabel(QLabel):
             # クリック位置を取得
             pos = event.pos()
             self.last_click_time = current_time  # クリック時間を更新
-                        
+
+            # speedバーのクリック判定（画像外でもspeedバー領域内なら処理）
+            if hasattr(self, 'target_rect') and self.is_point_in_speed_bar(pos, self.target_rect):
+                if event.button() == Qt.LeftButton:
+                    self.handle_speed_bar_click(pos)
+                    return
+
             # クリック位置が画像内かチェック
             if not self.target_rect.contains(pos):
                 return
@@ -1914,6 +2252,13 @@ class ImageLabel(QLabel):
                     self.main_window.skip_images(1)  # デフォルトは1枚
 
     def mouseReleaseEvent(self, event):
+        # speedバー調整完了処理
+        if self.is_adjusting_speed:
+            self.is_adjusting_speed = False
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+            return
+
         # 一筆書きウェイポイント描画完了処理
         if self.is_drawing_waypoints:
             self.is_drawing_waypoints = False
@@ -2029,6 +2374,33 @@ class ImageLabel(QLabel):
 
     def mouseMoveEvent(self, event):
         """マウス移動時の処理 - ハンドルによるサイズ変更機能を追加"""
+        pos = event.pos()
+
+        # speedバーの調整中の処理
+        if self.is_adjusting_speed:
+            self.handle_speed_bar_click(pos)  # 同じロジックを使用
+            return
+
+        # speedバーのホバー検出
+        if hasattr(self, 'target_rect'):
+            is_hovering = self.is_point_in_speed_bar(pos, self.target_rect)
+            if is_hovering:
+                # ホバー位置のY座標を保存
+                self.speed_bar_hover_y = pos.y()
+            else:
+                self.speed_bar_hover_y = None
+
+            if is_hovering != self.hovering_speed_bar:
+                self.hovering_speed_bar = is_hovering
+                if is_hovering:
+                    self.setCursor(Qt.PointingHandCursor)
+                else:
+                    self.setCursor(Qt.ArrowCursor)
+
+            # ホバー中は常に再描画（プレビューバー更新のため）
+            if is_hovering:
+                self.update()
+
         # ウェイポイントドラッグ中のカーソル設定
         if self.is_moving_waypoint:
             self.setCursor(Qt.ClosedHandCursor)  # つかんでいる状態
@@ -3311,6 +3683,16 @@ class ImageAnnotationTool(QMainWindow):
         apply_style(self.auto_annotate_button, 'special')
         pilot_layout.addWidget(self.auto_annotate_button)
 
+        # 将来アノテーション表示オプション
+        future_layout = QHBoxLayout()
+        self.future_annotation_checkbox = QCheckBox("5,10個先のアノテーション表示（燈色）")
+        self.future_annotation_checkbox.setChecked(True)  # デフォルトON
+        self.future_annotation_checkbox.setToolTip("5フレーム先と10フレーム先のアノテーションを表示")
+        self.future_annotation_checkbox.stateChanged.connect(self.toggle_future_annotation_display)
+        future_layout.addWidget(self.future_annotation_checkbox)
+        future_layout.addStretch()
+        pilot_layout.addLayout(future_layout)
+
         # 推論結果表示オプション
         inference_layout = QHBoxLayout()
         self.inference_checkbox = QCheckBox("推論結果表示（青丸）")
@@ -3338,8 +3720,37 @@ class ImageAnnotationTool(QMainWindow):
         self.diff_vector_checkbox.setToolTip("自動運転モデルが読み込まれていません")
         self.diff_vector_checkbox.stateChanged.connect(self.toggle_diff_vector_display)
         diff_vector_layout.addWidget(self.diff_vector_checkbox)
-        
+
         pilot_layout.addLayout(diff_vector_layout)
+
+        # GradCAM表示オプション
+        gradcam_layout = QHBoxLayout()
+        self.gradcam_checkbox = QCheckBox("GradCAM表示")
+        self.gradcam_checkbox.setChecked(False)
+        self.gradcam_checkbox.setEnabled(False)  # 初期状態は無効
+        self.gradcam_checkbox.setToolTip("自動運転モデルが読み込まれていません")
+        self.gradcam_checkbox.stateChanged.connect(self.toggle_gradcam_display)
+        gradcam_layout.addWidget(self.gradcam_checkbox)
+
+        # GradCAM対象選択
+        self.gradcam_target_combo = QComboBox()
+        self.gradcam_target_combo.addItems(["angle", "throttle", "speed"])
+        self.gradcam_target_combo.setCurrentText("angle")
+        self.gradcam_target_combo.setEnabled(False)
+        self.gradcam_target_combo.setToolTip("GradCAMで可視化する出力を選択")
+        self.gradcam_target_combo.currentTextChanged.connect(self.change_gradcam_target)
+        gradcam_layout.addWidget(self.gradcam_target_combo)
+
+        # CAM手法選択
+        self.gradcam_method_combo = QComboBox()
+        self.gradcam_method_combo.addItems(["gradcam", "gradcam++", "eigencam", "layercam"])
+        self.gradcam_method_combo.setCurrentText("gradcam")
+        self.gradcam_method_combo.setEnabled(False)
+        self.gradcam_method_combo.setToolTip("CAM可視化手法を選択")
+        self.gradcam_method_combo.currentTextChanged.connect(self.change_gradcam_method)
+        gradcam_layout.addWidget(self.gradcam_method_combo)
+
+        pilot_layout.addLayout(gradcam_layout)
 
         left_layout.addWidget(self.pilot_container)
                     
@@ -5728,10 +6139,10 @@ class ImageAnnotationTool(QMainWindow):
         """自動再生（逆方向）"""
         # 再生中かどうかをチェック
         is_playing = hasattr(self, 'auto_play_timer') and self.auto_play_timer.isActive()
-        
+
         # 再生または停止
         self.auto_play(forward=False)
-        
+
         # 再生状態に応じてボタンテキストを更新
         if is_playing:
             # 停止した場合
@@ -5740,6 +6151,15 @@ class ImageAnnotationTool(QMainWindow):
         else:
             # 再生開始した場合
             self.reverse_play_button.setText("■停止")
+
+    def stop_auto_play(self):
+        """自動再生を停止する"""
+        if hasattr(self, 'auto_play_timer') and self.auto_play_timer.isActive():
+            self.auto_play_timer.stop()
+
+            # ボタンのテキストを元に戻す
+            self.play_button.setText("▶再生")
+            self.reverse_play_button.setText("◀逆再生")
 
     def on_variant_changed(self, variant):
         """
@@ -6281,8 +6701,20 @@ class ImageAnnotationTool(QMainWindow):
             else:
                 self.batch_inference_button.setEnabled(False)
                 self.batch_inference_button.setToolTip("自動運転モデルが読み込まれていません")
-    
-   
+
+        # GradCAM表示（自動運転モデルに依存）
+        if hasattr(self, 'gradcam_checkbox'):
+            if hasattr(self, 'model') and self.model is not None:
+                self.gradcam_checkbox.setEnabled(True)
+                self.gradcam_checkbox.setToolTip("モデルの注目領域をヒートマップで表示")
+                self.gradcam_target_combo.setEnabled(True)
+                self.gradcam_method_combo.setEnabled(True)
+            else:
+                self.gradcam_checkbox.setEnabled(False)
+                self.gradcam_checkbox.setChecked(False)
+                self.gradcam_checkbox.setToolTip("自動運転モデルが読み込まれていません")
+                self.gradcam_target_combo.setEnabled(False)
+                self.gradcam_method_combo.setEnabled(False)
 
     def add_segmentation_annotation(self, polygon_data):
         """セグメンテーションアノテーションを追加"""
@@ -11567,6 +11999,124 @@ class ImageAnnotationTool(QMainWindow):
                 # 既にある結果の表示を更新
                 self.update_segmentation_inference_display()
 
+    def toggle_future_annotation_display(self, state):
+        """将来アノテーション表示の切り替え"""
+        show_future = (state == Qt.Checked)
+        self.main_image_view.show_future_annotations = show_future
+        self.main_image_view.update()
+
+        if show_future:
+            self.statusBar().showMessage("将来アノテーション表示をオンにしました", 3000)
+        else:
+            self.statusBar().showMessage("将来アノテーション表示をオフにしました", 3000)
+
+    def toggle_gradcam_display(self, state):
+        """GradCAM表示の切り替え"""
+        show_gradcam = (state == Qt.Checked)
+        self.main_image_view.show_gradcam = show_gradcam
+
+        if show_gradcam:
+            # GradCAMを生成して表示
+            self.update_gradcam_visualization()
+            self.statusBar().showMessage("GradCAM表示をオンにしました", 3000)
+        else:
+            # GradCAMオーバーレイをクリア
+            self.main_image_view.gradcam_overlay = None
+            self.main_image_view.update()
+            self.statusBar().showMessage("GradCAM表示をオフにしました", 3000)
+
+    def change_gradcam_target(self, target):
+        """GradCAM対象出力の変更"""
+        self.main_image_view.gradcam_target = target
+
+        # GradCAM表示中なら更新
+        if self.main_image_view.show_gradcam:
+            self.update_gradcam_visualization()
+
+    def change_gradcam_method(self, method):
+        """CAM手法の変更"""
+        self.main_image_view.gradcam_method = method
+
+        # GradCAM表示中なら更新
+        if self.main_image_view.show_gradcam:
+            self.update_gradcam_visualization()
+
+    def update_gradcam_visualization(self):
+        """GradCAM可視化を更新"""
+        if not self.images or not hasattr(self, 'model') or self.model is None:
+            return
+
+        try:
+            from utils.gradcam_utils import GradCAM, overlay_heatmap
+            import cv2
+
+            # 現在の画像パス
+            img_path = self.images[self.current_index]
+
+            # 画像を読み込み
+            original_image = Image.open(img_path).convert('RGB')
+            original_np = np.array(original_image)
+
+            # 前処理
+            transform = self.model.get_preprocess()
+            input_tensor = transform(original_image).unsqueeze(0)
+
+            # デバイスに移動
+            device = self.model.device if hasattr(self.model, 'device') else torch.device('cpu')
+            input_tensor = input_tensor.to(device)
+
+            # GradCAMインスタンス作成
+            gradcam = GradCAM(self.model)
+
+            try:
+                from utils.gradcam_utils import apply_colormap
+
+                # 対象出力のインデックスを取得
+                target_map = {'angle': 0, 'throttle': 1, 'speed': 2}
+                target_idx = target_map.get(self.main_image_view.gradcam_target, 0)
+
+                # CAM手法を取得
+                cam_method = getattr(self.main_image_view, 'gradcam_method', 'gradcam')
+
+                # ヒートマップ生成
+                heatmap = gradcam.generate_cam(
+                    input_tensor,
+                    target_output_index=target_idx,
+                    method=cam_method
+                )
+
+                # ヒートマップを画像サイズにリサイズ
+                h, w = original_np.shape[:2]
+                heatmap_resized = cv2.resize(heatmap, (w, h))
+
+                # カラーマップを適用（BGRで返る）
+                heatmap_colored = apply_colormap(heatmap_resized, cv2.COLORMAP_JET)
+                # BGRからRGBAに変換（アルファチャンネル付き）
+                heatmap_rgba = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGBA)
+
+                # アルファチャンネルをヒートマップの強度に基づいて設定
+                # 強度が高い部分ほど不透明に
+                alpha_value = int(255 * self.main_image_view.gradcam_alpha)
+                heatmap_rgba[:, :, 3] = (heatmap_resized * alpha_value).astype(np.uint8)
+
+                # QPixmapに変換（RGBA）
+                bytes_per_line = 4 * w
+                q_image = QImage(heatmap_rgba.data, w, h, bytes_per_line, QImage.Format_RGBA8888)
+                self.main_image_view.gradcam_overlay = QPixmap.fromImage(q_image.copy())
+
+                # 画面を更新
+                self.main_image_view.update()
+
+            finally:
+                # フックを削除してメモリリークを防ぐ
+                gradcam.remove_hooks()
+
+        except Exception as e:
+            print(f"GradCAM生成エラー: {e}")
+            import traceback
+            traceback.print_exc()
+            self.statusBar().showMessage(f"GradCAM生成エラー: {e}", 5000)
+
     def toggle_inference_display(self, state):
         """自動運転推論表示の切り替え"""
         show_inference = (state == Qt.Checked)
@@ -12921,12 +13471,12 @@ class ImageAnnotationTool(QMainWindow):
             QApplication.processEvents()
             
             # モデルを明示的に読み込み（self.modelに保存）
-            from model_catalog import get_model, load_model_weights
-            
+            from model_catalog import get_model, load_model_weights, detect_num_outputs_from_checkpoint
+
             # モデルファイル名から実際のモデルタイプを判定
             model_filename = os.path.basename(model_path)
             actual_model_type = model_type  # デフォルトは選択されたタイプ
-            
+
             # ファイル名に基づいてモデルタイプを調整
             if "_location_" in model_filename:
                 # 位置推論モデルの場合は適切なエラーメッセージを表示
@@ -12934,11 +13484,14 @@ class ImageAnnotationTool(QMainWindow):
             elif "yolo" in model_filename.lower():
                 # YOLOモデルの場合
                 raise ValueError(f"選択されたファイルはYOLOモデルです。自動運転モデルを選択してください。\nファイル: {model_filename}")
-            
-            # モデルインスタンスを作成
+
+            # チェックポイントから出力数を検出
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.model = get_model(actual_model_type, pretrained=False)
-            
+            num_outputs = detect_num_outputs_from_checkpoint(model_path, device)
+
+            # モデルインスタンスを作成（検出した出力数で）
+            self.model = get_model(actual_model_type, pretrained=False, num_outputs=num_outputs)
+
             # 重みを読み込み
             load_model_weights(self.model, model_path, device)
             self.model.eval()
@@ -13191,8 +13744,18 @@ class ImageAnnotationTool(QMainWindow):
                         entry_count += 1
                         if entry_count % 100 == 0 or entry_count == total_entries:
                             progress.setLabelText(f"カタログエントリ処理中: {entry_count}/{total_entries} エントリ")
-                            sub_progress = 30 + int(i * progress_step) + int((entry_count / total_entries) * progress_step)
-                            progress.setValue(min(80, sub_progress))
+                            # 安全な進捗計算
+                            try:
+                                if total_entries > 0:
+                                    sub_progress = 30 + int(i * progress_step) + int((entry_count / total_entries) * progress_step)
+                                else:
+                                    sub_progress = 30 + int(i * progress_step)
+                                # sub_progressがNoneまたは不正な値でないか確認
+                                if sub_progress is not None and isinstance(sub_progress, (int, float)):
+                                    progress.setValue(min(80, int(sub_progress)))
+                            except Exception as progress_error:
+                                # 進捗更新エラーは無視（致命的ではない）
+                                pass
                             QApplication.processEvents()
                         
                         entry = json.loads(line)
@@ -13272,15 +13835,18 @@ class ImageAnnotationTool(QMainWindow):
 
                             # 位置情報を取得
                             location = entry.get('user/loc', entry.get('pilot/loc', None))
-                                
+
+                            # Speed情報を取得
+                            speed = entry.get('speed', entry.get('user/speed', entry.get('pilot/speed', None)))
+
                             # 座標に変換
                             x = int((angle + 1) / 2 * img_width)
                             y = int((1 - throttle) / 2 * img_height)
-                            
+
                             # 範囲内に収める
                             x = max(0, min(x, img_width - 1))
                             y = max(0, min(y, img_height - 1))
-                            
+
                             # アノテーションを保存 - actual_indexを使用
                             self.annotations[actual_index] = {
                                 "angle": angle,
@@ -13294,9 +13860,13 @@ class ImageAnnotationTool(QMainWindow):
                             if location is not None:
                                 self.annotations[actual_index]["loc"] = location
                                 self.location_annotations[actual_index] = location
-                                
+
                                 # 位置情報ボタンがまだなければ追加
                                 self.ensure_location_button_exists(location)
+
+                            # Speed情報があれば追加
+                            if speed is not None:
+                                self.annotations[actual_index]["speed"] = speed
 
                             # タイムスタンプを保存
                             self.annotation_timestamps[actual_index] = entry.get('_timestamp_ms', int(time.time() * 1000))
@@ -13332,11 +13902,16 @@ class ImageAnnotationTool(QMainWindow):
                                     "x": pilot_x,
                                     "y": pilot_y
                                 }
-                                
+
                                 # 推論結果に位置情報があれば追加
                                 if "pilot/loc" in entry:
                                     self.inference_results[actual_index]["pilot/loc"] = entry["pilot/loc"]
                                     self.inference_results[actual_index]["loc"] = entry["pilot/loc"]
+
+                                # 推論結果にspeed情報があれば追加
+                                if "pilot/speed" in entry:
+                                    self.inference_results[actual_index]["pilot/speed"] = entry["pilot/speed"]
+                                    self.inference_results[actual_index]["speed"] = entry["pilot/speed"]
                                     
                         except Exception as e:
                             print(f"画像 {img_path} の処理中にエラー: {e}")
@@ -13561,6 +14136,10 @@ class ImageAnnotationTool(QMainWindow):
 
                 # 推論結果ポイント（青丸）の設定
                 self._set_inference_point_on_canvas()
+
+                # GradCAM表示が有効な場合は更新
+                if hasattr(self, 'gradcam_checkbox') and self.gradcam_checkbox.isChecked():
+                    self.update_gradcam_visualization()
 
             # Enhanced annotations display processing - UI要素の更新
             self._update_enhanced_ui_elements()
@@ -13965,11 +14544,22 @@ class ImageAnnotationTool(QMainWindow):
 
         new_index = self.current_index + count
 
+        # 自動再生中に境界に到達した場合は停止
+        is_auto_playing = hasattr(self, 'auto_play_timer') and self.auto_play_timer.isActive()
+
         # Ensure the new index is within bounds
         if new_index < 0:
             new_index = 0
+            # 自動再生中で最初の画像に到達した場合は停止
+            if is_auto_playing:
+                self.stop_auto_play()
+                self.statusBar().showMessage("最初の画像に到達したため自動再生を停止しました", 2000)
         elif new_index >= len(self.images):
             new_index = len(self.images) - 1
+            # 自動再生中で最後の画像に到達した場合は停止
+            if is_auto_playing:
+                self.stop_auto_play()
+                self.statusBar().showMessage("最後の画像に到達したため自動再生を停止しました", 2000)
 
         # インデックスが変わらない場合は何もしない
         if new_index == self.current_index:
@@ -15141,21 +15731,91 @@ class ImageAnnotationTool(QMainWindow):
         # 現在選択されているモデルを取得
         model_type = self.auto_method_combo.currentText()
         
+        # データにspeedキーがあるかチェック
+        has_speed_data = False
+        speed_count = 0
+        for idx, ann in self.annotations.items():
+            if 'speed' in ann or 'user/speed' in ann or 'pilot/speed' in ann:
+                speed_count += 1
+
+        if speed_count > 0:
+            has_speed_data = True
+            print(f"Speed data detected: {speed_count} annotations with speed information")
+
         # 学習設定ダイアログを表示
         training_settings = QDialog(self)
         training_settings.setWindowTitle("学習設定")
-        training_settings.setMinimumWidth(550)
-        training_settings.setMinimumHeight(600)  # ダイアログサイズを大きくする
-        
+        training_settings.setMinimumWidth(700)  # 横並び用に幅を広げる
+        training_settings.setMinimumHeight(600)
+
         settings_layout = QVBoxLayout(training_settings)
-        
+
         # タブウィジェットを作成
         tabs = QTabWidget()
-        
+
         # 基本設定タブ
         basic_tab = QWidget()
         basic_layout = QVBoxLayout(basic_tab)
-        
+
+        # 出力設定グループ（Speed出力と将来予測を統合）
+        output_settings_group = QGroupBox("出力設定")
+        output_settings_layout = QVBoxLayout()
+
+        # Speed出力オプション（データにspeedがある場合のみ表示）
+        speed_output_check = None
+        speed_normalize_spin = None
+        if has_speed_data:
+            # チェックボックスと正規化設定を横並びで配置
+            speed_row_layout = QHBoxLayout()
+
+            speed_output_check = QCheckBox("Speed（速度）を出力に追加")
+            speed_output_check.setChecked(False)
+            speed_row_layout.addWidget(speed_output_check)
+
+            # 正規化設定（チェックボックスの右側）
+            speed_normalize_label = QLabel("正規化値:")
+            speed_row_layout.addWidget(speed_normalize_label)
+            speed_normalize_spin = QDoubleSpinBox()
+            speed_normalize_spin.setRange(0.1, 100.0)
+            speed_normalize_spin.setValue(10.0)
+            speed_normalize_spin.setDecimals(1)
+            speed_normalize_spin.setSingleStep(1.0)
+            speed_normalize_spin.setToolTip("Speed値を正規化する際の除数（デフォルト: 10.0）")
+            speed_normalize_spin.setFixedWidth(70)
+            speed_row_layout.addWidget(speed_normalize_spin)
+
+            speed_normalize_info = QLabel("※ Speed値はこの値で除算されます")
+            speed_normalize_info.setStyleSheet("color: #666; font-size: 11px;")
+            speed_row_layout.addWidget(speed_normalize_info)
+
+            speed_row_layout.addStretch()
+            output_settings_layout.addLayout(speed_row_layout)
+
+            speed_info_label = QLabel(f"※ {speed_count}個のアノテーションにspeedデータが含まれています")
+            speed_info_label.setStyleSheet("color: #666; font-size: 11px;")
+            output_settings_layout.addWidget(speed_info_label)
+
+            # セクション間のスペース
+            output_settings_layout.addSpacing(10)
+
+        future_output_check = QCheckBox("将来フレームの予測を出力に追加")
+        future_output_check.setChecked(False)
+        future_output_check.setToolTip("5, 10フレーム先のangle, throttle(, speed)を追加出力")
+        output_settings_layout.addWidget(future_output_check)
+
+        future_info_label = QLabel("※ 5フレーム先と10フレーム先のangle, throttle(, speed)を追加出力")
+        future_info_label.setStyleSheet("color: #666; font-size: 11px;")
+        output_settings_layout.addWidget(future_info_label)
+
+        future_detail_label = QLabel("出力例（speed有）: [angle, throttle, speed, t+5_angle, t+5_throttle, t+5_speed, t+10_angle, t+10_throttle, t+10_speed]")
+        future_detail_label.setStyleSheet("color: #888; font-size: 11px;")
+        future_detail_label.setWordWrap(True)
+        output_settings_layout.addWidget(future_detail_label)
+
+        output_settings_layout.addStretch()
+        output_settings_group.setLayout(output_settings_layout)
+        basic_layout.addWidget(output_settings_group)
+
         # エポック数設定
         epoch_layout = QHBoxLayout()
         epoch_layout.addWidget(QLabel("学習エポック数:"))
@@ -15345,7 +16005,7 @@ class ImageAnnotationTool(QMainWindow):
         
         # データオーグメンテーション有効化チェックボックス
         aug_enable_check = QCheckBox("データオーグメンテーションを有効にする")
-        aug_enable_check.setChecked(True)
+        aug_enable_check.setChecked(False)  # デフォルトオフ
         aug_layout.addWidget(aug_enable_check)
         
         # オーグメンテーション設定のスクロールエリア
@@ -15587,6 +16247,17 @@ class ImageAnnotationTool(QMainWindow):
         model_name = autonomous_prefix + model_name_suffix_input.text().strip()
         comment = comment_input.toPlainText().strip()
 
+        # Speed出力設定の取得
+        use_speed_output = False
+        speed_normalize_value = 10.0
+        if has_speed_data and speed_output_check is not None:
+            use_speed_output = speed_output_check.isChecked()
+            if speed_normalize_spin is not None:
+                speed_normalize_value = speed_normalize_spin.value()
+
+        # 将来予測出力設定の取得
+        use_future_output = future_output_check.isChecked()
+
         # データ選択設定の取得
         use_all = data_radio_all.isChecked()
         use_skip = data_radio_skip.isChecked()
@@ -15732,7 +16403,15 @@ class ImageAnnotationTool(QMainWindow):
                 # パスからインデックスを逆引き
                 idx = self.images.index(img_path)
                 if idx in self.annotations:
-                    annotation_values.append(self.annotations[idx])
+                    # ディープコピーして元のデータを変更しないようにする
+                    annotation_values.append(deepcopy(self.annotations[idx]))
+
+            # Speed値の正規化（speedが含まれている場合）
+            if use_speed_output and speed_normalize_value > 0:
+                for annotation in annotation_values:
+                    if 'speed' in annotation:
+                        # speed値を正規化値で除算
+                        annotation['speed'] = annotation['speed'] / speed_normalize_value
 
             # データ数の確認とバッチサイズの調整
             # GPUメモリに応じて適切なバッチサイズを設定
@@ -15771,13 +16450,30 @@ class ImageAnnotationTool(QMainWindow):
                 QApplication.processEvents()
                 return not progress.wasCanceled()
                         
+            # 出力数を決定
+            # 基本: angle, throttle = 2
+            # speed追加: +1 = 3
+            # 将来予測追加: use_speed時は+6、use_speed無し時は+4
+            base_outputs = 3 if use_speed_output else 2
+            if use_future_output:
+                # 将来予測を含める場合
+                # use_speed=True: 5フレーム先(angle,throttle,speed) + 10フレーム先(angle,throttle,speed) = +6
+                # use_speed=False: 5フレーム先(angle,throttle) + 10フレーム先(angle,throttle) = +4
+                future_outputs_per_frame = 3 if use_speed_output else 2
+                num_outputs = base_outputs + (future_outputs_per_frame * 2)  # 2フレーム分（t+5, t+10）
+            else:
+                num_outputs = base_outputs
+
             # データセットの作成（バッチサイズと詳細オーグメンテーション設定を明示的に指定）
             train_loader, val_loader, dataset_info = create_datasets(
                 image_paths=image_paths,
                 annotations=annotation_values,
                 model_name=model_type,
                 use_augmentation=augmentation_params if augmentation_params['enabled'] else False,
-                batch_size=batch_size  # バッチサイズを追加
+                batch_size=batch_size,  # バッチサイズを追加
+                use_speed=use_speed_output,  # Speed出力を使用するかどうか
+                use_future=use_future_output,  # 将来予測出力を使用するかどうか
+                num_outputs=num_outputs  # 出力数を指定
             )
 
             # 最初の画像から実際のサイズを取得
@@ -15802,7 +16498,8 @@ class ImageAnnotationTool(QMainWindow):
                 learning_rate=learning_rate,  # 指定された学習率
                 use_early_stopping=use_early_stopping,  # Early Stoppingの有効/無効
                 patience=patience,  # 忍耐値
-                custom_model_name=model_name if model_name else None  # カスタムモデル名
+                custom_model_name=model_name if model_name else None,  # カスタムモデル名
+                num_outputs=num_outputs  # 出力数を指定
             )
             
             progress.close()
