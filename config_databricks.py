@@ -51,9 +51,11 @@ DATABRICKS_MODEL_REGISTRY_CATALOG = os.environ.get("DATABRICKS_CATALOG", "main")
 DATABRICKS_MODEL_REGISTRY_SCHEMA = os.environ.get("DATABRICKS_SCHEMA", "default")
 
 # Unity Catalog Volumes パス（データ保存用）
+# 形式: /Volumes/{catalog}/{schema}/{volume_name}
+# 例: /Volumes/workspace/default/annotation_data
 DATABRICKS_VOLUMES_PATH = os.environ.get(
     "DATABRICKS_VOLUMES_PATH",
-    "/Volumes/main/default/annotation_data"
+    "/Volumes/workspace/default/annotation_data"
 )
 
 # ===========================================

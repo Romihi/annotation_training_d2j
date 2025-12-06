@@ -215,3 +215,187 @@ annotation_training_d2j/
 - 大きなモデルファイルのアップロードには時間がかかる場合があります
 - ネットワーク接続が不安定な環境では、ローカルのみモードを推奨します
 - 環境変数を変更した場合は、アプリを再起動してください
+
+---
+
+# アノテーションデータの転送
+
+## 概要
+
+アノテーションツールで作成したデータをDatabricks Unity Catalog Volumesに転送できます。
+
+```
+アノテーションツール
+    │
+    ├─→ エクスポート（Donkeycar形式）
+    │
+    ├─→ ZIP圧縮
+    │
+    └─→ Databricks Volumes にアップロード
+            │
+            └─→ /Volumes/{catalog}/{schema}/{volume}/annotation_YYYYMMDD_HHMMSS.zip
+```
+
+## 転送先の設定
+
+### 環境変数
+
+```powershell
+# PowerShell
+$env:DATABRICKS_VOLUMES_PATH = "/Volumes/workspace/default/annotation_data"
+```
+
+```cmd
+# コマンドプロンプト
+set DATABRICKS_VOLUMES_PATH=/Volumes/workspace/default/annotation_data
+```
+
+### Databricksでの準備
+
+転送前にDatabricksでVolumesを作成しておく必要があります：
+
+1. Databricksワークスペースにログイン
+2. **カタログ** → **workspace**（または使用するカタログ）
+3. **default**（または使用するスキーマ）を選択
+4. **Create** → **Volume** をクリック
+5. Volume名を入力（例: `annotation_data`）
+6. **Create** をクリック
+
+## 転送方法
+
+1. アノテーションツールでアノテーションを作成
+2. 左パネルの「Databricks」セクションで「転送」ボタンをクリック
+3. ZIPファイル名を入力（デフォルト: `annotation_YYYYMMDD_HHMMSS`）
+4. 確認ダイアログで「はい」をクリック
+5. 転送完了を待つ
+
+### 転送される内容
+
+```
+annotation_YYYYMMDD_HHMMSS.zip
+├── catalog_0.catalog           # アノテーションデータ（JSON Lines）
+├── catalog_0.catalog_manifest  # カタログマニフェスト
+├── manifest.json               # 全体マニフェスト
+└── images/                     # 画像ファイル
+    ├── 0_cam_image_array_.jpg
+    ├── 0_cam0_image_array_.jpg
+    └── ...
+```
+
+## Databricksでのデータ活用
+
+### サンプルノートブック
+
+`databricks/` フォルダに以下のサンプルノートブックがあります：
+
+| ファイル | 説明 |
+|----------|------|
+| `01_extract_annotations.py` | ZIPファイルの展開 |
+| `02_load_annotations.py` | アノテーションデータの読み込みと可視化 |
+| `03_train_model.py` | PyTorchでのモデル学習 |
+
+### 使い方
+
+1. サンプルノートブックをDatabricksにインポート
+2. `ZIP_PATH` や `DATA_PATH` を実際のパスに変更
+3. セルを順番に実行
+
+### ZIPファイルの展開（基本）
+
+```python
+import zipfile
+
+zip_path = "/Volumes/workspace/default/annotation_data/annotation_20251201_001802.zip"
+extract_path = "/Volumes/workspace/default/annotation_data/annotation_20251201_001802"
+
+with zipfile.ZipFile(zip_path, 'r') as zf:
+    zf.extractall(extract_path)
+
+print("展開完了!")
+```
+
+### アノテーションの読み込み
+
+```python
+import os
+import json
+
+def load_annotations(data_path):
+    annotations = []
+    catalog_files = sorted([
+        f for f in os.listdir(data_path)
+        if f.endswith('.catalog') and not f.endswith('.catalog_manifest')
+    ])
+
+    for catalog_file in catalog_files:
+        with open(os.path.join(data_path, catalog_file), 'r') as f:
+            for line in f:
+                if line.strip():
+                    annotations.append(json.loads(line.strip()))
+
+    return annotations
+
+annotations = load_annotations(extract_path)
+print(f"アノテーション数: {len(annotations)}")
+```
+
+### 画像の表示
+
+```python
+from PIL import Image
+import os
+
+images_dir = os.path.join(extract_path, "images")
+sample = annotations[0]
+
+# 画像を読み込み
+img_name = sample['cam/image_array']
+img_path = os.path.join(images_dir, img_name)
+img = Image.open(img_path)
+
+display(img)
+print(f"Angle: {sample['user/angle']:.3f}")
+print(f"Throttle: {sample['user/throttle']:.3f}")
+```
+
+## トラブルシューティング
+
+### 転送先パスが存在しない
+
+```
+エラー: パスが存在しません: /Volumes/workspace/default/annotation_data
+```
+
+**対処法**: Databricksで先にVolumesを作成してください（上記「Databricksでの準備」参照）
+
+### タイムアウトエラー
+
+```
+エラー: Timed out after 0:05:00
+```
+
+**対処法**:
+- ネットワーク接続を確認
+- ファイルサイズが大きい場合は、アノテーション数を減らして再試行
+- 時間帯を変えて再試行（ネットワーク混雑の可能性）
+
+### 環境変数一覧（転送関連）
+
+| 環境変数 | 必須 | 説明 | デフォルト値 |
+|----------|------|------|-------------|
+| `DATABRICKS_VOLUMES_PATH` | No | 転送先Volumesパス | `/Volumes/workspace/default/annotation_data` |
+
+## ファイル構成
+
+```
+annotation_training_d2j/
+├── config_databricks.py          # Databricks設定
+├── utils/
+│   └── databricks_transfer.py    # 転送処理
+├── databricks/                   # Databricksサンプルノートブック
+│   ├── 01_extract_annotations.py # ZIPの展開
+│   ├── 02_load_annotations.py    # データ読み込み
+│   └── 03_train_model.py         # モデル学習
+├── mlruns/                       # ローカルMLflow記録
+└── README_DATABRICKS.md          # このファイル
+```

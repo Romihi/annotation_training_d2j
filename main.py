@@ -78,6 +78,7 @@ from styles import get_location_color, apply_style, set_theme, get_current_theme
 
 from managers import AnnotationDataManager, MLflowManager, ModelType
 from utils.yolo_utils import train_yolo_with_ui, TrainingOutputDialog
+from utils.databricks_transfer import DatabricksTransferManager
 
 import traceback
 def exception_hook(exc_type, exc_value, exc_traceback):
@@ -168,12 +169,13 @@ class ImageLabel(QLabel):
         # 将来アノテーション表示
         self.show_future_annotations = True  # デフォルトON
 
-        # GradCAM表示関連
-        self.show_gradcam = False  # GradCAM表示フラグ
-        self.gradcam_overlay = None  # GradCAMオーバーレイ画像 (QPixmap)
-        self.gradcam_alpha = 0.5  # GradCAMの透明度
-        self.gradcam_target = 'angle'  # GradCAM対象出力 ('angle', 'throttle', 'speed')
-        self.gradcam_method = 'gradcam'  # CAM手法 ('gradcam', 'gradcam++', 'eigencam', 'layercam')
+        # CAM表示関連
+        self.show_gradcam = False  # CAM表示フラグ
+        self.gradcam_overlay = None  # CAMオーバーレイ画像 (QPixmap)
+        self.gradcam_alpha = 0.5  # CAMの透明度
+        self.gradcam_target = 'angle'  # CAM対象出力 ('angle', 'throttle', 'speed')
+        self.gradcam_method = 'gradcam'  # CAM手法 ('gradcam', 'gradcam++', 'eigencam', 'layercam', 'scorecam')
+        self.gradcam_direction = 'both'  # 勾配方向 ('both', 'positive', 'negative')
 
     def add_point_to_polygon(self, polygon_index, x, y):
         """指定されたポリゴンに新しい点を追加する"""
@@ -460,7 +462,7 @@ class ImageLabel(QLabel):
 
         self.draw_initial_frame(painter)
 
-        # GradCAMオーバーレイを描画（ベース画像の上、他のアノテーションの下）
+        # CAMオーバーレイを描画（ベース画像の上、他のアノテーションの下）
         self.draw_gradcam_overlay(painter, self.target_rect)
 
         # 各機能毎に描画（描画順序を調整）
@@ -503,11 +505,11 @@ class ImageLabel(QLabel):
         painter.drawPixmap(self.target_rect, self.pixmap())
 
     def draw_gradcam_overlay(self, painter, target_rect):
-        """GradCAMヒートマップオーバーレイを描画"""
+        """CAMヒートマップオーバーレイを描画"""
         if not self.show_gradcam or self.gradcam_overlay is None:
             return
 
-        # GradCAMオーバーレイをtarget_rectにスケーリングして描画
+        # CAMオーバーレイをtarget_rectにスケーリングして描画
         # アルファチャンネルは既に画像に含まれているのでそのまま描画
         painter.drawPixmap(target_rect, self.gradcam_overlay)
 
@@ -3715,9 +3717,9 @@ class ImageAnnotationTool(QMainWindow):
 
         pilot_layout.addLayout(inference_layout)
 
-        # 差分ベクトル矢印表示オプション
+        # 差分ベクトル表示オプション
         diff_vector_layout = QHBoxLayout()
-        self.diff_vector_checkbox = QCheckBox("差分ベクトル矢印表示（緑矢印）")
+        self.diff_vector_checkbox = QCheckBox("差分ベクトル表示（緑矢印）")
         self.diff_vector_checkbox.setChecked(False)
         self.diff_vector_checkbox.setEnabled(False)  # 初期状態は無効
         self.diff_vector_checkbox.setToolTip("自動運転モデルが読み込まれていません")
@@ -3726,34 +3728,66 @@ class ImageAnnotationTool(QMainWindow):
 
         pilot_layout.addLayout(diff_vector_layout)
 
-        # GradCAM表示オプション
-        gradcam_layout = QHBoxLayout()
-        self.gradcam_checkbox = QCheckBox("GradCAM表示")
+        # CAM表示オプション - 2行レイアウト
+        gradcam_container = QVBoxLayout()
+
+        # 1行目: CAMチェックボックス + 手法選択
+        gradcam_row1 = QHBoxLayout()
+        self.gradcam_checkbox = QCheckBox("CAM")
         self.gradcam_checkbox.setChecked(False)
         self.gradcam_checkbox.setEnabled(False)  # 初期状態は無効
         self.gradcam_checkbox.setToolTip("自動運転モデルが読み込まれていません")
         self.gradcam_checkbox.stateChanged.connect(self.toggle_gradcam_display)
-        gradcam_layout.addWidget(self.gradcam_checkbox)
+        gradcam_row1.addWidget(self.gradcam_checkbox)
 
-        # GradCAM対象選択
+        gradcam_method_label = QLabel("手法:")
+        gradcam_row1.addWidget(gradcam_method_label)
+
+        self.gradcam_method_combo = QComboBox()
+        self.gradcam_method_combo.addItems(["gradcam", "gradcam++", "eigencam", "layercam", "scorecam"])
+        self.gradcam_method_combo.setCurrentText("gradcam")
+        self.gradcam_method_combo.setEnabled(False)
+        self.gradcam_method_combo.setToolTip("CAM可視化手法を選択\nScoreCAM: 勾配を使わない高精度手法（計算時間長め）")
+        self.gradcam_method_combo.currentTextChanged.connect(self.change_gradcam_method)
+        gradcam_row1.addWidget(self.gradcam_method_combo)
+
+        gradcam_row1.addStretch()
+        gradcam_container.addLayout(gradcam_row1)
+
+        # 2行目: 対象選択 + 方向選択
+        gradcam_row2 = QHBoxLayout()
+
+        gradcam_target_label = QLabel("対象:")
+        gradcam_row2.addWidget(gradcam_target_label)
+
         self.gradcam_target_combo = QComboBox()
         self.gradcam_target_combo.addItems(["angle", "throttle", "speed"])
         self.gradcam_target_combo.setCurrentText("angle")
         self.gradcam_target_combo.setEnabled(False)
-        self.gradcam_target_combo.setToolTip("GradCAMで可視化する出力を選択")
+        self.gradcam_target_combo.setToolTip("CAMで可視化する出力を選択")
         self.gradcam_target_combo.currentTextChanged.connect(self.change_gradcam_target)
-        gradcam_layout.addWidget(self.gradcam_target_combo)
+        gradcam_row2.addWidget(self.gradcam_target_combo)
 
-        # CAM手法選択
-        self.gradcam_method_combo = QComboBox()
-        self.gradcam_method_combo.addItems(["gradcam", "gradcam++", "eigencam", "layercam"])
-        self.gradcam_method_combo.setCurrentText("gradcam")
-        self.gradcam_method_combo.setEnabled(False)
-        self.gradcam_method_combo.setToolTip("CAM可視化手法を選択")
-        self.gradcam_method_combo.currentTextChanged.connect(self.change_gradcam_method)
-        gradcam_layout.addWidget(self.gradcam_method_combo)
+        gradcam_direction_label = QLabel("方向:")
+        gradcam_row2.addWidget(gradcam_direction_label)
 
-        pilot_layout.addLayout(gradcam_layout)
+        self.gradcam_direction_combo = QComboBox()
+        self.gradcam_direction_combo.addItems(["both", "positive", "negative"])
+        self.gradcam_direction_combo.setCurrentText("both")
+        self.gradcam_direction_combo.setEnabled(False)
+        self.gradcam_direction_combo.setToolTip(
+            "可視化する勾配の方向\n"
+            "both: 正負両方を同時表示（赤=正/青=負）\n"
+            "positive: 出力を増加させる根拠（右に切る/加速）\n"
+            "negative: 出力を減少させる根拠（左に切る/減速）"
+        )
+        self.gradcam_direction_combo.currentTextChanged.connect(self.change_gradcam_direction)
+        gradcam_row2.addWidget(self.gradcam_direction_combo)
+
+        gradcam_row2.addStretch()
+        gradcam_container.addLayout(gradcam_row2)
+
+        pilot_layout.addLayout(gradcam_container)
 
         left_layout.addWidget(self.pilot_container)
                     
@@ -3948,6 +3982,13 @@ class ImageAnnotationTool(QMainWindow):
         self.databricks_sync_button.clicked.connect(self._sync_to_databricks)
         self.databricks_sync_button.setToolTip("ローカルの学習記録をDatabricksにアップロード")
         databricks_buttons_layout.addWidget(self.databricks_sync_button)
+
+        # データ転送ボタン
+        self.databricks_transfer_button = QPushButton("転送")
+        apply_style(self.databricks_transfer_button, 'special')
+        self.databricks_transfer_button.clicked.connect(self._transfer_to_databricks)
+        self.databricks_transfer_button.setToolTip("現在のアノテーションをDatabricksに転送")
+        databricks_buttons_layout.addWidget(self.databricks_transfer_button)
 
         # 設定ボタン
         databricks_settings_button = QPushButton("設定")
@@ -6755,19 +6796,21 @@ class ImageAnnotationTool(QMainWindow):
                 self.batch_inference_button.setEnabled(False)
                 self.batch_inference_button.setToolTip("自動運転モデルが読み込まれていません")
 
-        # GradCAM表示（自動運転モデルに依存）
+        # CAM表示（自動運転モデルに依存）
         if hasattr(self, 'gradcam_checkbox'):
             if hasattr(self, 'model') and self.model is not None:
                 self.gradcam_checkbox.setEnabled(True)
                 self.gradcam_checkbox.setToolTip("モデルの注目領域をヒートマップで表示")
                 self.gradcam_target_combo.setEnabled(True)
                 self.gradcam_method_combo.setEnabled(True)
+                self.gradcam_direction_combo.setEnabled(True)
             else:
                 self.gradcam_checkbox.setEnabled(False)
                 self.gradcam_checkbox.setChecked(False)
                 self.gradcam_checkbox.setToolTip("自動運転モデルが読み込まれていません")
                 self.gradcam_target_combo.setEnabled(False)
                 self.gradcam_method_combo.setEnabled(False)
+                self.gradcam_direction_combo.setEnabled(False)
 
     def add_segmentation_annotation(self, polygon_data):
         """セグメンテーションアノテーションを追加"""
@@ -11773,6 +11816,225 @@ class ImageAnnotationTool(QMainWindow):
                 f"同期中にエラーが発生しました:\n\n{str(e)}"
             )
 
+    def _transfer_to_databricks(self):
+        """現在のアノテーションをDatabricksに転送"""
+        # Databricksモードが有効か確認
+        if not self.mlflow_manager.use_databricks:
+            QMessageBox.warning(
+                self,
+                "Databricks未有効",
+                "Databricks連携が有効になっていません。\n\n"
+                "「Databricks連携」チェックボックスをONにしてください。"
+            )
+            return
+
+        # アノテーションがあるか確認
+        if not self.annotations:
+            QMessageBox.information(
+                self,
+                "情報",
+                "転送するアノテーションがありません。\n\n"
+                "先にアノテーションを作成してください。"
+            )
+            return
+
+        # ZIPファイル名を入力
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"annotation_{timestamp}"
+
+        zip_name, ok = QInputDialog.getText(
+            self,
+            "ZIPファイル名",
+            "Databricksに転送するZIPファイル名を入力してください:\n"
+            "（.zipは自動で付加されます）",
+            QLineEdit.Normal,
+            default_name
+        )
+
+        if not ok or not zip_name.strip():
+            return
+
+        zip_name = zip_name.strip()
+        if not zip_name.endswith('.zip'):
+            zip_name += '.zip'
+
+        # 転送先を確認
+        from config_databricks import DATABRICKS_VOLUMES_PATH
+
+        # Volumesパスの存在確認
+        print("[転送] Volumesパスの存在確認中...")
+        temp_manager = DatabricksTransferManager()
+        path_exists, path_message = temp_manager.check_volumes_path()
+
+        if not path_exists:
+            # パスが存在しない場合、作成を試みるか確認
+            create_confirm = QMessageBox.question(
+                self,
+                "Volumesパスが存在しません",
+                f"転送先のVolumesパスが存在しません:\n\n"
+                f"{DATABRICKS_VOLUMES_PATH}\n\n"
+                f"詳細: {path_message}\n\n"
+                "Databricksでこのパスを作成してから再度お試しください。\n\n"
+                "環境変数 DATABRICKS_VOLUMES_PATH で\n"
+                "別のパスを指定することもできます。\n\n"
+                "例: /Volumes/workspace/default/test",
+                QMessageBox.Ok
+            )
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "転送確認",
+            f"以下の内容でDatabricksに転送します:\n\n"
+            f"アノテーション数: {len(self.annotations)}\n"
+            f"ファイル名: {zip_name}\n"
+            f"転送先: {DATABRICKS_VOLUMES_PATH}/{zip_name}\n\n"
+            "続行しますか？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+
+        if confirm != QMessageBox.Yes:
+            return
+
+        # 進捗ダイアログを作成
+        progress = QProgressDialog("転送準備中...", "キャンセル", 0, 100, self)
+        progress.setWindowTitle("Databricksへ転送中")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setMinimumWidth(400)
+        progress.setValue(0)
+        progress.show()
+
+        # キャンセルフラグ
+        cancelled = [False]
+
+        def progress_callback(stage, current, total, message):
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                cancelled[0] = True
+                return
+
+            # ステージに応じた進捗計算
+            # export: 0-20%, zip: 20-60%, upload: 60-100%
+            if stage == 'export':
+                percent = int((current / max(total, 1)) * 20)
+                stage_name = "エクスポート中"
+            elif stage == 'zip':
+                percent = 20 + int((current / max(total, 1)) * 40)
+                stage_name = "ZIP圧縮中"
+            elif stage == 'upload':
+                percent = 60 + int((current / max(total, 1)) * 40)
+                stage_name = "アップロード中"
+            else:
+                percent = 0
+                stage_name = ""
+
+            progress.setValue(percent)
+            progress.setLabelText(f"{stage_name}\n{message}")
+            QApplication.processEvents()
+
+        def cancel_check():
+            QApplication.processEvents()
+            return progress.wasCanceled() or cancelled[0]
+
+        # 転送実行
+        try:
+            print("[転送] DatabricksTransferManager を作成中...")
+            # DatabricksTransferManagerを作成
+            transfer_manager = DatabricksTransferManager()
+
+            print("[転送] image_mapとvariant_keysを構築中...")
+            # image_mapとvariant_keysを構築
+            image_map = {}
+            variant_keys = {}
+
+            # source_images_mapから構築
+            if hasattr(self, 'source_images_map') and self.source_images_map:
+                print(f"[転送] source_images_map を使用（バリアント数: {len(self.source_images_map)}）")
+                for variant, images_list in self.source_images_map.items():
+                    # variant_keysを設定
+                    if variant == 'cam':
+                        variant_keys[variant] = 'cam/image_array'
+                    elif variant == 'cam0':
+                        variant_keys[variant] = 'cam0/image_array'
+                    elif variant == 'lidar':
+                        variant_keys[variant] = 'lidar/image_array'
+                    else:
+                        variant_keys[variant] = f'{variant}/image_array'
+
+                    # image_mapを構築
+                    for idx, img_path in enumerate(images_list):
+                        if idx not in image_map:
+                            image_map[idx] = {}
+                        image_map[idx][variant] = img_path
+                print(f"[転送] image_map 構築完了（エントリ数: {len(image_map)}）")
+            else:
+                # 単一ソースの場合
+                if hasattr(self, 'images') and self.images:
+                    print(f"[転送] 単一ソースを使用（画像数: {len(self.images)}）")
+                    variant_keys['cam'] = 'cam/image_array'
+                    for idx, img_path in enumerate(self.images):
+                        image_map[idx] = {'cam': img_path}
+
+            # 削除インデックスを取得
+            deleted_indexes = getattr(self, 'deleted_indexes', [])
+            print(f"[転送] 削除インデックス数: {len(deleted_indexes)}")
+
+            # 差分ベクトルとウェイポイントを取得
+            diff_vectors = getattr(self, 'inference_diff_vectors', None)
+            waypoint_annotations = getattr(self, 'waypoint_annotations', None)
+            print(f"[転送] 差分ベクトル: {'あり' if diff_vectors else 'なし'}")
+            print(f"[転送] ウェイポイント: {'あり' if waypoint_annotations else 'なし'}")
+
+            print("[転送] transfer_annotations 呼び出し...")
+            # 転送実行
+            result = transfer_manager.transfer_annotations(
+                annotations=self.annotations,
+                inference_results=self.inference_results if hasattr(self, 'inference_results') else None,
+                image_map=image_map,
+                variant_keys=variant_keys,
+                zip_name=zip_name,
+                deleted_indexes=deleted_indexes,
+                diff_vectors=diff_vectors,
+                waypoint_annotations=waypoint_annotations,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check
+            )
+
+            print(f"[転送] transfer_annotations 完了: {result}")
+            progress.close()
+
+            if result['success']:
+                # サイズをMBに変換
+                size_mb = result['zip_size'] / (1024 * 1024)
+                QMessageBox.information(
+                    self,
+                    "転送完了",
+                    f"Databricksへの転送が完了しました。\n\n"
+                    f"アノテーション数: {result['annotation_count']}\n"
+                    f"ZIPサイズ: {size_mb:.2f} MB\n"
+                    f"転送先: {result['remote_path']}"
+                )
+            else:
+                error_msg = result.get('error', '不明なエラー')
+                if 'キャンセル' in error_msg:
+                    QMessageBox.information(self, "転送キャンセル", "転送がキャンセルされました。")
+                else:
+                    QMessageBox.critical(
+                        self,
+                        "転送エラー",
+                        f"転送中にエラーが発生しました:\n\n{error_msg}"
+                    )
+
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(
+                self,
+                "転送エラー",
+                f"転送中にエラーが発生しました:\n\n{str(e)}\n\n{traceback.format_exc()}"
+            )
+
     def _show_databricks_settings(self):
         """Databricks設定ダイアログを表示"""
         try:
@@ -12508,25 +12770,25 @@ class ImageAnnotationTool(QMainWindow):
             self.statusBar().showMessage("将来アノテーション表示をオフにしました", 3000)
 
     def toggle_gradcam_display(self, state):
-        """GradCAM表示の切り替え"""
+        """CAM表示の切り替え"""
         show_gradcam = (state == Qt.Checked)
         self.main_image_view.show_gradcam = show_gradcam
 
         if show_gradcam:
-            # GradCAMを生成して表示
+            # CAMを生成して表示
             self.update_gradcam_visualization()
-            self.statusBar().showMessage("GradCAM表示をオンにしました", 3000)
+            self.statusBar().showMessage("CAM表示をオンにしました", 3000)
         else:
-            # GradCAMオーバーレイをクリア
+            # CAMオーバーレイをクリア
             self.main_image_view.gradcam_overlay = None
             self.main_image_view.update()
-            self.statusBar().showMessage("GradCAM表示をオフにしました", 3000)
+            self.statusBar().showMessage("CAM表示をオフにしました", 3000)
 
     def change_gradcam_target(self, target):
-        """GradCAM対象出力の変更"""
+        """CAM対象出力の変更"""
         self.main_image_view.gradcam_target = target
 
-        # GradCAM表示中なら更新
+        # CAM表示中なら更新
         if self.main_image_view.show_gradcam:
             self.update_gradcam_visualization()
 
@@ -12534,17 +12796,25 @@ class ImageAnnotationTool(QMainWindow):
         """CAM手法の変更"""
         self.main_image_view.gradcam_method = method
 
-        # GradCAM表示中なら更新
+        # CAM表示中なら更新
+        if self.main_image_view.show_gradcam:
+            self.update_gradcam_visualization()
+
+    def change_gradcam_direction(self, direction):
+        """勾配方向の変更"""
+        self.main_image_view.gradcam_direction = direction
+
+        # CAM表示中なら更新
         if self.main_image_view.show_gradcam:
             self.update_gradcam_visualization()
 
     def update_gradcam_visualization(self):
-        """GradCAM可視化を更新"""
+        """CAM可視化を更新"""
         if not self.images or not hasattr(self, 'model') or self.model is None:
             return
 
         try:
-            from utils.gradcam_utils import GradCAM, overlay_heatmap
+            from utils.gradcam_utils import GradCAM, apply_colormap, generate_bidirectional_cam
             import cv2
 
             # 現在の画像パス
@@ -12562,12 +12832,10 @@ class ImageAnnotationTool(QMainWindow):
             device = self.model.device if hasattr(self.model, 'device') else torch.device('cpu')
             input_tensor = input_tensor.to(device)
 
-            # GradCAMインスタンス作成
+            # CAMインスタンス作成
             gradcam = GradCAM(self.model)
 
             try:
-                from utils.gradcam_utils import apply_colormap
-
                 # 対象出力のインデックスを取得
                 target_map = {'angle': 0, 'throttle': 1, 'speed': 2}
                 target_idx = target_map.get(self.main_image_view.gradcam_target, 0)
@@ -12575,26 +12843,55 @@ class ImageAnnotationTool(QMainWindow):
                 # CAM手法を取得
                 cam_method = getattr(self.main_image_view, 'gradcam_method', 'gradcam')
 
-                # ヒートマップ生成
-                heatmap = gradcam.generate_cam(
-                    input_tensor,
-                    target_output_index=target_idx,
-                    method=cam_method
-                )
+                # 勾配方向を取得
+                cam_direction = getattr(self.main_image_view, 'gradcam_direction', 'both')
 
-                # ヒートマップを画像サイズにリサイズ
+                # 画像サイズ
                 h, w = original_np.shape[:2]
-                heatmap_resized = cv2.resize(heatmap, (w, h))
 
-                # カラーマップを適用（BGRで返る）
-                heatmap_colored = apply_colormap(heatmap_resized, cv2.COLORMAP_JET)
-                # BGRからRGBAに変換（アルファチャンネル付き）
-                heatmap_rgba = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGBA)
+                if cam_direction == 'both':
+                    # 正負両方向を赤青で可視化
+                    positive_heatmap, negative_heatmap, combined_rgb = generate_bidirectional_cam(
+                        gradcam,
+                        input_tensor,
+                        target_output_index=target_idx,
+                        method=cam_method
+                    )
 
-                # アルファチャンネルをヒートマップの強度に基づいて設定
-                # 強度が高い部分ほど不透明に
-                alpha_value = int(255 * self.main_image_view.gradcam_alpha)
-                heatmap_rgba[:, :, 3] = (heatmap_resized * alpha_value).astype(np.uint8)
+                    # ヒートマップをリサイズ
+                    combined_rgb_resized = cv2.resize(combined_rgb, (w, h))
+                    positive_resized = cv2.resize(positive_heatmap, (w, h))
+                    negative_resized = cv2.resize(negative_heatmap, (w, h))
+
+                    # RGBからRGBAに変換
+                    heatmap_rgba = np.zeros((h, w, 4), dtype=np.uint8)
+                    heatmap_rgba[:, :, :3] = combined_rgb_resized
+
+                    # アルファチャンネル: 正負どちらかの強度が高い部分ほど不透明に
+                    combined_intensity = np.maximum(positive_resized, negative_resized)
+                    alpha_value = int(255 * self.main_image_view.gradcam_alpha)
+                    heatmap_rgba[:, :, 3] = (combined_intensity * alpha_value).astype(np.uint8)
+
+                else:
+                    # 単一方向（従来の処理）
+                    heatmap = gradcam.generate_cam(
+                        input_tensor,
+                        target_output_index=target_idx,
+                        method=cam_method,
+                        direction=cam_direction
+                    )
+
+                    # ヒートマップを画像サイズにリサイズ
+                    heatmap_resized = cv2.resize(heatmap, (w, h))
+
+                    # カラーマップを適用（BGRで返る）
+                    heatmap_colored = apply_colormap(heatmap_resized, cv2.COLORMAP_JET)
+                    # BGRからRGBAに変換（アルファチャンネル付き）
+                    heatmap_rgba = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGBA)
+
+                    # アルファチャンネルをヒートマップの強度に基づいて設定
+                    alpha_value = int(255 * self.main_image_view.gradcam_alpha)
+                    heatmap_rgba[:, :, 3] = (heatmap_resized * alpha_value).astype(np.uint8)
 
                 # QPixmapに変換（RGBA）
                 bytes_per_line = 4 * w
@@ -12609,10 +12906,10 @@ class ImageAnnotationTool(QMainWindow):
                 gradcam.remove_hooks()
 
         except Exception as e:
-            print(f"GradCAM生成エラー: {e}")
+            print(f"CAM生成エラー: {e}")
             import traceback
             traceback.print_exc()
-            self.statusBar().showMessage(f"GradCAM生成エラー: {e}", 5000)
+            self.statusBar().showMessage(f"CAM生成エラー: {e}", 5000)
 
     def toggle_inference_display(self, state):
         """自動運転推論表示の切り替え"""
@@ -14634,7 +14931,7 @@ class ImageAnnotationTool(QMainWindow):
                 # 推論結果ポイント（青丸）の設定
                 self._set_inference_point_on_canvas()
 
-                # GradCAM表示が有効な場合は更新
+                # CAM表示が有効な場合は更新
                 if hasattr(self, 'gradcam_checkbox') and self.gradcam_checkbox.isChecked():
                     self.update_gradcam_visualization()
 
@@ -15840,8 +16137,8 @@ class ImageAnnotationTool(QMainWindow):
         inference_check.setChecked(self.inference_checkbox.isChecked())  # UIの設定を初期値に
         dialog_layout.addWidget(inference_check)
         
-        # 追加: 差分ベクトル表示設定
-        diff_vector_check = QCheckBox("差分ベクトル矢印を表示する（緑矢印）")
+        # 差分ベクトル表示設定
+        diff_vector_check = QCheckBox("差分ベクトルを表示（緑矢印）")
         diff_vector_check.setChecked(self.diff_vector_checkbox.isChecked())  # UIの設定を初期値に
         dialog_layout.addWidget(diff_vector_check)
 

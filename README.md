@@ -132,6 +132,33 @@
 - **YOLO形式**: YOLO用のアノテーションをエクスポート
 - **アノテーション動画**: アノテーションを可視化した動画の作成
 
+### Grad-CAM（モデル判断根拠の可視化）
+- **GradCAM表示**: 自動運転モデルがどの画像領域に注目して判断しているかをヒートマップで可視化
+- **複数CAM手法**: 以下の可視化手法から選択可能
+
+| 手法 | 特徴 | 速度 | 用途 |
+|------|------|------|------|
+| `GradCAM` | 最終層の勾配を使用した標準手法 | 高速 | 一般的な可視化、まずはこれを試す |
+| `GradCAM++` | 重み付けを改良、複数オブジェクトに強い | 高速 | 画像内に複数の注目領域がある場合 |
+| `EigenCAM` | 主成分分析で特徴を抽出、勾配不使用 | 高速 | 勾配が不安定な場合の代替手法 |
+| `LayerCAM` | 各レイヤーの寄与を個別に計算 | 高速 | より細かい空間解像度が必要な場合 |
+| `ScoreCAM` | マスクベースで勾配不使用、高精度 | 低速 | 最も正確な可視化が必要な場合 |
+
+- **対象出力選択**: angle、throttle、speedそれぞれの判断根拠を個別に可視化
+- **勾配方向選択**: 正負両方の寄与を同時に可視化可能
+
+| 方向 | 表示内容 | カラー |
+|------|---------|--------|
+| `both` | 正負両方の寄与を同時表示 | 赤=正、青=負 |
+| `positive` | 出力を増加させる寄与のみ | JETカラーマップ |
+| `negative` | 出力を減少させる寄与のみ | JETカラーマップ |
+
+  - **bothモードの色の意味**:
+    - angle: 赤=右に切る根拠、青=左に切る根拠
+    - throttle: 赤=加速の根拠、青=減速の根拠
+
+- **ViT系モデル対応**: MobileViT、Swin Transformer、EfficientFormer等のTransformerベースモデルにも正しく対応
+
 ### 高度な機能
 - **実験追跡**: モデルパフォーマンス追跡のためのMLflow統合
 - **セッション管理**: アノテーションセッションの保存と復元
@@ -146,6 +173,7 @@
 - NumPy
 - MLflow
 - Ultralytics
+- pytorch-grad-cam（Grad-CAM可視化機能用）
 
 詳細なバージョン要件については、requirements.txtを参照してください。
 
@@ -346,6 +374,29 @@ python main.py
 4. **バッチ推論**
    - 「全画像を推論」ボタンで一括推論
    - 結果はCSVファイルにエクスポート可能
+
+5. **Grad-CAM（判断根拠の可視化）**
+   - モデルを読み込んだ状態で「GradCAM表示」チェックボックスをON
+   - **対象出力選択**: angle、throttle、speedから選択して個別に確認
+   - **勾配方向選択**:
+     - `both`（デフォルト）: 正負両方の寄与を同時表示
+       - 赤色: 正の寄与（右に切る/加速の根拠）
+       - 青色: 負の寄与（左に切る/減速の根拠）
+       - 紫色: 両方の寄与が重なる部分
+     - `positive`: 出力を増加させる寄与のみ（JETカラーマップ）
+     - `negative`: 出力を減少させる寄与のみ（JETカラーマップ）
+   - **CAM手法の選び方**:
+     - `gradcam`: まずはこれを試す。高速で一般的な可視化に最適
+     - `gradcam++`: 画像内に複数の注目領域がある場合に有効
+     - `eigencam`: 勾配計算が不安定な場合の代替。主成分分析ベース
+     - `layercam`: より細かい空間解像度が必要な場合
+     - `scorecam`: 最も正確だが計算時間が長い。重要な検証時に使用
+   - **活用例**:
+     - bothモードで左右のハンドル操作の根拠を同時に確認
+     - モデルがコースの白線に注目しているか確認
+     - 意図しない領域（背景など）に注目していないか検証
+     - angleとthrottleで注目領域が異なるか比較
+     - 学習データの品質改善に活用
 
 #### 7. 高度な機能
 
@@ -889,6 +940,7 @@ This project is licensed under the **GNU General Public License v3.0** - see the
 - PIL/Pillow: Licensed under MIT-CMU ([https://github.com/python-pillow/Pillow](https://github.com/python-pillow/Pillow))
 - NumPy: Licensed under NumPy License (BSD-3-Clause style) ([https://github.com/numpy/numpy](https://github.com/numpy/numpy))
 - MLflow: Licensed under Apache-2.0 ([https://github.com/mlflow/mlflow](https://github.com/mlflow/mlflow))
+- pytorch-grad-cam: Licensed under MIT ([https://github.com/jacobgil/pytorch-grad-cam](https://github.com/jacobgil/pytorch-grad-cam))
 
 ## 謝辞
 
