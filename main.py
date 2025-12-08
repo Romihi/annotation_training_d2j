@@ -15617,6 +15617,20 @@ class ImageAnnotationTool(QMainWindow):
             )
             return
 
+        # 確認ダイアログを表示
+        deleted_count = len(self.deleted_indexes)
+        reply = QMessageBox.question(
+            self,
+            "確認",
+            f"全ての削除状態をクリアします。よろしいですか？\n\n"
+            f"削除済みインデックス数: {deleted_count}個",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
         # 削除済みリストをクリア
         self.deleted_indexes = []
 
@@ -15640,36 +15654,16 @@ class ImageAnnotationTool(QMainWindow):
             return  # キャンセルされた場合
         
         try:
-            # deleted_indexesをactual_indexからoriginal_indexに変換
-            original_deleted_indexes = []
-            if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
-                for actual_idx in self.deleted_indexes:
-                    # アノテーションにoriginal_indexがある場合はそれを使用
-                    if actual_idx in self.annotations and "original_index" in self.annotations[actual_idx]:
-                        original_deleted_indexes.append(self.annotations[actual_idx]["original_index"])
-                    # アノテーションがない場合は、ファイル名から抽出
-                    elif 0 <= actual_idx < len(self.images):
-                        img_path = self.images[actual_idx]
-                        basename = os.path.basename(img_path)
-                        try:
-                            # Jetracer形式を優先的にチェック
-                            jetracer_match = re.match(r'^\d+_\d+_(\d+)_', basename)
-                            if jetracer_match:
-                                original_deleted_indexes.append(int(jetracer_match.group(1)))
-                            else:
-                                # 通常形式
-                                normal_match = re.match(r'^(\d+)_', basename)
-                                if normal_match:
-                                    original_deleted_indexes.append(int(normal_match.group(1)))
-                        except Exception as e:
-                            print(f"警告: 削除インデックス {actual_idx} の変換に失敗: {e}")
+            # deleted_indexesはactual_index（GUIでのインデックス）をそのまま渡す
+            # export_to_donkey内でassigned_indexに変換される
+            actual_deleted_indexes = list(self.deleted_indexes) if hasattr(self, 'deleted_indexes') and self.deleted_indexes else []
 
             # エクスポート実行
             catalog_path = export_to_donkey(
                 export_config['output_folder'],
                 self.annotations,
                 inference_results=self.inference_results,
-                deleted_indexes=original_deleted_indexes,
+                deleted_indexes=actual_deleted_indexes,
                 image_map=export_config['image_map'],
                 variant_keys=export_config['variant_keys'],
                 diff_vectors=self.inference_diff_vectors if hasattr(self, 'inference_diff_vectors') else None,
