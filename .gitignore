@@ -196,3 +196,8 @@ yolo*.pt
 # Windows reserved names (prevent accidental creation)
 nul
 NUL
+
+# Google OAuth credentials (security)
+client_secrets.json
+.google_credentials.json
+pydrive_settings.yaml

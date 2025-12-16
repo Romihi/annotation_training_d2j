@@ -594,7 +594,8 @@ class MLflowManager:
             "model_category": "autonomous_driving",
             "task_type": "regression",
             "framework": "pytorch",
-            "status": metrics.get("status", "completed")
+            "status": metrics.get("status", "completed"),
+            "training_environment": training_params.get("training_environment", "local")  # local, colab, databricks
         }
 
         # MLflow実行名（カスタムモデル名が指定されていればそれを使用）
@@ -660,7 +661,8 @@ class MLflowManager:
             "task_type": "classification",
             "framework": "pytorch",
             "status": metrics.get("status", "completed"),
-            "coordinate_type": training_params.get("coordinate_system", "classification")
+            "coordinate_type": training_params.get("coordinate_system", "classification"),
+            "training_environment": training_params.get("training_environment", "local")  # local, colab, databricks
         }
 
         # MLflow実行名（カスタムモデル名が指定されていればそれを使用）
@@ -713,7 +715,8 @@ class MLflowManager:
         tags = {
             "model_category": "object_detection",
             "framework": "yolo",
-            "task_type": "detection"
+            "task_type": "detection",
+            "training_environment": training_params.get("training_environment", "local")  # local, colab, databricks
         }
 
         run_name = f"yolo_{model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -889,7 +892,8 @@ class MLflowManager:
             "task_type": "segmentation",
             "framework": "yolo",
             "architecture": training_params.get("architecture", "yolo_segmentation"),
-            "status": "completed"
+            "status": "completed",
+            "training_environment": training_params.get("training_environment", "local")  # local, colab, databricks
         }
 
         # MLflow実行名（カスタムモデル名が指定されていればそれを使用）
@@ -1004,7 +1008,8 @@ class MLflowManager:
             "task_type": "regression",
             "framework": "pytorch",
             "status": metrics.get("status", "completed"),
-            "waypoint_count": str(training_params.get("num_waypoints", 4))
+            "waypoint_count": str(training_params.get("num_waypoints", 4)),
+            "training_environment": training_params.get("training_environment", "local")  # local, colab, databricks
         }
 
         # データセット情報の追加

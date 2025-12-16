@@ -281,7 +281,7 @@ class TIMMBasedModel(BaseModel):
     def get_preprocess(self):
         """モデル専用の前処理を返す"""
         input_size = self._get_model_input_size()
-        
+
         # モデルに適した前処理を定義
         # データ拡張なしのシンプルな評価用前処理
         return transforms.Compose([
@@ -1053,8 +1053,7 @@ class ResNet18WaypointModel(BaseWaypointModel):
         """ResNet18用の前処理"""
         return transforms.Compose([
             transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.ToTensor()
         ])
 
     def run(self, img_arr):

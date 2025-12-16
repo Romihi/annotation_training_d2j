@@ -43,7 +43,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                             QDoubleSpinBox, QDialog, QDialogButtonBox, QFormLayout,
                             QGroupBox, QRadioButton, QTabWidget, QSizePolicy,QButtonGroup,
                             QListView, QTreeView, QAbstractItemView,QStyleOptionSlider,QStyle, QTextEdit, QPlainTextEdit,
-                            QGraphicsOpacityEffect)
+                            QGraphicsOpacityEffect, QListWidget, QListWidgetItem)
 from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont, QPolygon, QCursor
 from PyQt5.QtCore import Qt, QRect, QPoint, QTimer, QEvent, QThread, pyqtSignal
 
@@ -3930,7 +3930,7 @@ class ImageAnnotationTool(QMainWindow):
         # --- モデル管理セクション ---
         model_mgmt_layout = QVBoxLayout()
 
-        model_mgmt_label = QLabel("モデル管理:")
+        model_mgmt_label = QLabel("モデル管理やクラウド学習:")
         model_mgmt_label.setStyleSheet("font-weight: bold;")
         model_mgmt_layout.addWidget(model_mgmt_label)
 
@@ -3998,6 +3998,55 @@ class ImageAnnotationTool(QMainWindow):
         databricks_buttons_layout.addWidget(databricks_settings_button)
 
         model_mgmt_layout.addLayout(databricks_buttons_layout)
+
+        # --- 3. Google Colabセクション ---
+        # Colab連携チェックボックスとステータス
+        colab_header_layout = QHBoxLayout()
+
+        self.colab_checkbox = QCheckBox("Google Colab連携")
+        self.colab_checkbox.setChecked(self._is_colab_enabled())
+        self.colab_checkbox.stateChanged.connect(self._on_colab_toggle)
+        colab_header_layout.addWidget(self.colab_checkbox)
+
+        self.colab_status_label = QLabel()
+        self._update_colab_status_label()
+        colab_header_layout.addWidget(self.colab_status_label)
+
+        colab_header_layout.addStretch()
+        model_mgmt_layout.addLayout(colab_header_layout)
+
+        # Colabボタン（開く、転送、設定を横並び）
+        colab_buttons_layout = QHBoxLayout()
+
+        # Colabを開くボタン
+        colab_open_button = QPushButton("Colabを開く")
+        apply_style(colab_open_button, 'special')
+        colab_open_button.clicked.connect(self._open_colab_ui)
+        colab_open_button.setToolTip("Google Colabをブラウザで開く")
+        colab_buttons_layout.addWidget(colab_open_button)
+
+        # データ転送ボタン
+        self.colab_transfer_button = QPushButton("転送")
+        apply_style(self.colab_transfer_button, 'special')
+        self.colab_transfer_button.clicked.connect(self._transfer_to_colab)
+        self.colab_transfer_button.setToolTip("現在のアノテーションをGoogle Driveに転送してColabで学習")
+        colab_buttons_layout.addWidget(self.colab_transfer_button)
+
+        # モデル取得ボタン
+        self.colab_download_button = QPushButton("取得")
+        apply_style(self.colab_download_button, 'special')
+        self.colab_download_button.clicked.connect(self._download_model_from_colab)
+        self.colab_download_button.setToolTip("Colabで学習したモデルをGoogle Driveからダウンロード")
+        colab_buttons_layout.addWidget(self.colab_download_button)
+
+        # 設定ボタン
+        colab_settings_button = QPushButton("設定")
+        colab_settings_button.setMaximumWidth(60)
+        apply_style(colab_settings_button, 'special')
+        colab_settings_button.clicked.connect(self._show_colab_settings)
+        colab_buttons_layout.addWidget(colab_settings_button)
+
+        model_mgmt_layout.addLayout(colab_buttons_layout)
 
         left_layout.addLayout(model_mgmt_layout)
 
@@ -12154,6 +12203,968 @@ class ImageAnnotationTool(QMainWindow):
                 subprocess.Popen(['xdg-open', readme_path])
         except Exception as e:
             QMessageBox.warning(self, "エラー", f"ファイルを開けませんでした:\n{e}")
+
+    # ========================================
+    # Google Colab連携メソッド
+    # ========================================
+
+    def _is_colab_enabled(self) -> bool:
+        """Colab連携が有効かどうかを返す"""
+        try:
+            from config_colab import COLAB_ENABLED
+            return COLAB_ENABLED
+        except ImportError:
+            return False
+
+    def _on_colab_toggle(self, state):
+        """Colabチェックボックスの状態変更"""
+        # 現在は環境変数で制御するため、チェックボックスは情報表示のみ
+        self._update_colab_status_label()
+
+    def _update_colab_status_label(self):
+        """Colabステータスラベルを更新"""
+        try:
+            from config_colab import get_colab_status
+            status = get_colab_status()
+            if status['enabled']:
+                if status.get('authenticated'):
+                    self.colab_status_label.setText("認証済み")
+                    self.colab_status_label.setStyleSheet("color: green;")
+                else:
+                    self.colab_status_label.setText("未認証")
+                    self.colab_status_label.setStyleSheet("color: orange;")
+            else:
+                self.colab_status_label.setText("無効")
+                self.colab_status_label.setStyleSheet("color: gray;")
+        except ImportError:
+            self.colab_status_label.setText("設定ファイルなし")
+            self.colab_status_label.setStyleSheet("color: red;")
+
+    def _open_colab_ui(self):
+        """Google Colabを開く"""
+        import webbrowser
+        webbrowser.open("https://colab.research.google.com/")
+
+    def _transfer_to_colab(self):
+        """現在のアノテーションをGoogle Driveに転送してColabで学習"""
+        # Colabモードが有効か確認
+        if not self._is_colab_enabled():
+            QMessageBox.warning(
+                self,
+                "Google Colab未有効",
+                "Google Colab連携が有効になっていません。\n\n"
+                "有効にするには環境変数を設定してください:\n"
+                "  COLAB_ENABLED=true\n"
+                "  GOOGLE_CLIENT_SECRETS=path/to/client_secrets.json\n\n"
+                "設定ボタンから詳細を確認できます。"
+            )
+            return
+
+        # アノテーションがあるか確認
+        if not self.annotations:
+            QMessageBox.information(
+                self,
+                "情報",
+                "転送するアノテーションがありません。\n\n"
+                "先にアノテーションを作成してください。"
+            )
+            return
+
+        # ZIPファイル名を入力
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"annotation_{timestamp}"
+
+        zip_name, ok = QInputDialog.getText(
+            self,
+            "ZIPファイル名",
+            "Google Driveに転送するZIPファイル名を入力してください:\n"
+            "（.zipは自動で付加されます）",
+            QLineEdit.Normal,
+            default_name
+        )
+
+        if not ok or not zip_name.strip():
+            return
+
+        zip_name = zip_name.strip()
+        if not zip_name.endswith('.zip'):
+            zip_name += '.zip'
+
+        # 転送確認ダイアログ
+        try:
+            from config_colab import COLAB_DRIVE_FOLDER_NAME
+        except ImportError:
+            COLAB_DRIVE_FOLDER_NAME = "annotation_data"
+
+        # オプションダイアログを表示
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Google Colab転送設定")
+        dialog.setMinimumWidth(400)
+
+        layout = QVBoxLayout(dialog)
+
+        # 転送内容
+        info_group = QGroupBox("転送内容")
+        info_layout = QVBoxLayout()
+        info_layout.addWidget(QLabel(f"アノテーション数: {len(self.annotations)}"))
+        info_layout.addWidget(QLabel(f"ファイル名: {zip_name}"))
+        info_layout.addWidget(QLabel(f"転送先: Google Drive/{COLAB_DRIVE_FOLDER_NAME}/"))
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+
+        # オプション
+        options_group = QGroupBox("オプション")
+        options_layout = QVBoxLayout()
+
+        generate_notebook_check = QCheckBox("学習用Notebookを生成")
+        generate_notebook_check.setChecked(True)
+        generate_notebook_check.setToolTip("転送後にGoogle Colabで使用できるNotebookを生成します")
+        options_layout.addWidget(generate_notebook_check)
+
+        open_colab_check = QCheckBox("転送後にColabを開く")
+        open_colab_check.setChecked(True)
+        open_colab_check.setToolTip("転送完了後にブラウザでColabを開きます")
+        options_layout.addWidget(open_colab_check)
+
+        options_group.setLayout(options_layout)
+        layout.addWidget(options_group)
+
+        # 認証に関する注意
+        note_label = QLabel(
+            "注意: 初回転送時はGoogleアカウントの認証が必要です。\n"
+            "ブラウザが開きますので、アカウントを選択して認証してください。"
+        )
+        note_label.setStyleSheet("color: gray; font-size: 10px;")
+        note_label.setWordWrap(True)
+        layout.addWidget(note_label)
+
+        # ボタン
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        generate_notebook = generate_notebook_check.isChecked()
+        open_colab = open_colab_check.isChecked()
+
+        # 認証確認
+        try:
+            from utils.colab_transfer import ColabTransferManager
+
+            # 認証中ダイアログを表示
+            auth_progress = QProgressDialog("Google Driveに認証中...", "キャンセル", 0, 0, self)
+            auth_progress.setWindowTitle("認証中")
+            auth_progress.setWindowModality(Qt.WindowModal)
+            auth_progress.setMinimumDuration(0)
+            auth_progress.setMinimumWidth(300)
+            auth_progress.show()
+            QApplication.processEvents()
+
+            # ColabTransferManagerを作成して認証
+            transfer_manager = ColabTransferManager()
+            success, message = transfer_manager.test_connection()
+
+            auth_progress.close()
+
+            if not success:
+                QMessageBox.critical(
+                    self,
+                    "認証失敗",
+                    f"Google Driveへの認証に失敗しました:\n\n{message}"
+                )
+                return
+
+            # 認証成功 - 転送確認ダイアログを表示
+            try:
+                from config_colab import COLAB_DRIVE_FOLDER_NAME
+            except ImportError:
+                COLAB_DRIVE_FOLDER_NAME = "annotation_data"
+
+            confirm_reply = QMessageBox.question(
+                self,
+                "認証完了 - 転送確認",
+                f"Google Driveへの認証が完了しました。\n\n"
+                f"以下の内容で転送を開始しますか？\n\n"
+                f"  転送先: Google Drive/{COLAB_DRIVE_FOLDER_NAME}/\n"
+                f"  ファイル名: {zip_name}\n"
+                f"  アノテーション数: {len(self.annotations)}\n"
+                f"  Notebook生成: {'あり' if generate_notebook else 'なし'}\n",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+
+            if confirm_reply != QMessageBox.Yes:
+                return
+
+        except ImportError as e:
+            QMessageBox.critical(
+                self,
+                "インポートエラー",
+                f"必要なライブラリがインストールされていません:\n\n{str(e)}\n\n"
+                "pip install pydrive2 google-auth google-auth-oauthlib pyyaml でインストールしてください。"
+            )
+            return
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "認証エラー",
+                f"認証中にエラーが発生しました:\n\n{str(e)}"
+            )
+            return
+
+        # 進捗ダイアログを作成
+        progress = QProgressDialog("転送準備中...", "キャンセル", 0, 100, self)
+        progress.setWindowTitle("Google Colabへ転送中")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setMinimumWidth(400)
+        progress.setValue(0)
+        progress.show()
+
+        # キャンセルフラグ
+        cancelled = [False]
+
+        # 最後に更新した進捗値を記録（不要な更新を避ける）
+        last_percent = [-1]
+
+        def progress_callback(stage, current, total, message):
+            # ステージに応じた進捗計算
+            if stage == 'export':
+                percent = int((current / max(total, 1)) * 15)
+                stage_header = "--- ステージ1: エクスポート ---"
+                if current == 0:
+                    detail = "アノテーションをエクスポート中..."
+                else:
+                    detail = f"エクスポート完了"
+            elif stage == 'zip':
+                percent = 15 + int((current / max(total, 1)) * 30)
+                stage_header = "--- ステージ2: ZIP圧縮 ---"
+                progress_pct = int((current / max(total, 1)) * 100)
+                detail = f"ZIP圧縮進捗: {current}/{total} ({progress_pct}%)"
+            elif stage == 'upload':
+                percent = 45 + int((current / max(total, 1)) * 35)
+                stage_header = "--- ステージ3: アップロード ---"
+                if current == 0:
+                    detail = f"Google Driveにアップロード中...\nファイルサイズ: {total / (1024*1024):.2f} MB"
+                else:
+                    detail = f"アップロード中: {current // (1024*1024)} MB / {total // (1024*1024)} MB"
+            elif stage == 'notebook':
+                percent = 80 + int((current / max(total, 1)) * 20)
+                stage_header = "--- ステージ4: Notebook生成 ---"
+                if current == 0:
+                    detail = "Colabノートブックを生成中..."
+                else:
+                    detail = "ノートブックアップロード完了"
+            else:
+                percent = 0
+                stage_header = ""
+                detail = message
+
+            # 進捗値が変わった場合のみGUI更新（パフォーマンス最適化）
+            if percent != last_percent[0]:
+                last_percent[0] = percent
+                progress.setValue(percent)
+                progress.setLabelText(f"{stage_header}\n{detail}")
+                QApplication.processEvents()
+
+                # キャンセルチェック
+                if progress.wasCanceled():
+                    cancelled[0] = True
+
+        def cancel_check():
+            # cancelled[0]がすでにTrueならprocessEventsをスキップ
+            if cancelled[0]:
+                return True
+            # GUIイベント処理してキャンセル状態を確認
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                cancelled[0] = True
+            return cancelled[0]
+
+        # 転送実行
+        try:
+            # image_mapとvariant_keysを構築（Databricksと同じロジック）
+            image_map = {}
+            variant_keys = {}
+
+            if hasattr(self, 'source_images_map') and self.source_images_map:
+                for variant, images_list in self.source_images_map.items():
+                    if variant == 'cam':
+                        variant_keys[variant] = 'cam/image_array'
+                    elif variant == 'cam0':
+                        variant_keys[variant] = 'cam0/image_array'
+                    elif variant == 'lidar':
+                        variant_keys[variant] = 'lidar/image_array'
+                    else:
+                        variant_keys[variant] = f'{variant}/image_array'
+
+                    for idx, img_path in enumerate(images_list):
+                        if idx not in image_map:
+                            image_map[idx] = {}
+                        image_map[idx][variant] = img_path
+            else:
+                if hasattr(self, 'images') and self.images:
+                    variant_keys['cam'] = 'cam/image_array'
+                    for idx, img_path in enumerate(self.images):
+                        image_map[idx] = {'cam': img_path}
+
+            deleted_indexes = getattr(self, 'deleted_indexes', [])
+            diff_vectors = getattr(self, 'inference_diff_vectors', None)
+            waypoint_annotations = getattr(self, 'waypoint_annotations', None)
+
+            # 転送実行（認証済みのtransfer_managerを使用）
+            result = transfer_manager.transfer_annotations(
+                annotations=self.annotations,
+                inference_results=self.inference_results if hasattr(self, 'inference_results') else None,
+                image_map=image_map,
+                variant_keys=variant_keys,
+                zip_name=zip_name,
+                deleted_indexes=deleted_indexes,
+                diff_vectors=diff_vectors,
+                waypoint_annotations=waypoint_annotations,
+                generate_notebook=generate_notebook,
+                open_colab=open_colab,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check
+            )
+
+            progress.close()
+
+            if result['success']:
+                size_mb = result['zip_size'] / (1024 * 1024)
+                message = (
+                    f"Google Driveへの転送が完了しました。\n\n"
+                    f"アノテーション数: {result['annotation_count']}\n"
+                    f"ZIPサイズ: {size_mb:.2f} MB"
+                )
+                if 'colab_url' in result:
+                    message += f"\n\nColab URL:\n{result['colab_url']}"
+
+                QMessageBox.information(self, "転送完了", message)
+                self._update_colab_status_label()
+            else:
+                error_msg = result.get('error', '不明なエラー')
+                if 'キャンセル' in error_msg:
+                    QMessageBox.information(self, "転送キャンセル", "転送がキャンセルされました。")
+                else:
+                    QMessageBox.critical(
+                        self,
+                        "転送エラー",
+                        f"転送中にエラーが発生しました:\n\n{error_msg}"
+                    )
+
+        except ImportError as e:
+            progress.close()
+            QMessageBox.critical(
+                self,
+                "インポートエラー",
+                f"必要なライブラリがインストールされていません:\n\n{str(e)}\n\n"
+                "pip install pydrive2 google-auth google-auth-oauthlib pyyaml でインストールしてください。"
+            )
+        except Exception as e:
+            progress.close()
+            import traceback
+            QMessageBox.critical(
+                self,
+                "転送エラー",
+                f"転送中にエラーが発生しました:\n\n{str(e)}\n\n{traceback.format_exc()}"
+            )
+
+    def _download_model_from_colab(self):
+        """Colabで学習したモデルをGoogle Driveからダウンロード"""
+        # Colabモードが有効か確認
+        if not self._is_colab_enabled():
+            QMessageBox.warning(
+                self,
+                "Google Colab未有効",
+                "Google Colab連携が有効になっていません。\n\n"
+                "有効にするには環境変数を設定してください:\n"
+                "  COLAB_ENABLED=true\n"
+                "  GOOGLE_CLIENT_SECRETS=path/to/client_secrets.json"
+            )
+            return
+
+        try:
+            from utils.colab_transfer import ColabTransferManager
+
+            # 進捗ダイアログを表示
+            progress = QProgressDialog("Google Driveに接続中...", "キャンセル", 0, 100, self)
+            progress.setWindowTitle("モデル一覧を取得中")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(10)
+            progress.show()
+            QApplication.processEvents()
+
+            # モデル一覧を取得
+            transfer_manager = ColabTransferManager()
+            models = transfer_manager.list_models()
+
+            progress.close()
+
+            if not models:
+                QMessageBox.information(
+                    self,
+                    "モデルなし",
+                    "Google Driveにモデルファイルが見つかりませんでした。\n\n"
+                    "Colabでモデルを学習し、Google Driveに保存してください。"
+                )
+                return
+
+            # モデル選択ダイアログを表示
+            dialog = QDialog(self)
+            dialog.setWindowTitle("モデルをダウンロード")
+            dialog.setMinimumWidth(500)
+
+            layout = QVBoxLayout(dialog)
+
+            # 説明ラベル
+            info_label = QLabel(f"Google Drive上のモデル: {len(models)}件")
+            layout.addWidget(info_label)
+
+            # モデルリスト
+            list_widget = QListWidget()
+            for m in models:
+                size_mb = m['size'] / (1024 * 1024)
+                # 作成日時をフォーマット
+                created = m['createdDate'][:10] if m['createdDate'] else "不明"
+                item_text = f"{m['name']}  ({size_mb:.2f} MB, {created})"
+                item = QListWidgetItem(item_text)
+                item.setData(Qt.UserRole, m)
+                list_widget.addItem(item)
+
+            list_widget.setCurrentRow(0)
+            layout.addWidget(list_widget)
+
+            # 保存先
+            save_group = QGroupBox("保存先")
+            save_layout = QHBoxLayout()
+            save_path_edit = QLineEdit()
+            models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
+            save_path_edit.setText(models_dir)
+            save_path_edit.setReadOnly(True)
+            save_layout.addWidget(save_path_edit)
+
+            browse_button = QPushButton("参照...")
+            def browse_folder():
+                folder = QFileDialog.getExistingDirectory(dialog, "保存先フォルダを選択", models_dir)
+                if folder:
+                    save_path_edit.setText(folder)
+            browse_button.clicked.connect(browse_folder)
+            save_layout.addWidget(browse_button)
+            save_group.setLayout(save_layout)
+            layout.addWidget(save_group)
+
+            # MLflowデータダウンロードオプション
+            mlruns_checkbox = QCheckBox("MLflow実験データ(mlruns)もダウンロードしてマージする")
+            mlruns_checkbox.setChecked(True)
+            mlruns_checkbox.setToolTip("Colabで記録されたMLflow実験データをローカルにマージします")
+            layout.addWidget(mlruns_checkbox)
+
+            # ボタン
+            button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            button_box.accepted.connect(dialog.accept)
+            button_box.rejected.connect(dialog.reject)
+            layout.addWidget(button_box)
+
+            if dialog.exec_() != QDialog.Accepted:
+                return
+
+            # 選択されたモデルを取得
+            current_item = list_widget.currentItem()
+            if not current_item:
+                return
+
+            selected_model = current_item.data(Qt.UserRole)
+            save_dir = save_path_edit.text()
+            download_mlruns = mlruns_checkbox.isChecked()
+
+            # 同じ名前のモデルが既に存在するかチェック
+            local_path = os.path.join(save_dir, selected_model['name'])
+            if os.path.exists(local_path):
+                local_size = os.path.getsize(local_path)
+                remote_size = selected_model['size']
+
+                if local_size == remote_size:
+                    # ファイルサイズが一致 → 同一ファイルの可能性が高い
+                    reply = QMessageBox.question(
+                        self,
+                        "同名モデルが存在",
+                        f"同じ名前のモデルが既に存在します:\n"
+                        f"  {selected_model['name']}\n\n"
+                        f"ローカル: {local_size / (1024*1024):.2f} MB\n"
+                        f"リモート: {remote_size / (1024*1024):.2f} MB\n\n"
+                        f"ファイルサイズが同じため、同一のモデルと思われます。\n"
+                        f"ダウンロードをスキップしますか？",
+                        QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                        QMessageBox.Yes
+                    )
+                    if reply == QMessageBox.Cancel:
+                        return
+                    elif reply == QMessageBox.Yes:
+                        # スキップしてmlrunsのみダウンロード
+                        if download_mlruns:
+                            progress = QProgressDialog("MLflow実験データをダウンロード中...", "キャンセル", 0, 100, self)
+                            progress.setWindowTitle("ダウンロード中")
+                            progress.setWindowModality(Qt.WindowModal)
+                            progress.setMinimumDuration(0)
+                            progress.setValue(50)
+                            progress.show()
+                            QApplication.processEvents()
+
+                            try:
+                                mlruns_merged = self._download_and_merge_mlruns(transfer_manager, progress)
+                            except Exception as e:
+                                print(f"[Colab] mlrunsのダウンロードに失敗: {e}")
+                            progress.close()
+
+                        QMessageBox.information(
+                            self,
+                            "スキップ",
+                            f"モデルのダウンロードをスキップしました。\n"
+                            f"既存のモデルを使用: {local_path}"
+                        )
+                        return
+                    # Noの場合は上書きダウンロードを続行
+                else:
+                    # ファイルサイズが異なる → 異なるバージョン
+                    reply = QMessageBox.question(
+                        self,
+                        "同名モデルが存在",
+                        f"同じ名前のモデルが既に存在しますが、サイズが異なります:\n"
+                        f"  {selected_model['name']}\n\n"
+                        f"ローカル: {local_size / (1024*1024):.2f} MB\n"
+                        f"リモート: {remote_size / (1024*1024):.2f} MB\n\n"
+                        f"上書きダウンロードしますか？",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.No
+                    )
+                    if reply != QMessageBox.Yes:
+                        return
+
+            # ダウンロード実行
+            progress = QProgressDialog("モデルをダウンロード中...", "キャンセル", 0, 100, self)
+            progress.setWindowTitle("ダウンロード中")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(20)
+            progress.show()
+            QApplication.processEvents()
+
+            def download_progress(current, total):
+                if total > 0:
+                    percent = int((current / total) * 80) + 20
+                    progress.setValue(percent)
+                    progress.setLabelText(f"ダウンロード中: {current // (1024*1024)} MB / {total // (1024*1024)} MB")
+                    QApplication.processEvents()
+
+            result_path = transfer_manager.download_file(
+                selected_model['id'],
+                local_path,
+                progress_callback=download_progress
+            )
+
+            if result_path:
+                # mlrunsをダウンロードしてマージ
+                mlruns_merged = False
+                if download_mlruns:
+                    progress.setLabelText("MLflow実験データをダウンロード中...")
+                    progress.setValue(50)
+                    QApplication.processEvents()
+
+                    try:
+                        mlruns_merged = self._download_and_merge_mlruns(transfer_manager, progress)
+                    except Exception as e:
+                        print(f"[Colab] mlrunsのダウンロードに失敗: {e}")
+                        # mlrunsのエラーは警告のみで続行
+
+                progress.close()
+
+                # ダウンロード成功
+                message = f"モデルをダウンロードしました:\n{result_path}"
+                if mlruns_merged:
+                    message += "\n\nMLflow実験データもマージしました。"
+                message += "\n\nこのモデルを読み込みますか？"
+
+                reply = QMessageBox.question(
+                    self,
+                    "ダウンロード完了",
+                    message,
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+
+                if reply == QMessageBox.Yes:
+                    # モデルを読み込み
+                    self._load_downloaded_model(result_path)
+            else:
+                progress.close()
+                QMessageBox.warning(self, "エラー", "モデルのダウンロードに失敗しました。")
+
+        except Exception as e:
+            if 'progress' in locals():
+                progress.close()
+            import traceback
+            QMessageBox.critical(
+                self,
+                "エラー",
+                f"モデルのダウンロード中にエラーが発生しました:\n\n{str(e)}\n\n{traceback.format_exc()}"
+            )
+
+    def _download_and_merge_mlruns(self, transfer_manager, progress) -> bool:
+        """Colabからmlrunsをダウンロードしてローカルにマージ
+
+        Args:
+            transfer_manager: ColabTransferManagerインスタンス
+            progress: QProgressDialog
+
+        Returns:
+            マージ成功した場合True
+        """
+        import tempfile
+        import shutil
+
+        print("[Colab] mlrunsダウンロード開始...")
+
+        # Google Driveからmlrunsをダウンロード
+        temp_dir = tempfile.mkdtemp(prefix="mlruns_download_")
+
+        try:
+            def mlruns_progress(filename, current, total):
+                progress.setLabelText(f"MLflow実験データをダウンロード中: {filename}")
+                if total > 0:
+                    percent = 50 + int((current / total) * 30)
+                    progress.setValue(percent)
+                QApplication.processEvents()
+
+            # ローカルのmlrunsパスを取得
+            local_mlruns = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mlruns')
+
+            download_result = transfer_manager.download_mlruns(
+                local_dir=temp_dir,
+                progress_callback=mlruns_progress,
+                compare_with_local=local_mlruns  # ローカルのmlrunsと比較してスキップ
+            )
+
+            if not download_result:
+                print("[Colab] mlrunsフォルダが見つかりませんでした")
+                return False
+
+            remote_mlruns = download_result['path']
+            downloaded = download_result['downloaded']
+            skipped = download_result['skipped']
+            total = download_result['total']
+
+            # スキップ情報を表示
+            if skipped > 0:
+                if downloaded == 0:
+                    print(f"[Colab] 全ファイルが既にダウンロード済みです ({skipped}件)")
+                else:
+                    print(f"[Colab] ダウンロード: {downloaded}件, スキップ: {skipped}件 (既存)")
+
+            # マージ処理
+            progress.setLabelText("MLflow実験データをマージ中...")
+            progress.setValue(85)
+            QApplication.processEvents()
+
+            merged_count = self._merge_mlruns_folders(remote_mlruns, local_mlruns)
+
+            print(f"[Colab] mlrunsマージ完了: {merged_count}件の実験データをマージ")
+            progress.setValue(95)
+            QApplication.processEvents()
+
+            return merged_count > 0
+
+        except Exception as e:
+            print(f"[Colab] mlrunsマージエラー: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+        finally:
+            # 一時ディレクトリをクリーンアップ
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception as e:
+                print(f"[Colab] 一時ディレクトリの削除に失敗: {e}")
+
+    def _merge_mlruns_folders(self, source_mlruns: str, dest_mlruns: str) -> int:
+        """mlrunsフォルダをマージ
+
+        Args:
+            source_mlruns: マージ元のmlrunsパス（Colabからダウンロードしたもの）
+            dest_mlruns: マージ先のmlrunsパス（ローカル）
+
+        Returns:
+            マージされた実験数
+        """
+        import shutil
+
+        # ローカルのmlrunsがなければ作成
+        os.makedirs(dest_mlruns, exist_ok=True)
+
+        merged_count = 0
+
+        # source_mlruns内の実験フォルダを取得
+        if not os.path.exists(source_mlruns):
+            return 0
+
+        for item in os.listdir(source_mlruns):
+            source_item = os.path.join(source_mlruns, item)
+
+            # .trashフォルダはスキップ
+            if item == '.trash':
+                continue
+
+            if os.path.isdir(source_item):
+                dest_item = os.path.join(dest_mlruns, item)
+
+                if item == 'models':
+                    # modelsフォルダは特別扱い（上書きマージ）
+                    if os.path.exists(dest_item):
+                        # 既存のmodelsフォルダに追加
+                        for model_file in os.listdir(source_item):
+                            src_model = os.path.join(source_item, model_file)
+                            dst_model = os.path.join(dest_item, model_file)
+                            if not os.path.exists(dst_model):
+                                if os.path.isdir(src_model):
+                                    shutil.copytree(src_model, dst_model)
+                                else:
+                                    shutil.copy2(src_model, dst_model)
+                    else:
+                        shutil.copytree(source_item, dest_item)
+                    continue
+
+                # 実験フォルダ（数字のID）
+                if os.path.exists(dest_item):
+                    # 既存の実験フォルダがある場合、run単位でマージ
+                    for run_id in os.listdir(source_item):
+                        src_run = os.path.join(source_item, run_id)
+                        dst_run = os.path.join(dest_item, run_id)
+
+                        if os.path.isdir(src_run) and not os.path.exists(dst_run):
+                            # 新しいrunをコピー
+                            shutil.copytree(src_run, dst_run)
+                            print(f"[Colab] run追加: {item}/{run_id}")
+                            merged_count += 1
+                        elif run_id == 'meta.yaml' and not os.path.exists(dst_run):
+                            # meta.yamlをコピー
+                            shutil.copy2(src_run, dst_run)
+                else:
+                    # 新しい実験フォルダをそのままコピー
+                    shutil.copytree(source_item, dest_item)
+                    # run数をカウント
+                    runs = [d for d in os.listdir(dest_item) if os.path.isdir(os.path.join(dest_item, d))]
+                    merged_count += len(runs)
+                    print(f"[Colab] 実験追加: {item} ({len(runs)} runs)")
+
+        return merged_count
+
+    def _load_downloaded_model(self, model_path: str):
+        """ダウンロードしたモデルを読み込む"""
+        try:
+            import torch
+
+            # モデルをロード
+            checkpoint = torch.load(model_path, map_location='cpu')
+
+            # configを取得
+            if 'config' in checkpoint:
+                config = checkpoint['config']
+                model_name = config.get('model_name', config.get('backbone', 'unknown'))
+                print(f"[Colab] モデルを読み込みました: {model_name}")
+
+                QMessageBox.information(
+                    self,
+                    "モデル読み込み完了",
+                    f"モデルを保存しました:\n\n"
+                    f"ファイル: {os.path.basename(model_path)}\n"
+                    f"モデル: {model_name}\n\n"
+                    "「モデル読込」ボタンから推論に使用できます。"
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "モデル保存完了",
+                    f"モデルファイルを保存しました:\n{model_path}\n\n"
+                    "「モデル読込」ボタンから読み込んでください。"
+                )
+
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "確認エラー",
+                f"モデルの確認に失敗しました:\n{str(e)}\n\n"
+                "ファイルは保存されています。「モデル読込」ボタンから読み込んでください。"
+            )
+
+    def _show_colab_settings(self):
+        """Colab設定ダイアログを表示"""
+        try:
+            from config_colab import (
+                COLAB_ENABLED, GOOGLE_CLIENT_SECRETS,
+                COLAB_DRIVE_FOLDER_NAME, get_colab_status, get_env_template,
+                get_oauth_setup_guide
+            )
+            config_available = True
+        except ImportError:
+            config_available = False
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Google Colab設定")
+        dialog.setMinimumWidth(600)
+        layout = QVBoxLayout(dialog)
+
+        # 現在の状態を表示
+        status_group = QGroupBox("接続状態")
+        status_layout = QVBoxLayout()
+
+        if config_available:
+            status = get_colab_status()
+            status_text = f"状態: {status['status']}\n{status['message']}"
+        else:
+            status_text = "config_colab.py が見つかりません"
+
+        status_label = QLabel(status_text)
+        status_label.setWordWrap(True)
+        status_layout.addWidget(status_label)
+        status_group.setLayout(status_layout)
+        layout.addWidget(status_group)
+
+        # 設定方法を表示（タブで切り替え）
+        tab_widget = QTabWidget()
+
+        # 環境変数タブ
+        env_tab = QWidget()
+        env_layout = QVBoxLayout(env_tab)
+        env_text = QPlainTextEdit()
+        env_text.setReadOnly(True)
+        if config_available:
+            env_text.setPlainText(get_env_template())
+        else:
+            env_text.setPlainText("config_colab.py が見つかりません")
+        env_text.setMinimumHeight(150)
+        env_layout.addWidget(env_text)
+
+        # コピーボタン
+        if config_available:
+            copy_env_button = QPushButton("環境変数テンプレートをコピー")
+            copy_env_button.clicked.connect(lambda: self._copy_env_template(get_env_template()))
+            env_layout.addWidget(copy_env_button)
+
+        tab_widget.addTab(env_tab, "環境変数")
+
+        # OAuth設定ガイドタブ
+        oauth_tab = QWidget()
+        oauth_layout = QVBoxLayout(oauth_tab)
+        oauth_text = QPlainTextEdit()
+        oauth_text.setReadOnly(True)
+        if config_available:
+            oauth_text.setPlainText(get_oauth_setup_guide())
+        else:
+            oauth_text.setPlainText(
+                "Google Colab連携を有効にするには、以下の手順を実行してください:\n\n"
+                "1. Google Cloud Consoleでプロジェクトを作成\n"
+                "2. Google Drive APIを有効化\n"
+                "3. OAuth 2.0クライアントIDを作成し、client_secrets.jsonをダウンロード\n"
+                "4. 環境変数を設定:\n"
+                "   COLAB_ENABLED=true\n"
+                "   GOOGLE_CLIENT_SECRETS=path/to/client_secrets.json"
+            )
+        oauth_text.setMinimumHeight(200)
+        oauth_layout.addWidget(oauth_text)
+        tab_widget.addTab(oauth_tab, "OAuth設定ガイド")
+
+        layout.addWidget(tab_widget)
+
+        # 認証テストボタン
+        if config_available and COLAB_ENABLED:
+            test_button = QPushButton("接続テスト")
+            test_button.clicked.connect(lambda: self._test_colab_connection(dialog))
+            layout.addWidget(test_button)
+
+        # 閉じるボタン
+        close_button = QPushButton("閉じる")
+        close_button.clicked.connect(dialog.accept)
+        layout.addWidget(close_button)
+
+        dialog.exec_()
+
+    def _test_colab_connection(self, parent_dialog):
+        """Google Drive接続テスト"""
+        try:
+            from utils.colab_transfer import ColabTransferManager
+
+            # 認証が必要な場合の事前通知
+            try:
+                from config_colab import GOOGLE_CREDENTIALS_PATH
+                import os
+                if not os.path.exists(GOOGLE_CREDENTIALS_PATH):
+                    reply = QMessageBox.question(
+                        parent_dialog,
+                        "認証が必要",
+                        "初回接続のため、ブラウザでGoogleアカウント認証が必要です。\n\n"
+                        "ブラウザが開いたら、Googleアカウントを選択して認証を完了してください。\n"
+                        "（タイムアウト: 60秒）\n\n"
+                        "続行しますか？",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.Yes
+                    )
+                    if reply != QMessageBox.Yes:
+                        return
+            except ImportError:
+                pass
+
+            # 進捗表示
+            parent_dialog.setEnabled(False)
+            self.statusBar().showMessage("Google認証中... ブラウザで認証を完了してください（タイムアウト: 60秒）")
+            QApplication.processEvents()
+
+            manager = ColabTransferManager()
+            success, message = manager.test_connection()
+
+            parent_dialog.setEnabled(True)
+            self.statusBar().clearMessage()
+
+            if success:
+                QMessageBox.information(parent_dialog, "接続テスト", message)
+            else:
+                QMessageBox.warning(parent_dialog, "接続テスト", message)
+
+            # ステータスを更新
+            self._update_colab_status_label()
+
+        except ImportError as e:
+            parent_dialog.setEnabled(True)
+            self.statusBar().clearMessage()
+            QMessageBox.critical(
+                parent_dialog,
+                "インポートエラー",
+                f"必要なライブラリがインストールされていません:\n\n{str(e)}\n\n"
+                "pip install pydrive2 google-auth google-auth-oauthlib pyyaml でインストールしてください。"
+            )
+        except TimeoutError as e:
+            parent_dialog.setEnabled(True)
+            self.statusBar().clearMessage()
+            QMessageBox.warning(
+                parent_dialog,
+                "認証タイムアウト",
+                f"{str(e)}\n\n"
+                "ブラウザを閉じた場合や、認証に時間がかかりすぎた場合に発生します。\n"
+                "再度「接続テスト」ボタンをクリックしてお試しください。"
+            )
+        except Exception as e:
+            parent_dialog.setEnabled(True)
+            self.statusBar().clearMessage()
+            import traceback
+            QMessageBox.critical(
+                parent_dialog,
+                "接続テストエラー",
+                f"接続テスト中にエラーが発生しました:\n\n{str(e)}"
+            )
 
     def toggle_dark_mode(self):
         """ダークモードを切り替える"""

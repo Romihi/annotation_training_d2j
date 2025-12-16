@@ -164,6 +164,12 @@
 - **セッション管理**: アノテーションセッションの保存と復元
 - **拡張プレビュー**: トレーニング前に拡張効果を確認
 
+### クラウド連携
+- **Google Colab連携**: アノテーションデータをGoogle Driveに転送し、Colabで学習を実行
+  - 詳細は [README_COLAB.md](README_COLAB.md) を参照
+- **Databricks連携**: アノテーションデータをDatabricksに転送し、クラスタで学習を実行
+  - 詳細は [README_DATABRICKS.md](README_DATABRICKS.md) を参照
+
 ## 要件
 
 - Python 3.7以上
