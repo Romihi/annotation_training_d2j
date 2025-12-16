@@ -130,37 +130,37 @@ COLOR_BLACK = (0, 0, 0)
 
 # クラス別色（バウンディングボックス）
 CLASS_COLORS = {
-    'car': COLOR_RED,
-    'person': COLOR_GREEN,
-    'sign': COLOR_BLUE,
-    'cone': COLOR_YELLOW,
+    'car': COLOR_BLUE,
+    'red_sign': COLOR_RED,
+    'green_sign': COLOR_GREEN,
+    'dog': COLOR_YELLOW,
     'unknown': COLOR_GRAY
 }
 
 # クラス別色（セグメンテーション）
 SEGMENTATION_CLASS_COLORS = {
-    'car': (255, 0, 0, 120),
-    'person': (0, 255, 0, 120),
-    'sign': (0, 0, 255, 120),
-    'cone': (255, 255, 0, 120),
+    'car': (0, 0, 255, 120),
+    'red_sign': (255, 0, 0, 120),
+    'green_sign': (0, 255, 0, 120),
+    'dog': (255, 255, 0, 120),
     'unknown': (128, 128, 128, 120)
 }
 
 # 推論結果色（物体検知）
 DETECTION_INFERENCE_CLASS_COLORS = {
-    'car': (255, 0, 0, 120),
-    'person': (0, 255, 0, 120),
-    'sign': (0, 0, 255, 120),
-    'cone': (255, 255, 0, 120),
+    'car': (0, 0, 255, 120),
+    'red_sign': (255, 0, 0, 120),
+    'green_sign': (0, 255, 0, 120),
+    'dog': (255, 255, 0, 120),
     'unknown': (128, 128, 128, 120)
 }
 
 # 推論結果色（文字表示用）
 DETECTION_INFERENCE_TEXT_COLORS = {
-    'car': "#FF0000",
-    'person': "#00FF00",
-    'sign': "#0000FF",
-    'cone': "#FFFF00",
+    'car': "#0000FF",
+    'red_sign': "#FF0000",
+    'green_sign': "#00FF00",
+    'dog': "#FFFF00",
     'unknown': "#808080"
 }
 

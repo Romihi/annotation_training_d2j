@@ -3829,9 +3829,9 @@ class ImageAnnotationTool(QMainWindow):
         class_label.setMinimumWidth(70)  # ラベルの最小幅を設定
         classes_layout.addWidget(class_label)
         
-        self.classes_input = QLineEdit("car,person,sign,cone")
+        self.classes_input = QLineEdit("car,red_sign,green_sign,dog")
         self.classes_input.setPlaceholderText("カンマ区切りでクラス名を入力")
-        self.classes_input.setToolTip("例: car,person,wall,crossroad,sign")
+        self.classes_input.setToolTip("例: car,red_sign,green_sign,dog")
         self.classes_input.setMinimumWidth(200)  # 入力フィールドの最小幅を設定（拡張）
         self.classes_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)  # 横は拡張、縦は固定
         classes_layout.addWidget(self.classes_input)
@@ -9062,7 +9062,7 @@ class ImageAnnotationTool(QMainWindow):
         
         classes_layout = QHBoxLayout()
         classes_layout.addWidget(QLabel("検知クラス:"))
-        classes_input = QLineEdit("car,person,sign,cone")
+        classes_input = QLineEdit("car,red_sign,green_sign,dog")
         classes_input.setPlaceholderText("カンマ区切りでクラス名を入力")
         classes_layout.addWidget(classes_input)
         class_layout.addLayout(classes_layout)
@@ -9983,8 +9983,8 @@ class ImageAnnotationTool(QMainWindow):
     #         text, ok = QInputDialog.getText(
     #             self, 
     #             "クラス情報", 
-    #             "クラス名をカンマで区切って入力してください（例: car,person,sign,cone）:",
-    #             text=self.classes_input.text() if hasattr(self, 'classes_input') else "car,person,sign,cone"
+    #             "クラス名をカンマで区切って入力してください（例: car,red_sign,green_sign,dog）:",
+    #             text=self.classes_input.text() if hasattr(self, 'classes_input') else "car,red_sign,green_sign,dog"
     #         )
             
     #         if ok and text:
@@ -10198,14 +10198,14 @@ class ImageAnnotationTool(QMainWindow):
 
     def _get_classes_from_user(self):
         """ユーザーからクラス情報を取得"""
-        default_classes = "car,person,sign,cone"
+        default_classes = "car,red_sign,green_sign,dog"
         if hasattr(self, 'classes_input') and self.classes_input.text():
             default_classes = self.classes_input.text()
         
         text, ok = QInputDialog.getText(
-            self, 
-            "クラス情報", 
-            "クラス名をカンマで区切って入力してください（例: car,person,sign,cone）:",
+            self,
+            "クラス情報",
+            "クラス名をカンマで区切って入力してください（例: car,red_sign,green_sign,dog）:",
             text=default_classes
         )
         
@@ -10519,10 +10519,14 @@ class ImageAnnotationTool(QMainWindow):
         if hasattr(self, 'main_image_view'):
             self.main_image_view.update()
         
-        # クラス情報を更新（アプリにクラス設定機能がある場合）
-        if hasattr(self, 'update_class_list'):
-            self.update_class_list(classes)
-        
+        # クラス情報をGUIに反映
+        if hasattr(self, 'classes_input') and classes:
+            classes_str = ','.join(classes)
+            self.classes_input.setText(classes_str)
+            # クラス色を初期化して反映
+            self._apply_class_changes(classes)
+            print(f"[YOLOアノテーション読み込み] クラス情報を反映: {classes_str}")
+
         # 読み込み完了をログに記録
         print(f"YOLOアノテーション読み込み完了: ズーム係数={self.get_current_zoom_factor()}")
         
