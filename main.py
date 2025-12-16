@@ -40,10 +40,10 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                             QLabel, QPushButton, QFileDialog, QMessageBox,
                             QScrollArea, QGridLayout, QFrame, QLineEdit, QProgressDialog,
                             QCheckBox, QSpinBox, QComboBox, QSlider, QInputDialog,
-                            QDoubleSpinBox, QDialog, QDialogButtonBox,
+                            QDoubleSpinBox, QDialog, QDialogButtonBox, QFormLayout,
                             QGroupBox, QRadioButton, QTabWidget, QSizePolicy,QButtonGroup,
                             QListView, QTreeView, QAbstractItemView,QStyleOptionSlider,QStyle, QTextEdit, QPlainTextEdit,
-                            QGraphicsOpacityEffect)
+                            QGraphicsOpacityEffect, QListWidget, QListWidgetItem)
 from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont, QPolygon, QCursor
 from PyQt5.QtCore import Qt, QRect, QPoint, QTimer, QEvent, QThread, pyqtSignal
 
@@ -78,6 +78,7 @@ from styles import get_location_color, apply_style, set_theme, get_current_theme
 
 from managers import AnnotationDataManager, MLflowManager, ModelType
 from utils.yolo_utils import train_yolo_with_ui, TrainingOutputDialog
+from utils.databricks_transfer import DatabricksTransferManager
 
 import traceback
 def exception_hook(exc_type, exc_value, exc_traceback):
@@ -168,12 +169,13 @@ class ImageLabel(QLabel):
         # 将来アノテーション表示
         self.show_future_annotations = True  # デフォルトON
 
-        # GradCAM表示関連
-        self.show_gradcam = False  # GradCAM表示フラグ
-        self.gradcam_overlay = None  # GradCAMオーバーレイ画像 (QPixmap)
-        self.gradcam_alpha = 0.5  # GradCAMの透明度
-        self.gradcam_target = 'angle'  # GradCAM対象出力 ('angle', 'throttle', 'speed')
-        self.gradcam_method = 'gradcam'  # CAM手法 ('gradcam', 'gradcam++', 'eigencam', 'layercam')
+        # CAM表示関連
+        self.show_gradcam = False  # CAM表示フラグ
+        self.gradcam_overlay = None  # CAMオーバーレイ画像 (QPixmap)
+        self.gradcam_alpha = 0.5  # CAMの透明度
+        self.gradcam_target = 'angle'  # CAM対象出力 ('angle', 'throttle', 'speed')
+        self.gradcam_method = 'gradcam'  # CAM手法 ('gradcam', 'gradcam++', 'eigencam', 'layercam', 'scorecam')
+        self.gradcam_direction = 'both'  # 勾配方向 ('both', 'positive', 'negative')
 
     def add_point_to_polygon(self, polygon_index, x, y):
         """指定されたポリゴンに新しい点を追加する"""
@@ -460,7 +462,7 @@ class ImageLabel(QLabel):
 
         self.draw_initial_frame(painter)
 
-        # GradCAMオーバーレイを描画（ベース画像の上、他のアノテーションの下）
+        # CAMオーバーレイを描画（ベース画像の上、他のアノテーションの下）
         self.draw_gradcam_overlay(painter, self.target_rect)
 
         # 各機能毎に描画（描画順序を調整）
@@ -503,11 +505,11 @@ class ImageLabel(QLabel):
         painter.drawPixmap(self.target_rect, self.pixmap())
 
     def draw_gradcam_overlay(self, painter, target_rect):
-        """GradCAMヒートマップオーバーレイを描画"""
+        """CAMヒートマップオーバーレイを描画"""
         if not self.show_gradcam or self.gradcam_overlay is None:
             return
 
-        # GradCAMオーバーレイをtarget_rectにスケーリングして描画
+        # CAMオーバーレイをtarget_rectにスケーリングして描画
         # アルファチャンネルは既に画像に含まれているのでそのまま描画
         painter.drawPixmap(target_rect, self.gradcam_overlay)
 
@@ -3514,6 +3516,9 @@ class ImageAnnotationTool(QMainWindow):
         # セッション復元チェックを遅延実行（UIが完全に表示された後）
         QTimer.singleShot(500, self.add_session_check_to_init_ui)
 
+        # Databricks接続確認を遅延実行
+        QTimer.singleShot(1000, self._check_databricks_connection_on_startup)
+
         QApplication.instance().installEventFilter(self)
 
     def init_ui(self):
@@ -3712,9 +3717,9 @@ class ImageAnnotationTool(QMainWindow):
 
         pilot_layout.addLayout(inference_layout)
 
-        # 差分ベクトル矢印表示オプション
+        # 差分ベクトル表示オプション
         diff_vector_layout = QHBoxLayout()
-        self.diff_vector_checkbox = QCheckBox("差分ベクトル矢印表示（緑矢印）")
+        self.diff_vector_checkbox = QCheckBox("差分ベクトル表示（緑矢印）")
         self.diff_vector_checkbox.setChecked(False)
         self.diff_vector_checkbox.setEnabled(False)  # 初期状態は無効
         self.diff_vector_checkbox.setToolTip("自動運転モデルが読み込まれていません")
@@ -3723,34 +3728,66 @@ class ImageAnnotationTool(QMainWindow):
 
         pilot_layout.addLayout(diff_vector_layout)
 
-        # GradCAM表示オプション
-        gradcam_layout = QHBoxLayout()
-        self.gradcam_checkbox = QCheckBox("GradCAM表示")
+        # CAM表示オプション - 2行レイアウト
+        gradcam_container = QVBoxLayout()
+
+        # 1行目: CAMチェックボックス + 手法選択
+        gradcam_row1 = QHBoxLayout()
+        self.gradcam_checkbox = QCheckBox("CAM")
         self.gradcam_checkbox.setChecked(False)
         self.gradcam_checkbox.setEnabled(False)  # 初期状態は無効
         self.gradcam_checkbox.setToolTip("自動運転モデルが読み込まれていません")
         self.gradcam_checkbox.stateChanged.connect(self.toggle_gradcam_display)
-        gradcam_layout.addWidget(self.gradcam_checkbox)
+        gradcam_row1.addWidget(self.gradcam_checkbox)
 
-        # GradCAM対象選択
+        gradcam_method_label = QLabel("手法:")
+        gradcam_row1.addWidget(gradcam_method_label)
+
+        self.gradcam_method_combo = QComboBox()
+        self.gradcam_method_combo.addItems(["gradcam", "gradcam++", "eigencam", "layercam", "scorecam"])
+        self.gradcam_method_combo.setCurrentText("gradcam")
+        self.gradcam_method_combo.setEnabled(False)
+        self.gradcam_method_combo.setToolTip("CAM可視化手法を選択\nScoreCAM: 勾配を使わない高精度手法（計算時間長め）")
+        self.gradcam_method_combo.currentTextChanged.connect(self.change_gradcam_method)
+        gradcam_row1.addWidget(self.gradcam_method_combo)
+
+        gradcam_row1.addStretch()
+        gradcam_container.addLayout(gradcam_row1)
+
+        # 2行目: 対象選択 + 方向選択
+        gradcam_row2 = QHBoxLayout()
+
+        gradcam_target_label = QLabel("対象:")
+        gradcam_row2.addWidget(gradcam_target_label)
+
         self.gradcam_target_combo = QComboBox()
         self.gradcam_target_combo.addItems(["angle", "throttle", "speed"])
         self.gradcam_target_combo.setCurrentText("angle")
         self.gradcam_target_combo.setEnabled(False)
-        self.gradcam_target_combo.setToolTip("GradCAMで可視化する出力を選択")
+        self.gradcam_target_combo.setToolTip("CAMで可視化する出力を選択")
         self.gradcam_target_combo.currentTextChanged.connect(self.change_gradcam_target)
-        gradcam_layout.addWidget(self.gradcam_target_combo)
+        gradcam_row2.addWidget(self.gradcam_target_combo)
 
-        # CAM手法選択
-        self.gradcam_method_combo = QComboBox()
-        self.gradcam_method_combo.addItems(["gradcam", "gradcam++", "eigencam", "layercam"])
-        self.gradcam_method_combo.setCurrentText("gradcam")
-        self.gradcam_method_combo.setEnabled(False)
-        self.gradcam_method_combo.setToolTip("CAM可視化手法を選択")
-        self.gradcam_method_combo.currentTextChanged.connect(self.change_gradcam_method)
-        gradcam_layout.addWidget(self.gradcam_method_combo)
+        gradcam_direction_label = QLabel("方向:")
+        gradcam_row2.addWidget(gradcam_direction_label)
 
-        pilot_layout.addLayout(gradcam_layout)
+        self.gradcam_direction_combo = QComboBox()
+        self.gradcam_direction_combo.addItems(["both", "positive", "negative"])
+        self.gradcam_direction_combo.setCurrentText("both")
+        self.gradcam_direction_combo.setEnabled(False)
+        self.gradcam_direction_combo.setToolTip(
+            "可視化する勾配の方向\n"
+            "both: 正負両方を同時表示（赤=正/青=負）\n"
+            "positive: 出力を増加させる根拠（右に切る/加速）\n"
+            "negative: 出力を減少させる根拠（左に切る/減速）"
+        )
+        self.gradcam_direction_combo.currentTextChanged.connect(self.change_gradcam_direction)
+        gradcam_row2.addWidget(self.gradcam_direction_combo)
+
+        gradcam_row2.addStretch()
+        gradcam_container.addLayout(gradcam_row2)
+
+        pilot_layout.addLayout(gradcam_container)
 
         left_layout.addWidget(self.pilot_container)
                     
@@ -3890,22 +3927,128 @@ class ImageAnnotationTool(QMainWindow):
         # 物体検知コンテナを追加
         left_layout.addWidget(self.object_detection_container)
 
-        # --- MLflow関連ボタンを追加 ---
-        mlflow_layout = QVBoxLayout()
+        # --- モデル管理セクション ---
+        model_mgmt_layout = QVBoxLayout()
 
-        mlflow_label = QLabel("モデル管理（mlflow/databricks）:")
-        mlflow_label.setStyleSheet("font-weight: bold;") 
-        mlflow_layout.addWidget(mlflow_label)
+        model_mgmt_label = QLabel("モデル管理やクラウド学習:")
+        model_mgmt_label.setStyleSheet("font-weight: bold;")
+        model_mgmt_layout.addWidget(model_mgmt_label)
 
-        # MLflow比較ボタン
-        mlflow_compare_button = QPushButton("Mlflowを開く")
-        apply_style(mlflow_compare_button, 'special')
+        # --- 1. MLflow（ローカル）セクション ---
+        mlflow_section_layout = QHBoxLayout()
 
-        mlflow_compare_button.clicked.connect(self.mlflow_manager.open_ui)
-        #mlflow_compare_button.clicked.connect(self.compare_models_mlflow)
-        mlflow_layout.addWidget(mlflow_compare_button)
+        mlflow_local_label = QLabel("MLflow（ローカル）:")
+        mlflow_section_layout.addWidget(mlflow_local_label)
 
-        left_layout.addLayout(mlflow_layout)
+        # MLflowを開くボタン
+        mlflow_open_button = QPushButton("MLflowを開く")
+        apply_style(mlflow_open_button, 'special')
+        mlflow_open_button.clicked.connect(self._open_local_mlflow_ui)
+        mlflow_open_button.setToolTip("ローカルMLflow UIを起動")
+        mlflow_section_layout.addWidget(mlflow_open_button)
+
+        mlflow_section_layout.addStretch()
+        model_mgmt_layout.addLayout(mlflow_section_layout)
+
+        # --- 2. Databricksセクション ---
+        # Databricks連携チェックボックスとステータス
+        databricks_header_layout = QHBoxLayout()
+
+        self.databricks_checkbox = QCheckBox("Databricks連携")
+        self.databricks_checkbox.setChecked(self.mlflow_manager.use_databricks)
+        self.databricks_checkbox.stateChanged.connect(self._on_databricks_toggle)
+        databricks_header_layout.addWidget(self.databricks_checkbox)
+
+        self.databricks_status_label = QLabel()
+        self._update_databricks_status_label()
+        databricks_header_layout.addWidget(self.databricks_status_label)
+
+        databricks_header_layout.addStretch()
+        model_mgmt_layout.addLayout(databricks_header_layout)
+
+        # Databricksボタン（開く、同期、設定を横並び）
+        databricks_buttons_layout = QHBoxLayout()
+
+        # Databricksを開くボタン
+        databricks_open_button = QPushButton("Databricksを開く")
+        apply_style(databricks_open_button, 'special')
+        databricks_open_button.clicked.connect(self._open_databricks_ui)
+        databricks_open_button.setToolTip("Databricks MLflow UIを開く")
+        databricks_buttons_layout.addWidget(databricks_open_button)
+
+        # 同期ボタン
+        self.databricks_sync_button = QPushButton("同期")
+        apply_style(self.databricks_sync_button, 'special')
+        self.databricks_sync_button.clicked.connect(self._sync_to_databricks)
+        self.databricks_sync_button.setToolTip("ローカルの学習記録をDatabricksにアップロード")
+        databricks_buttons_layout.addWidget(self.databricks_sync_button)
+
+        # データ転送ボタン
+        self.databricks_transfer_button = QPushButton("転送")
+        apply_style(self.databricks_transfer_button, 'special')
+        self.databricks_transfer_button.clicked.connect(self._transfer_to_databricks)
+        self.databricks_transfer_button.setToolTip("現在のアノテーションをDatabricksに転送")
+        databricks_buttons_layout.addWidget(self.databricks_transfer_button)
+
+        # 設定ボタン
+        databricks_settings_button = QPushButton("設定")
+        databricks_settings_button.setMaximumWidth(60)
+        apply_style(databricks_settings_button, 'special')
+        databricks_settings_button.clicked.connect(self._show_databricks_settings)
+        databricks_buttons_layout.addWidget(databricks_settings_button)
+
+        model_mgmt_layout.addLayout(databricks_buttons_layout)
+
+        # --- 3. Google Colabセクション ---
+        # Colab連携チェックボックスとステータス
+        colab_header_layout = QHBoxLayout()
+
+        self.colab_checkbox = QCheckBox("Google Colab連携")
+        self.colab_checkbox.setChecked(self._is_colab_enabled())
+        self.colab_checkbox.stateChanged.connect(self._on_colab_toggle)
+        colab_header_layout.addWidget(self.colab_checkbox)
+
+        self.colab_status_label = QLabel()
+        self._update_colab_status_label()
+        colab_header_layout.addWidget(self.colab_status_label)
+
+        colab_header_layout.addStretch()
+        model_mgmt_layout.addLayout(colab_header_layout)
+
+        # Colabボタン（開く、転送、設定を横並び）
+        colab_buttons_layout = QHBoxLayout()
+
+        # Colabを開くボタン
+        colab_open_button = QPushButton("Colabを開く")
+        apply_style(colab_open_button, 'special')
+        colab_open_button.clicked.connect(self._open_colab_ui)
+        colab_open_button.setToolTip("Google Colabをブラウザで開く")
+        colab_buttons_layout.addWidget(colab_open_button)
+
+        # データ転送ボタン
+        self.colab_transfer_button = QPushButton("転送")
+        apply_style(self.colab_transfer_button, 'special')
+        self.colab_transfer_button.clicked.connect(self._transfer_to_colab)
+        self.colab_transfer_button.setToolTip("現在のアノテーションをGoogle Driveに転送してColabで学習")
+        colab_buttons_layout.addWidget(self.colab_transfer_button)
+
+        # モデル取得ボタン
+        self.colab_download_button = QPushButton("取得")
+        apply_style(self.colab_download_button, 'special')
+        self.colab_download_button.clicked.connect(self._download_model_from_colab)
+        self.colab_download_button.setToolTip("Colabで学習したモデルをGoogle Driveからダウンロード")
+        colab_buttons_layout.addWidget(self.colab_download_button)
+
+        # 設定ボタン
+        colab_settings_button = QPushButton("設定")
+        colab_settings_button.setMaximumWidth(60)
+        apply_style(colab_settings_button, 'special')
+        colab_settings_button.clicked.connect(self._show_colab_settings)
+        colab_buttons_layout.addWidget(colab_settings_button)
+
+        model_mgmt_layout.addLayout(colab_buttons_layout)
+
+        left_layout.addLayout(model_mgmt_layout)
 
         # --- 表示設定ボタンを追加 ---
         settings_layout = QVBoxLayout()
@@ -6702,19 +6845,21 @@ class ImageAnnotationTool(QMainWindow):
                 self.batch_inference_button.setEnabled(False)
                 self.batch_inference_button.setToolTip("自動運転モデルが読み込まれていません")
 
-        # GradCAM表示（自動運転モデルに依存）
+        # CAM表示（自動運転モデルに依存）
         if hasattr(self, 'gradcam_checkbox'):
             if hasattr(self, 'model') and self.model is not None:
                 self.gradcam_checkbox.setEnabled(True)
                 self.gradcam_checkbox.setToolTip("モデルの注目領域をヒートマップで表示")
                 self.gradcam_target_combo.setEnabled(True)
                 self.gradcam_method_combo.setEnabled(True)
+                self.gradcam_direction_combo.setEnabled(True)
             else:
                 self.gradcam_checkbox.setEnabled(False)
                 self.gradcam_checkbox.setChecked(False)
                 self.gradcam_checkbox.setToolTip("自動運転モデルが読み込まれていません")
                 self.gradcam_target_combo.setEnabled(False)
                 self.gradcam_method_combo.setEnabled(False)
+                self.gradcam_direction_combo.setEnabled(False)
 
     def add_segmentation_annotation(self, polygon_data):
         """セグメンテーションアノテーションを追加"""
@@ -11400,6 +11545,1631 @@ class ImageAnnotationTool(QMainWindow):
             except Exception as e:
                 print(f"表示設定の読み込みエラー: {e}")
 
+    # ===========================================
+    # Databricks連携機能
+    # ===========================================
+
+    def _check_databricks_connection_on_startup(self):
+        """起動時にDatabricks接続を確認"""
+        try:
+            # Databricks連携が有効な場合のみ接続確認
+            if self.mlflow_manager.use_databricks:
+                print("起動時Databricks接続確認中...")
+
+                # 接続を試みる（ダイアログなしでバックグラウンドで実行）
+                self.mlflow_manager.is_initialized = False
+                success = self.mlflow_manager.initialize(self.mlflow_manager.folder_path, parent_widget=None)
+
+                if self.mlflow_manager._databricks_connected:
+                    print("Databricks接続成功")
+                else:
+                    print("Databricks接続失敗 - ローカルモードで動作")
+
+                # ステータスラベルを更新
+                self._update_databricks_status_label()
+        except Exception as e:
+            print(f"起動時Databricks接続確認エラー: {e}")
+
+    def _on_databricks_toggle(self, state):
+        """Databricks連携のON/OFF切り替え"""
+        enabled = state == Qt.Checked
+
+        # MLflowManagerのモードを切り替え
+        self.mlflow_manager.set_databricks_mode(enabled)
+
+        # 有効にした場合は接続を試みる
+        if enabled:
+            self.mlflow_manager.is_initialized = False
+            success = self.mlflow_manager.initialize(self.mlflow_manager.folder_path, parent_widget=self)
+            if not success:
+                QMessageBox.warning(
+                    self,
+                    "Databricks接続エラー",
+                    "Databricksへの接続に失敗しました。\n\n"
+                    "環境変数の設定を確認してください：\n"
+                    "- DATABRICKS_HOST\n"
+                    "- DATABRICKS_TOKEN\n\n"
+                    "ローカルMLflowモードにフォールバックします。"
+                )
+                self.databricks_checkbox.setChecked(False)
+        else:
+            # ローカルモードに戻す
+            self.mlflow_manager.is_initialized = False
+            self.mlflow_manager.initialize(self.mlflow_manager.folder_path, parent_widget=self)
+
+        # 状態ラベルを更新
+        self._update_databricks_status_label()
+
+    def _update_databricks_status_label(self):
+        """Databricks状態ラベルを更新"""
+        backend_info = self.mlflow_manager.get_backend_info()
+
+        if backend_info["type"] == "databricks+local":
+            self.databricks_status_label.setText(f"✓ Databricks+ローカル併用")
+            self.databricks_status_label.setStyleSheet("color: green; font-size: 10px;")
+        elif backend_info["type"] == "databricks":
+            if backend_info["status"] == "未接続":
+                self.databricks_status_label.setText("✗ Databricks: 未接続")
+                self.databricks_status_label.setStyleSheet("color: orange; font-size: 10px;")
+            else:
+                self.databricks_status_label.setText(f"✓ Databricks: {backend_info['host'][:30]}...")
+                self.databricks_status_label.setStyleSheet("color: green; font-size: 10px;")
+        else:
+            self.databricks_status_label.setText("ローカルMLflow使用中")
+            self.databricks_status_label.setStyleSheet("color: gray; font-size: 10px;")
+
+    def _open_local_mlflow_ui(self):
+        """ローカルMLflow UIを開く"""
+        try:
+            import subprocess
+            import sys
+            from config import mlflow_dir
+
+            # パスの正規化
+            normalized_path = os.path.normpath(mlflow_dir).replace('\\', '/')
+            if sys.platform.startswith('win'):
+                tracking_uri = f"file:///{normalized_path}"
+            else:
+                tracking_uri = f"file://{normalized_path}"
+
+            # MLflow UIを起動
+            if sys.platform.startswith('win'):
+                cmd = f'start cmd /k "mlflow ui --backend-store-uri {tracking_uri}"'
+                subprocess.Popen(cmd, shell=True)
+            else:
+                cmd = f'mlflow ui --backend-store-uri {tracking_uri}'
+                subprocess.Popen(cmd, shell=True)
+
+            QMessageBox.information(
+                self,
+                "MLflow UI",
+                "ローカルMLflow UIを起動しました。\n\n"
+                "ブラウザで http://localhost:5000 にアクセスして実験結果を確認できます。\n\n"
+                "UIを終了するには、コマンドウィンドウを閉じてください。"
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "エラー",
+                f"MLflow UIの起動に失敗しました:\n\n{str(e)}\n\n"
+                "MLflowがインストールされているか確認してください: pip install mlflow"
+            )
+
+    def _open_databricks_ui(self):
+        """Databricks MLflow UIを開く"""
+        # Databricksモードが有効か確認
+        if not self.mlflow_manager.use_databricks:
+            QMessageBox.warning(
+                self,
+                "Databricks未有効",
+                "Databricks連携が有効になっていません。\n\n"
+                "「Databricks連携」チェックボックスをONにしてください。"
+            )
+            return
+
+        # 未接続の場合、接続を試みる
+        if not self.mlflow_manager._databricks_connected:
+            self.mlflow_manager.is_initialized = False
+            success = self.mlflow_manager.initialize(self.mlflow_manager.folder_path, parent_widget=self)
+
+            self._update_databricks_status_label()
+
+            if not self.mlflow_manager._databricks_connected:
+                QMessageBox.warning(
+                    self,
+                    "Databricks接続失敗",
+                    "Databricksへの接続に失敗しました。\n\n"
+                    "環境変数の設定を確認してください。"
+                )
+                return
+
+            QMessageBox.information(
+                self,
+                "Databricks接続成功",
+                "Databricksへの接続に成功しました。"
+            )
+
+        # Databricks UIを開く
+        self.mlflow_manager._open_databricks_ui(self)
+
+        self._update_databricks_status_label()
+
+    def _sync_to_databricks(self):
+        """ローカルの学習記録をDatabricksに同期"""
+        # Databricksモードが有効か確認
+        if not self.mlflow_manager.use_databricks:
+            QMessageBox.warning(
+                self,
+                "Databricks未有効",
+                "Databricks連携が有効になっていません。\n\n"
+                "「Databricks連携」チェックボックスをONにしてください。"
+            )
+            return
+
+        # 同期状態を取得
+        sync_status = self.mlflow_manager.get_sync_status()
+
+        # 孤立Run数を取得（ローカルで削除されたがDatabricksに残っているRun）
+        orphaned_count = self.mlflow_manager.get_orphaned_runs_count()
+
+        # 同期オプションダイアログを表示
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Databricks同期設定")
+        dialog.setMinimumWidth(450)
+
+        layout = QVBoxLayout(dialog)
+
+        # 状態表示
+        status_group = QGroupBox("現在の状態")
+        status_layout = QVBoxLayout()
+        status_layout.addWidget(QLabel(f"ローカルのRun数: {sync_status['local_runs']}"))
+        status_layout.addWidget(QLabel(f"DatabricksのRun数: {sync_status['databricks_runs']}"))
+        status_layout.addWidget(QLabel(f"推定未同期Run数: {sync_status['unsynced_runs']}"))
+        if orphaned_count > 0:
+            orphaned_label = QLabel(f"Databricksにのみ存在するRun数: {orphaned_count}")
+            orphaned_label.setStyleSheet("color: orange;")
+            status_layout.addWidget(orphaned_label)
+        status_group.setLayout(status_layout)
+        layout.addWidget(status_group)
+
+        # 同期オプション
+        options_group = QGroupBox("同期オプション")
+        options_layout = QVBoxLayout()
+
+        # アップロード同期
+        upload_check = QCheckBox("ローカル→Databricks（新規Runをアップロード）")
+        upload_check.setChecked(True)
+        upload_check.setToolTip("ローカルにあってDatabricksにないRunをアップロードします")
+        options_layout.addWidget(upload_check)
+
+        # 削除同期
+        delete_check = QCheckBox("ローカルで削除したRunをDatabricksからも削除")
+        delete_check.setChecked(False)
+        delete_check.setToolTip("ローカルに存在しないRunをDatabricksから削除します（注意: 元に戻せません）")
+        if orphaned_count > 0:
+            delete_check.setText(f"ローカルで削除したRunをDatabricksからも削除 ({orphaned_count}件)")
+        options_layout.addWidget(delete_check)
+
+        # 警告ラベル
+        warning_label = QLabel("※ 削除オプションを有効にすると、Databricks上のRunが削除されます。\n   この操作は元に戻せません。")
+        warning_label.setStyleSheet("color: red; font-size: 10px;")
+        options_layout.addWidget(warning_label)
+
+        options_group.setLayout(options_layout)
+        layout.addWidget(options_group)
+
+        # ボタン
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        # オプションを取得
+        do_upload = upload_check.isChecked()
+        do_delete = delete_check.isChecked()
+
+        if not do_upload and not do_delete:
+            QMessageBox.information(self, "同期", "同期オプションが選択されていません。")
+            return
+
+        # 削除確認
+        if do_delete and orphaned_count > 0:
+            confirm = QMessageBox.warning(
+                self,
+                "削除確認",
+                f"Databricksから{orphaned_count}件のRunを削除します。\n\n"
+                "この操作は元に戻せません。続行しますか？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if confirm != QMessageBox.Yes:
+                return
+
+        # 進捗ダイアログを作成
+        progress = QProgressDialog("Databricksに同期中...", "キャンセル", 0, 100, self)
+        progress.setWindowTitle("同期中")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+
+        # キャンセルフラグ
+        cancelled = [False]
+
+        def progress_callback(current, total, message):
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                cancelled[0] = True
+                return
+            percent = int((current / total) * 100) if total > 0 else 0
+            progress.setValue(percent)
+            progress.setLabelText(f"{message}\n({current}/{total})")
+            QApplication.processEvents()
+
+        def cancel_check():
+            QApplication.processEvents()
+            return progress.wasCanceled() or cancelled[0]
+
+        # 同期実行
+        try:
+            if do_upload or do_delete:
+                result = self.mlflow_manager.sync_local_to_databricks(
+                    parent_widget=self,
+                    progress_callback=progress_callback,
+                    cancel_check=cancel_check,
+                    delete_orphaned=do_delete
+                )
+            else:
+                result = {"synced": 0, "skipped": 0, "failed": 0, "deleted": 0, "errors": [], "cancelled": False}
+
+            progress.close()
+
+            # キャンセルされた場合
+            if result.get("cancelled"):
+                result_message = (
+                    f"同期がキャンセルされました。\n\n"
+                    f"キャンセル前に同期成功: {result['synced']} 件\n"
+                    f"スキップ（既存）: {result['skipped']} 件\n"
+                    f"削除: {result.get('deleted', 0)} 件"
+                )
+                QMessageBox.information(self, "同期キャンセル", result_message)
+            elif result.get("message"):
+                QMessageBox.information(self, "同期完了", result["message"])
+            else:
+                result_message = (
+                    f"同期が完了しました。\n\n"
+                    f"同期成功: {result['synced']} 件\n"
+                    f"スキップ（既存）: {result['skipped']} 件\n"
+                    f"失敗: {result['failed']} 件"
+                )
+                if result.get('deleted', 0) > 0:
+                    result_message += f"\n削除: {result['deleted']} 件"
+
+                if result['errors']:
+                    result_message += f"\n\nエラー詳細:\n" + "\n".join(result['errors'][:5])
+                    if len(result['errors']) > 5:
+                        result_message += f"\n... 他 {len(result['errors']) - 5} 件"
+
+                if result['failed'] > 0:
+                    QMessageBox.warning(self, "同期完了（一部エラー）", result_message)
+                else:
+                    QMessageBox.information(self, "同期完了", result_message)
+
+            # 状態を更新
+            self._update_databricks_status_label()
+
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(
+                self,
+                "同期エラー",
+                f"同期中にエラーが発生しました:\n\n{str(e)}"
+            )
+
+    def _transfer_to_databricks(self):
+        """現在のアノテーションをDatabricksに転送"""
+        # Databricksモードが有効か確認
+        if not self.mlflow_manager.use_databricks:
+            QMessageBox.warning(
+                self,
+                "Databricks未有効",
+                "Databricks連携が有効になっていません。\n\n"
+                "「Databricks連携」チェックボックスをONにしてください。"
+            )
+            return
+
+        # アノテーションがあるか確認
+        if not self.annotations:
+            QMessageBox.information(
+                self,
+                "情報",
+                "転送するアノテーションがありません。\n\n"
+                "先にアノテーションを作成してください。"
+            )
+            return
+
+        # ZIPファイル名を入力
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"annotation_{timestamp}"
+
+        zip_name, ok = QInputDialog.getText(
+            self,
+            "ZIPファイル名",
+            "Databricksに転送するZIPファイル名を入力してください:\n"
+            "（.zipは自動で付加されます）",
+            QLineEdit.Normal,
+            default_name
+        )
+
+        if not ok or not zip_name.strip():
+            return
+
+        zip_name = zip_name.strip()
+        if not zip_name.endswith('.zip'):
+            zip_name += '.zip'
+
+        # 転送先を確認
+        from config_databricks import DATABRICKS_VOLUMES_PATH
+
+        # Volumesパスの存在確認
+        print("[転送] Volumesパスの存在確認中...")
+        temp_manager = DatabricksTransferManager()
+        path_exists, path_message = temp_manager.check_volumes_path()
+
+        if not path_exists:
+            # パスが存在しない場合、作成を試みるか確認
+            create_confirm = QMessageBox.question(
+                self,
+                "Volumesパスが存在しません",
+                f"転送先のVolumesパスが存在しません:\n\n"
+                f"{DATABRICKS_VOLUMES_PATH}\n\n"
+                f"詳細: {path_message}\n\n"
+                "Databricksでこのパスを作成してから再度お試しください。\n\n"
+                "環境変数 DATABRICKS_VOLUMES_PATH で\n"
+                "別のパスを指定することもできます。\n\n"
+                "例: /Volumes/workspace/default/test",
+                QMessageBox.Ok
+            )
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "転送確認",
+            f"以下の内容でDatabricksに転送します:\n\n"
+            f"アノテーション数: {len(self.annotations)}\n"
+            f"ファイル名: {zip_name}\n"
+            f"転送先: {DATABRICKS_VOLUMES_PATH}/{zip_name}\n\n"
+            "続行しますか？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+
+        if confirm != QMessageBox.Yes:
+            return
+
+        # 進捗ダイアログを作成
+        progress = QProgressDialog("転送準備中...", "キャンセル", 0, 100, self)
+        progress.setWindowTitle("Databricksへ転送中")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setMinimumWidth(400)
+        progress.setValue(0)
+        progress.show()
+
+        # キャンセルフラグ
+        cancelled = [False]
+
+        def progress_callback(stage, current, total, message):
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                cancelled[0] = True
+                return
+
+            # ステージに応じた進捗計算
+            # export: 0-20%, zip: 20-60%, upload: 60-100%
+            if stage == 'export':
+                percent = int((current / max(total, 1)) * 20)
+                stage_name = "エクスポート中"
+            elif stage == 'zip':
+                percent = 20 + int((current / max(total, 1)) * 40)
+                stage_name = "ZIP圧縮中"
+            elif stage == 'upload':
+                percent = 60 + int((current / max(total, 1)) * 40)
+                stage_name = "アップロード中"
+            else:
+                percent = 0
+                stage_name = ""
+
+            progress.setValue(percent)
+            progress.setLabelText(f"{stage_name}\n{message}")
+            QApplication.processEvents()
+
+        def cancel_check():
+            QApplication.processEvents()
+            return progress.wasCanceled() or cancelled[0]
+
+        # 転送実行
+        try:
+            print("[転送] DatabricksTransferManager を作成中...")
+            # DatabricksTransferManagerを作成
+            transfer_manager = DatabricksTransferManager()
+
+            print("[転送] image_mapとvariant_keysを構築中...")
+            # image_mapとvariant_keysを構築
+            image_map = {}
+            variant_keys = {}
+
+            # source_images_mapから構築
+            if hasattr(self, 'source_images_map') and self.source_images_map:
+                print(f"[転送] source_images_map を使用（バリアント数: {len(self.source_images_map)}）")
+                for variant, images_list in self.source_images_map.items():
+                    # variant_keysを設定
+                    if variant == 'cam':
+                        variant_keys[variant] = 'cam/image_array'
+                    elif variant == 'cam0':
+                        variant_keys[variant] = 'cam0/image_array'
+                    elif variant == 'lidar':
+                        variant_keys[variant] = 'lidar/image_array'
+                    else:
+                        variant_keys[variant] = f'{variant}/image_array'
+
+                    # image_mapを構築
+                    for idx, img_path in enumerate(images_list):
+                        if idx not in image_map:
+                            image_map[idx] = {}
+                        image_map[idx][variant] = img_path
+                print(f"[転送] image_map 構築完了（エントリ数: {len(image_map)}）")
+            else:
+                # 単一ソースの場合
+                if hasattr(self, 'images') and self.images:
+                    print(f"[転送] 単一ソースを使用（画像数: {len(self.images)}）")
+                    variant_keys['cam'] = 'cam/image_array'
+                    for idx, img_path in enumerate(self.images):
+                        image_map[idx] = {'cam': img_path}
+
+            # 削除インデックスを取得
+            deleted_indexes = getattr(self, 'deleted_indexes', [])
+            print(f"[転送] 削除インデックス数: {len(deleted_indexes)}")
+
+            # 差分ベクトルとウェイポイントを取得
+            diff_vectors = getattr(self, 'inference_diff_vectors', None)
+            waypoint_annotations = getattr(self, 'waypoint_annotations', None)
+            print(f"[転送] 差分ベクトル: {'あり' if diff_vectors else 'なし'}")
+            print(f"[転送] ウェイポイント: {'あり' if waypoint_annotations else 'なし'}")
+
+            print("[転送] transfer_annotations 呼び出し...")
+            # 転送実行
+            result = transfer_manager.transfer_annotations(
+                annotations=self.annotations,
+                inference_results=self.inference_results if hasattr(self, 'inference_results') else None,
+                image_map=image_map,
+                variant_keys=variant_keys,
+                zip_name=zip_name,
+                deleted_indexes=deleted_indexes,
+                diff_vectors=diff_vectors,
+                waypoint_annotations=waypoint_annotations,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check
+            )
+
+            print(f"[転送] transfer_annotations 完了: {result}")
+            progress.close()
+
+            if result['success']:
+                # サイズをMBに変換
+                size_mb = result['zip_size'] / (1024 * 1024)
+                QMessageBox.information(
+                    self,
+                    "転送完了",
+                    f"Databricksへの転送が完了しました。\n\n"
+                    f"アノテーション数: {result['annotation_count']}\n"
+                    f"ZIPサイズ: {size_mb:.2f} MB\n"
+                    f"転送先: {result['remote_path']}"
+                )
+            else:
+                error_msg = result.get('error', '不明なエラー')
+                if 'キャンセル' in error_msg:
+                    QMessageBox.information(self, "転送キャンセル", "転送がキャンセルされました。")
+                else:
+                    QMessageBox.critical(
+                        self,
+                        "転送エラー",
+                        f"転送中にエラーが発生しました:\n\n{error_msg}"
+                    )
+
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(
+                self,
+                "転送エラー",
+                f"転送中にエラーが発生しました:\n\n{str(e)}\n\n{traceback.format_exc()}"
+            )
+
+    def _show_databricks_settings(self):
+        """Databricks設定ダイアログを表示"""
+        try:
+            from config_databricks import (
+                DATABRICKS_ENABLED, DATABRICKS_HOST, DATABRICKS_TOKEN,
+                DATABRICKS_EXPERIMENT_PREFIX, get_databricks_status, get_env_template
+            )
+            config_available = True
+        except ImportError:
+            config_available = False
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Databricks設定")
+        dialog.setMinimumWidth(550)
+        layout = QVBoxLayout(dialog)
+
+        # 現在の状態を表示
+        status_group = QGroupBox("接続状態")
+        status_layout = QVBoxLayout()
+
+        if config_available:
+            status = get_databricks_status()
+            status_text = f"状態: {status['status']}\n{status['message']}"
+        else:
+            status_text = "config_databricks.py が見つかりません"
+
+        status_label = QLabel(status_text)
+        status_label.setWordWrap(True)
+        status_layout.addWidget(status_label)
+        status_group.setLayout(status_layout)
+        layout.addWidget(status_group)
+
+        # 環境変数の状態を表示
+        env_group = QGroupBox("環境変数の状態")
+        env_layout = QFormLayout()
+
+        env_enabled = os.environ.get("DATABRICKS_ENABLED", "")
+        env_host = os.environ.get("DATABRICKS_HOST", "")
+        env_token = os.environ.get("DATABRICKS_TOKEN", "")
+        env_prefix = os.environ.get("DATABRICKS_EXPERIMENT_PREFIX", "")
+
+        env_layout.addRow("DATABRICKS_ENABLED:", QLabel(env_enabled or "(未設定)"))
+        env_layout.addRow("DATABRICKS_HOST:", QLabel(env_host[:40] + "..." if len(env_host) > 40 else env_host or "(未設定)"))
+        env_layout.addRow("DATABRICKS_TOKEN:", QLabel("****" + env_token[-4:] if env_token else "(未設定)"))
+        env_layout.addRow("EXPERIMENT_PREFIX:", QLabel(env_prefix or "(デフォルト使用)"))
+
+        env_group.setLayout(env_layout)
+        layout.addWidget(env_group)
+
+        # 設定方法の説明
+        help_group = QGroupBox("環境変数の設定方法")
+        help_layout = QVBoxLayout()
+        help_text = QLabel(
+            "セキュリティのため、認証情報は環境変数で設定してください:\n\n"
+            "Windows (PowerShell):\n"
+            '  $env:DATABRICKS_ENABLED = "true"\n'
+            '  $env:DATABRICKS_HOST = "https://..."\n'
+            '  $env:DATABRICKS_TOKEN = "dapi..."\n\n'
+            "Linux/Mac:\n"
+            '  export DATABRICKS_ENABLED="true"\n'
+            '  export DATABRICKS_HOST="https://..."\n'
+            '  export DATABRICKS_TOKEN="dapi..."'
+        )
+        help_text.setWordWrap(True)
+        help_text.setStyleSheet("font-family: monospace;")
+        help_layout.addWidget(help_text)
+        help_group.setLayout(help_layout)
+        layout.addWidget(help_group)
+
+        # ボタンレイアウト
+        button_layout = QHBoxLayout()
+
+        # テンプレートをコピーボタン
+        if config_available:
+            copy_template_button = QPushButton("設定テンプレートをコピー")
+            copy_template_button.clicked.connect(lambda: self._copy_env_template(get_env_template()))
+            button_layout.addWidget(copy_template_button)
+
+        # READMEを開くボタン
+        open_readme_button = QPushButton("READMEを開く")
+        open_readme_button.clicked.connect(self._open_databricks_readme)
+        button_layout.addWidget(open_readme_button)
+
+        layout.addLayout(button_layout)
+
+        # 閉じるボタン
+        close_button = QPushButton("閉じる")
+        close_button.clicked.connect(dialog.accept)
+        layout.addWidget(close_button)
+
+        dialog.exec_()
+
+    def _copy_env_template(self, template: str):
+        """環境変数テンプレートをクリップボードにコピー"""
+        from PyQt5.QtWidgets import QApplication
+        clipboard = QApplication.clipboard()
+        clipboard.setText(template)
+        QMessageBox.information(self, "コピー完了", "環境変数設定テンプレートをクリップボードにコピーしました")
+
+    def _open_databricks_readme(self):
+        """README_DATABRICKS.md を開く"""
+        import subprocess
+        import sys
+
+        readme_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "README_DATABRICKS.md")
+
+        if not os.path.exists(readme_path):
+            QMessageBox.warning(self, "エラー", f"READMEが見つかりません:\n{readme_path}")
+            return
+
+        try:
+            if sys.platform.startswith('win'):
+                os.startfile(readme_path)
+            elif sys.platform.startswith('darwin'):
+                subprocess.Popen(['open', readme_path])
+            else:
+                subprocess.Popen(['xdg-open', readme_path])
+        except Exception as e:
+            QMessageBox.warning(self, "エラー", f"ファイルを開けませんでした:\n{e}")
+
+    # ========================================
+    # Google Colab連携メソッド
+    # ========================================
+
+    def _is_colab_enabled(self) -> bool:
+        """Colab連携が有効かどうかを返す"""
+        try:
+            from config_colab import COLAB_ENABLED
+            return COLAB_ENABLED
+        except ImportError:
+            return False
+
+    def _on_colab_toggle(self, state):
+        """Colabチェックボックスの状態変更"""
+        # 現在は環境変数で制御するため、チェックボックスは情報表示のみ
+        self._update_colab_status_label()
+
+    def _update_colab_status_label(self):
+        """Colabステータスラベルを更新"""
+        try:
+            from config_colab import get_colab_status
+            status = get_colab_status()
+            if status['enabled']:
+                if status.get('authenticated'):
+                    self.colab_status_label.setText("認証済み")
+                    self.colab_status_label.setStyleSheet("color: green;")
+                else:
+                    self.colab_status_label.setText("未認証")
+                    self.colab_status_label.setStyleSheet("color: orange;")
+            else:
+                self.colab_status_label.setText("無効")
+                self.colab_status_label.setStyleSheet("color: gray;")
+        except ImportError:
+            self.colab_status_label.setText("設定ファイルなし")
+            self.colab_status_label.setStyleSheet("color: red;")
+
+    def _open_colab_ui(self):
+        """Google Colabを開く"""
+        import webbrowser
+        webbrowser.open("https://colab.research.google.com/")
+
+    def _transfer_to_colab(self):
+        """現在のアノテーションをGoogle Driveに転送してColabで学習"""
+        # Colabモードが有効か確認
+        if not self._is_colab_enabled():
+            QMessageBox.warning(
+                self,
+                "Google Colab未有効",
+                "Google Colab連携が有効になっていません。\n\n"
+                "有効にするには環境変数を設定してください:\n"
+                "  COLAB_ENABLED=true\n"
+                "  GOOGLE_CLIENT_SECRETS=path/to/client_secrets.json\n\n"
+                "設定ボタンから詳細を確認できます。"
+            )
+            return
+
+        # アノテーションがあるか確認
+        if not self.annotations:
+            QMessageBox.information(
+                self,
+                "情報",
+                "転送するアノテーションがありません。\n\n"
+                "先にアノテーションを作成してください。"
+            )
+            return
+
+        # ZIPファイル名を入力
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"annotation_{timestamp}"
+
+        zip_name, ok = QInputDialog.getText(
+            self,
+            "ZIPファイル名",
+            "Google Driveに転送するZIPファイル名を入力してください:\n"
+            "（.zipは自動で付加されます）",
+            QLineEdit.Normal,
+            default_name
+        )
+
+        if not ok or not zip_name.strip():
+            return
+
+        zip_name = zip_name.strip()
+        if not zip_name.endswith('.zip'):
+            zip_name += '.zip'
+
+        # 転送確認ダイアログ
+        try:
+            from config_colab import COLAB_DRIVE_FOLDER_NAME
+        except ImportError:
+            COLAB_DRIVE_FOLDER_NAME = "annotation_data"
+
+        # オプションダイアログを表示
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Google Colab転送設定")
+        dialog.setMinimumWidth(400)
+
+        layout = QVBoxLayout(dialog)
+
+        # 転送内容
+        info_group = QGroupBox("転送内容")
+        info_layout = QVBoxLayout()
+        info_layout.addWidget(QLabel(f"アノテーション数: {len(self.annotations)}"))
+        info_layout.addWidget(QLabel(f"ファイル名: {zip_name}"))
+        info_layout.addWidget(QLabel(f"転送先: Google Drive/{COLAB_DRIVE_FOLDER_NAME}/"))
+        info_group.setLayout(info_layout)
+        layout.addWidget(info_group)
+
+        # オプション
+        options_group = QGroupBox("オプション")
+        options_layout = QVBoxLayout()
+
+        generate_notebook_check = QCheckBox("学習用Notebookを生成")
+        generate_notebook_check.setChecked(True)
+        generate_notebook_check.setToolTip("転送後にGoogle Colabで使用できるNotebookを生成します")
+        options_layout.addWidget(generate_notebook_check)
+
+        open_colab_check = QCheckBox("転送後にColabを開く")
+        open_colab_check.setChecked(True)
+        open_colab_check.setToolTip("転送完了後にブラウザでColabを開きます")
+        options_layout.addWidget(open_colab_check)
+
+        options_group.setLayout(options_layout)
+        layout.addWidget(options_group)
+
+        # 認証に関する注意
+        note_label = QLabel(
+            "注意: 初回転送時はGoogleアカウントの認証が必要です。\n"
+            "ブラウザが開きますので、アカウントを選択して認証してください。"
+        )
+        note_label.setStyleSheet("color: gray; font-size: 10px;")
+        note_label.setWordWrap(True)
+        layout.addWidget(note_label)
+
+        # ボタン
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        generate_notebook = generate_notebook_check.isChecked()
+        open_colab = open_colab_check.isChecked()
+
+        # 認証確認
+        try:
+            from utils.colab_transfer import ColabTransferManager
+
+            # 認証中ダイアログを表示
+            auth_progress = QProgressDialog("Google Driveに認証中...", "キャンセル", 0, 0, self)
+            auth_progress.setWindowTitle("認証中")
+            auth_progress.setWindowModality(Qt.WindowModal)
+            auth_progress.setMinimumDuration(0)
+            auth_progress.setMinimumWidth(300)
+            auth_progress.show()
+            QApplication.processEvents()
+
+            # ColabTransferManagerを作成して認証
+            transfer_manager = ColabTransferManager()
+            success, message = transfer_manager.test_connection()
+
+            auth_progress.close()
+
+            if not success:
+                QMessageBox.critical(
+                    self,
+                    "認証失敗",
+                    f"Google Driveへの認証に失敗しました:\n\n{message}"
+                )
+                return
+
+            # 認証成功 - 転送確認ダイアログを表示
+            try:
+                from config_colab import COLAB_DRIVE_FOLDER_NAME
+            except ImportError:
+                COLAB_DRIVE_FOLDER_NAME = "annotation_data"
+
+            confirm_reply = QMessageBox.question(
+                self,
+                "認証完了 - 転送確認",
+                f"Google Driveへの認証が完了しました。\n\n"
+                f"以下の内容で転送を開始しますか？\n\n"
+                f"  転送先: Google Drive/{COLAB_DRIVE_FOLDER_NAME}/\n"
+                f"  ファイル名: {zip_name}\n"
+                f"  アノテーション数: {len(self.annotations)}\n"
+                f"  Notebook生成: {'あり' if generate_notebook else 'なし'}\n",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+
+            if confirm_reply != QMessageBox.Yes:
+                return
+
+        except ImportError as e:
+            QMessageBox.critical(
+                self,
+                "インポートエラー",
+                f"必要なライブラリがインストールされていません:\n\n{str(e)}\n\n"
+                "pip install pydrive2 google-auth google-auth-oauthlib pyyaml でインストールしてください。"
+            )
+            return
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "認証エラー",
+                f"認証中にエラーが発生しました:\n\n{str(e)}"
+            )
+            return
+
+        # 進捗ダイアログを作成
+        progress = QProgressDialog("転送準備中...", "キャンセル", 0, 100, self)
+        progress.setWindowTitle("Google Colabへ転送中")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setMinimumWidth(400)
+        progress.setValue(0)
+        progress.show()
+
+        # キャンセルフラグ
+        cancelled = [False]
+
+        # 最後に更新した進捗値を記録（不要な更新を避ける）
+        last_percent = [-1]
+
+        def progress_callback(stage, current, total, message):
+            # ステージに応じた進捗計算
+            if stage == 'export':
+                percent = int((current / max(total, 1)) * 15)
+                stage_header = "--- ステージ1: エクスポート ---"
+                if current == 0:
+                    detail = "アノテーションをエクスポート中..."
+                else:
+                    detail = f"エクスポート完了"
+            elif stage == 'zip':
+                percent = 15 + int((current / max(total, 1)) * 30)
+                stage_header = "--- ステージ2: ZIP圧縮 ---"
+                progress_pct = int((current / max(total, 1)) * 100)
+                detail = f"ZIP圧縮進捗: {current}/{total} ({progress_pct}%)"
+            elif stage == 'upload':
+                percent = 45 + int((current / max(total, 1)) * 35)
+                stage_header = "--- ステージ3: アップロード ---"
+                if current == 0:
+                    detail = f"Google Driveにアップロード中...\nファイルサイズ: {total / (1024*1024):.2f} MB"
+                else:
+                    detail = f"アップロード中: {current // (1024*1024)} MB / {total // (1024*1024)} MB"
+            elif stage == 'notebook':
+                percent = 80 + int((current / max(total, 1)) * 20)
+                stage_header = "--- ステージ4: Notebook生成 ---"
+                if current == 0:
+                    detail = "Colabノートブックを生成中..."
+                else:
+                    detail = "ノートブックアップロード完了"
+            else:
+                percent = 0
+                stage_header = ""
+                detail = message
+
+            # 進捗値が変わった場合のみGUI更新（パフォーマンス最適化）
+            if percent != last_percent[0]:
+                last_percent[0] = percent
+                progress.setValue(percent)
+                progress.setLabelText(f"{stage_header}\n{detail}")
+                QApplication.processEvents()
+
+                # キャンセルチェック
+                if progress.wasCanceled():
+                    cancelled[0] = True
+
+        def cancel_check():
+            # cancelled[0]がすでにTrueならprocessEventsをスキップ
+            if cancelled[0]:
+                return True
+            # GUIイベント処理してキャンセル状態を確認
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                cancelled[0] = True
+            return cancelled[0]
+
+        # 転送実行
+        try:
+            # image_mapとvariant_keysを構築（Databricksと同じロジック）
+            image_map = {}
+            variant_keys = {}
+
+            if hasattr(self, 'source_images_map') and self.source_images_map:
+                for variant, images_list in self.source_images_map.items():
+                    if variant == 'cam':
+                        variant_keys[variant] = 'cam/image_array'
+                    elif variant == 'cam0':
+                        variant_keys[variant] = 'cam0/image_array'
+                    elif variant == 'lidar':
+                        variant_keys[variant] = 'lidar/image_array'
+                    else:
+                        variant_keys[variant] = f'{variant}/image_array'
+
+                    for idx, img_path in enumerate(images_list):
+                        if idx not in image_map:
+                            image_map[idx] = {}
+                        image_map[idx][variant] = img_path
+            else:
+                if hasattr(self, 'images') and self.images:
+                    variant_keys['cam'] = 'cam/image_array'
+                    for idx, img_path in enumerate(self.images):
+                        image_map[idx] = {'cam': img_path}
+
+            deleted_indexes = getattr(self, 'deleted_indexes', [])
+            diff_vectors = getattr(self, 'inference_diff_vectors', None)
+            waypoint_annotations = getattr(self, 'waypoint_annotations', None)
+
+            # 転送実行（認証済みのtransfer_managerを使用）
+            result = transfer_manager.transfer_annotations(
+                annotations=self.annotations,
+                inference_results=self.inference_results if hasattr(self, 'inference_results') else None,
+                image_map=image_map,
+                variant_keys=variant_keys,
+                zip_name=zip_name,
+                deleted_indexes=deleted_indexes,
+                diff_vectors=diff_vectors,
+                waypoint_annotations=waypoint_annotations,
+                generate_notebook=generate_notebook,
+                open_colab=open_colab,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check
+            )
+
+            progress.close()
+
+            if result['success']:
+                size_mb = result['zip_size'] / (1024 * 1024)
+                message = (
+                    f"Google Driveへの転送が完了しました。\n\n"
+                    f"アノテーション数: {result['annotation_count']}\n"
+                    f"ZIPサイズ: {size_mb:.2f} MB"
+                )
+                if 'colab_url' in result:
+                    message += f"\n\nColab URL:\n{result['colab_url']}"
+
+                QMessageBox.information(self, "転送完了", message)
+                self._update_colab_status_label()
+            else:
+                error_msg = result.get('error', '不明なエラー')
+                if 'キャンセル' in error_msg:
+                    QMessageBox.information(self, "転送キャンセル", "転送がキャンセルされました。")
+                else:
+                    QMessageBox.critical(
+                        self,
+                        "転送エラー",
+                        f"転送中にエラーが発生しました:\n\n{error_msg}"
+                    )
+
+        except ImportError as e:
+            progress.close()
+            QMessageBox.critical(
+                self,
+                "インポートエラー",
+                f"必要なライブラリがインストールされていません:\n\n{str(e)}\n\n"
+                "pip install pydrive2 google-auth google-auth-oauthlib pyyaml でインストールしてください。"
+            )
+        except Exception as e:
+            progress.close()
+            import traceback
+            QMessageBox.critical(
+                self,
+                "転送エラー",
+                f"転送中にエラーが発生しました:\n\n{str(e)}\n\n{traceback.format_exc()}"
+            )
+
+    def _download_model_from_colab(self):
+        """Colabで学習したモデルをGoogle Driveからダウンロード"""
+        # Colabモードが有効か確認
+        if not self._is_colab_enabled():
+            QMessageBox.warning(
+                self,
+                "Google Colab未有効",
+                "Google Colab連携が有効になっていません。\n\n"
+                "有効にするには環境変数を設定してください:\n"
+                "  COLAB_ENABLED=true\n"
+                "  GOOGLE_CLIENT_SECRETS=path/to/client_secrets.json"
+            )
+            return
+
+        try:
+            from utils.colab_transfer import ColabTransferManager
+
+            # 進捗ダイアログを表示
+            progress = QProgressDialog("Google Driveに接続中...", "キャンセル", 0, 100, self)
+            progress.setWindowTitle("モデル一覧を取得中")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(10)
+            progress.show()
+            QApplication.processEvents()
+
+            # モデル一覧を取得
+            transfer_manager = ColabTransferManager()
+            models = transfer_manager.list_models()
+
+            progress.close()
+
+            if not models:
+                QMessageBox.information(
+                    self,
+                    "モデルなし",
+                    "Google Driveにモデルファイルが見つかりませんでした。\n\n"
+                    "Colabでモデルを学習し、Google Driveに保存してください。"
+                )
+                return
+
+            # モデル選択ダイアログを表示
+            dialog = QDialog(self)
+            dialog.setWindowTitle("モデルをダウンロード")
+            dialog.setMinimumWidth(500)
+
+            layout = QVBoxLayout(dialog)
+
+            # 説明ラベル
+            info_label = QLabel(f"Google Drive上のモデル: {len(models)}件")
+            layout.addWidget(info_label)
+
+            # モデルリスト
+            list_widget = QListWidget()
+            for m in models:
+                size_mb = m['size'] / (1024 * 1024)
+                # 作成日時をフォーマット
+                created = m['createdDate'][:10] if m['createdDate'] else "不明"
+                item_text = f"{m['name']}  ({size_mb:.2f} MB, {created})"
+                item = QListWidgetItem(item_text)
+                item.setData(Qt.UserRole, m)
+                list_widget.addItem(item)
+
+            list_widget.setCurrentRow(0)
+            layout.addWidget(list_widget)
+
+            # 保存先
+            save_group = QGroupBox("保存先")
+            save_layout = QHBoxLayout()
+            save_path_edit = QLineEdit()
+            models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
+            save_path_edit.setText(models_dir)
+            save_path_edit.setReadOnly(True)
+            save_layout.addWidget(save_path_edit)
+
+            browse_button = QPushButton("参照...")
+            def browse_folder():
+                folder = QFileDialog.getExistingDirectory(dialog, "保存先フォルダを選択", models_dir)
+                if folder:
+                    save_path_edit.setText(folder)
+            browse_button.clicked.connect(browse_folder)
+            save_layout.addWidget(browse_button)
+            save_group.setLayout(save_layout)
+            layout.addWidget(save_group)
+
+            # MLflowデータダウンロードオプション
+            mlruns_checkbox = QCheckBox("MLflow実験データ(mlruns)もダウンロードしてマージする")
+            mlruns_checkbox.setChecked(True)
+            mlruns_checkbox.setToolTip("Colabで記録されたMLflow実験データをローカルにマージします")
+            layout.addWidget(mlruns_checkbox)
+
+            # ボタン
+            button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            button_box.accepted.connect(dialog.accept)
+            button_box.rejected.connect(dialog.reject)
+            layout.addWidget(button_box)
+
+            if dialog.exec_() != QDialog.Accepted:
+                return
+
+            # 選択されたモデルを取得
+            current_item = list_widget.currentItem()
+            if not current_item:
+                return
+
+            selected_model = current_item.data(Qt.UserRole)
+            save_dir = save_path_edit.text()
+            download_mlruns = mlruns_checkbox.isChecked()
+
+            # 同じ名前のモデルが既に存在するかチェック
+            local_path = os.path.join(save_dir, selected_model['name'])
+            if os.path.exists(local_path):
+                local_size = os.path.getsize(local_path)
+                remote_size = selected_model['size']
+
+                if local_size == remote_size:
+                    # ファイルサイズが一致 → 同一ファイルの可能性が高い
+                    reply = QMessageBox.question(
+                        self,
+                        "同名モデルが存在",
+                        f"同じ名前のモデルが既に存在します:\n"
+                        f"  {selected_model['name']}\n\n"
+                        f"ローカル: {local_size / (1024*1024):.2f} MB\n"
+                        f"リモート: {remote_size / (1024*1024):.2f} MB\n\n"
+                        f"ファイルサイズが同じため、同一のモデルと思われます。\n"
+                        f"ダウンロードをスキップしますか？",
+                        QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                        QMessageBox.Yes
+                    )
+                    if reply == QMessageBox.Cancel:
+                        return
+                    elif reply == QMessageBox.Yes:
+                        # スキップしてmlrunsのみダウンロード
+                        if download_mlruns:
+                            progress = QProgressDialog("MLflow実験データをダウンロード中...", "キャンセル", 0, 100, self)
+                            progress.setWindowTitle("ダウンロード中")
+                            progress.setWindowModality(Qt.WindowModal)
+                            progress.setMinimumDuration(0)
+                            progress.setValue(50)
+                            progress.show()
+                            QApplication.processEvents()
+
+                            try:
+                                mlruns_merged = self._download_and_merge_mlruns(transfer_manager, progress)
+                            except Exception as e:
+                                print(f"[Colab] mlrunsのダウンロードに失敗: {e}")
+                            progress.close()
+
+                        QMessageBox.information(
+                            self,
+                            "スキップ",
+                            f"モデルのダウンロードをスキップしました。\n"
+                            f"既存のモデルを使用: {local_path}"
+                        )
+                        return
+                    # Noの場合は上書きダウンロードを続行
+                else:
+                    # ファイルサイズが異なる → 異なるバージョン
+                    reply = QMessageBox.question(
+                        self,
+                        "同名モデルが存在",
+                        f"同じ名前のモデルが既に存在しますが、サイズが異なります:\n"
+                        f"  {selected_model['name']}\n\n"
+                        f"ローカル: {local_size / (1024*1024):.2f} MB\n"
+                        f"リモート: {remote_size / (1024*1024):.2f} MB\n\n"
+                        f"上書きダウンロードしますか？",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.No
+                    )
+                    if reply != QMessageBox.Yes:
+                        return
+
+            # ダウンロード実行
+            progress = QProgressDialog("モデルをダウンロード中...", "キャンセル", 0, 100, self)
+            progress.setWindowTitle("ダウンロード中")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(20)
+            progress.show()
+            QApplication.processEvents()
+
+            def download_progress(current, total):
+                if total > 0:
+                    percent = int((current / total) * 80) + 20
+                    progress.setValue(percent)
+                    progress.setLabelText(f"ダウンロード中: {current // (1024*1024)} MB / {total // (1024*1024)} MB")
+                    QApplication.processEvents()
+
+            result_path = transfer_manager.download_file(
+                selected_model['id'],
+                local_path,
+                progress_callback=download_progress
+            )
+
+            if result_path:
+                # mlrunsをダウンロードしてマージ
+                mlruns_merged = False
+                if download_mlruns:
+                    progress.setLabelText("MLflow実験データをダウンロード中...")
+                    progress.setValue(50)
+                    QApplication.processEvents()
+
+                    try:
+                        mlruns_merged = self._download_and_merge_mlruns(transfer_manager, progress)
+                    except Exception as e:
+                        print(f"[Colab] mlrunsのダウンロードに失敗: {e}")
+                        # mlrunsのエラーは警告のみで続行
+
+                progress.close()
+
+                # ダウンロード成功
+                message = f"モデルをダウンロードしました:\n{result_path}"
+                if mlruns_merged:
+                    message += "\n\nMLflow実験データもマージしました。"
+                message += "\n\nこのモデルを読み込みますか？"
+
+                reply = QMessageBox.question(
+                    self,
+                    "ダウンロード完了",
+                    message,
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+
+                if reply == QMessageBox.Yes:
+                    # モデルを読み込み
+                    self._load_downloaded_model(result_path)
+            else:
+                progress.close()
+                QMessageBox.warning(self, "エラー", "モデルのダウンロードに失敗しました。")
+
+        except Exception as e:
+            if 'progress' in locals():
+                progress.close()
+            import traceback
+            QMessageBox.critical(
+                self,
+                "エラー",
+                f"モデルのダウンロード中にエラーが発生しました:\n\n{str(e)}\n\n{traceback.format_exc()}"
+            )
+
+    def _download_and_merge_mlruns(self, transfer_manager, progress) -> bool:
+        """Colabからmlrunsをダウンロードしてローカルにマージ
+
+        Args:
+            transfer_manager: ColabTransferManagerインスタンス
+            progress: QProgressDialog
+
+        Returns:
+            マージ成功した場合True
+        """
+        import tempfile
+        import shutil
+
+        print("[Colab] mlrunsダウンロード開始...")
+
+        # Google Driveからmlrunsをダウンロード
+        temp_dir = tempfile.mkdtemp(prefix="mlruns_download_")
+
+        try:
+            def mlruns_progress(filename, current, total):
+                progress.setLabelText(f"MLflow実験データをダウンロード中: {filename}")
+                if total > 0:
+                    percent = 50 + int((current / total) * 30)
+                    progress.setValue(percent)
+                QApplication.processEvents()
+
+            # ローカルのmlrunsパスを取得
+            local_mlruns = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mlruns')
+
+            download_result = transfer_manager.download_mlruns(
+                local_dir=temp_dir,
+                progress_callback=mlruns_progress,
+                compare_with_local=local_mlruns  # ローカルのmlrunsと比較してスキップ
+            )
+
+            if not download_result:
+                print("[Colab] mlrunsフォルダが見つかりませんでした")
+                return False
+
+            remote_mlruns = download_result['path']
+            downloaded = download_result['downloaded']
+            skipped = download_result['skipped']
+            total = download_result['total']
+
+            # スキップ情報を表示
+            if skipped > 0:
+                if downloaded == 0:
+                    print(f"[Colab] 全ファイルが既にダウンロード済みです ({skipped}件)")
+                else:
+                    print(f"[Colab] ダウンロード: {downloaded}件, スキップ: {skipped}件 (既存)")
+
+            # マージ処理
+            progress.setLabelText("MLflow実験データをマージ中...")
+            progress.setValue(85)
+            QApplication.processEvents()
+
+            merged_count = self._merge_mlruns_folders(remote_mlruns, local_mlruns)
+
+            print(f"[Colab] mlrunsマージ完了: {merged_count}件の実験データをマージ")
+            progress.setValue(95)
+            QApplication.processEvents()
+
+            return merged_count > 0
+
+        except Exception as e:
+            print(f"[Colab] mlrunsマージエラー: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+        finally:
+            # 一時ディレクトリをクリーンアップ
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception as e:
+                print(f"[Colab] 一時ディレクトリの削除に失敗: {e}")
+
+    def _merge_mlruns_folders(self, source_mlruns: str, dest_mlruns: str) -> int:
+        """mlrunsフォルダをマージ
+
+        Args:
+            source_mlruns: マージ元のmlrunsパス（Colabからダウンロードしたもの）
+            dest_mlruns: マージ先のmlrunsパス（ローカル）
+
+        Returns:
+            マージされた実験数
+        """
+        import shutil
+
+        # ローカルのmlrunsがなければ作成
+        os.makedirs(dest_mlruns, exist_ok=True)
+
+        merged_count = 0
+
+        # source_mlruns内の実験フォルダを取得
+        if not os.path.exists(source_mlruns):
+            return 0
+
+        for item in os.listdir(source_mlruns):
+            source_item = os.path.join(source_mlruns, item)
+
+            # .trashフォルダはスキップ
+            if item == '.trash':
+                continue
+
+            if os.path.isdir(source_item):
+                dest_item = os.path.join(dest_mlruns, item)
+
+                if item == 'models':
+                    # modelsフォルダは特別扱い（上書きマージ）
+                    if os.path.exists(dest_item):
+                        # 既存のmodelsフォルダに追加
+                        for model_file in os.listdir(source_item):
+                            src_model = os.path.join(source_item, model_file)
+                            dst_model = os.path.join(dest_item, model_file)
+                            if not os.path.exists(dst_model):
+                                if os.path.isdir(src_model):
+                                    shutil.copytree(src_model, dst_model)
+                                else:
+                                    shutil.copy2(src_model, dst_model)
+                    else:
+                        shutil.copytree(source_item, dest_item)
+                    continue
+
+                # 実験フォルダ（数字のID）
+                if os.path.exists(dest_item):
+                    # 既存の実験フォルダがある場合、run単位でマージ
+                    for run_id in os.listdir(source_item):
+                        src_run = os.path.join(source_item, run_id)
+                        dst_run = os.path.join(dest_item, run_id)
+
+                        if os.path.isdir(src_run) and not os.path.exists(dst_run):
+                            # 新しいrunをコピー
+                            shutil.copytree(src_run, dst_run)
+                            print(f"[Colab] run追加: {item}/{run_id}")
+                            merged_count += 1
+                        elif run_id == 'meta.yaml' and not os.path.exists(dst_run):
+                            # meta.yamlをコピー
+                            shutil.copy2(src_run, dst_run)
+                else:
+                    # 新しい実験フォルダをそのままコピー
+                    shutil.copytree(source_item, dest_item)
+                    # run数をカウント
+                    runs = [d for d in os.listdir(dest_item) if os.path.isdir(os.path.join(dest_item, d))]
+                    merged_count += len(runs)
+                    print(f"[Colab] 実験追加: {item} ({len(runs)} runs)")
+
+        return merged_count
+
+    def _load_downloaded_model(self, model_path: str):
+        """ダウンロードしたモデルを読み込む"""
+        try:
+            import torch
+
+            # モデルをロード
+            checkpoint = torch.load(model_path, map_location='cpu')
+
+            # configを取得
+            if 'config' in checkpoint:
+                config = checkpoint['config']
+                model_name = config.get('model_name', config.get('backbone', 'unknown'))
+                print(f"[Colab] モデルを読み込みました: {model_name}")
+
+                QMessageBox.information(
+                    self,
+                    "モデル読み込み完了",
+                    f"モデルを保存しました:\n\n"
+                    f"ファイル: {os.path.basename(model_path)}\n"
+                    f"モデル: {model_name}\n\n"
+                    "「モデル読込」ボタンから推論に使用できます。"
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "モデル保存完了",
+                    f"モデルファイルを保存しました:\n{model_path}\n\n"
+                    "「モデル読込」ボタンから読み込んでください。"
+                )
+
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "確認エラー",
+                f"モデルの確認に失敗しました:\n{str(e)}\n\n"
+                "ファイルは保存されています。「モデル読込」ボタンから読み込んでください。"
+            )
+
+    def _show_colab_settings(self):
+        """Colab設定ダイアログを表示"""
+        try:
+            from config_colab import (
+                COLAB_ENABLED, GOOGLE_CLIENT_SECRETS,
+                COLAB_DRIVE_FOLDER_NAME, get_colab_status, get_env_template,
+                get_oauth_setup_guide
+            )
+            config_available = True
+        except ImportError:
+            config_available = False
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Google Colab設定")
+        dialog.setMinimumWidth(600)
+        layout = QVBoxLayout(dialog)
+
+        # 現在の状態を表示
+        status_group = QGroupBox("接続状態")
+        status_layout = QVBoxLayout()
+
+        if config_available:
+            status = get_colab_status()
+            status_text = f"状態: {status['status']}\n{status['message']}"
+        else:
+            status_text = "config_colab.py が見つかりません"
+
+        status_label = QLabel(status_text)
+        status_label.setWordWrap(True)
+        status_layout.addWidget(status_label)
+        status_group.setLayout(status_layout)
+        layout.addWidget(status_group)
+
+        # 設定方法を表示（タブで切り替え）
+        tab_widget = QTabWidget()
+
+        # 環境変数タブ
+        env_tab = QWidget()
+        env_layout = QVBoxLayout(env_tab)
+        env_text = QPlainTextEdit()
+        env_text.setReadOnly(True)
+        if config_available:
+            env_text.setPlainText(get_env_template())
+        else:
+            env_text.setPlainText("config_colab.py が見つかりません")
+        env_text.setMinimumHeight(150)
+        env_layout.addWidget(env_text)
+
+        # コピーボタン
+        if config_available:
+            copy_env_button = QPushButton("環境変数テンプレートをコピー")
+            copy_env_button.clicked.connect(lambda: self._copy_env_template(get_env_template()))
+            env_layout.addWidget(copy_env_button)
+
+        tab_widget.addTab(env_tab, "環境変数")
+
+        # OAuth設定ガイドタブ
+        oauth_tab = QWidget()
+        oauth_layout = QVBoxLayout(oauth_tab)
+        oauth_text = QPlainTextEdit()
+        oauth_text.setReadOnly(True)
+        if config_available:
+            oauth_text.setPlainText(get_oauth_setup_guide())
+        else:
+            oauth_text.setPlainText(
+                "Google Colab連携を有効にするには、以下の手順を実行してください:\n\n"
+                "1. Google Cloud Consoleでプロジェクトを作成\n"
+                "2. Google Drive APIを有効化\n"
+                "3. OAuth 2.0クライアントIDを作成し、client_secrets.jsonをダウンロード\n"
+                "4. 環境変数を設定:\n"
+                "   COLAB_ENABLED=true\n"
+                "   GOOGLE_CLIENT_SECRETS=path/to/client_secrets.json"
+            )
+        oauth_text.setMinimumHeight(200)
+        oauth_layout.addWidget(oauth_text)
+        tab_widget.addTab(oauth_tab, "OAuth設定ガイド")
+
+        layout.addWidget(tab_widget)
+
+        # 認証テストボタン
+        if config_available and COLAB_ENABLED:
+            test_button = QPushButton("接続テスト")
+            test_button.clicked.connect(lambda: self._test_colab_connection(dialog))
+            layout.addWidget(test_button)
+
+        # 閉じるボタン
+        close_button = QPushButton("閉じる")
+        close_button.clicked.connect(dialog.accept)
+        layout.addWidget(close_button)
+
+        dialog.exec_()
+
+    def _test_colab_connection(self, parent_dialog):
+        """Google Drive接続テスト"""
+        try:
+            from utils.colab_transfer import ColabTransferManager
+
+            # 認証が必要な場合の事前通知
+            try:
+                from config_colab import GOOGLE_CREDENTIALS_PATH
+                import os
+                if not os.path.exists(GOOGLE_CREDENTIALS_PATH):
+                    reply = QMessageBox.question(
+                        parent_dialog,
+                        "認証が必要",
+                        "初回接続のため、ブラウザでGoogleアカウント認証が必要です。\n\n"
+                        "ブラウザが開いたら、Googleアカウントを選択して認証を完了してください。\n"
+                        "（タイムアウト: 60秒）\n\n"
+                        "続行しますか？",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.Yes
+                    )
+                    if reply != QMessageBox.Yes:
+                        return
+            except ImportError:
+                pass
+
+            # 進捗表示
+            parent_dialog.setEnabled(False)
+            self.statusBar().showMessage("Google認証中... ブラウザで認証を完了してください（タイムアウト: 60秒）")
+            QApplication.processEvents()
+
+            manager = ColabTransferManager()
+            success, message = manager.test_connection()
+
+            parent_dialog.setEnabled(True)
+            self.statusBar().clearMessage()
+
+            if success:
+                QMessageBox.information(parent_dialog, "接続テスト", message)
+            else:
+                QMessageBox.warning(parent_dialog, "接続テスト", message)
+
+            # ステータスを更新
+            self._update_colab_status_label()
+
+        except ImportError as e:
+            parent_dialog.setEnabled(True)
+            self.statusBar().clearMessage()
+            QMessageBox.critical(
+                parent_dialog,
+                "インポートエラー",
+                f"必要なライブラリがインストールされていません:\n\n{str(e)}\n\n"
+                "pip install pydrive2 google-auth google-auth-oauthlib pyyaml でインストールしてください。"
+            )
+        except TimeoutError as e:
+            parent_dialog.setEnabled(True)
+            self.statusBar().clearMessage()
+            QMessageBox.warning(
+                parent_dialog,
+                "認証タイムアウト",
+                f"{str(e)}\n\n"
+                "ブラウザを閉じた場合や、認証に時間がかかりすぎた場合に発生します。\n"
+                "再度「接続テスト」ボタンをクリックしてお試しください。"
+            )
+        except Exception as e:
+            parent_dialog.setEnabled(True)
+            self.statusBar().clearMessage()
+            import traceback
+            QMessageBox.critical(
+                parent_dialog,
+                "接続テストエラー",
+                f"接続テスト中にエラーが発生しました:\n\n{str(e)}"
+            )
+
     def toggle_dark_mode(self):
         """ダークモードを切り替える"""
         self.is_dark_mode = not self.is_dark_mode
@@ -12015,25 +13785,25 @@ class ImageAnnotationTool(QMainWindow):
             self.statusBar().showMessage("将来アノテーション表示をオフにしました", 3000)
 
     def toggle_gradcam_display(self, state):
-        """GradCAM表示の切り替え"""
+        """CAM表示の切り替え"""
         show_gradcam = (state == Qt.Checked)
         self.main_image_view.show_gradcam = show_gradcam
 
         if show_gradcam:
-            # GradCAMを生成して表示
+            # CAMを生成して表示
             self.update_gradcam_visualization()
-            self.statusBar().showMessage("GradCAM表示をオンにしました", 3000)
+            self.statusBar().showMessage("CAM表示をオンにしました", 3000)
         else:
-            # GradCAMオーバーレイをクリア
+            # CAMオーバーレイをクリア
             self.main_image_view.gradcam_overlay = None
             self.main_image_view.update()
-            self.statusBar().showMessage("GradCAM表示をオフにしました", 3000)
+            self.statusBar().showMessage("CAM表示をオフにしました", 3000)
 
     def change_gradcam_target(self, target):
-        """GradCAM対象出力の変更"""
+        """CAM対象出力の変更"""
         self.main_image_view.gradcam_target = target
 
-        # GradCAM表示中なら更新
+        # CAM表示中なら更新
         if self.main_image_view.show_gradcam:
             self.update_gradcam_visualization()
 
@@ -12041,17 +13811,25 @@ class ImageAnnotationTool(QMainWindow):
         """CAM手法の変更"""
         self.main_image_view.gradcam_method = method
 
-        # GradCAM表示中なら更新
+        # CAM表示中なら更新
+        if self.main_image_view.show_gradcam:
+            self.update_gradcam_visualization()
+
+    def change_gradcam_direction(self, direction):
+        """勾配方向の変更"""
+        self.main_image_view.gradcam_direction = direction
+
+        # CAM表示中なら更新
         if self.main_image_view.show_gradcam:
             self.update_gradcam_visualization()
 
     def update_gradcam_visualization(self):
-        """GradCAM可視化を更新"""
+        """CAM可視化を更新"""
         if not self.images or not hasattr(self, 'model') or self.model is None:
             return
 
         try:
-            from utils.gradcam_utils import GradCAM, overlay_heatmap
+            from utils.gradcam_utils import GradCAM, apply_colormap, generate_bidirectional_cam
             import cv2
 
             # 現在の画像パス
@@ -12069,12 +13847,10 @@ class ImageAnnotationTool(QMainWindow):
             device = self.model.device if hasattr(self.model, 'device') else torch.device('cpu')
             input_tensor = input_tensor.to(device)
 
-            # GradCAMインスタンス作成
+            # CAMインスタンス作成
             gradcam = GradCAM(self.model)
 
             try:
-                from utils.gradcam_utils import apply_colormap
-
                 # 対象出力のインデックスを取得
                 target_map = {'angle': 0, 'throttle': 1, 'speed': 2}
                 target_idx = target_map.get(self.main_image_view.gradcam_target, 0)
@@ -12082,26 +13858,55 @@ class ImageAnnotationTool(QMainWindow):
                 # CAM手法を取得
                 cam_method = getattr(self.main_image_view, 'gradcam_method', 'gradcam')
 
-                # ヒートマップ生成
-                heatmap = gradcam.generate_cam(
-                    input_tensor,
-                    target_output_index=target_idx,
-                    method=cam_method
-                )
+                # 勾配方向を取得
+                cam_direction = getattr(self.main_image_view, 'gradcam_direction', 'both')
 
-                # ヒートマップを画像サイズにリサイズ
+                # 画像サイズ
                 h, w = original_np.shape[:2]
-                heatmap_resized = cv2.resize(heatmap, (w, h))
 
-                # カラーマップを適用（BGRで返る）
-                heatmap_colored = apply_colormap(heatmap_resized, cv2.COLORMAP_JET)
-                # BGRからRGBAに変換（アルファチャンネル付き）
-                heatmap_rgba = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGBA)
+                if cam_direction == 'both':
+                    # 正負両方向を赤青で可視化
+                    positive_heatmap, negative_heatmap, combined_rgb = generate_bidirectional_cam(
+                        gradcam,
+                        input_tensor,
+                        target_output_index=target_idx,
+                        method=cam_method
+                    )
 
-                # アルファチャンネルをヒートマップの強度に基づいて設定
-                # 強度が高い部分ほど不透明に
-                alpha_value = int(255 * self.main_image_view.gradcam_alpha)
-                heatmap_rgba[:, :, 3] = (heatmap_resized * alpha_value).astype(np.uint8)
+                    # ヒートマップをリサイズ
+                    combined_rgb_resized = cv2.resize(combined_rgb, (w, h))
+                    positive_resized = cv2.resize(positive_heatmap, (w, h))
+                    negative_resized = cv2.resize(negative_heatmap, (w, h))
+
+                    # RGBからRGBAに変換
+                    heatmap_rgba = np.zeros((h, w, 4), dtype=np.uint8)
+                    heatmap_rgba[:, :, :3] = combined_rgb_resized
+
+                    # アルファチャンネル: 正負どちらかの強度が高い部分ほど不透明に
+                    combined_intensity = np.maximum(positive_resized, negative_resized)
+                    alpha_value = int(255 * self.main_image_view.gradcam_alpha)
+                    heatmap_rgba[:, :, 3] = (combined_intensity * alpha_value).astype(np.uint8)
+
+                else:
+                    # 単一方向（従来の処理）
+                    heatmap = gradcam.generate_cam(
+                        input_tensor,
+                        target_output_index=target_idx,
+                        method=cam_method,
+                        direction=cam_direction
+                    )
+
+                    # ヒートマップを画像サイズにリサイズ
+                    heatmap_resized = cv2.resize(heatmap, (w, h))
+
+                    # カラーマップを適用（BGRで返る）
+                    heatmap_colored = apply_colormap(heatmap_resized, cv2.COLORMAP_JET)
+                    # BGRからRGBAに変換（アルファチャンネル付き）
+                    heatmap_rgba = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGBA)
+
+                    # アルファチャンネルをヒートマップの強度に基づいて設定
+                    alpha_value = int(255 * self.main_image_view.gradcam_alpha)
+                    heatmap_rgba[:, :, 3] = (heatmap_resized * alpha_value).astype(np.uint8)
 
                 # QPixmapに変換（RGBA）
                 bytes_per_line = 4 * w
@@ -12116,10 +13921,10 @@ class ImageAnnotationTool(QMainWindow):
                 gradcam.remove_hooks()
 
         except Exception as e:
-            print(f"GradCAM生成エラー: {e}")
+            print(f"CAM生成エラー: {e}")
             import traceback
             traceback.print_exc()
-            self.statusBar().showMessage(f"GradCAM生成エラー: {e}", 5000)
+            self.statusBar().showMessage(f"CAM生成エラー: {e}", 5000)
 
     def toggle_inference_display(self, state):
         """自動運転推論表示の切り替え"""
@@ -14141,7 +15946,7 @@ class ImageAnnotationTool(QMainWindow):
                 # 推論結果ポイント（青丸）の設定
                 self._set_inference_point_on_canvas()
 
-                # GradCAM表示が有効な場合は更新
+                # CAM表示が有効な場合は更新
                 if hasattr(self, 'gradcam_checkbox') and self.gradcam_checkbox.isChecked():
                     self.update_gradcam_visualization()
 
@@ -14827,6 +16632,20 @@ class ImageAnnotationTool(QMainWindow):
             )
             return
 
+        # 確認ダイアログを表示
+        deleted_count = len(self.deleted_indexes)
+        reply = QMessageBox.question(
+            self,
+            "確認",
+            f"全ての削除状態をクリアします。よろしいですか？\n\n"
+            f"削除済みインデックス数: {deleted_count}個",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
         # 削除済みリストをクリア
         self.deleted_indexes = []
 
@@ -14850,36 +16669,16 @@ class ImageAnnotationTool(QMainWindow):
             return  # キャンセルされた場合
         
         try:
-            # deleted_indexesをactual_indexからoriginal_indexに変換
-            original_deleted_indexes = []
-            if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
-                for actual_idx in self.deleted_indexes:
-                    # アノテーションにoriginal_indexがある場合はそれを使用
-                    if actual_idx in self.annotations and "original_index" in self.annotations[actual_idx]:
-                        original_deleted_indexes.append(self.annotations[actual_idx]["original_index"])
-                    # アノテーションがない場合は、ファイル名から抽出
-                    elif 0 <= actual_idx < len(self.images):
-                        img_path = self.images[actual_idx]
-                        basename = os.path.basename(img_path)
-                        try:
-                            # Jetracer形式を優先的にチェック
-                            jetracer_match = re.match(r'^\d+_\d+_(\d+)_', basename)
-                            if jetracer_match:
-                                original_deleted_indexes.append(int(jetracer_match.group(1)))
-                            else:
-                                # 通常形式
-                                normal_match = re.match(r'^(\d+)_', basename)
-                                if normal_match:
-                                    original_deleted_indexes.append(int(normal_match.group(1)))
-                        except Exception as e:
-                            print(f"警告: 削除インデックス {actual_idx} の変換に失敗: {e}")
+            # deleted_indexesはactual_index（GUIでのインデックス）をそのまま渡す
+            # export_to_donkey内でassigned_indexに変換される
+            actual_deleted_indexes = list(self.deleted_indexes) if hasattr(self, 'deleted_indexes') and self.deleted_indexes else []
 
             # エクスポート実行
             catalog_path = export_to_donkey(
                 export_config['output_folder'],
                 self.annotations,
                 inference_results=self.inference_results,
-                deleted_indexes=original_deleted_indexes,
+                deleted_indexes=actual_deleted_indexes,
                 image_map=export_config['image_map'],
                 variant_keys=export_config['variant_keys'],
                 diff_vectors=self.inference_diff_vectors if hasattr(self, 'inference_diff_vectors') else None,
@@ -15347,8 +17146,8 @@ class ImageAnnotationTool(QMainWindow):
         inference_check.setChecked(self.inference_checkbox.isChecked())  # UIの設定を初期値に
         dialog_layout.addWidget(inference_check)
         
-        # 追加: 差分ベクトル表示設定
-        diff_vector_check = QCheckBox("差分ベクトル矢印を表示する（緑矢印）")
+        # 差分ベクトル表示設定
+        diff_vector_check = QCheckBox("差分ベクトルを表示（緑矢印）")
         diff_vector_check.setChecked(self.diff_vector_checkbox.isChecked())  # UIの設定を初期値に
         dialog_layout.addWidget(diff_vector_check)
 

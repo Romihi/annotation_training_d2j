@@ -198,5 +198,7 @@ claude/
 nul
 NUL
 
-#backup
-backup/
+# Google OAuth credentials (security)
+client_secrets.json
+.google_credentials.json
+pydrive_settings.yaml

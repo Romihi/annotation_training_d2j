@@ -102,7 +102,10 @@ def export_to_donkey(
     
     # インデックスを最終的に割り当て（連続した番号になるように）
     catalog_entries = []
-    
+
+    # actual_index から assigned_index へのマッピング（削除インデックス変換用）
+    actual_to_assigned = {}
+
     for i, entry in enumerate(indexed_annotations):
         original_index = entry["index"]
         annotation = entry["annotation"]
@@ -240,6 +243,9 @@ def export_to_donkey(
         # 少なくとも1つの画像がエントリに追加された場合のみカタログに追加
         if any(key in catalog_entry for key in catalog_keys):
             catalog_entries.append(catalog_entry)
+            # actual_index から assigned_index へのマッピングを記録（削除インデックス変換用）
+            if actual_index is not None:
+                actual_to_assigned[actual_index] = assigned_index
     
     if not catalog_entries:
         print("警告: エクスポート可能なエントリがありません。")
@@ -276,6 +282,16 @@ def export_to_donkey(
     # 削除されたインデックスを確認し、設定（Noneの場合は空リスト）
     if deleted_indexes is None:
         deleted_indexes = []
+
+    # deleted_indexes を actual_index から assigned_index に変換
+    # （複数フォルダ読み込み時のインデックスずれを防止）
+    converted_deleted_indexes = []
+    for actual_idx in deleted_indexes:
+        if actual_idx in actual_to_assigned:
+            converted_deleted_indexes.append(actual_to_assigned[actual_idx])
+        else:
+            print(f"警告: 削除インデックス {actual_idx} に対応するエクスポートエントリが見つかりません（スキップ）")
+    deleted_indexes = sorted(converted_deleted_indexes)
     
     # カスタム列の設定（存在するデータを確認）
     # 画像カラム
