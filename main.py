@@ -17706,7 +17706,62 @@ class ImageAnnotationTool(QMainWindow):
         skip_spin.setValue(self.skip_count_spin.value())  # UIのスキップ値を初期値に
         skip_layout.addWidget(skip_spin)
         dialog_layout.addLayout(skip_layout)
-        
+
+        # 範囲指定設定
+        range_group = QGroupBox("対象範囲")
+        range_group_layout = QVBoxLayout(range_group)
+
+        # ラジオボタン
+        all_range_radio = QRadioButton("すべての画像")
+        all_range_radio.setChecked(True)
+        range_group_layout.addWidget(all_range_radio)
+
+        specified_range_radio = QRadioButton("インデックス範囲を指定")
+        range_group_layout.addWidget(specified_range_radio)
+
+        # インデックス範囲入力
+        range_index_layout = QHBoxLayout()
+        range_index_layout.addSpacing(20)
+        range_index_layout.addWidget(QLabel("開始:"))
+        range_start_spin = QSpinBox()
+        range_start_spin.setRange(0, len(self.images) - 1 if self.images else 0)
+        range_start_spin.setValue(0)
+        range_start_spin.setEnabled(False)
+        range_index_layout.addWidget(range_start_spin)
+
+        # 現在位置ボタン（開始）
+        range_start_current_btn = QPushButton("現在位置")
+        range_start_current_btn.setEnabled(False)
+        range_start_current_btn.setToolTip("現在表示中の画像インデックスを設定")
+        range_start_current_btn.clicked.connect(lambda: range_start_spin.setValue(self.current_index))
+        range_index_layout.addWidget(range_start_current_btn)
+
+        range_index_layout.addWidget(QLabel("終了:"))
+        range_end_spin = QSpinBox()
+        range_end_spin.setRange(0, len(self.images) - 1 if self.images else 0)
+        range_end_spin.setValue(len(self.images) - 1 if self.images else 0)
+        range_end_spin.setEnabled(False)
+        range_index_layout.addWidget(range_end_spin)
+
+        # 現在位置ボタン（終了）
+        range_end_current_btn = QPushButton("現在位置")
+        range_end_current_btn.setEnabled(False)
+        range_end_current_btn.setToolTip("現在表示中の画像インデックスを設定")
+        range_end_current_btn.clicked.connect(lambda: range_end_spin.setValue(self.current_index))
+        range_index_layout.addWidget(range_end_current_btn)
+
+        range_group_layout.addLayout(range_index_layout)
+        dialog_layout.addWidget(range_group)
+
+        # ラジオボタンの状態変化でスピンボックスとボタンを有効/無効化
+        def on_range_radio_toggled(checked):
+            range_start_spin.setEnabled(checked)
+            range_end_spin.setEnabled(checked)
+            range_start_current_btn.setEnabled(checked)
+            range_end_current_btn.setEnabled(checked)
+
+        specified_range_radio.toggled.connect(on_range_radio_toggled)
+
         # 推論結果表示設定
         inference_check = QCheckBox("推論結果を表示する（水色丸）")
         inference_check.setChecked(self.inference_checkbox.isChecked())  # UIの設定を初期値に
@@ -17840,28 +17895,34 @@ class ImageAnnotationTool(QMainWindow):
         def update_total_frames():
             skip = skip_spin.value()
             is_multi_mode = multi_source_radio.isChecked()
-            
+            is_range_specified = specified_range_radio.isChecked()
+
+            # 範囲指定の場合、範囲内の画像数を計算
+            range_start = range_start_spin.value()
+            range_end = range_end_spin.value()
+            range_info = ""
+
             if is_multi_mode:
                 # 複数ソースモードの場合、選択されたすべてのソースで最小の画像数を取得
                 selected_sources = []
                 for check in multi_source_checks:
                     if check.isChecked():
                         selected_sources.append(check.property("variant"))
-                
+
                 if not selected_sources:
                     total_frames_label.setText("合計フレーム数: 画像ソースが選択されていません")
                     return
-                    
+
                 # 各ソースの画像数を取得
                 source_counts = []
                 for source in selected_sources:
                     if source in variant_images:
                         source_counts.append(len(variant_images[source]))
-                
+
                 if not source_counts:
                     total_frames_label.setText("合計フレーム数: 有効な画像ソースがありません")
                     return
-                    
+
                 # 最小の画像数を使用（すべてのソースで揃えるため）
                 min_count = min(source_counts)
                 count = min_count
@@ -17872,12 +17933,23 @@ class ImageAnnotationTool(QMainWindow):
                     if button.isChecked():
                         selected_source = button.property("variant")
                         break
-                
+
                 if selected_source and selected_source in variant_images:
                     count = len(variant_images[selected_source])
                 else:
                     count = len(self.images) if hasattr(self, 'images') else 0
-            
+
+            # 範囲指定が有効な場合、範囲内の画像数に制限
+            if is_range_specified:
+                if range_start > range_end:
+                    total_frames_label.setText("合計フレーム数: 開始は終了以下にしてください")
+                    return
+                # 範囲が画像数を超えないように調整
+                effective_end = min(range_end, count - 1)
+                effective_start = min(range_start, effective_end)
+                count = effective_end - effective_start + 1
+                range_info = f"\n範囲: {effective_start} - {effective_end}"
+
             # スキップを適用した合計フレーム数（端数は切り上げ）
             total_frames = (count + skip - 1) // skip
             
@@ -17895,9 +17967,9 @@ class ImageAnnotationTool(QMainWindow):
                     source_info = f"\n選択ソース: {selected_sources_str} (各{min_count}枚)"
                 else:
                     source_info = ""
-                    
+
                 total_frames_label.setText(
-                    f"合計フレーム数: {total_frames}フレーム (約{time_str}){source_info}"
+                    f"合計フレーム数: {total_frames}フレーム (約{time_str}){source_info}{range_info}"
                 )
             else:
                 total_frames_label.setText(f"合計フレーム数: {total_frames}フレーム")
@@ -17907,13 +17979,18 @@ class ImageAnnotationTool(QMainWindow):
         fps_spin.valueChanged.connect(update_total_frames)
         single_source_radio.toggled.connect(update_total_frames)
         multi_source_radio.toggled.connect(update_total_frames)
-        
+
+        # 範囲指定の変更時にフレーム数更新
+        specified_range_radio.toggled.connect(update_total_frames)
+        range_start_spin.valueChanged.connect(update_total_frames)
+        range_end_spin.valueChanged.connect(update_total_frames)
+
         for button in single_source_buttons.buttons():
             button.toggled.connect(update_total_frames)
-        
+
         for check in multi_source_checks:
             check.stateChanged.connect(update_total_frames)
-        
+
         # 初期フレーム数計算
         update_total_frames()
         
@@ -17934,6 +18011,16 @@ class ImageAnnotationTool(QMainWindow):
         show_diff_vectors = diff_vector_check.isChecked()  # 追加
         is_multi_mode = multi_source_radio.isChecked()
 
+        # 範囲指定の取得
+        is_range_specified = specified_range_radio.isChecked()
+        video_range_start = range_start_spin.value()
+        video_range_end = range_end_spin.value()
+
+        # 範囲の妥当性チェック
+        if is_range_specified and video_range_start > video_range_end:
+            QMessageBox.warning(settings_dialog, "警告", "開始インデックスは終了インデックス以下である必要があります。")
+            return
+
         # 選択された画像ソースを取得
         if is_multi_mode:
             # 複数ソースモード
@@ -17941,23 +18028,28 @@ class ImageAnnotationTool(QMainWindow):
             for check in multi_source_checks:
                 if check.isChecked():
                     selected_variants.append(check.property("variant"))
-            
+
             if not selected_variants:
                 QMessageBox.warning(settings_dialog, "警告", "画像ソースが選択されていません。")
                 return
-                
+
             # 各ソースの画像リスト
             multi_source_images = []
             for variant in selected_variants:
                 if variant in variant_images:
-                    multi_source_images.append(variant_images[variant])
+                    images_list = variant_images[variant]
+                    # 範囲指定が有効な場合はスライス
+                    if is_range_specified:
+                        effective_end = min(video_range_end + 1, len(images_list))
+                        images_list = images_list[video_range_start:effective_end]
+                    multi_source_images.append(images_list)
                 else:
                     QMessageBox.warning(settings_dialog, "警告", f"ソース '{variant}' の画像が見つかりません。")
                     return
-            
+
             # 各ソースで利用可能な画像数の最小値を取得
             min_images_count = min(len(images) for images in multi_source_images)
-            
+
             if min_images_count == 0:
                 QMessageBox.warning(settings_dialog, "警告", "選択したソースのいずれかに画像がありません。")
                 return
@@ -17968,17 +18060,22 @@ class ImageAnnotationTool(QMainWindow):
                 if button.isChecked():
                     selected_variant = button.property("variant")
                     break
-            
+
             if not selected_variant:
                 QMessageBox.warning(settings_dialog, "警告", "画像ソースが選択されていません。")
                 return
-                
+
             # 選択されたソースの画像を取得
             if selected_variant in variant_images:
                 selected_images = variant_images[selected_variant]
             else:
                 selected_images = self.images if hasattr(self, 'images') else []
-                
+
+            # 範囲指定が有効な場合はスライス
+            if is_range_specified:
+                effective_end = min(video_range_end + 1, len(selected_images))
+                selected_images = selected_images[video_range_start:effective_end]
+
             if not selected_images:
                 QMessageBox.warning(settings_dialog, "警告", f"選択したソース '{selected_variant}' に画像がありません。")
                 return
@@ -18045,14 +18142,20 @@ class ImageAnnotationTool(QMainWindow):
                     source_info = f"複数ソース: {', '.join(selected_variants)}"
                 else:
                     source_info = f"ソース: {selected_variant}"
-                    
+
+                # 範囲情報
+                if is_range_specified:
+                    range_info = f"\n範囲: {video_range_start} - {video_range_end}"
+                else:
+                    range_info = ""
+
                 QMessageBox.information(
-                    self, 
-                    "成功", 
+                    self,
+                    "成功",
                     f"アノテーション動画を作成しました:\n"
                     f"ファイル: {os.path.basename(selected_file)}\n"
                     f"フレーム数: {frames_count}フレーム\n"
-                    f"{source_info}\n"
+                    f"{source_info}{range_info}\n"
                     f"設定: {fps}fps, {skip_count}枚ごと"
                 )
             else:
