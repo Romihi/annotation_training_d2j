@@ -19459,6 +19459,14 @@ class ImageAnnotationTool(QMainWindow):
         index_layout.addWidget(end_current_button)
 
         range_layout.addLayout(index_layout)
+
+        # 既存アノテーション上書きチェックボックス
+        overwrite_checkbox = QCheckBox("既存のアノテーションを上書きする")
+        overwrite_checkbox.setChecked(False)
+        overwrite_checkbox.setEnabled(False)  # 初期状態で非アクティブ（範囲指定時のみ有効）
+        overwrite_checkbox.setToolTip("チェックすると、既にアノテーションされている画像も再推論で上書きします")
+        range_layout.addWidget(overwrite_checkbox)
+
         layout.addWidget(range_group)
 
         # ラジオボタンの状態変化でスピンボックスとボタンを有効/無効化
@@ -19467,6 +19475,9 @@ class ImageAnnotationTool(QMainWindow):
             end_spin.setEnabled(checked)
             start_current_button.setEnabled(checked)
             end_current_button.setEnabled(checked)
+            overwrite_checkbox.setEnabled(checked)
+            if not checked:
+                overwrite_checkbox.setChecked(False)
 
         range_radio.toggled.connect(on_range_radio_toggled)
 
@@ -19480,25 +19491,30 @@ class ImageAnnotationTool(QMainWindow):
         if range_dialog.exec_() != QDialog.Accepted:
             return
 
-        # 範囲に基づいてアノテーション対象画像を取得
+        # 範囲に基づいてアノテーション対象のインデックスを取得
         if all_radio.isChecked():
-            # すべてのアノテーションされていない画像
-            unannotated_images = [img for img in self.images if img not in self.annotations]
+            # すべてのアノテーションされていないインデックス
+            target_indices = [idx for idx in range(len(self.images)) if idx not in self.annotations]
         else:
-            # 指定範囲のアノテーションされていない画像
-            start_idx = start_spin.value()
-            end_idx = end_spin.value()
-            if start_idx > end_idx:
+            # 指定範囲のインデックスを取得
+            range_start = start_spin.value()
+            range_end = end_spin.value()
+            if range_start > range_end:
                 QMessageBox.warning(self, "警告", "開始インデックスは終了インデックス以下である必要があります。")
                 return
 
-            range_images = self.images[start_idx:end_idx + 1]
-            unannotated_images = [img for img in range_images if img not in self.annotations]
+            # 上書きオプションに応じて対象インデックスを決定
+            if overwrite_checkbox.isChecked():
+                # 上書きモード: 範囲内の全インデックスを対象
+                target_indices = list(range(range_start, range_end + 1))
+            else:
+                # 通常モード: 未アノテーションのインデックスのみ
+                target_indices = [idx for idx in range(range_start, range_end + 1) if idx not in self.annotations]
 
-        if not unannotated_images:
+        if not target_indices:
             QMessageBox.information(self, "情報", "指定範囲にアノテーションされていない画像がありません。")
             return
-        
+
         # 選択された学習方法（モデル）を取得
         model_type = self.auto_method_combo.currentText()
         selected_model = self.model_combo.currentText()
@@ -19515,7 +19531,7 @@ class ImageAnnotationTool(QMainWindow):
         
         # 進捗ダイアログを表示
         progress = QProgressDialog(
-            f"オートアノテーション準備中... ({len(unannotated_images)}枚の画像)", 
+            f"オートアノテーション準備中... ({len(target_indices)}枚の画像)",
             "キャンセル", 0, 100, self
         )
         progress.setWindowTitle("オートアノテーション実行中")
@@ -19524,15 +19540,15 @@ class ImageAnnotationTool(QMainWindow):
         progress.setValue(0)
         progress.show()
         QApplication.processEvents()
-        
+
         # 処理前の確認
         progress.setLabelText(f"モデル '{model_type}' を使用した処理を準備中...")
         progress.setValue(5)
         QApplication.processEvents()
-        
+
         # バッチサイズ - 大量の画像を一度に処理するとメモリ不足になる可能性があるため
         batch_size = 50
-        total_batches = (len(unannotated_images) + batch_size - 1) // batch_size
+        total_batches = (len(target_indices) + batch_size - 1) // batch_size
         
         try:
             # モデル初期化
@@ -19562,50 +19578,59 @@ class ImageAnnotationTool(QMainWindow):
             for batch_idx in range(total_batches):
                 if progress.wasCanceled():
                     break
-                    
-                # 現在のバッチの画像取得
-                start_idx = batch_idx * batch_size
-                end_idx = min((batch_idx + 1) * batch_size, len(unannotated_images))
-                current_batch = unannotated_images[start_idx:end_idx]
-                
+
+                # 現在のバッチのインデックス取得
+                batch_start = batch_idx * batch_size
+                batch_end = min((batch_idx + 1) * batch_size, len(target_indices))
+                current_batch_indices = target_indices[batch_start:batch_end]
+
+                # インデックスからファイルパスのリストを作成（batch_inferenceに渡す用）
+                current_batch_paths = [self.images[idx] for idx in current_batch_indices]
+
                 progress.setLabelText(
                     f"バッチ {batch_idx+1}/{total_batches} 処理中...\n"
-                    f"画像 {start_idx+1}-{end_idx}/{len(unannotated_images)}"
+                    f"画像 {batch_start+1}-{batch_end}/{len(target_indices)}"
                 )
-                
+
                 # 進捗値計算 - バッチ処理に80%の進捗を割り当て (15-95%)
                 batch_progress = 15 + int((batch_idx / total_batches) * 80)
                 progress.setValue(batch_progress)
                 QApplication.processEvents()
-                
+
                 # 推論を実行
                 try:
                     inference_results = batch_inference(
-                        current_batch, 
-                        method="model", 
+                        current_batch_paths,
+                        method="model",
                         model_type=model_type,
                         model_path=model_path,
                         force_reload=(batch_idx == 0)  # 最初のバッチのみ強制再読込
                     )
-                    
+
                     # サブ進捗表示
-                    batch_size = len(current_batch)
-                    for i, (img_path, result) in enumerate(inference_results.items()):
+                    current_batch_size = len(current_batch_indices)
+                    for i, img_index in enumerate(current_batch_indices):
                         if progress.wasCanceled():
                             break
-                            
+
+                        img_path = self.images[img_index]
+                        result = inference_results.get(img_path, {})
+
+                        if not result:
+                            continue
+
                         # 10画像ごとに進捗更新
-                        if i % 10 == 0 or i == batch_size - 1:
-                            sub_progress = batch_progress + int((i / batch_size) * (80 / total_batches))
+                        if i % 10 == 0 or i == current_batch_size - 1:
+                            sub_progress = batch_progress + int((i / current_batch_size) * (80 / total_batches))
                             progress.setValue(min(95, sub_progress))
                             progress.setLabelText(
                                 f"バッチ {batch_idx+1}/{total_batches} 処理中...\n"
-                                f"画像 {start_idx+i+1}/{len(unannotated_images)} を処理中"
+                                f"画像 {batch_start+i+1}/{len(target_indices)} を処理中"
                             )
                             QApplication.processEvents()
-                        
-                        # アノテーションを保存
-                        self.annotations[img_path] = {
+
+                        # アノテーションを保存（インデックスをキーとして使用）
+                        self.annotations[img_index] = {
                             "angle": result.get("angle", 0),
                             "throttle": result.get("throttle", 0),
                             "x": result.get("x", 0),
@@ -19615,26 +19640,28 @@ class ImageAnnotationTool(QMainWindow):
                         # 位置情報があれば追加
                         if "loc" in result or "pilot/loc" in result:
                             loc_value = result.get("pilot/loc", result.get("loc", 0))
-                            self.annotations[self.current_index]["loc"] = loc_value
-                            self.location_annotations[self.current_index] = loc_value
-                            
-                            # 位置情報ボタンがまだなimg_pathければ追加
+                            self.annotations[img_index]["loc"] = loc_value
+                            self.location_annotations[img_index] = loc_value
+
+                            # 位置情報ボタンがまだなければ追加
                             self.ensure_location_button_exists(loc_value)
 
-                        # タイムスタンプを記録
-                        self.annotation_timestamps[img_path] = int(time.time() * 1000)
-                        
-                        # 推論結果も保存
-                        self.inference_results[img_path] = result
-                        
+                        # タイムスタンプを記録（インデックスをキーとして使用）
+                        self.annotation_timestamps[img_index] = int(time.time() * 1000)
+
+                        # 推論結果も保存（インデックスをキーとして使用）
+                        self.inference_results[img_index] = result
+
                         # カウント更新
                         processed_count += 1
                         success_count += 1
-                    
+
                 except Exception as e:
                     print(f"バッチ {batch_idx+1} 処理中にエラー: {e}")
+                    import traceback
+                    traceback.print_exc()
                     # エラーがあっても次のバッチを処理する
-                    processed_count += len(current_batch)
+                    processed_count += len(current_batch_indices)
             
             # 最終処理
             if not progress.wasCanceled():
@@ -19665,22 +19692,25 @@ class ImageAnnotationTool(QMainWindow):
                 progress.setLabelText(f"完了: {success_count}枚の画像にオートアノテーションを適用しました")
                 progress.setValue(100)
                 QApplication.processEvents()
-            
+
+            # キャンセル状態を保存（close()前に取得）
+            was_canceled = progress.wasCanceled()
+
             # 処理完了
             progress.close()
-            
-            if not progress.wasCanceled():
+
+            if not was_canceled:
                 QMessageBox.information(
-                    self, 
-                    "完了", 
+                    self,
+                    "完了",
                     f"{success_count}枚の画像にオートアノテーションを適用しました。\n"
-                    f"使用モデル: {model_type}" + 
+                    f"使用モデル: {model_type}" +
                     (f" ({os.path.basename(model_path)})" if model_path else " (事前学習済み)")
                 )
             else:
                 QMessageBox.information(
-                    self, 
-                    "キャンセル", 
+                    self,
+                    "キャンセル",
                     f"オートアノテーションがキャンセルされました。\n"
                     f"{success_count}枚の画像が処理されました。"
                 )
