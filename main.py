@@ -17560,6 +17560,186 @@ class ImageAnnotationTool(QMainWindow):
         basic_tab = QWidget()
         basic_layout = QVBoxLayout(basic_tab)
 
+        # 初期化設定グループ（モデル選択と重みの読み込み）
+        init_group = QGroupBox("初期化設定")
+        init_layout = QVBoxLayout()
+
+        # モデルアーキテクチャ選択（初期化設定の先頭に配置）
+        model_select_layout = QHBoxLayout()
+        model_select_label = QLabel("モデルアーキテクチャ:")
+        model_type_combo = QComboBox()
+        model_type_combo.setMinimumWidth(200)
+
+        # 利用可能なモデルアーキテクチャのリストを取得
+        available_architectures = list_available_models()
+        model_type_combo.addItems(available_architectures)
+
+        # 現在選択されているモデルタイプをデフォルトにする
+        if model_type in available_architectures:
+            model_type_combo.setCurrentText(model_type)
+
+        model_select_layout.addWidget(model_select_label)
+        model_select_layout.addWidget(model_type_combo)
+        model_select_layout.addStretch()
+        init_layout.addLayout(model_select_layout)
+
+        # セパレーター的なスペース
+        init_layout.addSpacing(10)
+
+        # 利用可能なモデルファイルのリストを取得
+        all_available_models = []
+        if os.path.exists(models_dir):
+            for f in os.listdir(models_dir):
+                if f.endswith('.pth'):
+                    model_path_check = os.path.join(models_dir, f)
+                    if os.path.exists(model_path_check):
+                        all_available_models.append(f)
+        all_available_models.sort(reverse=True)  # 新しいものが上に来るようにソート
+
+        # 選択されたモデルタイプに基づいてフィルタリングする関数
+        def get_filtered_models(selected_model_type):
+            """選択されたモデルタイプに基づいてモデルファイルをフィルタリング"""
+            filtered = []
+            for model_file in all_available_models:
+                # モデルファイル名のプレフィックスをチェック（例: ResNet18_xxx.pth, MobileNetV3_xxx.pth）
+                model_name_lower = model_file.lower()
+                selected_type_lower = selected_model_type.lower().replace('_', '').replace('-', '')
+
+                # モデルタイプ名のバリエーションをチェック
+                if selected_type_lower in model_name_lower.replace('_', '').replace('-', ''):
+                    filtered.append(model_file)
+            return filtered
+
+        # 現在のモデルタイプに基づいてフィルタリングされたモデルリスト
+        filtered_models = get_filtered_models(model_type)
+        has_valid_models = len(filtered_models) > 0
+
+        # 事前学習済みの重みがないモデルのリスト
+        models_without_pretrained = ["donkeycar", "donkey_fcn"]
+
+        def has_pretrained_weights(model_name):
+            """指定されたモデルが事前学習済みの重みを持つかどうかを判定"""
+            return model_name.lower() not in [m.lower() for m in models_without_pretrained]
+
+        # ラジオボタングループ
+        weights_button_group = QButtonGroup(training_settings)
+
+        # 現在選択されているモデルが事前学習済みの重みを持つかどうか
+        initial_has_pretrained = has_pretrained_weights(model_type)
+
+        weights_radio_pretrained = QRadioButton("事前学習済みの重みを使用（推奨）")
+        if initial_has_pretrained:
+            weights_radio_pretrained.setChecked(True)
+            weights_radio_pretrained.setToolTip("ImageNetで事前学習済みの重みを使用して学習します（転移学習）")
+        else:
+            weights_radio_pretrained.setEnabled(False)
+            weights_radio_pretrained.setToolTip("このモデルには事前学習済みの重みがありません")
+        weights_button_group.addButton(weights_radio_pretrained)
+        init_layout.addWidget(weights_radio_pretrained)
+
+        weights_radio_random = QRadioButton("ランダム初期化（スクラッチから学習）")
+        weights_radio_random.setToolTip("重みをランダムに初期化して最初から学習します（学習に時間がかかります）")
+        # 事前学習済みがない場合はランダム初期化をデフォルトに
+        if not initial_has_pretrained:
+            weights_radio_random.setChecked(True)
+        weights_button_group.addButton(weights_radio_random)
+        init_layout.addWidget(weights_radio_random)
+
+        weights_radio_finetune = QRadioButton("既存モデルの重みを使用（ファインチューニング）")
+        if has_valid_models:
+            weights_radio_finetune.setToolTip("選択したモデルの重みを使用してファインチューニングします")
+        else:
+            weights_radio_finetune.setEnabled(False)
+            weights_radio_finetune.setToolTip("選択したモデルタイプに対応するモデルがありません")
+        weights_button_group.addButton(weights_radio_finetune)
+        init_layout.addWidget(weights_radio_finetune)
+
+        # モデル選択用のコンボボックス
+        finetune_model_layout = QHBoxLayout()
+        finetune_model_layout.setContentsMargins(20, 0, 0, 0)  # 左インデント
+        finetune_model_label = QLabel("ベースモデル:")
+        finetune_model_combo = QComboBox()
+        finetune_model_combo.setMinimumWidth(300)
+
+        # フィルタリングされたモデルでコンボボックスを初期化
+        def update_finetune_model_list():
+            """モデルタイプに基づいてファインチューニング用モデルリストと事前学習済みオプションを更新"""
+            selected_type = model_type_combo.currentText()
+            filtered = get_filtered_models(selected_type)
+
+            # 事前学習済みの重みの有無をチェック
+            has_pretrained = has_pretrained_weights(selected_type)
+            if has_pretrained:
+                weights_radio_pretrained.setEnabled(True)
+                weights_radio_pretrained.setToolTip("ImageNetで事前学習済みの重みを使用して学習します（転移学習）")
+            else:
+                weights_radio_pretrained.setEnabled(False)
+                weights_radio_pretrained.setToolTip("このモデルには事前学習済みの重みがありません")
+                # 事前学習済みが選択されていたら、ランダム初期化に切り替え
+                if weights_radio_pretrained.isChecked():
+                    weights_radio_random.setChecked(True)
+
+            finetune_model_combo.clear()
+            if filtered:
+                finetune_model_combo.addItems(filtered)
+                # 現在選択されているモデルがリストにあればデフォルトにする
+                current_model = self.model_combo.currentText()
+                if current_model in filtered:
+                    finetune_model_combo.setCurrentText(current_model)
+                # ファインチューニングオプションを有効化
+                weights_radio_finetune.setEnabled(True)
+                weights_radio_finetune.setToolTip("選択したモデルの重みを使用してファインチューニングします")
+            else:
+                finetune_model_combo.addItem(f"{selected_type}のモデルがありません")
+                # ファインチューニングオプションを無効化
+                weights_radio_finetune.setEnabled(False)
+                weights_radio_finetune.setToolTip(f"{selected_type}に対応するモデルがありません")
+                # ファインチューニングが選択されていたら、適切なオプションに切り替え
+                if weights_radio_finetune.isChecked():
+                    if has_pretrained:
+                        weights_radio_pretrained.setChecked(True)
+                    else:
+                        weights_radio_random.setChecked(True)
+
+            # コンボボックスの有効/無効状態を更新
+            toggle_finetune_model_combo()
+
+        # 初期リストを設定
+        if has_valid_models:
+            finetune_model_combo.addItems(filtered_models)
+            current_model = self.model_combo.currentText()
+            if current_model in filtered_models:
+                finetune_model_combo.setCurrentText(current_model)
+        else:
+            finetune_model_combo.addItem(f"{model_type}のモデルがありません")
+
+        finetune_model_combo.setEnabled(False)  # 初期状態では無効
+        finetune_model_label.setEnabled(False)
+
+        finetune_model_layout.addWidget(finetune_model_label)
+        finetune_model_layout.addWidget(finetune_model_combo)
+        finetune_model_layout.addStretch()
+        init_layout.addLayout(finetune_model_layout)
+
+        # ラジオボタンの状態に応じてコンボボックスの有効/無効を切り替え
+        def toggle_finetune_model_combo():
+            is_finetune = weights_radio_finetune.isChecked()
+            selected_type = model_type_combo.currentText()
+            filtered = get_filtered_models(selected_type)
+            has_models = len(filtered) > 0
+            finetune_model_combo.setEnabled(is_finetune and has_models)
+            finetune_model_label.setEnabled(is_finetune and has_models)
+
+        weights_radio_pretrained.toggled.connect(toggle_finetune_model_combo)
+        weights_radio_random.toggled.connect(toggle_finetune_model_combo)
+        weights_radio_finetune.toggled.connect(toggle_finetune_model_combo)
+
+        # モデルタイプが変更されたらファインチューニング用モデルリストを更新
+        model_type_combo.currentIndexChanged.connect(update_finetune_model_list)
+
+        init_group.setLayout(init_layout)
+        basic_layout.addWidget(init_group)
+
         # 出力設定グループ（Speed出力と将来予測を統合）
         output_settings_group = QGroupBox("出力設定")
         output_settings_layout = QVBoxLayout()
@@ -17619,19 +17799,121 @@ class ImageAnnotationTool(QMainWindow):
         output_settings_group.setLayout(output_settings_layout)
         basic_layout.addWidget(output_settings_group)
 
-        # エポック数設定
-        epoch_layout = QHBoxLayout()
-        epoch_layout.addWidget(QLabel("学習エポック数:"))
+        # 学習パラメータグループ
+        training_params_group = QGroupBox("学習パラメータ")
+        training_params_layout = QVBoxLayout()
+
+        # エポック数・学習率設定（同じ行に配置）
+        epoch_lr_layout = QHBoxLayout()
+        epoch_lr_layout.addWidget(QLabel("学習エポック数:"))
         epoch_spin = QSpinBox()
         epoch_spin.setRange(1, 1000)
         epoch_spin.setValue(30)  # デフォルト: 30エポック
-        epoch_layout.addWidget(epoch_spin)
-        basic_layout.addLayout(epoch_layout)
-        
-        # Early Stopping設定
-        early_stopping_check = QCheckBox("Early Stopping を有効にする")
-        early_stopping_check.setChecked(True)
-        basic_layout.addWidget(early_stopping_check)
+        epoch_lr_layout.addWidget(epoch_spin)
+
+        epoch_lr_layout.addWidget(QLabel("学習率:"))
+        lr_combo = QComboBox()
+        learning_rates = ["0.001", "0.0005", "0.0001", "0.00005", "0.00001"]
+        lr_combo.addItems(learning_rates)
+        lr_combo.setCurrentIndex(0)  # デフォルト: 0.001
+        epoch_lr_layout.addWidget(lr_combo)
+
+        epoch_lr_layout.addStretch()
+        training_params_layout.addLayout(epoch_lr_layout)
+
+        # Early Stopping設定（チェックボックスと忍耐エポック数を同じ行に配置）
+        early_stopping_layout = QHBoxLayout()
+        early_stopping_check = QCheckBox("Early Stopping")
+        early_stopping_check.setChecked(False)  # デフォルト: 無効
+        early_stopping_layout.addWidget(early_stopping_check)
+
+        patience_label = QLabel("忍耐エポック数:")
+        patience_label.setEnabled(False)  # 初期状態では無効
+        early_stopping_layout.addWidget(patience_label)
+        patience_spin = QSpinBox()
+        patience_spin.setRange(1, 50)
+        patience_spin.setValue(5)
+        patience_spin.setEnabled(False)  # 初期状態では無効
+        early_stopping_layout.addWidget(patience_spin)
+
+        min_delta_label = QLabel("最小改善量:")
+        min_delta_label.setEnabled(False)  # 初期状態では無効
+        early_stopping_layout.addWidget(min_delta_label)
+        min_delta_spin = QDoubleSpinBox()
+        min_delta_spin.setRange(0.0, 1.0)
+        min_delta_spin.setSingleStep(0.0001)
+        min_delta_spin.setDecimals(4)
+        min_delta_spin.setValue(0.0001)  # デフォルト: 0.0001
+        min_delta_spin.setEnabled(False)  # 初期状態では無効
+        early_stopping_layout.addWidget(min_delta_spin)
+
+        early_stopping_layout.addStretch()
+        training_params_layout.addLayout(early_stopping_layout)
+
+        # Early Stoppingチェックボックスの状態に応じて設定の有効/無効を切り替え
+        def update_early_stopping_ui():
+            enabled = early_stopping_check.isChecked()
+            patience_label.setEnabled(enabled)
+            patience_spin.setEnabled(enabled)
+            min_delta_label.setEnabled(enabled)
+            min_delta_spin.setEnabled(enabled)
+
+        early_stopping_check.toggled.connect(update_early_stopping_ui)
+
+        # バッチサイズ・検証データ割合・Weight Decay設定（同じ行に配置）
+        batch_val_wd_layout = QHBoxLayout()
+
+        batch_val_wd_layout.addWidget(QLabel("バッチサイズ:"))
+        batch_size_combo = QComboBox()
+        batch_sizes = ["8", "16", "32", "64", "128", "256"]
+        batch_size_combo.addItems(batch_sizes)
+        batch_size_combo.setCurrentIndex(2)  # デフォルト: 32
+        batch_val_wd_layout.addWidget(batch_size_combo)
+
+        batch_val_wd_layout.addWidget(QLabel("検証データ割合:"))
+        val_split_spin = QDoubleSpinBox()
+        val_split_spin.setRange(0.1, 0.5)
+        val_split_spin.setSingleStep(0.05)
+        val_split_spin.setDecimals(2)
+        val_split_spin.setValue(0.2)  # デフォルト: 20%
+        val_split_spin.setToolTip("学習データから検証用に分割する割合")
+        batch_val_wd_layout.addWidget(val_split_spin)
+
+        batch_val_wd_layout.addWidget(QLabel("Weight Decay:"))
+        weight_decay_combo = QComboBox()
+        weight_decays = ["0", "1e-5", "1e-4", "1e-3", "1e-2"]
+        weight_decay_combo.addItems(weight_decays)
+        weight_decay_combo.setCurrentIndex(2)  # デフォルト: 1e-4
+        weight_decay_combo.setToolTip("L2正則化の強さ（過学習防止）")
+        batch_val_wd_layout.addWidget(weight_decay_combo)
+
+        batch_val_wd_layout.addStretch()
+        training_params_layout.addLayout(batch_val_wd_layout)
+
+        # Optimizer・Scheduler設定（同じ行に配置）
+        optimizer_scheduler_layout = QHBoxLayout()
+
+        optimizer_scheduler_layout.addWidget(QLabel("Optimizer:"))
+        optimizer_combo = QComboBox()
+        optimizers = ["Adam", "AdamW", "SGD"]
+        optimizer_combo.addItems(optimizers)
+        optimizer_combo.setCurrentIndex(0)  # デフォルト: Adam
+        optimizer_combo.setToolTip("Adam: 汎用的, AdamW: Weight Decay改良版, SGD: 古典的だが安定")
+        optimizer_scheduler_layout.addWidget(optimizer_combo)
+
+        optimizer_scheduler_layout.addWidget(QLabel("Scheduler:"))
+        scheduler_combo = QComboBox()
+        schedulers = ["ReduceLROnPlateau", "StepLR", "CosineAnnealingLR", "None"]
+        scheduler_combo.addItems(schedulers)
+        scheduler_combo.setCurrentIndex(0)  # デフォルト: ReduceLROnPlateau
+        scheduler_combo.setToolTip("ReduceLROnPlateau: 損失停滞時に学習率低下, StepLR: 固定ステップで低下, CosineAnnealing: コサイン曲線で調整")
+        optimizer_scheduler_layout.addWidget(scheduler_combo)
+
+        optimizer_scheduler_layout.addStretch()
+        training_params_layout.addLayout(optimizer_scheduler_layout)
+
+        training_params_group.setLayout(training_params_layout)
+        basic_layout.addWidget(training_params_group)
 
         # 学習対象データ選択グループボックス
         data_selection_group = QGroupBox("学習データ選択")
@@ -17642,27 +17924,23 @@ class ImageAnnotationTool(QMainWindow):
         data_radio_all.setChecked(True)  # デフォルトですべて使用
         data_selection_layout.addWidget(data_radio_all)
 
-        data_radio_skip = QRadioButton("スキップ設定でデータを間引く")
-        data_selection_layout.addWidget(data_radio_skip)
-
-        data_radio_range = QRadioButton("インデックス範囲を指定")
-        data_selection_layout.addWidget(data_radio_range)
-
-        # スキップ設定（オプション）
+        # スキップ設定（ラジオボタンとスピンボックスを同じ行に配置）
         skip_layout = QHBoxLayout()
-        skip_layout.addWidget(QLabel("       "))  # インデント用スペース
+        data_radio_skip = QRadioButton("スキップ設定でデータを間引く")
+        skip_layout.addWidget(data_radio_skip)
         skip_layout.addWidget(QLabel("スキップ枚数:"))
         custom_skip_spin = QSpinBox()
         custom_skip_spin.setRange(2, 100)
         custom_skip_spin.setValue(5)  # デフォルト: 5枚
         custom_skip_spin.setEnabled(False)  # 初期状態では無効
         skip_layout.addWidget(custom_skip_spin)
+        skip_layout.addStretch()
         data_selection_layout.addLayout(skip_layout)
 
-        # インデックス範囲指定（新機能）
+        # インデックス範囲指定（ラジオボタンとスピンボックスを同じ行に配置）
         range_layout = QHBoxLayout()
-        range_layout.addWidget(QLabel("       "))  # インデント用スペース
-        range_layout.addWidget(QLabel("インデックス範囲:"))
+        data_radio_range = QRadioButton("インデックス範囲を指定")
+        range_layout.addWidget(data_radio_range)
 
         # インデックス範囲の入力フィールド
         range_start_spin = QSpinBox()
@@ -17678,27 +17956,10 @@ class ImageAnnotationTool(QMainWindow):
         range_end_spin.setEnabled(False)  # 初期状態では無効
 
         range_layout.addWidget(range_start_spin)
-        range_layout.addWidget(QLabel("から"))
+        range_layout.addWidget(QLabel("〜"))
         range_layout.addWidget(range_end_spin)
+        range_layout.addStretch()
         data_selection_layout.addLayout(range_layout)
-
-        # 範囲の現在値ボタン
-        range_current_layout = QHBoxLayout()
-        range_current_layout.addWidget(QLabel("       "))  # インデント用スペース
-
-        # 現在の位置を開始インデックスにするボタン
-        set_start_button = QPushButton("現在の位置を開始に設定")
-        set_start_button.clicked.connect(lambda: range_start_spin.setValue(self.current_index))
-        set_start_button.setEnabled(False)  # 初期状態では無効
-        range_current_layout.addWidget(set_start_button)
-
-        # 現在の位置を終了インデックスにするボタン
-        set_end_button = QPushButton("現在の位置を終了に設定")
-        set_end_button.clicked.connect(lambda: range_end_spin.setValue(self.current_index))
-        set_end_button.setEnabled(False)  # 初期状態では無効
-        range_current_layout.addWidget(set_end_button)
-
-        data_selection_layout.addLayout(range_current_layout)
 
         # データサンプル数の表示ラベル
         data_sample_label = QLabel("")
@@ -17712,8 +17973,6 @@ class ImageAnnotationTool(QMainWindow):
             # インデックス範囲設定の有効/無効
             range_start_spin.setEnabled(data_radio_range.isChecked())
             range_end_spin.setEnabled(data_radio_range.isChecked())
-            set_start_button.setEnabled(data_radio_range.isChecked())
-            set_end_button.setEnabled(data_radio_range.isChecked())
             
             # サンプル数の計算と表示（削除済みマークを考慮）
             if data_radio_all.isChecked():
@@ -17779,26 +18038,6 @@ class ImageAnnotationTool(QMainWindow):
         data_selection_group.setLayout(data_selection_layout)
         basic_layout.addWidget(data_selection_group)
 
-        patience_layout = QHBoxLayout()
-        patience_layout.addWidget(QLabel("忍耐エポック数:"))
-        patience_spin = QSpinBox()
-        patience_spin.setRange(1, 20)
-        patience_spin.setValue(5)
-        patience_spin.setEnabled(True)
-        patience_layout.addWidget(patience_spin)
-        basic_layout.addLayout(patience_layout)
-        
-        # 学習率設定
-        lr_layout = QHBoxLayout()
-        lr_layout.addWidget(QLabel("学習率:"))
-        
-        lr_combo = QComboBox()
-        learning_rates = ["0.001", "0.0005", "0.0001", "0.00005", "0.00001"]
-        lr_combo.addItems(learning_rates)
-        lr_combo.setCurrentIndex(0)  # デフォルト: 0.001
-        lr_layout.addWidget(lr_combo)
-        basic_layout.addLayout(lr_layout)
-        
         # タブに追加
         tabs.addTab(basic_tab, "基本設定")
         
@@ -17994,15 +18233,14 @@ class ImageAnnotationTool(QMainWindow):
 
         # プレフィックス（固定）とサフィックス（編集可能）を分離
         # 自動運転モデルの場合はmodel_typeをプレフィックスとする
-        autonomous_prefix = f"{model_type}_"
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         # プレフィックスとサフィックスを横並びで表示
         name_input_layout = QHBoxLayout()
         name_input_layout.addWidget(QLabel("モデル名:"))
 
-        # プレフィックス（固定、編集不可）
-        prefix_label = QLabel(autonomous_prefix)
+        # プレフィックス（固定、編集不可）- 動的に更新される
+        prefix_label = QLabel(f"{model_type}_")
         prefix_label.setStyleSheet("background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc; font-family: monospace;")
         name_input_layout.addWidget(prefix_label)
 
@@ -18017,6 +18255,14 @@ class ImageAnnotationTool(QMainWindow):
         model_name_note = QLabel(f"※ モデルタイプ ({model_type}) のプレフィックスは変更できません。.pthは自動的に付与されます")
         model_name_note.setStyleSheet("color: #888; font-style: italic; font-size: 10px;")
         model_name_layout.addWidget(model_name_note)
+
+        # モデルタイプが変更されたらプレフィックスと注釈を更新
+        def update_model_name_prefix():
+            selected_type = model_type_combo.currentText()
+            prefix_label.setText(f"{selected_type}_")
+            model_name_note.setText(f"※ モデルタイプ ({selected_type}) のプレフィックスは変更できません。.pthは自動的に付与されます")
+
+        model_type_combo.currentIndexChanged.connect(update_model_name_prefix)
 
         settings_layout.addWidget(model_name_group)
 
@@ -18033,22 +18279,53 @@ class ImageAnnotationTool(QMainWindow):
         settings_layout.addWidget(comment_group)
 
         # ボタンの配置
-        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box = QDialogButtonBox(QDialogButtonBox.Cancel)
+        start_button = button_box.addButton("Start training", QDialogButtonBox.AcceptRole)
         button_box.accepted.connect(training_settings.accept)
         button_box.rejected.connect(training_settings.reject)
         settings_layout.addWidget(button_box)
-        
+
         # ダイアログを表示
         if not training_settings.exec_():
             return
         
         # 設定値の取得
+        # ダイアログで選択されたモデルタイプを使用
+        model_type = model_type_combo.currentText()
+        autonomous_prefix = f"{model_type}_"
+
         num_epochs = epoch_spin.value()
         use_early_stopping = early_stopping_check.isChecked()
         patience = patience_spin.value() if use_early_stopping else 0
+        min_delta = min_delta_spin.value() if use_early_stopping else 0.0
         learning_rate = float(lr_combo.currentText())
+
+        # バッチサイズ
+        user_batch_size = int(batch_size_combo.currentText())
+
+        # 検証データ割合
+        val_split = val_split_spin.value()
+
+        # Weight Decay
+        weight_decay_text = weight_decay_combo.currentText()
+        weight_decay = float(weight_decay_text) if weight_decay_text != "0" else 0.0
+
+        # Optimizer・Scheduler
+        optimizer_name = optimizer_combo.currentText()
+        scheduler_name = scheduler_combo.currentText()
+
         model_name = autonomous_prefix + model_name_suffix_input.text().strip()
         comment = comment_input.toPlainText().strip()
+
+        # モデル重み設定の取得
+        use_pretrained = weights_radio_pretrained.isChecked()  # 事前学習済みの重みを使用
+        use_random_init = weights_radio_random.isChecked()  # ランダム初期化
+        load_weights = weights_radio_finetune.isChecked()  # ファインチューニング
+        selected_finetune_model = finetune_model_combo.currentText() if load_weights else None
+        # ファインチューニング用モデルが有効かどうかを確認
+        filtered_models_for_check = get_filtered_models(model_type)
+        has_valid_finetune_models = len(filtered_models_for_check) > 0 and selected_finetune_model in filtered_models_for_check
+        model_path = os.path.join(models_dir, selected_finetune_model) if load_weights and has_valid_finetune_models else None
 
         # Speed出力設定の取得
         use_speed_output = False
@@ -18087,93 +18364,7 @@ class ImageAnnotationTool(QMainWindow):
             'erase_min_ratio': aug_erase_min_ratio.value(),
             'erase_max_ratio': aug_erase_max_ratio.value()
         }
-        
-        # モデルトレーニングの続きの確認
-        sampling_info = ""
-        # deleted_indexesを安全に取得
-        deleted_indexes = getattr(self, 'deleted_indexes', [])
-        
-        if use_all:
-            total_annotations = len(self.annotations)
-            excluded_count = sum(1 for idx in self.annotations if idx in deleted_indexes)
-            used_count = total_annotations - excluded_count
-            sampling_info = f"データサンプリング: すべて使用 ({used_count}/{total_annotations}枚使用, 削除済み{excluded_count}枚を除外)"
-        elif use_skip:
-            total_annotations = len(self.annotations)
-            valid_indices = [idx for idx in self.annotations if idx not in deleted_indexes]
-            sampled_count = len([idx for idx in valid_indices if idx % skip_count == 0])
-            excluded_count = sum(1 for idx in self.annotations if idx in deleted_indexes)
-            sampling_info = f"データサンプリング: {skip_count}枚ごとに1枚 ({sampled_count}/{total_annotations}枚使用, 削除済み{excluded_count}枚を除外)"
-        elif use_range:
-            start = range_start
-            end = range_end
-            # インデックス範囲内のアノテーションをカウント（削除済みを除く）
-            in_range_count = sum(1 for idx in self.annotations if start <= idx <= end)
-            excluded_count = sum(1 for idx in self.annotations if start <= idx <= end and idx in deleted_indexes)
-            sample_count = in_range_count - excluded_count
-            total_count = len(self.annotations)
-            sampling_info = f"データサンプリング: インデックス範囲 {start}～{end} ({sample_count}/{total_count}枚使用, 削除済み{excluded_count}枚を除外)"
 
-        # オーグメンテーション情報を生成
-        aug_info = "データオーグメンテーション: "
-        if augmentation_params['enabled']:
-            aug_info += "有効\n"
-            if augmentation_params['use_flip']:
-                aug_info += f"・水平反転 (確率: {augmentation_params['flip_prob']})\n"
-            if augmentation_params['use_color']:
-                aug_info += f"・色調整 (明るさ: {augmentation_params['brightness']}, "
-                aug_info += f"コントラスト: {augmentation_params['contrast']}, "
-                aug_info += f"彩度: {augmentation_params['saturation']})\n"
-            if augmentation_params['use_geometry']:
-                aug_info += f"・幾何変換 (回転: ±{augmentation_params['rotation_degrees']}度, "
-                aug_info += f"平行移動: ±{augmentation_params['translate_ratio']})\n"
-            if augmentation_params['use_erase']:
-                aug_info += f"・ランダムイレース (確率: {augmentation_params['erase_prob']}, "
-                aug_info += f"範囲: {augmentation_params['erase_min_ratio']}～{augmentation_params['erase_max_ratio']})\n"
-        else:
-            aug_info += "無効\n"
-
-        reply = QMessageBox.question(
-            self, 
-            "モデル学習確認", 
-            f"選択されたモデル '{model_type}' を以下の設定で学習しますか？\n\n"
-            f"エポック数: {num_epochs}\n"
-            f"学習率: {learning_rate}\n"
-            f"{sampling_info}\n"
-            f"Early Stopping: {'有効（忍耐値: ' + str(patience) + '）' if use_early_stopping else '無効'}\n\n"
-            f"{aug_info}",
-            QMessageBox.Yes | QMessageBox.No, 
-            QMessageBox.Yes
-        )
-
-        if reply == QMessageBox.No:
-            return
-        
-        # 既存のモデル重みをロードするかの確認
-        load_weights = False
-        model_path = None
-        selected_model = self.model_combo.currentText()
-        
-        if selected_model and selected_model not in ["モデルが見つかりません", "フォルダを選択してください"] and "が見つかりません" not in selected_model:
-            # アノテーションフォルダ内のモデルのフルパスを作成
-            annotation_folder = os.path.join(self.folder_path, ANNOTATION_DIR_NAME)
-            # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
-            model_path = os.path.join(models_dir, selected_model)
-            
-            # モデルが存在するか確認
-            if os.path.exists(model_path):
-                weights_reply = QMessageBox.question(
-                    self, 
-                    "モデル重みの読み込み", 
-                    f"現在選択されているモデル '{selected_model}' の重みを使って学習を始めますか？\n\n"
-                    f"「はい」: 選択したモデルの重みからファインチューニングします。\n"
-                    f"「いいえ」: 新しくモデルをトレーニングします。",
-                    QMessageBox.Yes | QMessageBox.No, 
-                    QMessageBox.Yes
-                )
-                
-                load_weights = (weights_reply == QMessageBox.Yes)
-        
         try:
             # 学習データの準備（データ選択設定を適用）
             image_paths = []
@@ -18217,24 +18408,50 @@ class ImageAnnotationTool(QMainWindow):
                         annotation['speed'] = annotation['speed'] / speed_normalize_value
 
             # データ数の確認とバッチサイズの調整
-            # GPUメモリに応じて適切なバッチサイズを設定
-            if torch.cuda.is_available():
-                # GPUメモリサイズに応じてバッチサイズを調整
-                gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3  # GB単位
-                if gpu_mem >= 8:
-                    default_batch_size = 64*4
-                elif gpu_mem >= 4:
-                    default_batch_size = 32*4
-                else:
-                    default_batch_size = 16*4
-            else:
-                default_batch_size = 16*4
-            
-            batch_size = min(default_batch_size, len(image_paths))  # バッチサイズを調整
+            batch_size = min(user_batch_size, len(image_paths))
             if batch_size < 2:
                 QMessageBox.warning(self, "警告", "データ数が不足しています。最低2枚の画像が必要です。")
                 return
-                        
+
+            # デバッグ出力: 学習設定
+            print("\n" + "="*60)
+            print("【学習開始】トレーニング設定")
+            print("="*60)
+            print(f"[モデル設定]")
+            print(f"  モデルアーキテクチャ: {model_type}")
+            print(f"  モデル名: {model_name}")
+            print(f"  初期化方法: {'事前学習済み' if use_pretrained else ('ランダム初期化' if use_random_init else 'ファインチューニング')}")
+            if load_weights and selected_finetune_model:
+                print(f"  ファインチューニング元: {selected_finetune_model}")
+            print(f"[学習パラメータ]")
+            print(f"  エポック数: {num_epochs}")
+            print(f"  学習率: {learning_rate}")
+            print(f"  Weight Decay: {weight_decay}")
+            print(f"  バッチサイズ: {batch_size}")
+            print(f"  検証データ割合: {val_split:.0%}")
+            print(f"  Optimizer: {optimizer_name}")
+            print(f"  Scheduler: {scheduler_name}")
+            print(f"[Early Stopping]")
+            print(f"  有効: {use_early_stopping}")
+            if use_early_stopping:
+                print(f"  忍耐エポック数: {patience}")
+                print(f"  最小改善量: {min_delta}")
+            print(f"[出力設定]")
+            print(f"  Speed出力: {use_speed_output}")
+            print(f"  将来予測出力: {use_future_output}")
+            print(f"[データ設定]")
+            print(f"  学習データ数: {len(image_paths)}枚")
+            print(f"  データ選択: {'全て' if use_all else ('スキップ' if use_skip else 'インデックス範囲')}")
+            if use_skip:
+                print(f"  スキップ枚数: {skip_count}")
+            if use_range:
+                print(f"  範囲: {range_start} - {range_end}")
+            print(f"[オーグメンテーション]")
+            print(f"  有効: {augmentation_params['enabled']}")
+            if augmentation_params['enabled']:
+                print(f"  設定: {augmentation_params}")
+            print("="*60 + "\n")
+
             # 進捗ダイアログ
             progress = QProgressDialog(
                 f"モデル '{model_type}' の学習中...", 
@@ -18273,7 +18490,8 @@ class ImageAnnotationTool(QMainWindow):
                 annotations=annotation_values,
                 model_name=model_type,
                 use_augmentation=augmentation_params if augmentation_params['enabled'] else False,
-                batch_size=batch_size,  # バッチサイズを追加
+                batch_size=batch_size,  # バッチサイズ
+                val_split=val_split,  # 検証データ割合
                 use_speed=use_speed_output,  # Speed出力を使用するかどうか
                 use_future=use_future_output,  # 将来予測出力を使用するかどうか
                 num_outputs=num_outputs  # 出力数を指定
@@ -18288,24 +18506,42 @@ class ImageAnnotationTool(QMainWindow):
             progress.setValue(10)
             QApplication.processEvents()
 
-            # モデルの学習 - 事前学習済み重みをロードするかどうかのフラグを追加
+            # モデルの学習 - 初期化設定に基づいてパラメータを設定
+            # - 事前学習済み: pretrained=True, model_path=None
+            # - ランダム初期化: pretrained=False, model_path=None
+            # - ファインチューニング: pretrained=False, model_path=指定されたパス
             training_results = train_model(
                 model_name=model_type,
                 train_loader=train_loader,
                 val_loader=val_loader,
                 save_dir=models_dir,
                 progress_callback=update_progress,
-                pretrained=not load_weights,  # 既存モデルを使う場合はTrueにしない
-                model_path=model_path if load_weights else None,  # ロードする場合はパスを指定
+                pretrained=use_pretrained,  # 事前学習済みの重みを使用するか
+                model_path=model_path if load_weights else None,  # ファインチューニングの場合はパスを指定
                 num_epochs=num_epochs,  # 指定されたエポック数
                 learning_rate=learning_rate,  # 指定された学習率
+                weight_decay=weight_decay,  # L2正則化
                 use_early_stopping=use_early_stopping,  # Early Stoppingの有効/無効
                 patience=patience,  # 忍耐値
+                min_delta=min_delta,  # 最小改善量
+                optimizer_name=optimizer_name,  # 最適化アルゴリズム
+                scheduler_name=scheduler_name,  # 学習率スケジューラ
                 custom_model_name=model_name if model_name else None,  # カスタムモデル名
                 num_outputs=num_outputs  # 出力数を指定
             )
             
             progress.close()
+
+            # キャンセルされた場合の処理
+            if training_results.get('cancelled', False):
+                QMessageBox.information(
+                    self,
+                    "学習キャンセル",
+                    f"モデル学習がキャンセルされました。\n\n"
+                    f"完了したエポック数: {training_results.get('completed_epochs', 0)}/{num_epochs}"
+                )
+                self.statusBar().showMessage("学習がキャンセルされました", 5000)
+                return
 
             # MLflowに結果を記録 - 統合版
             mlflow_info = self._log_autonomous_driving_training(
@@ -18316,12 +18552,17 @@ class ImageAnnotationTool(QMainWindow):
                     "num_epochs": num_epochs,
                     "completed_epochs": training_results.get('completed_epochs', num_epochs),
                     "learning_rate": learning_rate,
+                    "weight_decay": weight_decay,
                     "batch_size": batch_size,
+                    "val_split": val_split,
+                    "optimizer": optimizer_name,
+                    "scheduler": scheduler_name,
                     "use_early_stopping": use_early_stopping,
                     "patience": patience if use_early_stopping else 0,
+                    "min_delta": min_delta if use_early_stopping else 0.0,
                     "early_stopped": training_results.get('early_stopped', False),
-                    "initial_weights": "fine-tuned" if load_weights else "pretrained",
-                    "pretrained_model_name": selected_model if load_weights else None,
+                    "initial_weights": "fine-tuned" if load_weights else ("random" if use_random_init else "pretrained"),
+                    "pretrained_model_name": selected_finetune_model if load_weights else None,
                     "augmentation_enabled": augmentation_params['enabled'],
                     "sampling_strategy": self._get_sampling_strategy_name(use_all, use_skip, use_range, skip_count),
                     "augmentation_params": augmentation_params,
@@ -18348,11 +18589,17 @@ class ImageAnnotationTool(QMainWindow):
                     "model_type": model_type,
                     "num_epochs": num_epochs,
                     "learning_rate": learning_rate,
+                    "weight_decay": weight_decay,
                     "batch_size": batch_size,
+                    "val_split": val_split,
+                    "optimizer": optimizer_name,
+                    "scheduler": scheduler_name,
                     "use_early_stopping": use_early_stopping,
                     "patience": patience,
+                    "min_delta": min_delta,
                     "load_weights": load_weights,
-                    "selected_model": selected_model if load_weights else None,
+                    "use_random_init": use_random_init,
+                    "selected_model": selected_finetune_model if load_weights else None,
                     "data_folder": os.path.basename(self.folder_path) if hasattr(self, 'folder_path') and self.folder_path else "unknown"
                 },
                 dataset_info={
@@ -18480,6 +18727,8 @@ class ImageAnnotationTool(QMainWindow):
         weights_info = ""
         if training_params['load_weights']:
             weights_info = f"初期重み: {training_params['selected_model']} から読み込み\n"
+        elif training_params.get('use_random_init', False):
+            weights_info = "初期重み: ランダム初期化（スクラッチ）\n"
         else:
             weights_info = "初期重み: 事前学習済みモデル\n"
         
@@ -18516,8 +18765,9 @@ class ImageAnnotationTool(QMainWindow):
             f"学習データ数: {dataset_info['image_paths_count']}枚 {dataset_info['sampling_info']}\n" +
             input_size_info +
             weights_info +
-            f"学習率: {training_params['learning_rate']}\n" +
-            f"バッチサイズ: {training_params['batch_size']}\n" +
+            f"学習率: {training_params['learning_rate']}, Weight Decay: {training_params['weight_decay']}\n" +
+            f"バッチサイズ: {training_params['batch_size']}, 検証データ割合: {training_params['val_split']:.0%}\n" +
+            f"Optimizer: {training_params['optimizer']}, Scheduler: {training_params['scheduler']}\n" +
             aug_details +
             f"\n{mlflow_info}"
         )

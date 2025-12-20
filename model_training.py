@@ -609,6 +609,9 @@ def train_model(
     model_path: Optional[str] = None,
     use_early_stopping: bool = False,
     patience: int = 5,
+    min_delta: float = 0.0001,
+    optimizer_name: str = 'Adam',
+    scheduler_name: str = 'ReduceLROnPlateau',
     custom_model_name: Optional[str] = None,
     num_outputs: int = 2
 ) -> Dict[str, Any]:
@@ -628,6 +631,9 @@ def train_model(
         model_path: 特定のモデルファイルから重みをロードする場合のパス
         use_early_stopping: Early Stoppingを使用するかどうか
         patience: Early Stoppingの忍耐値（検証損失が改善しなくなってから待機するエポック数）
+        min_delta: Early Stoppingの最小改善量（この値以上の改善がないと改善とみなさない）
+        optimizer_name: 最適化アルゴリズム名（Adam, AdamW, SGD）
+        scheduler_name: 学習率スケジューラ名（ReduceLROnPlateau, StepLR, CosineAnnealingLR, None）
         num_outputs: 出力数（2=angle/throttle, 3=angle/throttle/speed）
 
     Returns:
@@ -677,11 +683,29 @@ def train_model(
             print("事前学習済みモデルまたはランダム初期化を使用します")
     
     model = model.to(device)
-    
-    # 損失関数と最適化アルゴリズム
+
+    # 損失関数
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
+
+    # 最適化アルゴリズムの選択
+    if optimizer_name == 'Adam':
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    elif optimizer_name == 'AdamW':
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    elif optimizer_name == 'SGD':
+        optimizer = optim.SGD(model.parameters(), lr=learning_rate, weight_decay=weight_decay, momentum=0.9)
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+    # 学習率スケジューラの選択
+    if scheduler_name == 'ReduceLROnPlateau':
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
+    elif scheduler_name == 'StepLR':
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+    elif scheduler_name == 'CosineAnnealingLR':
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    else:
+        scheduler = None
     
     # トレーニングループ
     train_losses = []
@@ -698,6 +722,9 @@ def train_model(
     early_stopping_counter = 0
     early_stopped = False
     stopped_epoch = 0
+
+    # キャンセル用の変数
+    cancelled = False
 
     # 保存ディレクトリの作成
     os.makedirs(save_dir, exist_ok=True)
@@ -721,7 +748,7 @@ def train_model(
         # 進捗コールバック - エポック開始（統一フォーマット）
         if progress_callback:
             elapsed_time = time.time() - training_start_time
-            
+
             # エポック開始メッセージ
             message = create_unified_progress_message(
                 epoch=epoch,
@@ -730,11 +757,16 @@ def train_model(
                 epoch_times=epoch_times if epoch > 0 else None,
                 is_epoch_start=True
             )
-            
+
             should_continue = progress_callback(epoch, num_epochs, message)
             if not should_continue:
+                cancelled = True
                 break
-        
+
+        # キャンセルされた場合はエポックループを抜ける
+        if cancelled:
+            break
+
         model.train()
         epoch_loss = 0.0
         epoch_steering_loss = 0.0
@@ -798,7 +830,12 @@ def train_model(
 
                 should_continue = progress_callback(int(total_progress * num_epochs), num_epochs, message)
                 if not should_continue:
+                    cancelled = True
                     break
+
+        # バッチレベルでキャンセルされた場合はエポックループを抜ける
+        if cancelled:
+            break
 
         # エポック損失の計算
         epoch_loss /= len(train_loader.dataset)
@@ -845,7 +882,11 @@ def train_model(
         val_throttle_losses.append(val_throttle_loss)
 
         # 学習率の調整
-        scheduler.step(val_loss)
+        if scheduler is not None:
+            if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(val_loss)
+            else:
+                scheduler.step()
 
         # エポックの完了をカウント
         completed_epochs = epoch + 1
@@ -876,13 +917,17 @@ def train_model(
 
             should_continue = progress_callback(epoch + 1, num_epochs, message)
             if not should_continue:
+                cancelled = True
                 break
-        
-        # 最良モデルの保存
+
+        # 最良モデルの保存（min_deltaを考慮した改善判定）
+        improved = val_loss < best_val_loss - min_delta
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+
+        if improved:
             early_stopping_counter = 0  # カウンタをリセット
-            
+
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -890,27 +935,61 @@ def train_model(
                 'loss': best_val_loss,
                 'input_size': model_input_size,
             }, best_model_path)
-            
+
             if progress_callback:
-                progress_callback(epoch + 1, num_epochs, 
+                progress_callback(epoch + 1, num_epochs,
                                 f"エポック {epoch+1}/{num_epochs}: 新しい最良モデルを保存しました（損失: {best_val_loss:.6f}）")
         else:
-            # 検証損失が改善しなかった場合
+            # 検証損失が改善しなかった場合（min_delta以上の改善なし）
             if use_early_stopping:
                 early_stopping_counter += 1
                 if progress_callback:
-                    progress_callback(epoch + 1, num_epochs, 
+                    progress_callback(epoch + 1, num_epochs,
                                     f"エポック {epoch+1}/{num_epochs}: 検証損失が改善しませんでした（カウンタ: {early_stopping_counter}/{patience}）")
-                
+
                 # Early Stoppingの判定
                 if early_stopping_counter >= patience:
                     if progress_callback:
-                        progress_callback(epoch + 1, num_epochs, 
+                        progress_callback(epoch + 1, num_epochs,
                                         f"エポック {epoch+1}/{num_epochs}: Early Stoppingによりトレーニングを終了します")
                     early_stopped = True
                     stopped_epoch = epoch + 1
                     break
     
+    # 学習時間を計算
+    total_training_time = time.time() - training_start_time
+    avg_epoch_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0
+
+    # キャンセルされた場合の処理
+    if cancelled:
+        print("学習がキャンセルされました")
+        training_results = {
+            'model_name': model_name,
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'best_val_loss': best_val_loss,
+            'model_path': None,
+            'best_model_path': best_model_path if os.path.exists(best_model_path) else None,
+            'num_epochs': num_epochs,
+            'completed_epochs': completed_epochs,
+            'learning_rate': learning_rate,
+            'weight_decay': weight_decay,
+            'pretrained': pretrained,
+            'loaded_weights': False,
+            'early_stopped': False,
+            'stopped_epoch': completed_epochs,
+            'patience': patience if use_early_stopping else 0,
+            'total_training_time': total_training_time,
+            'avg_epoch_time': avg_epoch_time,
+            'epoch_times': epoch_times,
+            'train_steering_losses': train_steering_losses,
+            'train_throttle_losses': train_throttle_losses,
+            'val_steering_losses': val_steering_losses,
+            'val_throttle_losses': val_throttle_losses,
+            'cancelled': True
+        }
+        return training_results
+
     # 最終モデルの保存
     torch.save({
         'epoch': completed_epochs,
@@ -923,11 +1002,7 @@ def train_model(
         'stopped_epoch': stopped_epoch if early_stopped else completed_epochs,
         'input_size': model_input_size,
     }, model_path)
-    
-    # 学習時間を計算
-    total_training_time = time.time() - training_start_time
-    avg_epoch_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0
-    
+
     # トレーニング結果
     training_results = {
         'model_name': model_name,
@@ -951,12 +1026,13 @@ def train_model(
         'train_steering_losses': train_steering_losses,
         'train_throttle_losses': train_throttle_losses,
         'val_steering_losses': val_steering_losses,
-        'val_throttle_losses': val_throttle_losses
+        'val_throttle_losses': val_throttle_losses,
+        'cancelled': False
     }
-    
+
     # トレーニング結果の可視化
     plot_training_results(training_results, save_dir, timestamp)
-    
+
     return training_results
 
 def validate_model(model, dataloader, criterion, device):
@@ -1549,6 +1625,9 @@ def train_location_model(
     model_path: Optional[str] = None,
     use_early_stopping: bool = False,
     patience: int = 5,
+    min_delta: float = 0.0001,
+    optimizer_name: str = 'Adam',
+    scheduler_name: str = 'ReduceLROnPlateau',
     custom_model_name: Optional[str] = None
 ) -> Dict[str, Any]:
     """位置分類モデルをトレーニングする
@@ -1568,6 +1647,7 @@ def train_location_model(
         model_path: 特定のモデルファイルから重みをロードする場合のパス
         use_early_stopping: Early Stoppingを使用するかどうか
         patience: Early Stoppingの忍耐値
+        min_delta: Early Stoppingの最小改善量（この値以上の改善がないと改善とみなさない）
 
     Returns:
         トレーニング結果の辞書
@@ -1618,12 +1698,30 @@ def train_location_model(
             print("事前学習済みモデルまたはランダム初期化を使用します")
     
     model = model.to(device)
-    
-    # 損失関数と最適化アルゴリズム
+
+    # 損失関数
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
-    
+
+    # 最適化アルゴリズムの選択
+    if optimizer_name == 'Adam':
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    elif optimizer_name == 'AdamW':
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    elif optimizer_name == 'SGD':
+        optimizer = optim.SGD(model.parameters(), lr=learning_rate, weight_decay=weight_decay, momentum=0.9)
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+    # 学習率スケジューラの選択
+    if scheduler_name == 'ReduceLROnPlateau':
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
+    elif scheduler_name == 'StepLR':
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+    elif scheduler_name == 'CosineAnnealingLR':
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    else:
+        scheduler = None
+
     # トレーニングループ
     train_losses = []
     val_losses = []
@@ -1637,6 +1735,9 @@ def train_location_model(
     early_stopped = False
     stopped_epoch = 0
 
+    # キャンセル用の変数
+    cancelled = False
+
     # 保存ディレクトリの作成
     os.makedirs(save_dir, exist_ok=True)
 
@@ -1647,19 +1748,19 @@ def train_location_model(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_path = os.path.join(save_dir, f'{save_name}.pth')
     best_model_path = os.path.join(save_dir, f'{save_name}_best.pth')
-    
+
     # 時間計測用の変数
     training_start_time = time.time()
     epoch_times = []
-    
+
     completed_epochs = 0
     for epoch in range(num_epochs):
         epoch_start_time = time.time()
-        
+
         # 進捗コールバック - エポック開始（統一フォーマット）
         if progress_callback:
             elapsed_time = time.time() - training_start_time
-            
+
             # エポック開始メッセージ
             message = create_unified_progress_message(
                 epoch=epoch,
@@ -1668,11 +1769,16 @@ def train_location_model(
                 epoch_times=epoch_times if epoch > 0 else None,
                 is_epoch_start=True
             )
-            
+
             should_continue = progress_callback(epoch, num_epochs, message)
             if not should_continue:
+                cancelled = True
                 break
-        
+
+        # キャンセルされた場合はエポックループを抜ける
+        if cancelled:
+            break
+
         model.train()
         epoch_loss = 0.0
         correct = 0
@@ -1713,8 +1819,13 @@ def train_location_model(
                 
                 should_continue = progress_callback(int(total_progress * num_epochs), num_epochs, message)
                 if not should_continue:
+                    cancelled = True
                     break
-        
+
+        # バッチレベルでキャンセルされた場合はエポックループを抜ける
+        if cancelled:
+            break
+
         # エポック損失と精度の計算
         epoch_loss /= len(train_loader.dataset)
         epoch_accuracy = 100 * correct / total
@@ -1744,10 +1855,14 @@ def train_location_model(
         val_accuracy = 100 * correct / total
         val_losses.append(val_loss)
         val_accuracies.append(val_accuracy)
-        
+
         # 学習率の調整
-        scheduler.step(val_loss)
-        
+        if scheduler is not None:
+            if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(val_loss)
+            else:
+                scheduler.step()
+
         # エポックの完了をカウント
         completed_epochs = epoch + 1
         
@@ -1759,15 +1874,18 @@ def train_location_model(
             if not should_continue:
                 break
         
-        # 最良モデルの保存（検証損失の改善）
+        # 最良モデルの保存（min_deltaを考慮した改善判定）
+        improved = val_loss < best_val_loss - min_delta
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+
+        if improved:
             early_stopping_counter = 0  # カウンタをリセット
-            
+
             # 最良精度も更新
             if val_accuracy > best_val_acc:
                 best_val_acc = val_accuracy
-            
+
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -1776,15 +1894,16 @@ def train_location_model(
                 'accuracy': best_val_acc,
                 'num_classes': num_classes
             }, best_model_path)
-            
+
             if progress_callback:
-                progress_callback(epoch + 1, num_epochs, 
+                progress_callback(epoch + 1, num_epochs,
                                 f"エポック {epoch+1}/{num_epochs}: 新しい最良モデルを保存しました"
                                 f"（損失: {best_val_loss:.6f}, 精度: {best_val_acc:.2f}%）")
         # 検証精度のみ改善した場合
         elif val_accuracy > best_val_acc:
             best_val_acc = val_accuracy
-            
+            early_stopping_counter = 0  # 精度が改善した場合もカウンタをリセット
+
             # 精度が改善した場合も保存
             torch.save({
                 'epoch': epoch,
@@ -1794,30 +1913,64 @@ def train_location_model(
                 'accuracy': best_val_acc,
                 'num_classes': num_classes
             }, best_model_path)
-            
+
             if progress_callback:
-                progress_callback(epoch + 1, num_epochs, 
+                progress_callback(epoch + 1, num_epochs,
                                 f"エポック {epoch+1}/{num_epochs}: 新しい最良精度を保存しました"
                                 f"（精度: {best_val_acc:.2f}%, 損失: {val_loss:.6f}）")
         else:
-            # 検証損失が改善しなかった場合
+            # 検証損失・精度ともに改善しなかった場合
             if use_early_stopping:
                 early_stopping_counter += 1
                 if progress_callback:
-                    progress_callback(epoch + 1, num_epochs, 
+                    progress_callback(epoch + 1, num_epochs,
                                     f"エポック {epoch+1}/{num_epochs}: 検証損失が改善しませんでした"
                                     f"（カウンタ: {early_stopping_counter}/{patience}）")
-                
+
                 # Early Stoppingの判定
                 if early_stopping_counter >= patience:
                     if progress_callback:
-                        progress_callback(epoch + 1, num_epochs, 
+                        progress_callback(epoch + 1, num_epochs,
                                         f"エポック {epoch+1}/{num_epochs}: Early Stoppingにより"
                                         f"トレーニングを終了します")
                     early_stopped = True
                     stopped_epoch = epoch + 1
                     break
     
+    # 学習時間を計算
+    total_training_time = time.time() - training_start_time
+    avg_epoch_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0
+
+    # キャンセルされた場合の処理
+    if cancelled:
+        print("学習がキャンセルされました")
+        training_results = {
+            'model_name': model_name,
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'train_accuracies': train_accuracies,
+            'val_accuracies': val_accuracies,
+            'best_val_loss': best_val_loss,
+            'best_val_acc': best_val_acc,
+            'model_path': None,
+            'best_model_path': best_model_path if os.path.exists(best_model_path) else None,
+            'num_epochs': num_epochs,
+            'completed_epochs': completed_epochs,
+            'learning_rate': learning_rate,
+            'weight_decay': weight_decay,
+            'pretrained': pretrained,
+            'loaded_weights': False,
+            'early_stopped': False,
+            'stopped_epoch': completed_epochs,
+            'patience': patience if use_early_stopping else 0,
+            'num_classes': num_classes,
+            'total_training_time': total_training_time,
+            'avg_epoch_time': avg_epoch_time,
+            'epoch_times': epoch_times,
+            'cancelled': True
+        }
+        return training_results
+
     # 最終モデルの保存
     torch.save({
         'epoch': completed_epochs,
@@ -1833,11 +1986,7 @@ def train_location_model(
         'stopped_epoch': stopped_epoch if early_stopped else completed_epochs,
         'num_classes': num_classes
     }, model_path)
-    
-    # 学習時間を計算
-    total_training_time = time.time() - training_start_time
-    avg_epoch_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0
-    
+
     # トレーニング結果
     training_results = {
         'model_name': model_name,
@@ -1861,12 +2010,13 @@ def train_location_model(
         'num_classes': num_classes,
         'total_training_time': total_training_time,
         'avg_epoch_time': avg_epoch_time,
-        'epoch_times': epoch_times
+        'epoch_times': epoch_times,
+        'cancelled': False
     }
-    
+
     # トレーニング結果の可視化
     plot_location_training_results(training_results, save_dir, timestamp)
-    
+
     return training_results
 
 def plot_location_training_results(results, save_dir, timestamp):
