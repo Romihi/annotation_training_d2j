@@ -13754,6 +13754,11 @@ class ImageAnnotationTool(QMainWindow):
 
             self.update_ui()
 
+            # データ分析ダイアログが開いている場合、現在位置を更新
+            if hasattr(self, 'data_analysis_dialog') and self.data_analysis_dialog is not None:
+                if self.data_analysis_dialog.isVisible():
+                    self.data_analysis_dialog.update_current_position(value)
+
     def execute_slider_inference(self):
         """スライダー変更後のデバウンス処理で推論を実行"""
         if not self.images:
@@ -15217,6 +15222,8 @@ class ImageAnnotationTool(QMainWindow):
             self.current_index = index
             self.display_current_image()
             self.update_gallery()
+            self.image_slider.setValue(index)
+            self.slider_value_label.setText(f"{index + 1}/{len(self.images)}")
             self.statusBar().showMessage(f"インデックス {index} にジャンプしました", 3000)
 
     def load_selected_model(self):
@@ -16596,6 +16603,11 @@ class ImageAnnotationTool(QMainWindow):
 
         # 位置アノテーション数の表示を更新
         self.update_location_button_counts()
+
+        # データ分析ダイアログが開いている場合、現在位置を更新
+        if hasattr(self, 'data_analysis_dialog') and self.data_analysis_dialog is not None:
+            if self.data_analysis_dialog.isVisible():
+                self.data_analysis_dialog.update_current_position(new_index)
 
     def handle_annotation(self, x, y):
         """画像のアノテーションを処理する - 削除済み画像への再アノテーションをサポート（パフォーマンス最適化版）"""
