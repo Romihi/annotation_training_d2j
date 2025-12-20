@@ -43,12 +43,14 @@ class DataAnalysisDialog(QDialog):
     # 画像ジャンプシグナル（インデックスを送信）
     jump_to_image = pyqtSignal(int)
 
-    def __init__(self, parent=None, annotations=None, images=None, deleted_indexes=None, available_sensor_keys=None):
+    def __init__(self, parent=None, annotations=None, images=None, deleted_indexes=None,
+                 downsampled_indexes=None, available_sensor_keys=None):
         super().__init__(parent)
         self.parent_window = parent
         self.annotations = annotations or {}
         self.images = images or []
         self.deleted_indexes = deleted_indexes or []
+        self.downsampled_indexes = downsampled_indexes or []
         self.available_sensor_keys = available_sensor_keys or set()
         self.current_index = parent.current_index if parent else 0
 
@@ -88,25 +90,34 @@ class DataAnalysisDialog(QDialog):
         self.stats_table.setAlternatingRowColors(True)
         self.stats_table.setStyleSheet("""
             QTableWidget {
-                font-size: 11px;
-                gridline-color: #ddd;
+                font-size: 10px;
+                gridline-color: #555;
+                background-color: #2b2b2b;
+                color: #e0e0e0;
             }
             QTableWidget::item {
-                padding: 2px;
+                padding: 1px 2px;
+                background-color: #2b2b2b;
+                color: #e0e0e0;
             }
             QHeaderView::section {
-                background-color: #4a90d9;
+                background-color: #3a6ea5;
                 color: white;
                 font-weight: bold;
                 font-size: 9px;
-                padding: 4px;
+                padding: 2px;
                 border: none;
+                min-height: 18px;
+                max-height: 18px;
             }
             QTableWidget::item:alternate {
-                background-color: #f5f5f5;
+                background-color: #353535;
             }
         """)
         self.stats_table.verticalHeader().setVisible(False)
+        # 行の高さを狭める
+        self.stats_table.verticalHeader().setDefaultSectionSize(20)
+        self.stats_table.horizontalHeader().setFixedHeight(22)
         stats_dist_layout.addWidget(self.stats_table, 1)
 
         # 右側: 分布グラフ（AngleとThrottleを1つのグラフに統合）
@@ -238,11 +249,6 @@ class DataAnalysisDialog(QDialog):
 
         # 下部ボタン
         button_layout = QHBoxLayout()
-
-        self.update_button = QPushButton("更新")
-        self.update_button.clicked.connect(self.update_analysis)
-        button_layout.addWidget(self.update_button)
-
         button_layout.addStretch()
 
         self.close_button = QPushButton("閉じる")
@@ -262,6 +268,7 @@ class DataAnalysisDialog(QDialog):
             self.annotations = self.parent_window.annotations
             self.images = self.parent_window.images
             self.deleted_indexes = getattr(self.parent_window, 'deleted_indexes', [])
+            self.downsampled_indexes = getattr(self.parent_window, 'downsampled_indexes', [])
             self.current_index = self.parent_window.current_index
 
             # センサーキーも更新
@@ -288,6 +295,8 @@ class DataAnalysisDialog(QDialog):
 
         for idx, ann in self.annotations.items():
             if idx in self.deleted_indexes:
+                continue
+            if idx in self.downsampled_indexes:
                 continue
             for key in self.all_keys:
                 if key in ann and ann[key] is not None:
@@ -336,38 +345,66 @@ class DataAnalysisDialog(QDialog):
                     self.stats_table.setItem(row, col, item)
 
     def update_distribution_graph(self):
-        """分布グラフを更新（AngleとThrottleを1つのグラフに統合）"""
+        """分布グラフを更新（元データとダウンサンプリング後を重ねて表示）"""
         self.dist_figure.clear()
 
-        # データ収集
-        angles = []
-        throttles = []
+        # 元データ収集（削除済みのみ除外）
+        angles_orig = []
+        throttles_orig = []
+        # ダウンサンプリング後のデータ収集（削除済み+ダウンサンプリング除外）
+        angles_ds = []
+        throttles_ds = []
 
         for idx, ann in self.annotations.items():
             if idx in self.deleted_indexes:
                 continue
+            # 元データに追加
             if 'angle' in ann:
-                angles.append(ann['angle'])
+                angles_orig.append(ann['angle'])
             if 'throttle' in ann:
-                throttles.append(ann['throttle'])
+                throttles_orig.append(ann['throttle'])
+            # ダウンサンプリング後のデータに追加
+            if idx not in self.downsampled_indexes:
+                if 'angle' in ann:
+                    angles_ds.append(ann['angle'])
+                if 'throttle' in ann:
+                    throttles_ds.append(ann['throttle'])
 
         ax = self.dist_figure.add_subplot(111)
 
-        if angles or throttles:
-            # AngleとThrottleを同じグラフに重ねて表示
-            if angles:
-                ax.hist(angles, bins=50, color='steelblue', edgecolor='white',
-                        alpha=0.6, label='Angle')
-            if throttles:
-                ax.hist(throttles, bins=50, color='forestgreen', edgecolor='white',
-                        alpha=0.6, label='Throttle')
+        if angles_orig or throttles_orig:
+            # 共通のビン範囲を計算
+            all_values = angles_orig + throttles_orig
+            bin_min = min(all_values) if all_values else -1
+            bin_max = max(all_values) if all_values else 1
+            bins = np.linspace(bin_min, bin_max, 51)
 
-            data_count = max(len(angles), len(throttles))
-            ax.set_title(f'Angle / Throttle 分布 (n={data_count:,})')
+            # 元データを薄い色で表示（背景）
+            if angles_orig:
+                ax.hist(angles_orig, bins=bins, color='steelblue', edgecolor='none',
+                        alpha=0.25, label=f'Angle(元: {len(angles_orig)})')
+            if throttles_orig:
+                ax.hist(throttles_orig, bins=bins, color='forestgreen', edgecolor='none',
+                        alpha=0.25, label=f'Throttle(元: {len(throttles_orig)})')
+
+            # ダウンサンプリング後のデータを濃い色で表示（前景）
+            if angles_ds:
+                ax.hist(angles_ds, bins=bins, color='steelblue', edgecolor='white',
+                        alpha=0.8, label=f'Angle(DS後: {len(angles_ds)})')
+            if throttles_ds:
+                ax.hist(throttles_ds, bins=bins, color='forestgreen', edgecolor='white',
+                        alpha=0.8, label=f'Throttle(DS後: {len(throttles_ds)})')
+
+            ds_count = len(self.downsampled_indexes)
+            data_count = max(len(angles_ds), len(throttles_ds))
+            if ds_count > 0:
+                ax.set_title(f'Angle / Throttle 分布 (n={data_count:,}, DS除外: {ds_count})')
+            else:
+                ax.set_title(f'Angle / Throttle 分布 (n={data_count:,})')
             ax.set_xlabel('値')
             ax.set_ylabel('頻度')
             ax.axvline(x=0, color='red', linestyle='--', alpha=0.5, linewidth=1)
-            ax.legend(fontsize=8, loc='upper right')
+            ax.legend(fontsize=7, loc='upper right')
             ax.grid(True, alpha=0.3)
         else:
             ax.text(0.5, 0.5, 'データなし', ha='center', va='center', fontsize=12)
@@ -393,6 +430,8 @@ class DataAnalysisDialog(QDialog):
 
         for idx, ann in self.annotations.items():
             if idx in self.deleted_indexes:
+                continue
+            if idx in self.downsampled_indexes:
                 continue
             indices_set.add(idx)
             for key in selected_keys:
