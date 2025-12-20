@@ -78,6 +78,7 @@ from styles import get_location_color, apply_style, set_theme, get_current_theme
 
 from managers import AnnotationDataManager, MLflowManager, ModelType
 from utils.yolo_utils import train_yolo_with_ui, TrainingOutputDialog
+from data_analysis import DataAnalysisDialog
 from utils.databricks_transfer import DatabricksTransferManager
 
 import traceback
@@ -3680,7 +3681,7 @@ class ImageAnnotationTool(QMainWindow):
         model_buttons_layout.addWidget(self.model_load_button)
 
         pilot_layout.addLayout(model_buttons_layout)
-        
+
         # オートアノテーションボタン
         self.auto_annotate_button = QPushButton("オートアノテーション実行")
         self.auto_annotate_button.clicked.connect(self.auto_annotate)
@@ -4142,11 +4143,20 @@ class ImageAnnotationTool(QMainWindow):
         spacer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         info_layout.addWidget(spacer)
 
-        # 分布タイトルラベル
-        self.graph_title = QLabel("運転アノテーション分布")
+        # 分布タイトルとデータ分析ボタン
+        graph_title_layout = QHBoxLayout()
+        self.graph_title = QLabel("データ分布")
         self.graph_title.setStyleSheet("font-weight: bold; color: #333333;")
-        self.graph_title.setAlignment(Qt.AlignCenter)
-        info_layout.addWidget(self.graph_title)
+        graph_title_layout.addWidget(self.graph_title)
+
+        self.data_analysis_button = QPushButton("分析")
+        self.data_analysis_button.setToolTip("アノテーションデータの統計分析と可視化")
+        self.data_analysis_button.clicked.connect(self.open_data_analysis)
+        self.data_analysis_button.setFixedWidth(50)
+        apply_style(self.data_analysis_button, 'primary')
+        graph_title_layout.addWidget(self.data_analysis_button)
+
+        info_layout.addLayout(graph_title_layout)
 
         # 分布グラフ用ラベル - 固定サイズで配置
         self.distribution_label = QLabel()
@@ -15172,10 +15182,42 @@ class ImageAnnotationTool(QMainWindow):
             
         except Exception as e:
             QMessageBox.critical(
-                self, 
-                "エラー", 
+                self,
+                "エラー",
                 f"サブフォルダアノテーションの読み込み中にエラーが発生しました: {str(e)}"
             )
+
+    def open_data_analysis(self):
+        """データ分析ダイアログを開く"""
+        if not self.annotations:
+            QMessageBox.warning(self, "警告", "アノテーションデータがありません。")
+            return
+
+        # 利用可能なセンサーキーを取得
+        available_keys = getattr(self, 'available_sensor_keys', set())
+
+        # ダイアログを作成
+        self.data_analysis_dialog = DataAnalysisDialog(
+            parent=self,
+            annotations=self.annotations,
+            images=self.images,
+            deleted_indexes=getattr(self, 'deleted_indexes', []),
+            available_sensor_keys=available_keys
+        )
+
+        # ジャンプシグナルを接続
+        self.data_analysis_dialog.jump_to_image.connect(self.jump_to_index_from_analysis)
+
+        # 非モーダルで表示（メインウィンドウと並行操作可能）
+        self.data_analysis_dialog.show()
+
+    def jump_to_index_from_analysis(self, index):
+        """データ分析ダイアログからのジャンプ要求を処理"""
+        if 0 <= index < len(self.images):
+            self.current_index = index
+            self.display_current_image()
+            self.update_gallery()
+            self.statusBar().showMessage(f"インデックス {index} にジャンプしました", 3000)
 
     def load_selected_model(self):
         """選択されたモデルを明示的に読み込む - 詳細な進捗メッセージ付き"""
@@ -15676,6 +15718,22 @@ class ImageAnnotationTool(QMainWindow):
                             # Speed情報があれば追加
                             if speed is not None:
                                 self.annotations[actual_index]["speed"] = speed
+
+                            # その他のセンサーデータを保存（数値データのみ）
+                            for key, value in entry.items():
+                                # 既に処理済みのキーやメタデータはスキップ
+                                if key.startswith('_') or key.endswith('/image_array'):
+                                    continue
+                                if key in ['user/angle', 'pilot/angle', 'user/throttle', 'pilot/throttle',
+                                           'user/loc', 'pilot/loc', 'speed', 'user/speed', 'pilot/speed']:
+                                    continue
+                                # 数値データのみ保存
+                                if isinstance(value, (int, float)):
+                                    self.annotations[actual_index][key] = value
+                                    # 利用可能なキーを記録
+                                    if not hasattr(self, 'available_sensor_keys'):
+                                        self.available_sensor_keys = set()
+                                    self.available_sensor_keys.add(key)
 
                             # タイムスタンプを保存
                             self.annotation_timestamps[actual_index] = entry.get('_timestamp_ms', int(time.time() * 1000))
