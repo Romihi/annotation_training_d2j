@@ -78,6 +78,7 @@ from styles import get_location_color, apply_style, set_theme, get_current_theme
 
 from managers import AnnotationDataManager, MLflowManager, ModelType
 from utils.yolo_utils import train_yolo_with_ui, TrainingOutputDialog
+from data_analysis import DataAnalysisDialog
 from utils.databricks_transfer import DatabricksTransferManager
 
 import traceback
@@ -104,7 +105,8 @@ class ImageLabel(QLabel):
         self.show_inference = False 
         self.zoom_factor = DEFAULT_ZOOM_FACTOR  
         self.is_deleted = False
-        
+        self.is_downsampled = False  # ダウンサンプリング対象フラグ
+
         # 画像描画とクリック制御関連
         self.is_image_loading = False  # 画像読み込み中フラグ
         self.click_disabled = False  # クリック無効化フラグ
@@ -548,20 +550,40 @@ class ImageLabel(QLabel):
             painter.setFont(QFont("Arial", 12, QFont.Bold))
             painter.drawText(badge_rect, Qt.AlignCenter, "削除済み")
 
+            # ダウンサンプリング対象の場合は削除済みバッジの下にDS対象バッジを表示
+            if self.is_downsampled:
+                ds_badge_rect = QRect(x - 100, y + 45, 80, 40)
+                painter.fillRect(ds_badge_rect, QColor(50, 100, 255))  # 青色
+                painter.setPen(QPen(Qt.white, 2))
+                painter.setFont(QFont("Arial", 12, QFont.Bold))
+                painter.drawText(ds_badge_rect, Qt.AlignCenter, "DS対象")
+
             # 削除済みの場合は半透明の赤オーバーレイを表示
             painter.setOpacity(0.25)  # 75%透明
             painter.fillRect(target_rect, QColor(255, 0, 0))
-            
+
             # 中央に削除済みテキストを表示
             painter.setOpacity(1.0)  # 不透明に戻す
             painter.setPen(QPen(Qt.white, 2))
             painter.setFont(QFont("Arial", 24, QFont.Bold))
-            
+
             painter.drawText(
-                target_rect, 
-                Qt.AlignCenter, 
+                target_rect,
+                Qt.AlignCenter,
                 "削除済み\nクリックで再アノテーション"
             )
+
+        elif self.is_downsampled:
+            # ダウンサンプリング対象のみの場合（削除済みでない）
+            painter.setPen(QPen(QColor(50, 100, 255), 4))  # 青い枠線
+            border_rect = QRect(x-4, y-4, scaled_width+8, scaled_height+8)
+            painter.drawRect(border_rect)
+
+            ds_badge_rect = QRect(x - 100, y, 80, 40)
+            painter.fillRect(ds_badge_rect, QColor(50, 100, 255))  # 青色
+            painter.setPen(QPen(Qt.white, 2))
+            painter.setFont(QFont("Arial", 12, QFont.Bold))
+            painter.drawText(ds_badge_rect, Qt.AlignCenter, "DS対象")
 
         elif self.main_window and hasattr(self.main_window, 'current_location') and self.main_window.current_location is not None:
             loc_value = self.main_window.current_location
@@ -3445,6 +3467,9 @@ class ImageAnnotationTool(QMainWindow):
         # 削除インデックス
         self.deleted_indexes = []
 
+        # ダウンサンプリング対象インデックス（直進時など）
+        self.downsampled_indexes = []
+
         # manifest.jsonのパスを保存する変数
         self.last_manifest_path = None
 
@@ -3680,7 +3705,7 @@ class ImageAnnotationTool(QMainWindow):
         model_buttons_layout.addWidget(self.model_load_button)
 
         pilot_layout.addLayout(model_buttons_layout)
-        
+
         # オートアノテーションボタン
         self.auto_annotate_button = QPushButton("オートアノテーション実行")
         self.auto_annotate_button.clicked.connect(self.auto_annotate)
@@ -4142,11 +4167,20 @@ class ImageAnnotationTool(QMainWindow):
         spacer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         info_layout.addWidget(spacer)
 
-        # 分布タイトルラベル
-        self.graph_title = QLabel("運転アノテーション分布")
+        # 分布タイトルとデータ分析ボタン
+        graph_title_layout = QHBoxLayout()
+        self.graph_title = QLabel("データ分布")
         self.graph_title.setStyleSheet("font-weight: bold; color: #333333;")
-        self.graph_title.setAlignment(Qt.AlignCenter)
-        info_layout.addWidget(self.graph_title)
+        graph_title_layout.addWidget(self.graph_title)
+
+        self.data_analysis_button = QPushButton("分析")
+        self.data_analysis_button.setToolTip("アノテーションデータの統計分析と可視化")
+        self.data_analysis_button.clicked.connect(self.open_data_analysis)
+        self.data_analysis_button.setFixedWidth(50)
+        apply_style(self.data_analysis_button, 'primary')
+        graph_title_layout.addWidget(self.data_analysis_button)
+
+        info_layout.addLayout(graph_title_layout)
 
         # 分布グラフ用ラベル - 固定サイズで配置
         self.distribution_label = QLabel()
@@ -4301,6 +4335,153 @@ class ImageAnnotationTool(QMainWindow):
 
         nav_container_layout.addLayout(clip_layout)
 
+        # ダウンサンプリング機能（直進時データの間引き）
+        downsample_layout = QHBoxLayout()
+        downsample_layout.addWidget(QLabel("ダウンサンプリング:"))
+
+        # angle範囲設定
+        downsample_layout.addWidget(QLabel("angle範囲:"))
+        self.downsample_angle_min = QDoubleSpinBox()
+        self.downsample_angle_min.setRange(-1.0, 1.0)
+        self.downsample_angle_min.setValue(-0.05)
+        self.downsample_angle_min.setSingleStep(0.05)
+        self.downsample_angle_min.setDecimals(2)
+        self.downsample_angle_min.setFixedWidth(60)
+        downsample_layout.addWidget(self.downsample_angle_min)
+
+        downsample_layout.addWidget(QLabel("〜"))
+
+        self.downsample_angle_max = QDoubleSpinBox()
+        self.downsample_angle_max.setRange(-1.0, 1.0)
+        self.downsample_angle_max.setValue(0.05)
+        self.downsample_angle_max.setSingleStep(0.05)
+        self.downsample_angle_max.setDecimals(2)
+        self.downsample_angle_max.setFixedWidth(60)
+        downsample_layout.addWidget(self.downsample_angle_max)
+
+        # 連続フレーム数
+        downsample_layout.addWidget(QLabel("連続:"))
+        self.downsample_consecutive = QSpinBox()
+        self.downsample_consecutive.setRange(2, 100)
+        self.downsample_consecutive.setValue(10)
+        self.downsample_consecutive.setFixedWidth(50)
+        self.downsample_consecutive.setToolTip("この数以上連続した場合にダウンサンプリング対象とする")
+        downsample_layout.addWidget(self.downsample_consecutive)
+
+        # 残す間隔
+        downsample_layout.addWidget(QLabel("間隔:"))
+        self.downsample_keep_every = QSpinBox()
+        self.downsample_keep_every.setRange(0, 20)
+        self.downsample_keep_every.setValue(3)
+        self.downsample_keep_every.setFixedWidth(50)
+        self.downsample_keep_every.setToolTip("何枚ごとに1枚残すか（例：3なら3枚中1枚を残す、0なら全て対象）")
+        downsample_layout.addWidget(self.downsample_keep_every)
+
+        # 検出ボタン
+        self.detect_downsample_button = QPushButton("検出")
+        self.detect_downsample_button.clicked.connect(self.detect_downsampling_targets)
+        self.detect_downsample_button.setToolTip("条件に該当するインデックスを検出してダウンサンプリング対象に設定")
+        self.detect_downsample_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4a90d9;
+                color: white;
+                font-weight: bold;
+                border-radius: 4px;
+                padding: 6px 12px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #3a7fc8;
+            }
+        """)
+        downsample_layout.addWidget(self.detect_downsample_button)
+
+        # ダウンサンプリング数表示ラベル
+        self.downsample_count_label = QLabel("0件")
+        self.downsample_count_label.setStyleSheet("color: #3366ff;")
+        downsample_layout.addWidget(self.downsample_count_label)
+
+        # 左揃えにするためストレッチを追加
+        downsample_layout.addStretch()
+
+        nav_container_layout.addLayout(downsample_layout)
+
+        # Throttleダウンサンプリング機能（低速走行時データの間引き）
+        throttle_downsample_layout = QHBoxLayout()
+        throttle_downsample_layout.addWidget(QLabel("                  "))
+
+        # throttle範囲設定
+        throttle_downsample_layout.addWidget(QLabel("throttle範囲:"))
+        self.downsample_throttle_min = QDoubleSpinBox()
+        self.downsample_throttle_min.setRange(-1.0, 1.0)
+        self.downsample_throttle_min.setValue(-0.05)
+        self.downsample_throttle_min.setSingleStep(0.05)
+        self.downsample_throttle_min.setDecimals(2)
+        self.downsample_throttle_min.setFixedWidth(60)
+        throttle_downsample_layout.addWidget(self.downsample_throttle_min)
+
+        throttle_downsample_layout.addWidget(QLabel("〜"))
+
+        self.downsample_throttle_max = QDoubleSpinBox()
+        self.downsample_throttle_max.setRange(-1.0, 1.0)
+        self.downsample_throttle_max.setValue(0.05)
+        self.downsample_throttle_max.setSingleStep(0.05)
+        self.downsample_throttle_max.setDecimals(2)
+        self.downsample_throttle_max.setFixedWidth(60)
+        throttle_downsample_layout.addWidget(self.downsample_throttle_max)
+
+        # 連続フレーム数
+        throttle_downsample_layout.addWidget(QLabel("連続:"))
+        self.downsample_throttle_consecutive = QSpinBox()
+        self.downsample_throttle_consecutive.setRange(2, 100)
+        self.downsample_throttle_consecutive.setValue(3)
+        self.downsample_throttle_consecutive.setFixedWidth(50)
+        self.downsample_throttle_consecutive.setToolTip("この数以上連続した場合にダウンサンプリング対象とする")
+        throttle_downsample_layout.addWidget(self.downsample_throttle_consecutive)
+
+        # 残す間隔
+        throttle_downsample_layout.addWidget(QLabel("間隔:"))
+        self.downsample_throttle_keep_every = QSpinBox()
+        self.downsample_throttle_keep_every.setRange(0, 20)
+        self.downsample_throttle_keep_every.setValue(0)
+        self.downsample_throttle_keep_every.setFixedWidth(50)
+        self.downsample_throttle_keep_every.setToolTip("何枚ごとに1枚残すか（例：3なら3枚中1枚を残す、0なら全て対象）")
+        throttle_downsample_layout.addWidget(self.downsample_throttle_keep_every)
+
+        # 検出ボタン
+        self.detect_throttle_downsample_button = QPushButton("検出")
+        self.detect_throttle_downsample_button.clicked.connect(self.detect_throttle_downsampling_targets)
+        self.detect_throttle_downsample_button.setToolTip("条件に該当するインデックスを検出してダウンサンプリング対象に設定")
+        self.detect_throttle_downsample_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4a90d9;
+                color: white;
+                font-weight: bold;
+                border-radius: 4px;
+                padding: 6px 12px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #3a7fc8;
+            }
+        """)
+        throttle_downsample_layout.addWidget(self.detect_throttle_downsample_button)
+
+        # ダウンサンプリング数表示ラベル（throttle用）
+        self.throttle_downsample_count_label = QLabel("(0件)")
+        self.throttle_downsample_count_label.setStyleSheet("color: #3366ff;")
+        throttle_downsample_layout.addWidget(self.throttle_downsample_count_label)
+
+        # 解除ボタン（全てのダウンサンプリング対象を解除）
+        clear_throttle_downsample_button = QPushButton("解除")
+        clear_throttle_downsample_button.clicked.connect(self.clear_downsampling_targets)
+        clear_throttle_downsample_button.setToolTip("ダウンサンプリング対象をすべて解除")
+        throttle_downsample_layout.addWidget(clear_throttle_downsample_button)
+
+        # 左揃えにするためストレッチを追加
+        throttle_downsample_layout.addStretch()
+
+        nav_container_layout.addLayout(throttle_downsample_layout)
 
         # ナビゲーションコンテナをメイン画像コンテナに追加
         main_image_container.addWidget(nav_container)
@@ -4746,106 +4927,117 @@ class ImageAnnotationTool(QMainWindow):
             return {}
 
     def update_distribution_graph(self):
-        """アノテーションの角度とスロットル値の分布を縦並びのヒストグラムで表示 - 削除済みを除外"""
-        
+        """アノテーションの角度とスロットル値の分布を縦並びのヒストグラムで表示
+        元データ（薄い色）とダウンサンプリング後（濃い色）を重ねて表示"""
+
         if not self.annotations:
             # アノテーションがない場合は空のグラフを表示
             self.distribution_label.clear()
             self.distribution_label.setText("アノテーションがありません")
             return
-        
+
         # 既存のアノテーションからangleとthrottleの値を抽出
-        # 削除済みのインデックスは除外
-        angles = []
-        throttles = []
-        
+        # 元データ（削除済みのみ除外）とダウンサンプリング後（削除済み+ダウンサンプリング対象を除外）
+        angles_orig = []
+        throttles_orig = []
+        angles_ds = []
+        throttles_ds = []
+
         for idx, anno in self.annotations.items():
             # 削除済みインデックスをスキップ
             if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
                 continue
-                
+
             if 'angle' in anno and 'throttle' in anno:
-                angles.append(anno['angle'])
-                throttles.append(anno['throttle'])
-        
+                # 元データに追加
+                angles_orig.append(anno['angle'])
+                throttles_orig.append(anno['throttle'])
+
+                # ダウンサンプリング対象でなければダウンサンプリング後データにも追加
+                if not (hasattr(self, 'downsampled_indexes') and idx in self.downsampled_indexes):
+                    angles_ds.append(anno['angle'])
+                    throttles_ds.append(anno['throttle'])
+
         # データがない場合は終了
-        if not angles or not throttles:
+        if not angles_orig or not throttles_orig:
             self.distribution_label.clear()
             self.distribution_label.setText("有効なアノテーションがありません")
             return
-        
+
         # グラフ作成
         try:
             # 情報パネルの幅に合わせてグラフサイズを調整
             panel_width = self.info_panel_width - self.info_panel_margin
             # 縦に2つのグラフを配置（縦長）
             fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(panel_width/100, 3.6))
-            
-            # カラーマップとヒストグラムの設定
-            cm = plt.get_cmap('viridis')
+
             bins = 20
-            
-            # angle分布をヒストグラムで表示（パーセント表記）
-            weights1 = [100.0 / len(angles)] * len(angles)  # アノテーション総数を100%として重み付け
-            n1, bins1, patches1 = ax1.hist(angles, bins=bins, weights=weights1, alpha=0.7, color='skyblue')
-            # 度数に応じた色付け
-            bin_centers1 = 0.5 * (bins1[:-1] + bins1[1:])
-            col1 = bin_centers1 - min(bin_centers1)
-            col1 = col1 / max(col1) if max(col1) > 0 else col1
-            for c, p in zip(col1, patches1):
-                plt.setp(p, 'facecolor', cm(c))
-            
+
+            # ダウンサンプリングが有効かどうか
+            has_downsampling = hasattr(self, 'downsampled_indexes') and len(self.downsampled_indexes) > 0
+
+            # === Angle分布 ===
+            if has_downsampling:
+                # 元データを薄い色で表示（背景）
+                ax1.hist(angles_orig, bins=bins, color='steelblue', edgecolor='none',
+                        alpha=0.25, label=f'元: {len(angles_orig)}')
+                # ダウンサンプリング後のデータを濃い色で表示（前景）
+                if angles_ds:
+                    ax1.hist(angles_ds, bins=bins, color='steelblue', edgecolor='white',
+                            alpha=0.8, label=f'DS後: {len(angles_ds)}')
+                ax1.legend(fontsize=6, loc='upper right')
+            else:
+                # ダウンサンプリングなしの場合は通常表示
+                ax1.hist(angles_orig, bins=bins, color='steelblue', edgecolor='white',
+                        alpha=0.7)
+
             # スタイル設定
-            ax1.set_title('Angle dist', fontsize=10)
-            # ax1.set_xlabel('Angle値 (-1.0～1.0)', fontsize=8)
-            ax1.set_ylabel('Percentage (%)', fontsize=8)
+            ax1.set_title(f'Angle (n={len(angles_ds) if has_downsampling else len(angles_orig)})', fontsize=10)
             ax1.tick_params(axis='both', which='major', labelsize=7)
             ax1.grid(True, alpha=0.3)
             ax1.set_xlim(-1.05, 1.05)
-                        
-            # throttle分布をヒストグラムで表示（パーセント表記）
-            weights2 = [100.0 / len(throttles)] * len(throttles)  # アノテーション総数を100%として重み付け
-            n2, bins2, patches2 = ax2.hist(throttles, bins=bins, weights=weights2, alpha=0.7, color='salmon')
-            # 度数に応じた色付け
-            bin_centers2 = 0.5 * (bins2[:-1] + bins2[1:])
-            col2 = bin_centers2 - min(bin_centers2)
-            col2 = col2 / max(col2) if max(col2) > 0 else col2
-            for c, p in zip(col2, patches2):
-                plt.setp(p, 'facecolor', cm(c))
-            
+
+            # === Throttle分布 ===
+            if has_downsampling:
+                # 元データを薄い色で表示（背景）
+                ax2.hist(throttles_orig, bins=bins, color='forestgreen', edgecolor='none',
+                        alpha=0.25, label=f'元: {len(throttles_orig)}')
+                # ダウンサンプリング後のデータを濃い色で表示（前景）
+                if throttles_ds:
+                    ax2.hist(throttles_ds, bins=bins, color='forestgreen', edgecolor='white',
+                            alpha=0.8, label=f'DS後: {len(throttles_ds)}')
+                ax2.legend(fontsize=6, loc='upper right')
+            else:
+                # ダウンサンプリングなしの場合は通常表示
+                ax2.hist(throttles_orig, bins=bins, color='forestgreen', edgecolor='white',
+                        alpha=0.7)
+
             # スタイル設定
-            ax2.set_title('Throttle dist', fontsize=10)
-            # ax2.set_xlabel('Throttle値 (-1.0～1.0)', fontsize=8)
-            ax2.set_ylabel('Percentage (%)', fontsize=8)
+            ax2.set_title(f'Throttle (n={len(throttles_ds) if has_downsampling else len(throttles_orig)})', fontsize=10)
             ax2.tick_params(axis='both', which='major', labelsize=7)
             ax2.grid(True, alpha=0.3)
             ax2.set_xlim(-1.05, 1.05)
-                        
+
             # レイアウト調整
             plt.tight_layout(pad=1.0)
-            
+
             # メモリ上にグラフを保存
             buf = io.BytesIO()
             fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
             buf.seek(0)
-            
+
             # QImageに変換してQPixmapに設定
             image = QImage.fromData(buf.getvalue())
             pixmap = QPixmap.fromImage(image)
-            
-            # 分布グラフタイトルに削除分を除外している旨を追加
-            total_annotations = len(self.annotations)
-            deleted_count = sum(1 for idx in self.annotations if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes)
-            valid_count = total_annotations - deleted_count
-            
+
             # グラフタイトルラベルを更新
             if hasattr(self, 'distribution_label'):
                 self.distribution_label.setPixmap(pixmap)
                 self.distribution_label.setScaledContents(True)
-                            
+
             # 後始末
             plt.close(fig)
-            
+
         except Exception as e:
             print(f"分布グラフ作成中にエラー: {str(e)}")
             traceback.print_exc()
@@ -13599,13 +13791,318 @@ class ImageAnnotationTool(QMainWindow):
         self.update_slider_deleted_indexes()
         
         QMessageBox.information(
-            self, 
-            "範囲削除完了", 
+            self,
+            "範囲削除完了",
             f"インデックス {start_idx} から {end_idx} までの範囲から"
             f"\n{marked_as_deleted_count}個の画像を削除済みとしてマークしました。"
             f"\nアノテーションデータは保持されています。"
             f"\n\n削除済みインデックスの合計数: {len(self.deleted_indexes)}"
         )
+
+    def detect_downsampling_targets(self):
+        """直進時（angle値が一定範囲内で連続）のデータを検出してダウンサンプリング対象に設定"""
+        if not self.images or not self.annotations:
+            QMessageBox.warning(self, "警告", "画像とアノテーションデータを読み込んでください。")
+            return
+
+        # パラメータ取得
+        angle_min = self.downsample_angle_min.value()
+        angle_max = self.downsample_angle_max.value()
+        min_consecutive = self.downsample_consecutive.value()
+        keep_every = self.downsample_keep_every.value()
+
+        if angle_min >= angle_max:
+            QMessageBox.warning(self, "警告", "angle範囲の最小値は最大値より小さくしてください。")
+            return
+
+        # 連続区間の検出
+        consecutive_runs = []  # [(start_idx, end_idx), ...]
+        current_run_start = None
+
+        # インデックス順にソートしてチェック
+        sorted_indices = sorted(self.annotations.keys())
+
+        for i, idx in enumerate(sorted_indices):
+            ann = self.annotations[idx]
+            angle = ann.get('angle')
+
+            # 削除済みはスキップ
+            if idx in self.deleted_indexes:
+                if current_run_start is not None:
+                    # 連続区間終了
+                    run_end = sorted_indices[i - 1] if i > 0 else current_run_start
+                    if run_end - current_run_start + 1 >= min_consecutive:
+                        consecutive_runs.append((current_run_start, run_end))
+                    current_run_start = None
+                continue
+
+            if angle is not None and angle_min <= angle <= angle_max:
+                # 範囲内
+                if current_run_start is None:
+                    current_run_start = idx
+            else:
+                # 範囲外 - 連続区間終了
+                if current_run_start is not None:
+                    run_end = sorted_indices[i - 1] if i > 0 else current_run_start
+                    if run_end - current_run_start + 1 >= min_consecutive:
+                        consecutive_runs.append((current_run_start, run_end))
+                    current_run_start = None
+
+        # 最後の連続区間をチェック
+        if current_run_start is not None:
+            run_end = sorted_indices[-1]
+            if run_end - current_run_start + 1 >= min_consecutive:
+                consecutive_runs.append((current_run_start, run_end))
+
+        # ダウンサンプリング対象を決定（連続区間内でkeep_every枚ごとに1枚を残す、0なら全て対象）
+        new_downsampled = []
+        for run_start, run_end in consecutive_runs:
+            count = 0
+            for idx in range(run_start, run_end + 1):
+                if idx in self.deleted_indexes:
+                    continue
+                if idx not in self.annotations:
+                    continue
+                count += 1
+                if keep_every == 0:
+                    # 間隔0: 全てダウンサンプリング対象
+                    new_downsampled.append(idx)
+                else:
+                    # keep_every枚ごとに1枚残す（1, keep_every+1, 2*keep_every+1, ...を残す）
+                    if count % keep_every != 1:
+                        new_downsampled.append(idx)
+
+        # 既存のダウンサンプリング対象と統合
+        self.downsampled_indexes = sorted(list(set(self.downsampled_indexes + new_downsampled)))
+
+        # UI更新
+        self.update_slider_downsampled_indexes()
+        self.downsample_count_label.setText(f"{len(self.downsampled_indexes)}件")
+
+        # angle検出ボタンを「再検出」に変更し水色にする
+        redetect_style = """
+            QPushButton {
+                background-color: #5bc0de;
+                color: white;
+                font-weight: bold;
+                border-radius: 4px;
+                padding: 6px 12px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #46b8da;
+            }
+        """
+        if hasattr(self, 'detect_downsample_button'):
+            self.detect_downsample_button.setText("再検出")
+            self.detect_downsample_button.setStyleSheet(redetect_style)
+
+        # 分布グラフを更新
+        if hasattr(self, 'update_distribution_graph'):
+            self.update_distribution_graph()
+
+        # 現在の画像表示を更新（DS対象バッジ表示のため）
+        if hasattr(self, '_set_annotation_point_on_canvas'):
+            self._set_annotation_point_on_canvas()
+
+        # 分析ウィンドウが開いている場合は更新
+        if hasattr(self, 'data_analysis_dialog') and self.data_analysis_dialog is not None:
+            if self.data_analysis_dialog.isVisible():
+                self.data_analysis_dialog.update_analysis()
+
+        # 結果表示
+        QMessageBox.information(
+            self,
+            "ダウンサンプリング検出完了",
+            f"検出条件:\n"
+            f"・angle範囲: {angle_min:.2f} 〜 {angle_max:.2f}\n"
+            f"・連続フレーム数: {min_consecutive}以上\n"
+            f"・残す間隔: {keep_every}枚に1枚\n\n"
+            f"検出された連続区間: {len(consecutive_runs)}箇所\n"
+            f"ダウンサンプリング対象: {len(self.downsampled_indexes)}件"
+        )
+
+    def detect_throttle_downsampling_targets(self):
+        """throttle値が一定範囲内で連続するデータを検出してダウンサンプリング対象に設定"""
+        if not self.images or not self.annotations:
+            QMessageBox.warning(self, "警告", "画像とアノテーションデータを読み込んでください。")
+            return
+
+        # パラメータ取得
+        throttle_min = self.downsample_throttle_min.value()
+        throttle_max = self.downsample_throttle_max.value()
+        min_consecutive = self.downsample_throttle_consecutive.value()
+        keep_every = self.downsample_throttle_keep_every.value()
+
+        if throttle_min >= throttle_max:
+            QMessageBox.warning(self, "警告", "throttle範囲の最小値は最大値より小さくしてください。")
+            return
+
+        # 連続区間の検出
+        consecutive_runs = []  # [(start_idx, end_idx), ...]
+        current_run_start = None
+
+        # インデックス順にソートしてチェック
+        sorted_indices = sorted(self.annotations.keys())
+
+        for i, idx in enumerate(sorted_indices):
+            ann = self.annotations[idx]
+            throttle = ann.get('throttle')
+
+            # 削除済みはスキップ
+            if idx in self.deleted_indexes:
+                if current_run_start is not None:
+                    # 連続区間終了
+                    run_end = sorted_indices[i - 1] if i > 0 else current_run_start
+                    if run_end - current_run_start + 1 >= min_consecutive:
+                        consecutive_runs.append((current_run_start, run_end))
+                    current_run_start = None
+                continue
+
+            if throttle is not None and throttle_min <= throttle <= throttle_max:
+                # 範囲内
+                if current_run_start is None:
+                    current_run_start = idx
+            else:
+                # 範囲外 - 連続区間終了
+                if current_run_start is not None:
+                    run_end = sorted_indices[i - 1] if i > 0 else current_run_start
+                    if run_end - current_run_start + 1 >= min_consecutive:
+                        consecutive_runs.append((current_run_start, run_end))
+                    current_run_start = None
+
+        # 最後の連続区間をチェック
+        if current_run_start is not None:
+            run_end = sorted_indices[-1]
+            if run_end - current_run_start + 1 >= min_consecutive:
+                consecutive_runs.append((current_run_start, run_end))
+
+        # ダウンサンプリング対象を決定（連続区間内でkeep_every枚ごとに1枚を残す、0なら全て対象）
+        new_downsampled = []
+        for run_start, run_end in consecutive_runs:
+            count = 0
+            for idx in range(run_start, run_end + 1):
+                if idx in self.deleted_indexes:
+                    continue
+                if idx not in self.annotations:
+                    continue
+                count += 1
+                if keep_every == 0:
+                    # 間隔0: 全てダウンサンプリング対象
+                    new_downsampled.append(idx)
+                else:
+                    # keep_every枚ごとに1枚残す（1, keep_every+1, 2*keep_every+1, ...を残す）
+                    if count % keep_every != 1:
+                        new_downsampled.append(idx)
+
+        # 既存のダウンサンプリング対象と統合
+        self.downsampled_indexes = sorted(list(set(self.downsampled_indexes + new_downsampled)))
+
+        # UI更新
+        self.update_slider_downsampled_indexes()
+        self.downsample_count_label.setText(f"{len(self.downsampled_indexes)}件")
+        self.throttle_downsample_count_label.setText(f"(+{len(new_downsampled)}件)")
+
+        # throttle検出ボタンを「再検出」に変更し水色にする
+        redetect_style = """
+            QPushButton {
+                background-color: #5bc0de;
+                color: white;
+                font-weight: bold;
+                border-radius: 4px;
+                padding: 6px 12px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #46b8da;
+            }
+        """
+        if hasattr(self, 'detect_throttle_downsample_button'):
+            self.detect_throttle_downsample_button.setText("再検出")
+            self.detect_throttle_downsample_button.setStyleSheet(redetect_style)
+
+        # 分布グラフを更新
+        if hasattr(self, 'update_distribution_graph'):
+            self.update_distribution_graph()
+
+        # 現在の画像表示を更新（DS対象バッジ表示のため）
+        if hasattr(self, '_set_annotation_point_on_canvas'):
+            self._set_annotation_point_on_canvas()
+
+        # 分析ウィンドウが開いている場合は更新
+        if hasattr(self, 'data_analysis_dialog') and self.data_analysis_dialog is not None:
+            if self.data_analysis_dialog.isVisible():
+                self.data_analysis_dialog.update_analysis()
+
+        # 結果表示
+        QMessageBox.information(
+            self,
+            "Throttleダウンサンプリング検出完了",
+            f"検出条件:\n"
+            f"・throttle範囲: {throttle_min:.2f} 〜 {throttle_max:.2f}\n"
+            f"・連続フレーム数: {min_consecutive}以上\n"
+            f"・残す間隔: {keep_every}枚に1枚\n\n"
+            f"検出された連続区間: {len(consecutive_runs)}箇所\n"
+            f"今回追加: {len(new_downsampled)}件\n"
+            f"ダウンサンプリング対象合計: {len(self.downsampled_indexes)}件"
+        )
+
+    def clear_downsampling_targets(self):
+        """ダウンサンプリング対象をすべて解除"""
+        if not self.downsampled_indexes:
+            QMessageBox.information(self, "情報", "ダウンサンプリング対象はありません。")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "確認",
+            f"{len(self.downsampled_indexes)}件のダウンサンプリング対象をすべて解除しますか？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            self.downsampled_indexes = []
+            self.update_slider_downsampled_indexes()
+            self.downsample_count_label.setText("0件")
+            if hasattr(self, 'throttle_downsample_count_label'):
+                self.throttle_downsample_count_label.setText("(0件)")
+
+            # 検出ボタンを「検出」に戻し青色にリセット
+            detect_style = """
+                QPushButton {
+                    background-color: #4a90d9;
+                    color: white;
+                    font-weight: bold;
+                    border-radius: 4px;
+                    padding: 6px 12px;
+                    border: none;
+                }
+                QPushButton:hover {
+                    background-color: #3a7fc8;
+                }
+            """
+            if hasattr(self, 'detect_downsample_button'):
+                self.detect_downsample_button.setText("検出")
+                self.detect_downsample_button.setStyleSheet(detect_style)
+            if hasattr(self, 'detect_throttle_downsample_button'):
+                self.detect_throttle_downsample_button.setText("検出")
+                self.detect_throttle_downsample_button.setStyleSheet(detect_style)
+
+            # 分布グラフを更新
+            if hasattr(self, 'update_distribution_graph'):
+                self.update_distribution_graph()
+
+            # 現在の画像表示を更新（DS対象バッジ表示解除のため）
+            if hasattr(self, '_set_annotation_point_on_canvas'):
+                self._set_annotation_point_on_canvas()
+
+            # 分析ウィンドウが開いている場合は更新
+            if hasattr(self, 'data_analysis_dialog') and self.data_analysis_dialog is not None:
+                if self.data_analysis_dialog.isVisible():
+                    self.data_analysis_dialog.update_analysis()
+
+            QMessageBox.information(self, "完了", "ダウンサンプリング対象を解除しました。")
 
     def on_folder_path_changed(self, text):
         """フォルダパスが変更されたときの処理"""
@@ -13743,6 +14240,11 @@ class ImageAnnotationTool(QMainWindow):
             self.inference_debounce_timer.start(self.inference_debounce_delay)
 
             self.update_ui()
+
+            # データ分析ダイアログが開いている場合、現在位置を更新
+            if hasattr(self, 'data_analysis_dialog') and self.data_analysis_dialog is not None:
+                if self.data_analysis_dialog.isVisible():
+                    self.data_analysis_dialog.update_current_position(value)
 
     def execute_slider_inference(self):
         """スライダー変更後のデバウンス処理で推論を実行"""
@@ -15172,10 +15674,45 @@ class ImageAnnotationTool(QMainWindow):
             
         except Exception as e:
             QMessageBox.critical(
-                self, 
-                "エラー", 
+                self,
+                "エラー",
                 f"サブフォルダアノテーションの読み込み中にエラーが発生しました: {str(e)}"
             )
+
+    def open_data_analysis(self):
+        """データ分析ダイアログを開く"""
+        if not self.annotations:
+            QMessageBox.warning(self, "警告", "アノテーションデータがありません。")
+            return
+
+        # 利用可能なセンサーキーを取得
+        available_keys = getattr(self, 'available_sensor_keys', set())
+
+        # ダイアログを作成
+        self.data_analysis_dialog = DataAnalysisDialog(
+            parent=self,
+            annotations=self.annotations,
+            images=self.images,
+            deleted_indexes=getattr(self, 'deleted_indexes', []),
+            downsampled_indexes=getattr(self, 'downsampled_indexes', []),
+            available_sensor_keys=available_keys
+        )
+
+        # ジャンプシグナルを接続
+        self.data_analysis_dialog.jump_to_image.connect(self.jump_to_index_from_analysis)
+
+        # 非モーダルで表示（メインウィンドウと並行操作可能）
+        self.data_analysis_dialog.show()
+
+    def jump_to_index_from_analysis(self, index):
+        """データ分析ダイアログからのジャンプ要求を処理"""
+        if 0 <= index < len(self.images):
+            self.current_index = index
+            self.display_current_image()
+            self.update_gallery()
+            self.image_slider.setValue(index)
+            self.slider_value_label.setText(f"{index + 1}/{len(self.images)}")
+            self.statusBar().showMessage(f"インデックス {index} にジャンプしました", 3000)
 
     def load_selected_model(self):
         """選択されたモデルを明示的に読み込む - 詳細な進捗メッセージ付き"""
@@ -15676,6 +16213,22 @@ class ImageAnnotationTool(QMainWindow):
                             # Speed情報があれば追加
                             if speed is not None:
                                 self.annotations[actual_index]["speed"] = speed
+
+                            # その他のセンサーデータを保存（数値データのみ）
+                            for key, value in entry.items():
+                                # 既に処理済みのキーやメタデータはスキップ
+                                if key.startswith('_') or key.endswith('/image_array'):
+                                    continue
+                                if key in ['user/angle', 'pilot/angle', 'user/throttle', 'pilot/throttle',
+                                           'user/loc', 'pilot/loc', 'speed', 'user/speed', 'pilot/speed']:
+                                    continue
+                                # 数値データのみ保存
+                                if isinstance(value, (int, float)):
+                                    self.annotations[actual_index][key] = value
+                                    # 利用可能なキーを記録
+                                    if not hasattr(self, 'available_sensor_keys'):
+                                        self.available_sensor_keys = set()
+                                    self.available_sensor_keys.add(key)
 
                             # タイムスタンプを保存
                             self.annotation_timestamps[actual_index] = entry.get('_timestamp_ms', int(time.time() * 1000))
@@ -16236,6 +16789,10 @@ class ImageAnnotationTool(QMainWindow):
         else:
             self.main_image_view.is_deleted = False
 
+        # ダウンサンプリング対象の場合
+        is_downsampled = hasattr(self, 'downsampled_indexes') and self.current_index in self.downsampled_indexes
+        self.main_image_view.is_downsampled = is_downsampled
+
         # UIを更新（画像読み込みの成功/失敗に関係なく実行）
         self.main_image_view.update()
 
@@ -16533,11 +17090,20 @@ class ImageAnnotationTool(QMainWindow):
                 self.update_segmentation_inference_display()
 
         # 画面を更新 - ギャラリーは遅延更新でパフォーマンス改善
-        self._schedule_gallery_update()  # デバウンスで遅延更新
+        # 再生中はデバウンスをスキップして直接更新（タイマーリセット問題を回避）
+        if is_auto_playing:
+            self.update_gallery()
+        else:
+            self._schedule_gallery_update()  # デバウンスで遅延更新
         self.update_inference_display()
 
         # 位置アノテーション数の表示を更新
         self.update_location_button_counts()
+
+        # データ分析ダイアログが開いている場合、現在位置を更新
+        if hasattr(self, 'data_analysis_dialog') and self.data_analysis_dialog is not None:
+            if self.data_analysis_dialog.isVisible():
+                self.data_analysis_dialog.update_current_position(new_index)
 
     def handle_annotation(self, x, y):
         """画像のアノテーションを処理する - 削除済み画像への再アノテーションをサポート（パフォーマンス最適化版）"""
@@ -17965,61 +18531,94 @@ class ImageAnnotationTool(QMainWindow):
         data_sample_label = QLabel("")
         data_selection_layout.addWidget(data_sample_label)
 
+        # ダウンサンプリング除外チェックボックス
+        exclude_downsampled_check = QCheckBox("ダウンサンプリング対象を除外")
+        exclude_downsampled_check.setChecked(True)  # デフォルトでON
+        downsampled_count = len(getattr(self, 'downsampled_indexes', []))
+        exclude_downsampled_check.setToolTip(f"直進時などのダウンサンプリング対象データ（現在{downsampled_count}件）を学習から除外します")
+        if downsampled_count == 0:
+            exclude_downsampled_check.setEnabled(False)
+            exclude_downsampled_check.setText("ダウンサンプリング対象を除外 (0件)")
+        else:
+            exclude_downsampled_check.setText(f"ダウンサンプリング対象を除外 ({downsampled_count}件)")
+        data_selection_layout.addWidget(exclude_downsampled_check)
+
         # ラジオボタンの状態に応じて各設定欄の有効/無効を切り替える
         def update_data_selection_ui():
             # スキップ設定の有効/無効
             custom_skip_spin.setEnabled(data_radio_skip.isChecked())
-            
+
             # インデックス範囲設定の有効/無効
             range_start_spin.setEnabled(data_radio_range.isChecked())
             range_end_spin.setEnabled(data_radio_range.isChecked())
-            
-            # サンプル数の計算と表示（削除済みマークを考慮）
+
+            # ダウンサンプリング除外設定を取得
+            exclude_downsampled = exclude_downsampled_check.isChecked()
+            downsampled_set = set(getattr(self, 'downsampled_indexes', []))
+
+            # サンプル数の計算と表示（削除済み・ダウンサンプリングを考慮）
             if data_radio_all.isChecked():
-                # アノテーション総数と削除済み数を計算
+                # アノテーション総数と除外数を計算
                 total_annotations = len(self.annotations)
-                
-                # 削除済みアノテーションをカウント（actual_indexで判定）
-                excluded_count = 0
+
+                # 削除済み・ダウンサンプリングをカウント
+                deleted_count = 0
+                ds_count = 0
                 for idx in self.annotations.keys():
                     if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
-                        excluded_count += 1
-                sample_count = total_annotations - excluded_count  # 実際に使用される数
-                
-                data_sample_label.setText(f"<b>使用データ数: {sample_count}枚</b> (全{total_annotations}枚 - 削除済み{excluded_count}枚)")
+                        deleted_count += 1
+                    elif exclude_downsampled and idx in downsampled_set:
+                        ds_count += 1
+                excluded_count = deleted_count + ds_count
+                sample_count = total_annotations - excluded_count
+
+                exclude_info = f"削除済み{deleted_count}枚"
+                if exclude_downsampled and ds_count > 0:
+                    exclude_info += f" + DS{ds_count}枚"
+                data_sample_label.setText(f"<b>使用データ数: {sample_count}枚</b> (全{total_annotations}枚 - {exclude_info})")
                 data_sample_label.setStyleSheet("color: #2E7D32; font-weight: bold; font-size: 13px;")
             elif data_radio_skip.isChecked():
                 skip = custom_skip_spin.value()
-                # スキップ対象のアノテーションと削除済みを計算
                 total_skipped = 0
-                excluded_count = 0
+                deleted_count = 0
+                ds_count = 0
 
                 for idx in self.annotations.keys():
-                    if idx % skip == 0:  # スキップ対象のインデックス
+                    if idx % skip == 0:
                         total_skipped += 1
-                        # 削除済みチェック（actual_indexで判定）
                         if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
-                            excluded_count += 1
-                sample_count = total_skipped - excluded_count  # 実際に使用される数
-                
-                data_sample_label.setText(f"<b>使用データ数: {sample_count}枚</b> ({skip}枚ごと、対象{total_skipped}枚 - 削除済み{excluded_count}枚)")
+                            deleted_count += 1
+                        elif exclude_downsampled and idx in downsampled_set:
+                            ds_count += 1
+                excluded_count = deleted_count + ds_count
+                sample_count = total_skipped - excluded_count
+
+                exclude_info = f"削除済み{deleted_count}枚"
+                if exclude_downsampled and ds_count > 0:
+                    exclude_info += f" + DS{ds_count}枚"
+                data_sample_label.setText(f"<b>使用データ数: {sample_count}枚</b> ({skip}枚ごと、対象{total_skipped}枚 - {exclude_info})")
                 data_sample_label.setStyleSheet("color: #2E7D32; font-weight: bold; font-size: 13px;")
             elif data_radio_range.isChecked():
                 start = range_start_spin.value()
                 end = range_end_spin.value()
-                # インデックス範囲内のアノテーションと削除済みを計算
                 total_in_range = 0
-                excluded_count = 0
+                deleted_count = 0
+                ds_count = 0
 
                 for idx in self.annotations:
                     if start <= idx <= end:
                         total_in_range += 1
-                        # 削除済みチェック（actual_indexで判定）
                         if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
-                            excluded_count += 1
-                sample_count = total_in_range - excluded_count  # 実際に使用される数
-                
-                data_sample_label.setText(f"<b>使用データ数: {sample_count}枚</b> (範囲{start}-{end}、対象{total_in_range}枚 - 削除済み{excluded_count}枚)")
+                            deleted_count += 1
+                        elif exclude_downsampled and idx in downsampled_set:
+                            ds_count += 1
+                excluded_count = deleted_count + ds_count
+                sample_count = total_in_range - excluded_count
+
+                exclude_info = f"削除済み{deleted_count}枚"
+                if exclude_downsampled and ds_count > 0:
+                    exclude_info += f" + DS{ds_count}枚"
+                data_sample_label.setText(f"<b>使用データ数: {sample_count}枚</b> (範囲{start}-{end}、対象{total_in_range}枚 - {exclude_info})")
                 data_sample_label.setStyleSheet("color: #2E7D32; font-weight: bold; font-size: 13px;")
 
         # ラジオボタンの状態変更イベントを接続
@@ -18031,6 +18630,9 @@ class ImageAnnotationTool(QMainWindow):
         custom_skip_spin.valueChanged.connect(update_data_selection_ui)
         range_start_spin.valueChanged.connect(update_data_selection_ui)
         range_end_spin.valueChanged.connect(update_data_selection_ui)
+
+        # ダウンサンプリング除外チェックボックスの変更イベントを接続
+        exclude_downsampled_check.toggled.connect(update_data_selection_ui)
 
         # 初期表示を設定
         update_data_selection_ui()
@@ -18347,6 +18949,9 @@ class ImageAnnotationTool(QMainWindow):
         range_start = range_start_spin.value() if use_range else 0
         range_end = range_end_spin.value() if use_range else (len(self.images) - 1)
 
+        # ダウンサンプリング除外設定の取得
+        exclude_downsampled = exclude_downsampled_check.isChecked()
+
         # オーグメンテーション設定の取得
         augmentation_params = {
             'enabled': aug_enable_check.isChecked(),
@@ -18368,9 +18973,15 @@ class ImageAnnotationTool(QMainWindow):
         try:
             # 学習データの準備（データ選択設定を適用）
             image_paths = []
+            downsampled_set = set(getattr(self, 'downsampled_indexes', []))
+
             for idx in self.annotations.keys():
                 # 削除済みインデックスをスキップ（actual_indexで判定）
                 if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
+                    continue
+
+                # ダウンサンプリング対象をスキップ（チェックボックスがONの場合）
+                if exclude_downsampled and idx in downsampled_set:
                     continue
 
                 if isinstance(idx, int) and 0 <= idx < len(self.images):
@@ -18848,6 +19459,14 @@ class ImageAnnotationTool(QMainWindow):
         index_layout.addWidget(end_current_button)
 
         range_layout.addLayout(index_layout)
+
+        # 既存アノテーション上書きチェックボックス
+        overwrite_checkbox = QCheckBox("既存のアノテーションを上書きする")
+        overwrite_checkbox.setChecked(False)
+        overwrite_checkbox.setEnabled(False)  # 初期状態で非アクティブ（範囲指定時のみ有効）
+        overwrite_checkbox.setToolTip("チェックすると、既にアノテーションされている画像も再推論で上書きします")
+        range_layout.addWidget(overwrite_checkbox)
+
         layout.addWidget(range_group)
 
         # ラジオボタンの状態変化でスピンボックスとボタンを有効/無効化
@@ -18856,6 +19475,9 @@ class ImageAnnotationTool(QMainWindow):
             end_spin.setEnabled(checked)
             start_current_button.setEnabled(checked)
             end_current_button.setEnabled(checked)
+            overwrite_checkbox.setEnabled(checked)
+            if not checked:
+                overwrite_checkbox.setChecked(False)
 
         range_radio.toggled.connect(on_range_radio_toggled)
 
@@ -18869,25 +19491,30 @@ class ImageAnnotationTool(QMainWindow):
         if range_dialog.exec_() != QDialog.Accepted:
             return
 
-        # 範囲に基づいてアノテーション対象画像を取得
+        # 範囲に基づいてアノテーション対象のインデックスを取得
         if all_radio.isChecked():
-            # すべてのアノテーションされていない画像
-            unannotated_images = [img for img in self.images if img not in self.annotations]
+            # すべてのアノテーションされていないインデックス
+            target_indices = [idx for idx in range(len(self.images)) if idx not in self.annotations]
         else:
-            # 指定範囲のアノテーションされていない画像
-            start_idx = start_spin.value()
-            end_idx = end_spin.value()
-            if start_idx > end_idx:
+            # 指定範囲のインデックスを取得
+            range_start = start_spin.value()
+            range_end = end_spin.value()
+            if range_start > range_end:
                 QMessageBox.warning(self, "警告", "開始インデックスは終了インデックス以下である必要があります。")
                 return
 
-            range_images = self.images[start_idx:end_idx + 1]
-            unannotated_images = [img for img in range_images if img not in self.annotations]
+            # 上書きオプションに応じて対象インデックスを決定
+            if overwrite_checkbox.isChecked():
+                # 上書きモード: 範囲内の全インデックスを対象
+                target_indices = list(range(range_start, range_end + 1))
+            else:
+                # 通常モード: 未アノテーションのインデックスのみ
+                target_indices = [idx for idx in range(range_start, range_end + 1) if idx not in self.annotations]
 
-        if not unannotated_images:
+        if not target_indices:
             QMessageBox.information(self, "情報", "指定範囲にアノテーションされていない画像がありません。")
             return
-        
+
         # 選択された学習方法（モデル）を取得
         model_type = self.auto_method_combo.currentText()
         selected_model = self.model_combo.currentText()
@@ -18904,7 +19531,7 @@ class ImageAnnotationTool(QMainWindow):
         
         # 進捗ダイアログを表示
         progress = QProgressDialog(
-            f"オートアノテーション準備中... ({len(unannotated_images)}枚の画像)", 
+            f"オートアノテーション準備中... ({len(target_indices)}枚の画像)",
             "キャンセル", 0, 100, self
         )
         progress.setWindowTitle("オートアノテーション実行中")
@@ -18913,15 +19540,15 @@ class ImageAnnotationTool(QMainWindow):
         progress.setValue(0)
         progress.show()
         QApplication.processEvents()
-        
+
         # 処理前の確認
         progress.setLabelText(f"モデル '{model_type}' を使用した処理を準備中...")
         progress.setValue(5)
         QApplication.processEvents()
-        
+
         # バッチサイズ - 大量の画像を一度に処理するとメモリ不足になる可能性があるため
         batch_size = 50
-        total_batches = (len(unannotated_images) + batch_size - 1) // batch_size
+        total_batches = (len(target_indices) + batch_size - 1) // batch_size
         
         try:
             # モデル初期化
@@ -18951,50 +19578,59 @@ class ImageAnnotationTool(QMainWindow):
             for batch_idx in range(total_batches):
                 if progress.wasCanceled():
                     break
-                    
-                # 現在のバッチの画像取得
-                start_idx = batch_idx * batch_size
-                end_idx = min((batch_idx + 1) * batch_size, len(unannotated_images))
-                current_batch = unannotated_images[start_idx:end_idx]
-                
+
+                # 現在のバッチのインデックス取得
+                batch_start = batch_idx * batch_size
+                batch_end = min((batch_idx + 1) * batch_size, len(target_indices))
+                current_batch_indices = target_indices[batch_start:batch_end]
+
+                # インデックスからファイルパスのリストを作成（batch_inferenceに渡す用）
+                current_batch_paths = [self.images[idx] for idx in current_batch_indices]
+
                 progress.setLabelText(
                     f"バッチ {batch_idx+1}/{total_batches} 処理中...\n"
-                    f"画像 {start_idx+1}-{end_idx}/{len(unannotated_images)}"
+                    f"画像 {batch_start+1}-{batch_end}/{len(target_indices)}"
                 )
-                
+
                 # 進捗値計算 - バッチ処理に80%の進捗を割り当て (15-95%)
                 batch_progress = 15 + int((batch_idx / total_batches) * 80)
                 progress.setValue(batch_progress)
                 QApplication.processEvents()
-                
+
                 # 推論を実行
                 try:
                     inference_results = batch_inference(
-                        current_batch, 
-                        method="model", 
+                        current_batch_paths,
+                        method="model",
                         model_type=model_type,
                         model_path=model_path,
                         force_reload=(batch_idx == 0)  # 最初のバッチのみ強制再読込
                     )
-                    
+
                     # サブ進捗表示
-                    batch_size = len(current_batch)
-                    for i, (img_path, result) in enumerate(inference_results.items()):
+                    current_batch_size = len(current_batch_indices)
+                    for i, img_index in enumerate(current_batch_indices):
                         if progress.wasCanceled():
                             break
-                            
+
+                        img_path = self.images[img_index]
+                        result = inference_results.get(img_path, {})
+
+                        if not result:
+                            continue
+
                         # 10画像ごとに進捗更新
-                        if i % 10 == 0 or i == batch_size - 1:
-                            sub_progress = batch_progress + int((i / batch_size) * (80 / total_batches))
+                        if i % 10 == 0 or i == current_batch_size - 1:
+                            sub_progress = batch_progress + int((i / current_batch_size) * (80 / total_batches))
                             progress.setValue(min(95, sub_progress))
                             progress.setLabelText(
                                 f"バッチ {batch_idx+1}/{total_batches} 処理中...\n"
-                                f"画像 {start_idx+i+1}/{len(unannotated_images)} を処理中"
+                                f"画像 {batch_start+i+1}/{len(target_indices)} を処理中"
                             )
                             QApplication.processEvents()
-                        
-                        # アノテーションを保存
-                        self.annotations[img_path] = {
+
+                        # アノテーションを保存（インデックスをキーとして使用）
+                        self.annotations[img_index] = {
                             "angle": result.get("angle", 0),
                             "throttle": result.get("throttle", 0),
                             "x": result.get("x", 0),
@@ -19004,26 +19640,28 @@ class ImageAnnotationTool(QMainWindow):
                         # 位置情報があれば追加
                         if "loc" in result or "pilot/loc" in result:
                             loc_value = result.get("pilot/loc", result.get("loc", 0))
-                            self.annotations[self.current_index]["loc"] = loc_value
-                            self.location_annotations[self.current_index] = loc_value
-                            
-                            # 位置情報ボタンがまだなimg_pathければ追加
+                            self.annotations[img_index]["loc"] = loc_value
+                            self.location_annotations[img_index] = loc_value
+
+                            # 位置情報ボタンがまだなければ追加
                             self.ensure_location_button_exists(loc_value)
 
-                        # タイムスタンプを記録
-                        self.annotation_timestamps[img_path] = int(time.time() * 1000)
-                        
-                        # 推論結果も保存
-                        self.inference_results[img_path] = result
-                        
+                        # タイムスタンプを記録（インデックスをキーとして使用）
+                        self.annotation_timestamps[img_index] = int(time.time() * 1000)
+
+                        # 推論結果も保存（インデックスをキーとして使用）
+                        self.inference_results[img_index] = result
+
                         # カウント更新
                         processed_count += 1
                         success_count += 1
-                    
+
                 except Exception as e:
                     print(f"バッチ {batch_idx+1} 処理中にエラー: {e}")
+                    import traceback
+                    traceback.print_exc()
                     # エラーがあっても次のバッチを処理する
-                    processed_count += len(current_batch)
+                    processed_count += len(current_batch_indices)
             
             # 最終処理
             if not progress.wasCanceled():
@@ -19054,22 +19692,25 @@ class ImageAnnotationTool(QMainWindow):
                 progress.setLabelText(f"完了: {success_count}枚の画像にオートアノテーションを適用しました")
                 progress.setValue(100)
                 QApplication.processEvents()
-            
+
+            # キャンセル状態を保存（close()前に取得）
+            was_canceled = progress.wasCanceled()
+
             # 処理完了
             progress.close()
-            
-            if not progress.wasCanceled():
+
+            if not was_canceled:
                 QMessageBox.information(
-                    self, 
-                    "完了", 
+                    self,
+                    "完了",
                     f"{success_count}枚の画像にオートアノテーションを適用しました。\n"
-                    f"使用モデル: {model_type}" + 
+                    f"使用モデル: {model_type}" +
                     (f" ({os.path.basename(model_path)})" if model_path else " (事前学習済み)")
                 )
             else:
                 QMessageBox.information(
-                    self, 
-                    "キャンセル", 
+                    self,
+                    "キャンセル",
                     f"オートアノテーションがキャンセルされました。\n"
                     f"{success_count}枚の画像が処理されました。"
                 )
@@ -21843,6 +22484,11 @@ class ImageAnnotationTool(QMainWindow):
         if hasattr(self, 'image_slider') and isinstance(self.image_slider, DeletedIndexesSlider):
             self.image_slider.setDeletedIndexes(self.deleted_indexes, len(self.images))
 
+    def update_slider_downsampled_indexes(self):
+        """スライダーのダウンサンプリング対象インデックス表示を更新"""
+        if hasattr(self, 'image_slider') and isinstance(self.image_slider, DeletedIndexesSlider):
+            self.image_slider.setDownsampledIndexes(self.downsampled_indexes, len(self.images))
+
     ###
     def _export_segmentation_subset(self, indices, output_dir, class_to_index):
         """セグメンテーションサブセットのエクスポート - クラス名修正版"""
@@ -22138,25 +22784,32 @@ class ImageAnnotationTool(QMainWindow):
 
 # 追加機能切り出し　削除表示
 class DeletedIndexesSlider(QSlider):
-    """削除済みインデックスを視覚的に表示するカスタムスライダー"""
-    
+    """削除済みインデックスとダウンサンプリングインデックスを視覚的に表示するカスタムスライダー"""
+
     def __init__(self, parent=None):
         super().__init__(Qt.Horizontal, parent)
         self.deleted_indexes = []  # 削除済みインデックスのリスト
+        self.downsampled_indexes = []  # ダウンサンプリング対象インデックスのリスト
         self.total_count = 0       # 総インデックス数
-    
+
     def setDeletedIndexes(self, deleted_indexes, total_count):
         """削除済みインデックスを設定"""
         self.deleted_indexes = deleted_indexes
         self.total_count = total_count
         self.update()  # スライダーを再描画
-   
+
+    def setDownsampledIndexes(self, downsampled_indexes, total_count):
+        """ダウンサンプリング対象インデックスを設定"""
+        self.downsampled_indexes = downsampled_indexes
+        self.total_count = total_count
+        self.update()  # スライダーを再描画
+
     def paintEvent(self, event):
-        """削除インデックス表示を上に描くスライダー"""
+        """削除インデックス（赤）とダウンサンプリングインデックス（青）を表示するスライダー"""
         # 最初にスライダー全体を通常通り描画（ハンドルも含む）
         super().paintEvent(event)
 
-        # カスタム描画開始（赤マークを重ねる）
+        # カスタム描画開始
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
@@ -22174,7 +22827,25 @@ class DeletedIndexesSlider(QSlider):
             track_start = groove_rect.x()
             track_height = groove_rect.height()
 
-            # 削除インデックス描画（赤マーク）
+            # ダウンサンプリングインデックス描画（青マーク）- 先に描画（下層）
+            if self.downsampled_indexes and self.total_count > 0:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(QColor(50, 100, 255, 180)))
+
+                for idx in self.downsampled_indexes:
+                    if 0 <= idx < self.total_count:
+                        position = track_start + (idx / (self.total_count - 1)) * track_length
+                        mark_width = max(3, track_length / self.total_count)
+                        mark_height = track_height + 6
+
+                        painter.drawRect(
+                            int(position - mark_width / 2),
+                            int(groove_rect.center().y()),
+                            int(mark_width),
+                            int(mark_height / 2)
+                        )
+
+            # 削除インデックス描画（赤マーク）- 後に描画（上層）
             if self.deleted_indexes and self.total_count > 0:
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QBrush(QColor(255, 50, 50, 180)))
@@ -22185,12 +22856,12 @@ class DeletedIndexesSlider(QSlider):
                         mark_width = max(3, track_length / self.total_count)
                         mark_height = track_height + 6
 
-                    painter.drawRect(
-                        int(position - mark_width / 2),
-                        int(groove_rect.center().y()),          
-                        int(mark_width),
-                        int(mark_height / 2)                    
-                    )
+                        painter.drawRect(
+                            int(position - mark_width / 2),
+                            int(groove_rect.center().y()),
+                            int(mark_width),
+                            int(mark_height / 2)
+                        )
 
         finally:
             painter.end()
