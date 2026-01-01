@@ -202,20 +202,271 @@
 
 ## インストール
 
-1. リポジトリをクローンします:
+### 前提条件
+- **Windows**: Python 3.11（Donkeycarとの互換性を考慮）
+- **Ubuntu / JetPack 6.2**: Python 3.10
+- Git
+- GPU利用時: NVIDIA GPU + CUDAドライバ
+
+---
+
+### Ubuntu 22.04（PC）での環境構築
+
+#### 1. システム依存パッケージのインストール
+
 ```bash
-git clone https://github.com/Romihi/annotation_training_d2j.git
-cd minicar-annotation-tool
+# システムを更新
+sudo apt update && sudo apt upgrade -y
+
+# Python関連パッケージ
+sudo apt install -y python3.10 python3.10-venv python3.10-dev python3-pip
+
+# PyQt5依存ライブラリ
+sudo apt install -y libxcb-xinerama0 libxcb-cursor0 libxkbcommon-x11-0 \
+    libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+    libxcb-render-util0 libxcb-shape0
+
+# OpenCV依存ライブラリ
+sudo apt install -y libgl1-mesa-glx libglib2.0-0
+
+# (オプション) GPU利用時 - NVIDIA CUDAドライバ
+# https://developer.nvidia.com/cuda-downloads からインストール
 ```
 
-2. 必要なパッケージをインストールします:
+#### 2. リポジトリのクローン
+
 ```bash
+git clone https://github.com/Romihi/annotation_training_d2j.git
+cd annotation_training_d2j
+```
+
+#### 3. 仮想環境の作成と有効化
+
+```bash
+# 仮想環境を作成
+python3.10 -m venv venv
+
+# 仮想環境を有効化
+source venv/bin/activate
+
+# pipのアップグレード
+pip install --upgrade pip
+```
+
+#### 4. 依存パッケージのインストール
+
+**CPU版（GPUなし）:**
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
 ```
 
-3. ツールを実行します:
+**GPU版（CUDA 11.8）:**
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+pip install -r requirements.txt
+```
+
+**GPU版（CUDA 12.1）:**
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt
+```
+
+#### 5. 起動
+
 ```bash
 python main.py
+```
+
+#### 6. 仮想環境の終了
+
+```bash
+deactivate
+```
+
+---
+
+### JetPack 6.2（Jetson Orin）での環境構築
+
+JetsonのARM64環境では、以下のパッケージはシステムパッケージを使用します:
+- PyQt5, NumPy, OpenCV, Matplotlib（aptでインストール）
+- PyTorch（JetPack付属）
+
+requirements.txtの環境マーカーにより、これらは自動的にスキップされます。
+
+#### 1. システム依存パッケージのインストール
+
+```bash
+# システムを更新
+sudo apt update && sudo apt upgrade -y
+
+# Python関連パッケージ
+sudo apt install -y python3.10-venv python3.10-dev python3-pip
+
+# ARM64ではpipでインストールできないパッケージをaptでインストール
+sudo apt install -y python3-pyqt5 python3-numpy python3-opencv python3-matplotlib
+
+# PyQt5依存ライブラリ
+sudo apt install -y libxcb-xinerama0 libxcb-cursor0 libxkbcommon-x11-0 \
+    libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+    libxcb-render-util0 libxcb-shape0
+
+# OpenCV依存ライブラリ
+sudo apt install -y libgl1-mesa-glx libglib2.0-0
+```
+
+#### 2. リポジトリのクローン
+
+```bash
+git clone https://github.com/Romihi/annotation_training_d2j.git
+cd annotation_training_d2j
+```
+
+#### 3. 仮想環境の作成と有効化
+
+```bash
+# 仮想環境を作成（システムパッケージを継承）
+python3.10 -m venv venv --system-site-packages
+
+# 仮想環境を有効化
+source venv/bin/activate
+
+# pipのアップグレード
+pip install --upgrade pip
+```
+
+#### 4. 依存パッケージのインストール
+
+```bash
+# 依存パッケージをインストール
+pip install -r requirements.txt
+
+# 依存関係で再インストールされたパッケージを削除（システムパッケージを使用）
+pip uninstall -y numpy opencv-python
+```
+
+> **注意**: ultralytics等の依存関係でnumpyとopencv-pythonが自動インストールされますが、
+> システムのmatplotlibと互換性がないため削除が必要です。
+
+#### 5. 起動
+
+```bash
+python main.py
+```
+
+#### 6. 仮想環境の終了
+
+```bash
+deactivate
+```
+
+---
+
+### Windows での環境構築
+
+#### 1. Pythonのインストール
+
+1. [Python公式サイト](https://www.python.org/downloads/)からPython 3.11をダウンロード
+2. インストール時に「Add Python to PATH」にチェックを入れる
+3. コマンドプロンプトで確認:
+   ```cmd
+   python --version
+   ```
+
+#### 2. リポジトリのクローン
+
+```cmd
+git clone https://github.com/Romihi/annotation_training_d2j.git
+cd annotation_training_d2j
+```
+
+#### 3. 仮想環境の作成と有効化
+
+```cmd
+# 仮想環境を作成
+python -m venv venv
+
+# 仮想環境を有効化
+venv\Scripts\activate
+```
+
+#### 4. 依存パッケージのインストール
+
+**CPU版（GPUなし）:**
+```cmd
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements.txt
+```
+
+**GPU版（CUDA 11.8）:**
+```cmd
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+pip install -r requirements.txt
+```
+
+**GPU版（CUDA 12.1）:**
+```cmd
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt
+```
+
+**RTX 50シリーズ（CUDA 12.8 Nightly）:**
+```cmd
+pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
+pip install -r requirements.txt
+```
+
+#### 5. 起動
+
+```cmd
+python main.py
+```
+
+#### 6. 仮想環境の終了
+
+```cmd
+deactivate
+```
+
+---
+
+### GPU動作確認
+
+Pythonで以下を実行してGPUが認識されているか確認:
+
+```python
+import torch
+print(f"PyTorch version: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"CUDA version: {torch.version.cuda}")
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+```
+
+---
+
+### トラブルシューティング（環境構築）
+
+**Ubuntu: PyQt5がクラッシュする**
+```bash
+# XCB関連ライブラリを追加インストール
+sudo apt install -y libxcb-xinerama0 libxcb-cursor0
+export QT_QPA_PLATFORM=xcb
+```
+
+**Windows: DLLエラーが発生する**
+- [Microsoft Visual C++ 再頒布可能パッケージ](https://aka.ms/vs/17/release/vc_redist.x64.exe) をインストール
+
+**GPU が認識されない**
+1. NVIDIAドライバが最新か確認: `nvidia-smi`
+2. PyTorchのCUDAバージョンがドライバと一致しているか確認
+3. 仮想環境内でPyTorchを再インストール
+
+**pip install が遅い/失敗する**
+```bash
+# ミラーを使用
+pip install -r requirements.txt -i https://pypi.org/simple/
 ```
 
 ## 操作説明
