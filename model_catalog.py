@@ -1228,6 +1228,7 @@ def list_available_models():
         "donkeycar",
         "resnet18",
         "mobilevit_xxs",
+        "mobilevitv2_050",
         "mobilenetv3_small_100",
         "mobilenetv4_conv_small",
         "efficientnet_b0",

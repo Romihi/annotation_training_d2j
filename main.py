@@ -604,12 +604,18 @@ class ImageLabel(QLabel):
         """バウンディングボックスの描画と編集"""
         if self.main_window and hasattr(self.main_window, 'bbox_annotations'):
             current_index = self.main_window.current_index  # インデックスベースに変更
-            
+
+            # デバッグ: 描画時の状態確認（デバッグフラグがある場合のみ）
+            if getattr(self.main_window, 'debug_annotation_display', False):
+                has_bbox = current_index in self.main_window.bbox_annotations
+                bbox_count = len(self.main_window.bbox_annotations.get(current_index, []))
+                print(f"[DEBUG draw_bbox] idx={current_index}, has_bbox={has_bbox}, count={bbox_count}")
+
             # 現在のインデックスが有効かチェック
-            if (current_index is not None and 
-                isinstance(current_index, int) and 
+            if (current_index is not None and
+                isinstance(current_index, int) and
                 current_index in self.main_window.bbox_annotations):
-                
+
                 bboxes = self.main_window.bbox_annotations[current_index]
                 
                 for i, bbox in enumerate(bboxes):
@@ -1410,13 +1416,20 @@ class ImageLabel(QLabel):
     ###
     def draw_segmentation(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
         """セグメンテーションポリゴンの描画と編集（手動アノテーション + 推論結果）"""
-        
+
         # 1. 推論結果のセグメンテーションを描画
         self.draw_segmentation_inference_results(pix_width, pix_height, painter, target_rect)
-        
+
         # 2. 手動アノテーションのセグメンテーションを描画
         if hasattr(self.main_window, 'segmentation_annotations'):
             current_index = self.main_window.current_index  # インデックスベースに変更
+
+            # デバッグ: 描画時の状態確認（デバッグフラグがある場合のみ）
+            if getattr(self.main_window, 'debug_annotation_display', False):
+                has_seg = current_index in self.main_window.segmentation_annotations
+                seg_count = len(self.main_window.segmentation_annotations.get(current_index, []))
+                print(f"[DEBUG draw_segmentation] idx={current_index}, has_seg={has_seg}, count={seg_count}")
+
             if current_index in self.main_window.segmentation_annotations:
                 polygons = self.main_window.segmentation_annotations[current_index]
                 
@@ -10291,31 +10304,105 @@ class ImageAnnotationTool(QMainWindow):
     #             "エラー",
     #             f"YOLOアノテーションの読み込み中にエラーが発生しました: {str(e)}"
     #         )
+    def _detect_variant_from_labels(self, labels_dir):
+        """ラベルファイルからバリアント名を検出する"""
+        import re
+        try:
+            label_files = [f for f in os.listdir(labels_dir) if f.endswith('.txt')]
+            if not label_files:
+                return None
+
+            # 先頭のラベルファイル名からバリアント名を抽出
+            # パターン: {index}_{variant}_image_array_.txt
+            # 例: 0_cam1_image_array_.txt -> cam1
+            sample_file = label_files[0]
+            match = re.match(r'\d+_([a-zA-Z0-9]+)_image_array_', sample_file)
+            if match:
+                detected_variant = match.group(1)
+                print(f"[DEBUG] ラベルファイルから検出したバリアント: {detected_variant}")
+                return detected_variant
+
+            return None
+        except Exception as e:
+            print(f"[DEBUG] バリアント検出エラー: {e}")
+            return None
+
+    def _switch_variant_for_annotation_loading(self, detected_variant):
+        """アノテーション読み込み用にバリアントを切り替える"""
+        if not hasattr(self, 'available_variants') or not self.available_variants:
+            return False
+
+        current = getattr(self, 'current_variant', None)
+        if current == detected_variant:
+            print(f"[DEBUG] バリアント '{detected_variant}' は既に選択されています")
+            return True
+
+        if detected_variant not in self.available_variants:
+            print(f"[DEBUG] バリアント '{detected_variant}' は利用できません。利用可能: {self.available_variants}")
+            return False
+
+        # バリアント切り替えを実行
+        print(f"[DEBUG] バリアントを '{current}' から '{detected_variant}' に切り替えます")
+        self.on_variant_changed(detected_variant)
+        return True
+
     def load_yolo_annotations(self):
         """YOLO形式のアノテーションを読み込む - 表示スケール対応版"""
         if not self.images:
             QMessageBox.warning(self, "警告", "先に画像を読み込んでください。")
             return
-        
+
         # zoom_factorを確認・設定
         if not hasattr(self, 'zoom_factor'):
             self.zoom_factor = 2.5  # デフォルト値
-        
+
         # YOLOアノテーションフォルダを選択
         yolo_dir = QFileDialog.getExistingDirectory(
-            self, "YOLOアノテーションフォルダを選択", 
+            self, "YOLOアノテーションフォルダを選択",
             self.folder_path,
             QFileDialog.ShowDirsOnly
         )
-        
+
         if not yolo_dir:
             return
-        
+
         # ラベルフォルダを確認・検索
         labels_dir = self._find_labels_directory(yolo_dir)
         if not labels_dir:
             return
-        
+
+        # ラベルファイルからバリアントを検出し、必要に応じて切り替え
+        detected_variant = self._detect_variant_from_labels(labels_dir)
+        if detected_variant:
+            current_variant = getattr(self, 'current_variant', None)
+            if current_variant != detected_variant:
+                # バリアントが異なる場合、ユーザーに確認
+                if detected_variant in getattr(self, 'available_variants', []):
+                    reply = QMessageBox.question(
+                        self,
+                        "画像ソースの切り替え",
+                        f"アノテーションファイルは '{detected_variant}' 用です。\n"
+                        f"現在の画像ソースは '{current_variant}' です。\n\n"
+                        f"'{detected_variant}' に切り替えてから読み込みますか？",
+                        QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                        QMessageBox.Yes
+                    )
+
+                    if reply == QMessageBox.Cancel:
+                        return
+                    elif reply == QMessageBox.Yes:
+                        if not self._switch_variant_for_annotation_loading(detected_variant):
+                            QMessageBox.warning(self, "警告", f"画像ソース '{detected_variant}' への切り替えに失敗しました。")
+                            return
+                else:
+                    QMessageBox.warning(
+                        self, "警告",
+                        f"アノテーションは '{detected_variant}' 用ですが、\n"
+                        f"この画像ソースは利用できません。\n"
+                        f"利用可能な画像ソース: {getattr(self, 'available_variants', [])}"
+                    )
+                    return
+
         # クラス情報を読み込む
         classes = self._load_yolo_classes(labels_dir)
         if not classes:
@@ -10443,15 +10530,34 @@ class ImageAnnotationTool(QMainWindow):
 
     def _execute_yolo_annotation_loading(self, labels_dir, classes):
         """YOLOアノテーション読み込みのメイン処理"""
+        # デバッグ: 読み込み開始時の情報を出力
+        print("=" * 60)
+        print("[DEBUG] YOLOアノテーション読み込み開始")
+        print(f"[DEBUG] labels_dir: {labels_dir}")
+        print(f"[DEBUG] classes: {classes}")
+        print(f"[DEBUG] 画像数: {len(self.images)}")
+
+        # デバッグ: ラベルフォルダ内のファイル一覧を取得
+        label_files = set()
+        if os.path.exists(labels_dir):
+            label_files = {os.path.splitext(f)[0] for f in os.listdir(labels_dir) if f.endswith('.txt')}
+            print(f"[DEBUG] ラベルファイル数: {len(label_files)}")
+            print(f"[DEBUG] ラベルファイル例 (先頭5件): {sorted(list(label_files))[:5]}")
+
+        # デバッグ: 画像ファイル名一覧
+        image_basenames = [os.path.splitext(os.path.basename(p))[0] for p in self.images[:5]]
+        print(f"[DEBUG] 画像ファイル例 (先頭5件): {image_basenames}")
+        print("=" * 60)
+
         # プログレスダイアログ
         progress = QProgressDialog(
-            "YOLOアノテーションを読み込み中...", 
+            "YOLOアノテーションを読み込み中...",
             "キャンセル", 0, len(self.images), self
         )
         progress.setWindowTitle("読み込み中")
         progress.setWindowModality(Qt.WindowModal)
         progress.show()
-        
+
         # 統計情報を記録
         loading_stats = {
             'total_images': len(self.images),
@@ -10460,7 +10566,9 @@ class ImageAnnotationTool(QMainWindow):
             'total_bbox_annotations': 0,
             'total_seg_annotations': 0,
             'class_distribution': {cls: 0 for cls in classes},
-            'errors': []
+            'errors': [],
+            'matched_files': [],  # デバッグ用: マッチしたファイル
+            'unmatched_images': []  # デバッグ用: マッチしなかった画像
         }
         
         try:
@@ -10508,7 +10616,16 @@ class ImageAnnotationTool(QMainWindow):
             # 画像ファイル名からラベルファイル名を生成
             img_basename = os.path.splitext(os.path.basename(img_path))[0]
             label_path = os.path.join(labels_dir, f"{img_basename}.txt")
-            
+
+            # デバッグ: 先頭10件のマッチング状況を出力
+            if img_index < 10:
+                exists = os.path.exists(label_path)
+                print(f"[DEBUG] idx={img_index}: 画像={img_basename} -> ラベル存在={exists}")
+                if exists:
+                    stats['matched_files'].append((img_index, img_basename))
+                else:
+                    stats['unmatched_images'].append((img_index, img_basename))
+
             # 対応するラベルファイルが存在しない場合は空のリストを返す
             if not os.path.exists(label_path):
                 return [], []
@@ -10696,6 +10813,30 @@ class ImageAnnotationTool(QMainWindow):
 
     def _finalize_yolo_annotation_loading(self, stats, classes):
         """YOLOアノテーション読み込み完了後の処理"""
+        # デバッグフラグを有効化（描画時のデバッグログ用）
+        self.debug_annotation_display = True
+
+        # デバッグ: 読み込み結果サマリー
+        print("=" * 60)
+        print("[DEBUG] YOLOアノテーション読み込み結果サマリー")
+        print(f"[DEBUG] 処理画像数: {stats['processed_images']}/{stats['total_images']}")
+        print(f"[DEBUG] アノテーション付き画像: {stats['images_with_annotations']}")
+        print(f"[DEBUG] バウンディングボックス数: {stats['total_bbox_annotations']}")
+        print(f"[DEBUG] セグメンテーション数: {stats['total_seg_annotations']}")
+        print(f"[DEBUG] bbox_annotations のキー数: {len(self.bbox_annotations)}")
+        print(f"[DEBUG] segmentation_annotations のキー数: {len(self.segmentation_annotations)}")
+        if self.bbox_annotations:
+            sample_keys = list(self.bbox_annotations.keys())[:5]
+            print(f"[DEBUG] bbox_annotations キー例: {sample_keys}")
+            for key in sample_keys:
+                print(f"[DEBUG]   idx={key}: {len(self.bbox_annotations[key])}個のボックス")
+        if self.segmentation_annotations:
+            sample_keys = list(self.segmentation_annotations.keys())[:5]
+            print(f"[DEBUG] segmentation_annotations キー例: {sample_keys}")
+            for key in sample_keys:
+                print(f"[DEBUG]   idx={key}: {len(self.segmentation_annotations[key])}個のセグメント")
+        print("=" * 60)
+
         # 統計情報を更新 - 全体の統計情報を更新
         if hasattr(self, 'update_driving_annotation_stats'):
             self.update_driving_annotation_stats()
@@ -19952,21 +20093,21 @@ class ImageAnnotationTool(QMainWindow):
         if range_dialog.exec_() != QDialog.Accepted:
             return
 
-        # 範囲に基づいて処理対象画像を取得
+        # 範囲に基づいて処理対象インデックスを取得
         if all_radio.isChecked():
-            # すべての画像
-            target_images = self.images[:]
+            # すべての画像のインデックス
+            target_indices = list(range(len(self.images)))
         else:
-            # 指定範囲の画像
+            # 指定範囲のインデックス
             start_idx = start_spin.value()
             end_idx = end_spin.value()
             if start_idx > end_idx:
                 QMessageBox.warning(self, "警告", "開始インデックスは終了インデックス以下である必要があります。")
                 return
 
-            target_images = self.images[start_idx:end_idx + 1]
+            target_indices = list(range(start_idx, end_idx + 1))
 
-        if not target_images:
+        if not target_indices:
             QMessageBox.information(self, "情報", "処理対象の画像がありません。")
             return
         
@@ -20028,11 +20169,11 @@ class ImageAnnotationTool(QMainWindow):
         estimate_label = QLabel()
         def update_estimate():
             if all_radio.isChecked():
-                count = len(target_images)
+                count = len(target_indices)
                 estimate_label.setText(f"処理予定: {count}枚")
             else:
                 skip = skip_spinbox.value()
-                count = (len(target_images) + skip - 1) // skip
+                count = (len(target_indices) + skip - 1) // skip
                 estimate_label.setText(f"処理予定: 約{count}枚（{skip}枚ごと）")
 
         all_radio.toggled.connect(update_estimate)
@@ -20053,15 +20194,18 @@ class ImageAnnotationTool(QMainWindow):
         process_all = all_radio.isChecked()
         skip_count = skip_spinbox.value() if not process_all else 1
 
-        # 処理する画像リストを作成（範囲指定されたtarget_imagesに対してスキップ処理を適用）
+        # 処理するインデックスリストを作成（範囲指定されたtarget_indicesに対してスキップ処理を適用）
         if process_all:
-            images_to_process = target_images
+            indices_to_process = target_indices
         else:
-            images_to_process = target_images[::skip_count]
-        
+            indices_to_process = target_indices[::skip_count]
+
+        # インデックスから対応する画像パスのリストを生成
+        images_to_process = [self.images[idx] for idx in indices_to_process]
+
         # 進捗ダイアログを表示
         progress = QProgressDialog(
-            f"YOLO オートアノテーション準備中... ({len(images_to_process)}枚の画像)",
+            f"YOLO オートアノテーション準備中... ({len(indices_to_process)}枚の画像)",
             "キャンセル", 0, 100, self
         )
         progress.setWindowTitle("YOLO オートアノテーション実行中")
@@ -20131,7 +20275,7 @@ class ImageAnnotationTool(QMainWindow):
             
             from utils.yolo_utils import batch_detect_objects_and_segments
             results = batch_detect_objects_and_segments(
-                images_to_process, model, conf_threshold, progress_callback
+                images_to_process, model, conf_threshold, progress_callback, indices=indices_to_process
             )
             
             if progress.wasCanceled():
@@ -20150,16 +20294,9 @@ class ImageAnnotationTool(QMainWindow):
             
             detection_count = 0
             segmentation_count = 0
-            
-            # 画像パスからインデックスへのマッピングを作成
-            img_path_to_index = {path: idx for idx, path in enumerate(self.images)}
-            
-            for img_path, result in results.items():
-                # 画像インデックスを取得
-                if img_path not in img_path_to_index:
-                    continue
-                img_index = img_path_to_index[img_path]
-                
+
+            # 結果はインデックスをキーとして返されるため、直接処理
+            for img_index, result in results.items():
                 # バウンディングボックス処理（物体検知モデルの場合のみ）
                 if model_type == "detect" and result['detections']:
                     if target_classes:
@@ -20325,13 +20462,13 @@ class ImageAnnotationTool(QMainWindow):
             # 完了メッセージ
             if model_type == "segment":
                 message = f"セグメンテーション オートアノテーションが完了しました。\n"
-                message += f"処理画像数: {len(images_to_process)}枚"
+                message += f"処理画像数: {len(indices_to_process)}枚"
                 if not process_all:
                     message += f"（{skip_count}枚ごと）"
                 message += f"\n検出されたセグメンテーション: {segmentation_count}個"
             else:
                 message = f"物体検知 オートアノテーションが完了しました。\n"
-                message += f"処理画像数: {len(images_to_process)}枚"
+                message += f"処理画像数: {len(indices_to_process)}枚"
                 if not process_all:
                     message += f"（{skip_count}枚ごと）"
                 message += f"\n検出されたバウンディングボックス: {detection_count}個"
