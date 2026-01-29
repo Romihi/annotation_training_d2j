@@ -15,6 +15,7 @@ Databricks連携設定
 """
 
 import os
+from translations import get_text
 
 # ===========================================
 # 環境変数から設定を読み込み
@@ -68,12 +69,12 @@ def validate_databricks_config():
 
     if DATABRICKS_ENABLED:
         if not DATABRICKS_HOST:
-            errors.append("環境変数 DATABRICKS_HOST が設定されていません")
+            errors.append(get_text('msg_env_host_not_set'))
         elif not DATABRICKS_HOST.startswith("https://"):
-            errors.append("DATABRICKS_HOST は https:// で始まる必要があります")
+            errors.append(get_text('msg_env_host_https_required'))
 
         if not DATABRICKS_TOKEN:
-            errors.append("環境変数 DATABRICKS_TOKEN が設定されていません")
+            errors.append(get_text('msg_env_token_not_set'))
 
     return errors
 
@@ -82,19 +83,15 @@ def get_databricks_status():
     if not DATABRICKS_ENABLED:
         return {
             "enabled": False,
-            "status": "無効",
-            "message": "Databricks連携は無効です（ローカルMLflowを使用）\n\n"
-                      "有効にするには環境変数を設定してください:\n"
-                      "  DATABRICKS_ENABLED=true\n"
-                      "  DATABRICKS_HOST=https://...\n"
-                      "  DATABRICKS_TOKEN=dapi..."
+            "status": get_text('status_disabled'),
+            "message": get_text('msg_databricks_disabled')
         }
 
     errors = validate_databricks_config()
     if errors:
         return {
             "enabled": True,
-            "status": "設定エラー",
+            "status": get_text('status_config_error'),
             "message": "\n".join(errors)
         }
 
@@ -103,11 +100,11 @@ def get_databricks_status():
 
     return {
         "enabled": True,
-        "status": "設定済み",
+        "status": get_text('status_configured'),
         "host": DATABRICKS_HOST,
         "token_masked": masked_token,
         "experiment_prefix": DATABRICKS_EXPERIMENT_PREFIX,
-        "message": f"Databricksワークスペース: {DATABRICKS_HOST}"
+        "message": get_text('msg_databricks_workspace', DATABRICKS_HOST)
     }
 
 def print_config_status():
@@ -131,30 +128,4 @@ def print_config_status():
 
 def get_env_template():
     """環境変数設定のテンプレートを返す"""
-    return """
-# Databricks設定用環境変数
-
-# Windows (PowerShell):
-$env:DATABRICKS_ENABLED = "true"
-$env:DATABRICKS_HOST = "https://your-workspace.cloud.databricks.com"
-$env:DATABRICKS_TOKEN = "dapi..."
-$env:DATABRICKS_EXPERIMENT_PREFIX = "/Users/your-email@example.com/experiments"
-
-# Windows (コマンドプロンプト):
-set DATABRICKS_ENABLED=true
-set DATABRICKS_HOST=https://your-workspace.cloud.databricks.com
-set DATABRICKS_TOKEN=dapi...
-set DATABRICKS_EXPERIMENT_PREFIX=/Users/your-email@example.com/experiments
-
-# Linux/Mac:
-export DATABRICKS_ENABLED="true"
-export DATABRICKS_HOST="https://your-workspace.cloud.databricks.com"
-export DATABRICKS_TOKEN="dapi..."
-export DATABRICKS_EXPERIMENT_PREFIX="/Users/your-email@example.com/experiments"
-
-# .env ファイル形式:
-DATABRICKS_ENABLED=true
-DATABRICKS_HOST=https://your-workspace.cloud.databricks.com
-DATABRICKS_TOKEN=dapi...
-DATABRICKS_EXPERIMENT_PREFIX=/Users/your-email@example.com/experiments
-"""
+    return get_text('msg_databricks_env_template')

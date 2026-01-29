@@ -2,6 +2,7 @@
 """データ分析ダイアログ - アノテーションデータの統計分析と可視化"""
 
 import numpy as np
+from translations import get_text
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -58,7 +59,7 @@ class DataAnalysisDialog(QDialog):
         self.base_keys = ['angle', 'throttle', 'speed']
         self.all_keys = self.base_keys + sorted(list(self.available_sensor_keys))
 
-        self.setWindowTitle("データ分析")
+        self.setWindowTitle(get_text('dlg_data_analysis'))
         self.setMinimumSize(900, 900)
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
 
@@ -76,15 +77,17 @@ class DataAnalysisDialog(QDialog):
         layout = QVBoxLayout(scroll_widget)
 
         # === 統計・分布セクション（横並び） ===
-        stats_dist_group = QGroupBox("統計・分布")
+        stats_dist_group = QGroupBox(get_text('section_stats_distribution'))
         stats_dist_layout = QHBoxLayout()
 
         # 左側: 統計量テーブル
         self.stats_table = QTableWidget()
         self.stats_table.setColumnCount(6)
-        self.stats_table.setHorizontalHeaderLabels(
-            ["項目", "平均", "標準偏差", "最小", "最大", "中央値"]
-        )
+        self.stats_table.setHorizontalHeaderLabels([
+            get_text('label_stats_item'), get_text('label_stats_mean'),
+            get_text('label_stats_std'), get_text('label_stats_min'),
+            get_text('label_stats_max'), get_text('label_stats_median')
+        ])
         self.stats_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.stats_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.stats_table.setAlternatingRowColors(True)
@@ -130,27 +133,27 @@ class DataAnalysisDialog(QDialog):
         layout.addWidget(stats_dist_group)
 
         # === 時系列セクション ===
-        timeseries_group = QGroupBox("時系列")
+        timeseries_group = QGroupBox(get_text('section_timeseries'))
         timeseries_layout = QVBoxLayout()
 
         # 上部: 表示形式設定
         settings_layout = QHBoxLayout()
 
-        settings_layout.addWidget(QLabel("表示:"))
+        settings_layout.addWidget(QLabel(get_text('label_display')))
 
         self.display_mode_group = QButtonGroup(self)
-        self.raw_data_radio = QRadioButton("生データ")
+        self.raw_data_radio = QRadioButton(get_text('label_raw_data'))
         self.raw_data_radio.setChecked(True)
         self.display_mode_group.addButton(self.raw_data_radio, 0)
         self.raw_data_radio.toggled.connect(self.update_timeseries_graph)
         settings_layout.addWidget(self.raw_data_radio)
 
-        self.moving_avg_radio = QRadioButton("移動平均")
+        self.moving_avg_radio = QRadioButton(get_text('label_moving_avg'))
         self.display_mode_group.addButton(self.moving_avg_radio, 1)
         self.moving_avg_radio.toggled.connect(self.update_timeseries_graph)
         settings_layout.addWidget(self.moving_avg_radio)
 
-        self.mean_hist_radio = QRadioButton("区間平均")
+        self.mean_hist_radio = QRadioButton(get_text('label_bin_avg'))
         self.display_mode_group.addButton(self.mean_hist_radio, 2)
         self.mean_hist_radio.toggled.connect(self.update_timeseries_graph)
         settings_layout.addWidget(self.mean_hist_radio)
@@ -158,7 +161,7 @@ class DataAnalysisDialog(QDialog):
         settings_layout.addWidget(QLabel("|"))
 
         # 移動平均の窓サイズ
-        settings_layout.addWidget(QLabel("窓:"))
+        settings_layout.addWidget(QLabel(get_text('label_window')))
         self.moving_avg_spin = QSpinBox()
         self.moving_avg_spin.setRange(2, 300)
         self.moving_avg_spin.setValue(50)
@@ -167,7 +170,7 @@ class DataAnalysisDialog(QDialog):
         settings_layout.addWidget(self.moving_avg_spin)
 
         # 区間平均の区間サイズ
-        settings_layout.addWidget(QLabel("区間:"))
+        settings_layout.addWidget(QLabel(get_text('label_bin')))
         self.bin_size_spin = QSpinBox()
         self.bin_size_spin.setRange(10, 1000)
         self.bin_size_spin.setValue(200)
@@ -181,7 +184,7 @@ class DataAnalysisDialog(QDialog):
 
         # 2行目: 表示範囲設定
         range_layout = QHBoxLayout()
-        range_layout.addWidget(QLabel("表示範囲:"))
+        range_layout.addWidget(QLabel(get_text('label_display_range')))
 
         self.idx_min_spin = QSpinBox()
         self.idx_min_spin.setRange(0, 100000)
@@ -196,7 +199,7 @@ class DataAnalysisDialog(QDialog):
         self.idx_max_spin.setRange(0, 100000)
         self.idx_max_spin.setValue(0)
         self.idx_max_spin.setSingleStep(100)
-        self.idx_max_spin.setSpecialValueText("自動")
+        self.idx_max_spin.setSpecialValueText(get_text('label_auto'))
         self.idx_max_spin.valueChanged.connect(self.update_timeseries_graph)
         range_layout.addWidget(self.idx_max_spin)
 
@@ -215,7 +218,7 @@ class DataAnalysisDialog(QDialog):
 
         # キー選択リスト（右側）
         key_select_layout = QVBoxLayout()
-        key_select_layout.addWidget(QLabel("表示項目:"))
+        key_select_layout.addWidget(QLabel(get_text('label_display_items')))
         self.key_list = QListWidget()
         self.key_list.setSelectionMode(QAbstractItemView.MultiSelection)
         self.key_list.setMaximumWidth(120)
@@ -235,7 +238,7 @@ class DataAnalysisDialog(QDialog):
         timeseries_layout.addLayout(graph_layout)
 
         # 説明ラベル
-        info_label = QLabel("グラフをクリックすると該当画像にジャンプします")
+        info_label = QLabel(get_text('label_click_to_jump'))
         info_label.setStyleSheet("color: gray;")
         timeseries_layout.addWidget(info_label)
 
@@ -251,7 +254,7 @@ class DataAnalysisDialog(QDialog):
         button_layout = QHBoxLayout()
         button_layout.addStretch()
 
-        self.close_button = QPushButton("閉じる")
+        self.close_button = QPushButton(get_text('btn_close'))
         self.close_button.clicked.connect(self.close)
         button_layout.addWidget(self.close_button)
 
@@ -382,33 +385,33 @@ class DataAnalysisDialog(QDialog):
             # 元データを薄い色で表示（背景）
             if angles_orig:
                 ax.hist(angles_orig, bins=bins, color='steelblue', edgecolor='none',
-                        alpha=0.25, label=f'Angle(元: {len(angles_orig)})')
+                        alpha=0.25, label=get_text('label_angle_original', len(angles_orig)))
             if throttles_orig:
                 ax.hist(throttles_orig, bins=bins, color='forestgreen', edgecolor='none',
-                        alpha=0.25, label=f'Throttle(元: {len(throttles_orig)})')
+                        alpha=0.25, label=get_text('label_throttle_original', len(throttles_orig)))
 
             # ダウンサンプリング後のデータを濃い色で表示（前景）
             if angles_ds:
                 ax.hist(angles_ds, bins=bins, color='steelblue', edgecolor='white',
-                        alpha=0.8, label=f'Angle(DS後: {len(angles_ds)})')
+                        alpha=0.8, label=get_text('label_angle_ds', len(angles_ds)))
             if throttles_ds:
                 ax.hist(throttles_ds, bins=bins, color='forestgreen', edgecolor='white',
-                        alpha=0.8, label=f'Throttle(DS後: {len(throttles_ds)})')
+                        alpha=0.8, label=get_text('label_throttle_ds', len(throttles_ds)))
 
             ds_count = len(self.downsampled_indexes)
             data_count = max(len(angles_ds), len(throttles_ds))
             if ds_count > 0:
-                ax.set_title(f'Angle / Throttle 分布 (n={data_count:,}, DS除外: {ds_count})')
+                ax.set_title(get_text('label_dist_title_with_ds', f'{data_count:,}', ds_count))
             else:
-                ax.set_title(f'Angle / Throttle 分布 (n={data_count:,})')
-            ax.set_xlabel('値')
-            ax.set_ylabel('頻度')
+                ax.set_title(get_text('label_dist_title', f'{data_count:,}'))
+            ax.set_xlabel(get_text('label_value'))
+            ax.set_ylabel(get_text('label_frequency'))
             ax.axvline(x=0, color='red', linestyle='--', alpha=0.5, linewidth=1)
             ax.legend(fontsize=7, loc='upper right')
             ax.grid(True, alpha=0.3)
         else:
-            ax.text(0.5, 0.5, 'データなし', ha='center', va='center', fontsize=12)
-            ax.set_title('Angle / Throttle 分布')
+            ax.text(0.5, 0.5, get_text('label_no_data'), ha='center', va='center', fontsize=12)
+            ax.set_title(get_text('label_dist_title', '0'))
 
         self.dist_figure.tight_layout()
         self.dist_canvas.draw()
@@ -420,7 +423,7 @@ class DataAnalysisDialog(QDialog):
         selected_keys = self.get_selected_keys()
         if not selected_keys:
             ax = self.timeseries_figure.add_subplot(111)
-            ax.text(0.5, 0.5, '表示項目を選択してください', ha='center', va='center', fontsize=14)
+            ax.text(0.5, 0.5, get_text('label_select_display_item'), ha='center', va='center', fontsize=14)
             self.timeseries_canvas.draw()
             return
 
@@ -440,7 +443,7 @@ class DataAnalysisDialog(QDialog):
 
         if not indices_set:
             ax = self.timeseries_figure.add_subplot(111)
-            ax.text(0.5, 0.5, 'データがありません', ha='center', va='center', fontsize=14)
+            ax.text(0.5, 0.5, get_text('label_no_data_available'), ha='center', va='center', fontsize=14)
             self.timeseries_canvas.draw()
             return
 
@@ -486,7 +489,7 @@ class DataAnalysisDialog(QDialog):
                        width=bar_width, color=color, alpha=0.7,
                        label=key, edgecolor='white')
 
-            ax.set_title(f'区間平均（{bin_size}インデックスごと）')
+            ax.set_title(get_text('label_bin_avg_title', bin_size))
 
             # 現在位置マーカー
             ax.axvline(x=self.current_index, color='purple', linestyle='--', alpha=0.8, linewidth=2)
@@ -514,7 +517,7 @@ class DataAnalysisDialog(QDialog):
                         # データが少ない場合は生データのみ
                         ax.plot(key_indices, key_values, '-', color=color, alpha=0.7, label=key, linewidth=0.8)
 
-            ax.set_title(f'データ推移（移動平均: 窓{window_size}）')
+            ax.set_title(get_text('label_data_trend_ma', window_size))
 
             # 現在位置マーカー
             ax.axvline(x=self.current_index, color='purple', linestyle='--', alpha=0.8, linewidth=2)
@@ -533,7 +536,7 @@ class DataAnalysisDialog(QDialog):
                     color = COLORS[key_idx % len(COLORS)]
                     ax.plot(key_indices, key_values, '-', color=color, alpha=0.7, label=key, linewidth=0.8)
 
-            ax.set_title('データ推移')
+            ax.set_title(get_text('label_data_trend'))
 
             # 現在位置マーカー
             ax.axvline(x=self.current_index, color='purple', linestyle='--', alpha=0.8, linewidth=2)
@@ -543,8 +546,8 @@ class DataAnalysisDialog(QDialog):
                     y_val = data_by_key[selected_keys[0]][self.current_index]
                     ax.scatter([self.current_index], [y_val], color='purple', s=100, zorder=5, marker='o')
 
-        ax.set_xlabel('インデックス')
-        ax.set_ylabel('値')
+        ax.set_xlabel(get_text('label_index'))
+        ax.set_ylabel(get_text('label_value'))
         ax.legend(loc='upper right', fontsize=7)
         ax.grid(True, alpha=0.3)
 
