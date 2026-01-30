@@ -3559,9 +3559,183 @@ class ImageAnnotationTool(QMainWindow):
 
         QApplication.instance().installEventFilter(self)
 
+    def _create_settings_toolbar(self):
+        """右上に表示設定ツールバーを作成"""
+        from PyQt5.QtWidgets import QToolBar, QToolButton, QMenu
+        from PyQt5.QtCore import Qt
+
+        toolbar = QToolBar()
+        toolbar.setMovable(False)
+        toolbar.setFloatable(False)
+        toolbar.setStyleSheet("""
+            QToolBar { border: none; spacing: 5px; padding: 2px; }
+            QToolButton { padding: 4px 8px; }
+        """)
+
+        # Openボタン（フォルダ選択）
+        open_button = QPushButton(f"📂 {get_text('toolbar_open')}")
+        open_button.clicked.connect(self._toolbar_open_folder)
+        open_button.setStyleSheet("padding: 4px 8px;")
+        toolbar.addWidget(open_button)
+
+        # Saveボタン（アノテーション保存メニュー）
+        save_button = QPushButton(f"💾 {get_text('toolbar_save')}")
+        save_button.clicked.connect(self._show_save_menu)
+        save_button.setStyleSheet("padding: 4px 8px;")
+        toolbar.addWidget(save_button)
+        self.toolbar_save_button = save_button
+
+        # セパレーター
+        toolbar.addSeparator()
+
+        # 左側にスペーサーを追加して右寄せ
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        toolbar.addWidget(spacer)
+
+        # MLflowボタン
+        mlflow_button = QPushButton(f"📊 {get_text('toolbar_mlflow')}")
+        mlflow_button.clicked.connect(self._show_mlflow_menu)
+        mlflow_button.setStyleSheet("padding: 4px 8px;")
+        toolbar.addWidget(mlflow_button)
+        self.toolbar_mlflow_button = mlflow_button
+
+        # Cloudボタン（Databricks/Colab）
+        cloud_button = QPushButton(f"☁ {get_text('toolbar_cloud')}")
+        cloud_button.clicked.connect(self._show_cloud_menu)
+        cloud_button.setStyleSheet("padding: 4px 8px;")
+        toolbar.addWidget(cloud_button)
+        self.toolbar_cloud_button = cloud_button
+
+        # セパレーター
+        toolbar.addSeparator()
+
+        # 表示設定ボタン
+        settings_button = QPushButton(f"⚙ {get_text('window_font_settings')}")
+        settings_button.clicked.connect(self.show_display_settings)
+        settings_button.setStyleSheet("padding: 4px 8px;")
+        toolbar.addWidget(settings_button)
+
+        # ダークモード切替ボタン
+        self.dark_mode_button = QPushButton(get_text('dark_mode'))
+        self.dark_mode_button.setCheckable(True)
+        self.dark_mode_button.clicked.connect(self.toggle_dark_mode)
+        self.dark_mode_button.setStyleSheet("padding: 4px 8px;")
+        toolbar.addWidget(self.dark_mode_button)
+
+        # 言語切替ボタン
+        current_lang = get_current_language()
+        lang_label = "English" if current_lang == 'ja' else "日本語"
+        self.language_button = QPushButton(f"🌐 {lang_label}")
+        self.language_button.setToolTip(get_text('language_switch'))
+        self.language_button.clicked.connect(self.toggle_language)
+        self.language_button.setStyleSheet("padding: 4px 8px;")
+        toolbar.addWidget(self.language_button)
+
+        self.addToolBar(Qt.TopToolBarArea, toolbar)
+        self.settings_toolbar = toolbar
+
+    def _show_mlflow_menu(self):
+        """MLflowメニューを表示"""
+        from PyQt5.QtWidgets import QMenu
+        menu = QMenu(self)
+
+        # MLflow UIを開く
+        open_action = menu.addAction(f"🚀 {get_text('open_mlflow')}")
+        open_action.triggered.connect(self._open_local_mlflow_ui)
+
+        # ボタンの下にメニューを表示
+        button = self.toolbar_mlflow_button
+        menu.exec_(button.mapToGlobal(button.rect().bottomLeft()))
+
+    def _show_cloud_menu(self):
+        """Cloudメニューを表示（Databricks/Colab）"""
+        from PyQt5.QtWidgets import QMenu
+        menu = QMenu(self)
+
+        # --- Databricks セクション ---
+        menu.addSection("Databricks")
+
+        db_open = menu.addAction(f"🔗 {get_text('open_databricks')}")
+        db_open.triggered.connect(self._open_databricks_ui)
+
+        db_sync = menu.addAction(f"🔄 {get_text('sync')}")
+        db_sync.triggered.connect(self._sync_to_databricks)
+
+        db_transfer = menu.addAction(f"📤 {get_text('transfer')}")
+        db_transfer.triggered.connect(self._transfer_to_databricks)
+
+        db_settings = menu.addAction(f"⚙ {get_text('settings')}")
+        db_settings.triggered.connect(self._show_databricks_settings)
+
+        menu.addSeparator()
+
+        # --- Colab セクション ---
+        menu.addSection("Google Colab")
+
+        colab_open = menu.addAction(f"🔗 {get_text('open_colab')}")
+        colab_open.triggered.connect(self._open_colab_ui)
+
+        colab_transfer = menu.addAction(f"📤 {get_text('transfer')}")
+        colab_transfer.triggered.connect(self._transfer_to_colab)
+
+        colab_download = menu.addAction(f"📥 {get_text('download')}")
+        colab_download.triggered.connect(self._download_model_from_colab)
+
+        colab_settings = menu.addAction(f"⚙ {get_text('settings')}")
+        colab_settings.triggered.connect(self._show_colab_settings)
+
+        # ボタンの下にメニューを表示
+        button = self.toolbar_cloud_button
+        menu.exec_(button.mapToGlobal(button.rect().bottomLeft()))
+
+    def _toolbar_open_folder(self):
+        """ツールバーからフォルダを開く"""
+        folder = QFileDialog.getExistingDirectory(self, get_text('dlg_select_folder'), "")
+        if folder:
+            self.folder_input.setText(folder)
+            self.load_images()
+
+    def _show_save_menu(self):
+        """保存メニューを表示"""
+        from PyQt5.QtWidgets import QMenu
+        menu = QMenu(self)
+
+        # --- 自動運転アノテーション ---
+        menu.addSection(get_text('menu_driving_annotation'))
+
+        donkey_action = menu.addAction(f"🚗 Donkey")
+        donkey_action.triggered.connect(self.export_to_donkey)
+
+        jetracer_action = menu.addAction(f"🏎 Jetracer")
+        jetracer_action.triggered.connect(self.export_to_jetracer)
+
+        menu.addSeparator()
+
+        # --- 物体検知/セグメンテーション ---
+        menu.addSection(get_text('menu_detection_annotation'))
+
+        yolo_action = menu.addAction(f"📦 YOLO")
+        yolo_action.triggered.connect(self.export_to_yolo_unified)
+
+        menu.addSeparator()
+
+        # --- 動画作成 ---
+        menu.addSection(get_text('menu_video_export'))
+
+        video_action = menu.addAction(f"🎬 {get_text('create_video')}")
+        video_action.triggered.connect(self.create_annotation_video)
+
+        # ボタンの下にメニューを表示
+        button = self.toolbar_save_button
+        menu.exec_(button.mapToGlobal(button.rect().bottomLeft()))
+
     def init_ui(self):
         self.setWindowTitle(get_text('window_title'))
         self.setGeometry(MAIN_WINDOW_X, MAIN_WINDOW_Y, MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT)
+
+        # 右上にツールバーを作成（表示設定用）
+        self._create_settings_toolbar()
 
         # Main widget and layout
         central_widget = QWidget()
@@ -3583,39 +3757,33 @@ class ImageAnnotationTool(QMainWindow):
         left_scroll_area.setWidget(left_panel)
         main_layout.addWidget(left_scroll_area)
 
-        # Folder selection
-        folder_label = QLabel(get_text('data_load_section'))
-        folder_label.setStyleSheet("font-weight: bold;")
-        left_layout.addWidget(folder_label)
-
+        # フォルダ選択（コンパクト表示）- メインの読み込みはツールバーから
         folder_layout = QHBoxLayout()
+        folder_layout.setSpacing(2)
         self.folder_input = QLineEdit()
         self.folder_input.setPlaceholderText(get_text('folder_placeholder'))
         self.folder_input.textChanged.connect(self.on_folder_path_changed)
         folder_layout.addWidget(self.folder_input)
 
-        browse_button = QPushButton(get_text('browse'))
+        browse_button = QPushButton("...")
+        browse_button.setMaximumWidth(30)
         browse_button.clicked.connect(self.browse_folder)
+        browse_button.setToolTip(get_text('browse'))
         folder_layout.addWidget(browse_button)
-        apply_style(browse_button, 'primary')
-        left_layout.addLayout(folder_layout)
-
-        load_button_layout = QHBoxLayout()
 
         self.load_button = QPushButton(get_text('load_images'))
         self.load_button.clicked.connect(self.load_images)
-        self.load_button.setEnabled(False)  # 初期状態は無効
+        self.load_button.setEnabled(False)
         apply_style(self.load_button, 'primary')
-        load_button_layout.addWidget(self.load_button)
+        folder_layout.addWidget(self.load_button)
 
-        # アノテーションデータ読み込みボタンを追加
         self.load_annotation_button = QPushButton(get_text('load_annotations'))
         self.load_annotation_button.clicked.connect(self.load_annotations)
-        self.load_annotation_button.setEnabled(False)  # 初期状態は無効
+        self.load_annotation_button.setEnabled(False)
         apply_style(self.load_annotation_button, 'primary')
-        load_button_layout.addWidget(self.load_annotation_button)
+        folder_layout.addWidget(self.load_annotation_button)
 
-        left_layout.addLayout(load_button_layout)
+        left_layout.addLayout(folder_layout)
 
         # Stats
         self.stats_label = QLabel(get_text('annotated_count', 0, 0))
@@ -3638,37 +3806,7 @@ class ImageAnnotationTool(QMainWindow):
             rb.toggled.connect(lambda checked, v=var: self.on_variant_changed(v) if checked else None)
         left_layout.addWidget(variant_box)
 
-        # エクスポートセクション
-        save_label = QLabel(get_text('save_annotation_section'))
-        save_label.setStyleSheet("font-weight: bold;")
-        left_layout.addWidget(save_label)
-
-        export_layout = QHBoxLayout()
-
-        # donkey保存
-        donkey_btn = QPushButton("Donkey")
-        donkey_btn.clicked.connect(self.export_to_donkey)
-        apply_style(donkey_btn, 'export')
-        export_layout.addWidget(donkey_btn)
-
-        # jetracer保存
-        jetracer_btn = QPushButton("Jetracer")
-        jetracer_btn.clicked.connect(self.export_to_jetracer)
-        apply_style(jetracer_btn, 'export')
-        export_layout.addWidget(jetracer_btn)
-
-        # 統合YOLOエクスポートボタン
-        yolo_btn = QPushButton("YOLO")
-        yolo_btn.clicked.connect(self.export_to_yolo_unified)
-        apply_style(yolo_btn, 'export')
-        export_layout.addWidget(yolo_btn)
-
-        left_layout.addLayout(export_layout)
-
-        # 動画作成ボタン
-        create_video_button = QPushButton(get_text('create_video'))
-        create_video_button.clicked.connect(self.create_annotation_video)
-        left_layout.addWidget(create_video_button)
+        # エクスポートセクションはツールバーの保存メニューに移動済み
 
         # 自動運転コンテナ
         self.pilot_container = QWidget()
@@ -3764,20 +3902,16 @@ class ImageAnnotationTool(QMainWindow):
 
         pilot_layout.addLayout(diff_vector_layout)
 
-        # CAM表示オプション - 2行レイアウト
-        gradcam_container = QVBoxLayout()
+        # CAM表示オプション - 1行レイアウト
+        gradcam_row = QHBoxLayout()
+        gradcam_row.setSpacing(4)
 
-        # 1行目: CAMチェックボックス + 手法選択
-        gradcam_row1 = QHBoxLayout()
         self.gradcam_checkbox = QCheckBox("CAM")
         self.gradcam_checkbox.setChecked(False)
-        self.gradcam_checkbox.setEnabled(False)  # 初期状態は無効
+        self.gradcam_checkbox.setEnabled(False)
         self.gradcam_checkbox.setToolTip(get_text('model_not_loaded'))
         self.gradcam_checkbox.stateChanged.connect(self.toggle_gradcam_display)
-        gradcam_row1.addWidget(self.gradcam_checkbox)
-
-        gradcam_method_label = QLabel(get_text('cam_method'))
-        gradcam_row1.addWidget(gradcam_method_label)
+        gradcam_row.addWidget(self.gradcam_checkbox)
 
         self.gradcam_method_combo = QComboBox()
         self.gradcam_method_combo.addItems(["gradcam", "gradcam++", "eigencam", "layercam", "scorecam"])
@@ -3785,16 +3919,7 @@ class ImageAnnotationTool(QMainWindow):
         self.gradcam_method_combo.setEnabled(False)
         self.gradcam_method_combo.setToolTip(get_text('cam_method_tooltip'))
         self.gradcam_method_combo.currentTextChanged.connect(self.change_gradcam_method)
-        gradcam_row1.addWidget(self.gradcam_method_combo)
-
-        gradcam_row1.addStretch()
-        gradcam_container.addLayout(gradcam_row1)
-
-        # 2行目: 対象選択 + 方向選択
-        gradcam_row2 = QHBoxLayout()
-
-        gradcam_target_label = QLabel(get_text('cam_target'))
-        gradcam_row2.addWidget(gradcam_target_label)
+        gradcam_row.addWidget(self.gradcam_method_combo)
 
         self.gradcam_target_combo = QComboBox()
         self.gradcam_target_combo.addItems(["angle", "throttle", "speed"])
@@ -3802,10 +3927,7 @@ class ImageAnnotationTool(QMainWindow):
         self.gradcam_target_combo.setEnabled(False)
         self.gradcam_target_combo.setToolTip(get_text('tip_cam_target'))
         self.gradcam_target_combo.currentTextChanged.connect(self.change_gradcam_target)
-        gradcam_row2.addWidget(self.gradcam_target_combo)
-
-        gradcam_direction_label = QLabel(get_text('cam_direction'))
-        gradcam_row2.addWidget(gradcam_direction_label)
+        gradcam_row.addWidget(self.gradcam_target_combo)
 
         self.gradcam_direction_combo = QComboBox()
         self.gradcam_direction_combo.addItems(["both", "positive", "negative"])
@@ -3813,12 +3935,10 @@ class ImageAnnotationTool(QMainWindow):
         self.gradcam_direction_combo.setEnabled(False)
         self.gradcam_direction_combo.setToolTip(get_text('cam_direction_tooltip'))
         self.gradcam_direction_combo.currentTextChanged.connect(self.change_gradcam_direction)
-        gradcam_row2.addWidget(self.gradcam_direction_combo)
+        gradcam_row.addWidget(self.gradcam_direction_combo)
 
-        gradcam_row2.addStretch()
-        gradcam_container.addLayout(gradcam_row2)
-
-        pilot_layout.addLayout(gradcam_container)
+        gradcam_row.addStretch()
+        pilot_layout.addLayout(gradcam_row)
 
         left_layout.addWidget(self.pilot_container)
 
@@ -3958,175 +4078,27 @@ class ImageAnnotationTool(QMainWindow):
         # 物体検知コンテナを追加
         left_layout.addWidget(self.object_detection_container)
 
-        # --- モデル管理セクション ---
-        model_mgmt_layout = QVBoxLayout()
-
-        model_mgmt_label = QLabel(get_text('model_management_section'))
-        model_mgmt_label.setStyleSheet("font-weight: bold;")
-        model_mgmt_layout.addWidget(model_mgmt_label)
-
-        # --- 1. MLflow（ローカル）セクション ---
-        mlflow_section_layout = QHBoxLayout()
-
-        mlflow_local_label = QLabel(get_text('mlflow_local'))
-        mlflow_section_layout.addWidget(mlflow_local_label)
-
-        # MLflowを開くボタン
-        mlflow_open_button = QPushButton(get_text('open_mlflow'))
-        apply_style(mlflow_open_button, 'special')
-        mlflow_open_button.clicked.connect(self._open_local_mlflow_ui)
-        mlflow_open_button.setToolTip(get_text('open_mlflow_tooltip'))
-        mlflow_section_layout.addWidget(mlflow_open_button)
-
-        mlflow_section_layout.addStretch()
-        model_mgmt_layout.addLayout(mlflow_section_layout)
-
-        # --- 2. Databricksセクション ---
-        # Databricks連携チェックボックスとステータス
-        databricks_header_layout = QHBoxLayout()
-
-        self.databricks_checkbox = QCheckBox(get_text('databricks_integration'))
+        # --- モデル管理セクションは右上ツールバーに移動済み ---
+        # 内部で使用する変数のみ初期化（UIには表示しない）
+        self.databricks_checkbox = QCheckBox()
         self.databricks_checkbox.setChecked(self.mlflow_manager.use_databricks)
         self.databricks_checkbox.stateChanged.connect(self._on_databricks_toggle)
-        databricks_header_layout.addWidget(self.databricks_checkbox)
 
         self.databricks_status_label = QLabel()
         self._update_databricks_status_label()
-        databricks_header_layout.addWidget(self.databricks_status_label)
 
-        databricks_header_layout.addStretch()
-        model_mgmt_layout.addLayout(databricks_header_layout)
+        self.databricks_sync_button = QPushButton()
+        self.databricks_transfer_button = QPushButton()
 
-        # Databricksボタン（開く、同期、設定を横並び）
-        databricks_buttons_layout = QHBoxLayout()
-        databricks_buttons_layout.setSpacing(2)
-
-        # ボタン用の小さいフォントを作成
-        small_font = self.font()
-        small_font.setPointSize(small_font.pointSize() - 2)
-
-        # Databricksを開くボタン
-        databricks_open_button = QPushButton(get_text('open_databricks'))
-        databricks_open_button.setFont(small_font)
-        apply_style(databricks_open_button, 'special')
-        databricks_open_button.clicked.connect(self._open_databricks_ui)
-        databricks_open_button.setToolTip(get_text('open_databricks_tooltip'))
-        databricks_buttons_layout.addWidget(databricks_open_button)
-
-        # 同期ボタン
-        self.databricks_sync_button = QPushButton(get_text('sync'))
-        self.databricks_sync_button.setFont(small_font)
-        apply_style(self.databricks_sync_button, 'special')
-        self.databricks_sync_button.clicked.connect(self._sync_to_databricks)
-        self.databricks_sync_button.setToolTip(get_text('sync_tooltip'))
-        databricks_buttons_layout.addWidget(self.databricks_sync_button)
-
-        # データ転送ボタン
-        self.databricks_transfer_button = QPushButton(get_text('transfer'))
-        self.databricks_transfer_button.setFont(small_font)
-        apply_style(self.databricks_transfer_button, 'special')
-        self.databricks_transfer_button.clicked.connect(self._transfer_to_databricks)
-        self.databricks_transfer_button.setToolTip(get_text('transfer_tooltip'))
-        databricks_buttons_layout.addWidget(self.databricks_transfer_button)
-
-        # 設定ボタン
-        databricks_settings_button = QPushButton(get_text('settings'))
-        databricks_settings_button.setFont(small_font)
-        apply_style(databricks_settings_button, 'special')
-        databricks_settings_button.clicked.connect(self._show_databricks_settings)
-        databricks_buttons_layout.addWidget(databricks_settings_button)
-
-        model_mgmt_layout.addLayout(databricks_buttons_layout)
-
-        # --- 3. Google Colabセクション ---
-        # Colab連携チェックボックスとステータス
-        colab_header_layout = QHBoxLayout()
-
-        self.colab_checkbox = QCheckBox(get_text('colab_integration'))
+        self.colab_checkbox = QCheckBox()
         self.colab_checkbox.setChecked(self._is_colab_enabled())
         self.colab_checkbox.stateChanged.connect(self._on_colab_toggle)
-        colab_header_layout.addWidget(self.colab_checkbox)
 
         self.colab_status_label = QLabel()
         self._update_colab_status_label()
-        colab_header_layout.addWidget(self.colab_status_label)
 
-        colab_header_layout.addStretch()
-        model_mgmt_layout.addLayout(colab_header_layout)
-
-        # Colabボタン（開く、転送、設定を横並び）
-        colab_buttons_layout = QHBoxLayout()
-        colab_buttons_layout.setSpacing(2)
-
-        # Colabを開くボタン
-        colab_open_button = QPushButton(get_text('open_colab'))
-        colab_open_button.setFont(small_font)
-        apply_style(colab_open_button, 'special')
-        colab_open_button.clicked.connect(self._open_colab_ui)
-        colab_open_button.setToolTip(get_text('open_colab_tooltip'))
-        colab_buttons_layout.addWidget(colab_open_button)
-
-        # データ転送ボタン
-        self.colab_transfer_button = QPushButton(get_text('transfer'))
-        self.colab_transfer_button.setFont(small_font)
-        apply_style(self.colab_transfer_button, 'special')
-        self.colab_transfer_button.clicked.connect(self._transfer_to_colab)
-        self.colab_transfer_button.setToolTip(get_text('colab_transfer_tooltip'))
-        colab_buttons_layout.addWidget(self.colab_transfer_button)
-
-        # モデル取得ボタン
-        self.colab_download_button = QPushButton(get_text('download'))
-        self.colab_download_button.setFont(small_font)
-        apply_style(self.colab_download_button, 'special')
-        self.colab_download_button.clicked.connect(self._download_model_from_colab)
-        self.colab_download_button.setToolTip(get_text('colab_download_tooltip'))
-        colab_buttons_layout.addWidget(self.colab_download_button)
-
-        # 設定ボタン
-        colab_settings_button = QPushButton(get_text('settings'))
-        colab_settings_button.setFont(small_font)
-        apply_style(colab_settings_button, 'special')
-        colab_settings_button.clicked.connect(self._show_colab_settings)
-        colab_buttons_layout.addWidget(colab_settings_button)
-
-        model_mgmt_layout.addLayout(colab_buttons_layout)
-
-        left_layout.addLayout(model_mgmt_layout)
-
-        # --- 表示設定ボタンを追加 ---
-        settings_layout = QVBoxLayout()
-
-        settings_label = QLabel(get_text('display_settings_section'))
-        settings_label.setStyleSheet("font-weight: bold;")
-        settings_layout.addWidget(settings_label)
-
-        # ボタンを横並びにするレイアウト
-        settings_buttons_layout = QHBoxLayout()
-
-        settings_button = QPushButton(get_text('window_font_settings'))
-        settings_button.clicked.connect(self.show_display_settings)
-        apply_style(settings_button, 'special')
-        settings_buttons_layout.addWidget(settings_button)
-
-        # ダークモード切替ボタンを追加
-        self.dark_mode_button = QPushButton(get_text('dark_mode'))
-        self.dark_mode_button.setCheckable(True)
-        self.dark_mode_button.clicked.connect(self.toggle_dark_mode)
-        apply_style(self.dark_mode_button, 'special')
-        settings_buttons_layout.addWidget(self.dark_mode_button)
-
-        # 言語切替ボタンを追加
-        current_lang = get_current_language()
-        lang_label = "English" if current_lang == 'ja' else "日本語"
-        self.language_button = QPushButton(f"🌐 {lang_label}")
-        self.language_button.setToolTip(get_text('language_switch'))
-        self.language_button.clicked.connect(self.toggle_language)
-        apply_style(self.language_button, 'special')
-        settings_buttons_layout.addWidget(self.language_button)
-
-        settings_layout.addLayout(settings_buttons_layout)
-
-        left_layout.addLayout(settings_layout)
+        self.colab_transfer_button = QPushButton()
+        self.colab_download_button = QPushButton()
 
         self.on_method_changed(self.auto_method_combo.currentIndex())
 
@@ -4143,6 +4115,8 @@ class ImageAnnotationTool(QMainWindow):
         # Right panel for images
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 5)  # 下部マージンを削減
+        right_layout.setSpacing(3)  # スペーシングを削減
         main_layout.addWidget(right_panel)
         
         # メイン画像と位置情報パネルを横に並べるレイアウト - 1:4:1の比率に変更
@@ -4241,11 +4215,15 @@ class ImageAnnotationTool(QMainWindow):
         
         self.main_image_view = ImageLabel(main_window=self)
         self.main_image_view.setMinimumSize(800, 600)
-        main_image_container.addWidget(self.main_image_view)
-        
+        self.main_image_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        main_image_container.addWidget(self.main_image_view, 1)  # ストレッチファクター1で拡張
+
         # ナビゲーションコントロールをメイン画像の下に配置
         nav_container = QWidget()
+        nav_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         nav_container_layout = QVBoxLayout(nav_container)
+        nav_container_layout.setContentsMargins(0, 5, 0, 0)  # 上部マージンを5pxに削減
+        nav_container_layout.setSpacing(2)  # 行間を詰める
         
         # スライダーの配置
         slider_layout = QHBoxLayout()
@@ -4800,6 +4778,7 @@ class ImageAnnotationTool(QMainWindow):
         gallery_scroll.setWidgetResizable(True)
         gallery_scroll.setWidget(self.gallery_widget)
         gallery_scroll.setMinimumHeight(GALLERY_MIN_HEIGHT)
+        gallery_scroll.setMaximumHeight(GALLERY_MIN_HEIGHT + 20)  # 最大高さを制限
         right_layout.addWidget(gallery_scroll)
         
         # 位置情報ボタンを初期化（8個作成）

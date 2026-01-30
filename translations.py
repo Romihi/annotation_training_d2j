@@ -308,6 +308,7 @@ TRANSLATIONS = {
         'dlg_info': '情報',
         'dlg_complete': '完了',
         'dlg_confirm': '確認',
+        'dlg_select_folder': 'フォルダを選択',
         'dlg_export_complete': 'エクスポート完了',
         'dlg_load_complete': '読み込み完了',
         'dlg_load_complete_warning': '読み込み完了（警告あり）',
@@ -323,6 +324,7 @@ TRANSLATIONS = {
         # msg_ : ダイアログ・エラーメッセージ
         # =====================================================================
         'msg_no_images': '画像が読み込まれていません。',
+        'msg_no_images_loaded': '画像が読み込まれていません。先に画像を読み込んでください。',
         'msg_no_annotations': '学習用のアノテーションがありません。',
         'msg_no_task_selected': 'タスクが選択されていません。',
         'msg_no_classes': '検知クラスが設定されていません。\n先にクラス設定を行ってください。',
@@ -529,6 +531,21 @@ TRANSLATIONS = {
         'btn_detection': '物体検知',
         'btn_segmentation': 'セグメンテーション',
         'btn_waypoint': 'ウェイポイント',
+
+        # =====================================================================
+        # ツールバーボタン
+        # =====================================================================
+        'toolbar_open': '開く',
+        'toolbar_save': '保存',
+        'toolbar_mlflow': 'MLflow',
+        'toolbar_cloud': 'クラウド',
+
+        # =====================================================================
+        # 保存メニュー
+        # =====================================================================
+        'menu_driving_annotation': '自動運転アノテーション',
+        'menu_detection_annotation': '物体検知/セグメンテーション',
+        'menu_video_export': '動画作成',
 
         # =====================================================================
         # 共通ボタン
@@ -1643,6 +1660,7 @@ Google Cloud Console での OAuth設定手順
         'dlg_info': 'Information',
         'dlg_complete': 'Complete',
         'dlg_confirm': 'Confirm',
+        'dlg_select_folder': 'Select Folder',
         'dlg_export_complete': 'Export Complete',
         'dlg_load_complete': 'Load Complete',
         'dlg_load_complete_warning': 'Load Complete (with warnings)',
@@ -1658,6 +1676,7 @@ Google Cloud Console での OAuth設定手順
         # msg_ : Dialog / Error Messages
         # =====================================================================
         'msg_no_images': 'No images loaded.',
+        'msg_no_images_loaded': 'No images loaded. Please load images first.',
         'msg_no_annotations': 'No annotations available for training.',
         'msg_no_task_selected': 'No task selected.',
         'msg_no_classes': 'Detection classes not configured.\nPlease configure classes first.',
@@ -1864,6 +1883,21 @@ Google Cloud Console での OAuth設定手順
         'btn_detection': 'Detection',
         'btn_segmentation': 'Segmentation',
         'btn_waypoint': 'Waypoint',
+
+        # =====================================================================
+        # Toolbar Buttons
+        # =====================================================================
+        'toolbar_open': 'Open',
+        'toolbar_save': 'Save',
+        'toolbar_mlflow': 'MLflow',
+        'toolbar_cloud': 'Cloud',
+
+        # =====================================================================
+        # Save Menu
+        # =====================================================================
+        'menu_driving_annotation': 'Driving Annotation',
+        'menu_detection_annotation': 'Detection/Segmentation',
+        'menu_video_export': 'Video Export',
 
         # =====================================================================
         # Common Buttons
