@@ -3616,6 +3616,35 @@ class ImageAnnotationTool(QMainWindow):
         # セパレーター
         toolbar.addSeparator()
 
+        # アノテーション済みカウント（枠付き）
+        stats_frame = QFrame()
+        stats_frame.setFrameShape(QFrame.StyledPanel)
+        stats_frame.setStyleSheet("QFrame { border: 1px solid #aaa; border-radius: 3px; padding: 2px 6px; }")
+        stats_frame_layout = QHBoxLayout(stats_frame)
+        stats_frame_layout.setContentsMargins(6, 2, 6, 2)
+        self.stats_label = QLabel(get_text('annotated_count', 0, 0))
+        stats_frame_layout.addWidget(self.stats_label)
+        toolbar.addWidget(stats_frame)
+
+        # 画像ソース切替（枠付き）
+        self.variant_box = QFrame()
+        self.variant_box.setFrameShape(QFrame.StyledPanel)
+        self.variant_box.setStyleSheet("QFrame { border: 1px solid #aaa; border-radius: 3px; padding: 2px 6px; }")
+        variant_layout = QHBoxLayout(self.variant_box)
+        variant_layout.setContentsMargins(6, 2, 6, 2)
+        variant_label = QLabel(get_text('image_source'))
+        variant_layout.addWidget(variant_label)
+        self.variant_button_group = QButtonGroup(self)
+        self.variant_button_group.setExclusive(True)
+        for var in self.available_variants:
+            rb = QRadioButton(var)
+            variant_layout.addWidget(rb)
+            self.variant_button_group.addButton(rb)
+            if var == self.current_variant:
+                rb.setChecked(True)
+            rb.toggled.connect(lambda checked, v=var: self.on_variant_changed(v) if checked else None)
+        toolbar.addWidget(self.variant_box)
+
         # 左側にスペーサーを追加して右寄せ
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -3785,26 +3814,7 @@ class ImageAnnotationTool(QMainWindow):
         left_scroll_area.setWidget(left_panel)
         main_layout.addWidget(left_scroll_area)
 
-        # Stats
-        self.stats_label = QLabel(get_text('annotated_count', 0, 0))
-        left_layout.addWidget(self.stats_label)
-                
-        # --- 統計ラベル直後にキー選択用ラジオボタン群を追加 ---
-        variants = self.available_variants
-        variant_box = QGroupBox(get_text('image_source'))
-        variant_layout = QHBoxLayout(variant_box)
-        # 排他制御用のボタングループ
-        self.variant_button_group = QButtonGroup(self)
-        self.variant_button_group.setExclusive(True)
-        for var in variants:
-            rb = QRadioButton(var)
-            variant_layout.addWidget(rb)
-            self.variant_button_group.addButton(rb)
-            if var == self.current_variant:
-                rb.setChecked(True)
-            # 切替時、チェックされた変化のみ受け取る
-            rb.toggled.connect(lambda checked, v=var: self.on_variant_changed(v) if checked else None)
-        left_layout.addWidget(variant_box)
+        # Stats と画像ソース切替はツールバーに移動済み
 
         # エクスポートセクションはツールバーの保存メニューに移動済み
 
@@ -6546,35 +6556,18 @@ class ImageAnnotationTool(QMainWindow):
         """
         available_variantsの内容に基づいてキーボタン群を更新する
         """
-        # GroupBoxを探す
-        variant_box = None
-        left_layout = self.get_left_layout()
-        
-        if left_layout is None:
-            print("警告: left_layoutが見つかりません")
+        if not hasattr(self, 'variant_box'):
+            print("警告: variant_boxが見つかりません")
             return
-            
-        try:
-            for i in range(left_layout.count()):
-                item = left_layout.itemAt(i).widget()
-                if isinstance(item, QGroupBox) and item.title() == get_text('label_image_source'):
-                    variant_box = item
-                    break
-        except Exception as e:
-            print(f"エラー: GroupBox検索に失敗しました: {e}")
-            return
-        
-        if not variant_box:
-            print("画像ソースのGroupBoxが見つかりませんでした")
-            return
-        
-        # 現在のレイアウトと全てのボタンをクリア
-        variant_layout = variant_box.layout()
-        while variant_layout.count():
-            item = variant_layout.takeAt(0)
+
+        variant_layout = self.variant_box.layout()
+
+        # ラベル以外のウィジェット(ラジオボタン)をクリア
+        while variant_layout.count() > 1:
+            item = variant_layout.takeAt(1)
             if item.widget():
                 item.widget().deleteLater()
-        
+
         # ボタングループをリセット
         if hasattr(self, 'variant_button_group'):
             for button in self.variant_button_group.buttons():
@@ -6582,7 +6575,7 @@ class ImageAnnotationTool(QMainWindow):
         else:
             self.variant_button_group = QButtonGroup(self)
             self.variant_button_group.setExclusive(True)
-        
+
         # 新しいキーボタンを追加
         for var in self.available_variants:
             rb = QRadioButton(var)
@@ -6590,7 +6583,6 @@ class ImageAnnotationTool(QMainWindow):
             self.variant_button_group.addButton(rb)
             if var == self.current_variant:
                 rb.setChecked(True)
-            # 切替時、チェックされた変化のみ受け取る
             rb.toggled.connect(lambda checked, v=var: self.on_variant_changed(v) if checked else None)
 
     def update_images_for_variant(self):
