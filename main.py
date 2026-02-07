@@ -3572,11 +3572,39 @@ class ImageAnnotationTool(QMainWindow):
             QToolButton { padding: 4px 8px; }
         """)
 
-        # Openボタン（フォルダ選択）
-        open_button = QPushButton(f"📂 {get_text('toolbar_open')}")
-        open_button.clicked.connect(self._toolbar_open_folder)
-        open_button.setStyleSheet("padding: 4px 8px;")
-        toolbar.addWidget(open_button)
+        # フォルダパス入力フィールド
+        self.folder_input = QLineEdit()
+        self.folder_input.setPlaceholderText(get_text('folder_placeholder'))
+        self.folder_input.textChanged.connect(self.on_folder_path_changed)
+        self.folder_input.setMinimumWidth(200)
+        self.folder_input.setMaximumWidth(400)
+        toolbar.addWidget(self.folder_input)
+
+        # 参照ボタン
+        browse_button = QPushButton("...")
+        browse_button.setMaximumWidth(30)
+        browse_button.clicked.connect(self.browse_folder)
+        browse_button.setToolTip(get_text('browse'))
+        toolbar.addWidget(browse_button)
+
+        # 画像を読込ボタン
+        self.load_button = QPushButton(f"📂 {get_text('load_images')}")
+        self.load_button.clicked.connect(self.load_images)
+        self.load_button.setEnabled(False)
+        self.load_button.setStyleSheet("padding: 4px 8px;")
+        apply_style(self.load_button, 'primary')
+        toolbar.addWidget(self.load_button)
+
+        # アノテーションデータを読込ボタン
+        self.load_annotation_button = QPushButton(f"🔴 {get_text('load_annotations')}")
+        self.load_annotation_button.clicked.connect(self.load_annotations)
+        self.load_annotation_button.setEnabled(False)
+        self.load_annotation_button.setStyleSheet("padding: 4px 8px;")
+        apply_style(self.load_annotation_button, 'primary')
+        toolbar.addWidget(self.load_annotation_button)
+
+        # セパレーター
+        toolbar.addSeparator()
 
         # Saveボタン（アノテーション保存メニュー）
         save_button = QPushButton(f"💾 {get_text('toolbar_save')}")
@@ -3756,34 +3784,6 @@ class ImageAnnotationTool(QMainWindow):
 
         left_scroll_area.setWidget(left_panel)
         main_layout.addWidget(left_scroll_area)
-
-        # フォルダ選択（コンパクト表示）- メインの読み込みはツールバーから
-        folder_layout = QHBoxLayout()
-        folder_layout.setSpacing(2)
-        self.folder_input = QLineEdit()
-        self.folder_input.setPlaceholderText(get_text('folder_placeholder'))
-        self.folder_input.textChanged.connect(self.on_folder_path_changed)
-        folder_layout.addWidget(self.folder_input)
-
-        browse_button = QPushButton("...")
-        browse_button.setMaximumWidth(30)
-        browse_button.clicked.connect(self.browse_folder)
-        browse_button.setToolTip(get_text('browse'))
-        folder_layout.addWidget(browse_button)
-
-        self.load_button = QPushButton(get_text('load_images'))
-        self.load_button.clicked.connect(self.load_images)
-        self.load_button.setEnabled(False)
-        apply_style(self.load_button, 'primary')
-        folder_layout.addWidget(self.load_button)
-
-        self.load_annotation_button = QPushButton(get_text('load_annotations'))
-        self.load_annotation_button.clicked.connect(self.load_annotations)
-        self.load_annotation_button.setEnabled(False)
-        apply_style(self.load_annotation_button, 'primary')
-        folder_layout.addWidget(self.load_annotation_button)
-
-        left_layout.addLayout(folder_layout)
 
         # Stats
         self.stats_label = QLabel(get_text('annotated_count', 0, 0))
@@ -4174,11 +4174,11 @@ class ImageAnnotationTool(QMainWindow):
         self.graph_title.setStyleSheet("font-weight: bold; color: #333333;")
         graph_title_layout.addWidget(self.graph_title)
 
-        self.data_analysis_button = QPushButton(get_text('analysis'))
+        self.data_analysis_button = QPushButton("📊")
         self.data_analysis_button.setToolTip(get_text('analysis_tooltip'))
         self.data_analysis_button.clicked.connect(self.open_data_analysis)
-        self.data_analysis_button.setFixedWidth(50)
-        apply_style(self.data_analysis_button, 'primary')
+        self.data_analysis_button.setFixedWidth(36)
+        apply_style(self.data_analysis_button, 'special')
         graph_title_layout.addWidget(self.data_analysis_button)
 
         info_layout.addLayout(graph_title_layout)
@@ -6702,7 +6702,7 @@ class ImageAnnotationTool(QMainWindow):
                     throttle = inference["throttle"]
 
                 # 推論情報のリッチテキスト
-                inference_text = f"<b>自動運転推論結果:</b><br>"
+                inference_text = f"<b>{get_text('label_driving_inference_header')}</b><br>"
                 inference_text += f"angle = <span style='color: #009999;'>{angle:.4f}</span><br>"
                 inference_text += f"throttle = <span style='color: #009999;'>{throttle:.4f}</span>"
 
@@ -11285,17 +11285,17 @@ class ImageAnnotationTool(QMainWindow):
                 class_counts[class_name] = class_counts.get(class_name, 0) + 1
             
             # 既存の推論情報ラベルに追加（または新規作成）
-            inference_text = "<b>物体検知推論結果:</b><br>"
-            inference_text += "検出オブジェクト:<br>"
-            
+            inference_text = f"<b>{get_text('label_detection_inference_header')}</b><br>"
+            inference_text += f"{get_text('label_detected_objects')}<br>"
+
             for class_name, count in class_counts.items():
                 # クラスに応じた色を設定
                 class_colors = DETECTION_INFERENCE_TEXT_COLORS
                 color = class_colors.get(class_name, "#FF0000")
-                
-                inference_text += f"<span style='color: {color}; font-weight: bold;'>● {class_name}</span>: {count}個<br>"
-            
-            inference_text += f"合計: {len(inference_bboxes)}個のオブジェクト<br>"
+
+                inference_text += f"<span style='color: {color}; font-weight: bold;'>● {class_name}</span>: {get_text('label_object_count', count)}<br>"
+
+            inference_text += f"{get_text('label_total_objects', len(inference_bboxes))}<br>"
             
             # 既存の推論情報ラベルがあればそれを更新
             if hasattr(self, 'detection_inference_info_label'):
@@ -11347,21 +11347,21 @@ class ImageAnnotationTool(QMainWindow):
                 all_objects[class_name] = all_objects.get(class_name, 0) + 1
             
             # HTML形式で表示テキストを作成（物体検知と同じ形式）
-            inference_text = "<b>セグメンテーション推論結果:</b><br>"
-            
+            inference_text = f"<b>{get_text('label_segmentation_inference_header')}</b><br>"
+
             # 物体検知推論結果と同じ色定数を使用
             from config import DETECTION_INFERENCE_TEXT_COLORS
-            
+
             # オブジェクトごとに表示
             total_count = 0
             for class_name, count in all_objects.items():
                 total_count += count
                 # クラス名に対応する色を取得（なければデフォルト色）
                 color = DETECTION_INFERENCE_TEXT_COLORS.get(class_name, "#808080")
-                inference_text += f"<span style='color: {color}; font-weight: bold;'>□ {class_name}</span>: {count}個<br>"
-            
+                inference_text += f"<span style='color: {color}; font-weight: bold;'>□ {class_name}</span>: {get_text('label_object_count', count)}<br>"
+
             # 合計を表示
-            inference_text += f"合計: {total_count}個のオブジェクト<br>"
+            inference_text += f"{get_text('label_total_objects', total_count)}<br>"
             
             # 物体検知推論結果と同じラベルに表示
             if hasattr(self, 'detection_inference_info_label'):
@@ -11879,6 +11879,7 @@ class ImageAnnotationTool(QMainWindow):
         try:
             import subprocess
             import sys
+            import webbrowser
             from config import mlflow_dir
 
             # パスの正規化
@@ -11890,11 +11891,14 @@ class ImageAnnotationTool(QMainWindow):
 
             # MLflow UIを起動
             if sys.platform.startswith('win'):
-                cmd = f'start cmd /k "mlflow ui --backend-store-uri {tracking_uri}"'
+                cmd = f'start cmd /k "mlflow ui --backend-store-uri {tracking_uri} --workers 1"'
                 subprocess.Popen(cmd, shell=True)
             else:
                 cmd = f'mlflow ui --backend-store-uri {tracking_uri}'
                 subprocess.Popen(cmd, shell=True)
+
+            # サーバー起動を待ってからブラウザを開く（3秒後）
+            QTimer.singleShot(3000, lambda: webbrowser.open('http://127.0.0.1:5000'))
 
             QMessageBox.information(
                 self,
@@ -14511,11 +14515,9 @@ class ImageAnnotationTool(QMainWindow):
             # 既存の推論結果がある場合は確認ダイアログを表示
             if self.inference_results and len(self.inference_results) > 0:
                 reply = QMessageBox.question(
-                    self, 
-                    "推論結果の再計算確認", 
-                    f"現在、{len(self.inference_results)}個の推論結果が保存されています。\n"
-                    f"一括推論を実行すると、すべての推論結果が現在のモデル '{model_type} ({selected_model})' を使って再計算されます。\n\n"
-                    "続行しますか？",
+                    self,
+                    get_text('dlg_inference_recalculate'),
+                    get_text('msg_inference_recalculate_body', len(self.inference_results), f"{model_type} ({selected_model})"),
                     QMessageBox.Yes | QMessageBox.No,
                     QMessageBox.Yes
                 )
@@ -14524,10 +14526,10 @@ class ImageAnnotationTool(QMainWindow):
                     return  # 操作をキャンセル
             
             target_images = self.images
-            progress_title = "全画像の推論を実行中..."
+            progress_title = get_text('msg_inference_all_running')
         else:
             target_images = [self.images[self.current_index]]
-            progress_title = "推論実行中..."
+            progress_title = get_text('msg_inference_running')
         
         # モデルのパスを取得 (コンボボックスから選択されたモデル)
         model_path = None
@@ -14553,7 +14555,7 @@ class ImageAnnotationTool(QMainWindow):
         
         try:
             # ステータスバーにメッセージ表示
-            model_desc = os.path.basename(model_path) if model_path else '事前学習済み'
+            model_desc = os.path.basename(model_path) if model_path else get_text('label_pretrained')
             self.statusBar().showMessage(get_text('status_inference_processing', model_type, model_desc))
             QApplication.processEvents()
 
@@ -14611,24 +14613,22 @@ class ImageAnnotationTool(QMainWindow):
                 
                 check_message = ""
                 if not was_checked:
-                    check_message = "\n\n推論結果表示が自動的にオンになりました。"
-                    
+                    check_message = get_text('msg_inference_auto_on')
+
                 QMessageBox.information(
-                    self, 
-                    "推論完了", 
-                    f"{len(target_images)}枚の画像に対する推論を完了しました。\n"
-                    f"{added_results}個の新しい結果が追加され、{updated_results}個の結果が更新されました。\n\n"
-                    f"使用モデル: {model_type} ({model_desc}){check_message}"
+                    self,
+                    get_text('dlg_inference_complete'),
+                    get_text('msg_inference_complete_body', len(target_images), added_results, updated_results, f"{model_type} ({model_desc})", check_message)
                 )
-            
+
         except Exception as e:
             self.statusBar().clearMessage()
             import traceback
             traceback.print_exc()  # エラーの詳細を表示
             QMessageBox.critical(
-                self, 
-                "エラー", 
-                f"推論中にエラーが発生しました: {str(e)}"
+                self,
+                get_text('dlg_error'),
+                get_text('msg_inference_processing_error', str(e))
             )
 
     def run_batch_inference(self):
@@ -14845,7 +14845,7 @@ class ImageAnnotationTool(QMainWindow):
         
         try:
             # ステータスバーにメッセージ表示
-            model_desc = os.path.basename(model_path) if model_path else '事前学習済み'
+            model_desc = os.path.basename(model_path) if model_path else get_text('label_pretrained')
             self.statusBar().showMessage(get_text('status_location_inference_processing', model_type, model_desc))
             QApplication.processEvents()
 
@@ -14907,7 +14907,7 @@ class ImageAnnotationTool(QMainWindow):
                 
                 check_message = ""
                 if not was_checked:
-                    check_message = "\n\n位置推論結果表示が自動的にオンになりました。"
+                    check_message = get_text('msg_location_inference_auto_on')
                     
                 QMessageBox.information(
                     self,
@@ -14956,7 +14956,7 @@ class ImageAnnotationTool(QMainWindow):
                 throttle = inference["throttle"]
 
             # 推論情報のリッチテキスト
-            inference_text = f"<b>推論結果:</b><br>"
+            inference_text = f"<b>{get_text('label_inference_result_header')}</b><br>"
             inference_text += f"angle = <span style='color: #009999;'>{angle:.4f}</span><br>"
             inference_text += f"throttle = <span style='color: #009999;'>{throttle:.4f}</span>"
 
@@ -14978,7 +14978,7 @@ class ImageAnnotationTool(QMainWindow):
                 
                 inference_text += f"<br><div style='margin-top: 10px;'>"
                 inference_text += f"<div style='display: inline-block; background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 5px; border-radius: 5px;'>"
-                inference_text += f"推論位置 {location}</div></div>"
+                inference_text += get_text('label_inference_location', location) + "</div></div>"
 
             # リッチテキストとして設定
             self.inference_info_label.setText(inference_text)
@@ -16418,7 +16418,7 @@ class ImageAnnotationTool(QMainWindow):
                 class_counts[class_name] = class_counts.get(class_name, 0) + 1
 
             # クラスカウント情報のフォーマット
-            bbox_info += "検出オブジェクト:<br>"
+            bbox_info += f"{get_text('label_detected_objects')}<br>"
             for class_name, count in class_counts.items():
                 # このクラスの色を取得
                 class_colors = {
@@ -16430,9 +16430,9 @@ class ImageAnnotationTool(QMainWindow):
                 }
                 color = class_colors.get(class_name, "#FF0000")
 
-                bbox_info += f"<span style='color: {color}; font-weight: bold;'>● {class_name}</span>: {count}個<br>"
+                bbox_info += f"<span style='color: {color}; font-weight: bold;'>● {class_name}</span>: {get_text('label_object_count', count)}<br>"
 
-            bbox_info += f"合計: {len(bboxes)}個のオブジェクト<br>"
+            bbox_info += f"{get_text('label_total_objects', len(bboxes))}<br>"
 
         return bbox_info
 
@@ -20491,17 +20491,17 @@ class ImageAnnotationTool(QMainWindow):
                     class_counts[class_name] = class_counts.get(class_name, 0) + 1
                 
                 # 情報テキストを構築
-                inference_text = "<b>物体検知推論結果:</b><br>"
-                inference_text += "検出オブジェクト:<br>"
-                
+                inference_text = f"<b>{get_text('label_detection_inference_header')}</b><br>"
+                inference_text += f"{get_text('label_detected_objects')}<br>"
+
                 for class_name, count in class_counts.items():
                     # クラスに応じた色を設定
                     class_colors = DETECTION_INFERENCE_TEXT_COLORS
                     color = class_colors.get(class_name, "#FF0000")
-                    
-                    inference_text += f"<span style='color: {color}; font-weight: bold;'>● {class_name}</span>: {count}個<br>"
-                
-                inference_text += f"合計: {len(inference_bboxes)}個のオブジェクト<br>"
+
+                    inference_text += f"<span style='color: {color}; font-weight: bold;'>● {class_name}</span>: {get_text('label_object_count', count)}<br>"
+
+                inference_text += f"{get_text('label_total_objects', len(inference_bboxes))}<br>"
                 
                 # テキストをラベルに直接設定
                 if hasattr(self, 'detection_inference_info_label'):
@@ -22518,7 +22518,7 @@ class ImageAnnotationTool(QMainWindow):
                             color = get_location_color(idx).name()
                         
                         # 各クラスの予測確率
-                        inference_text += f"<span style='color: {color}; font-weight: bold;'>{i+1}. 位置 {idx}: {all_probs[idx]:.4f}</span><br>"
+                        inference_text += f"<span style='color: {color}; font-weight: bold;'>{get_text('label_position_rank', i+1, idx, f'{all_probs[idx]:.4f}')}</span><br>"
                 
                 # HTMLタグを閉じる
                 inference_text += "</div>"

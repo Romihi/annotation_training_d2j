@@ -479,6 +479,23 @@ TRANSLATIONS = {
         # =====================================================================
         'label_driving_annotation_info': '運転アノテーション情報:',
         'label_location_inference_result': '位置推論結果:',
+        'label_driving_inference_header': '自動運転推論結果:',
+        'label_inference_result_header': '推論結果:',
+        'label_detection_inference_header': '物体検知推論結果:',
+        'label_detected_objects': '検出オブジェクト:',
+        'label_object_count': '{0}個',
+        'label_total_objects': '合計: {0}個のオブジェクト',
+        'label_segmentation_inference_header': 'セグメンテーション推論結果:',
+        'label_position_rank': '{0}. 位置 {1}: {2}',
+        'label_pretrained': '事前学習済み',
+        'dlg_inference_recalculate': '推論結果の再計算確認',
+        'msg_inference_recalculate_body': "現在、{0}個の推論結果が保存されています。\n一括推論を実行すると、すべての推論結果が現在のモデル '{1}' を使って再計算されます。\n\n続行しますか？",
+        'msg_inference_all_running': '全画像の推論を実行中...',
+        'msg_inference_running': '推論実行中...',
+        'dlg_inference_complete': '推論完了',
+        'msg_inference_complete_body': '{0}枚の画像に対する推論を完了しました。\n{1}個の新しい結果が追加され、{2}個の結果が更新されました。\n\n使用モデル: {3}{4}',
+        'msg_inference_processing_error': '推論中にエラーが発生しました: {0}',
+        'msg_location_inference_auto_on': '\n\n位置推論結果表示が自動的にオンになりました。',
 
         # =====================================================================
         # アノテーションモード
@@ -1488,7 +1505,7 @@ Google Cloud Console での OAuth設定手順
         'btn_create_video': 'Create Video',
 
         # --- Pilot Model ---
-        'btn_train_save': 'Train & Save',
+        'btn_train_save': 'Train',
         'btn_load_model': 'Load Model',
         'btn_auto_annotate': 'Auto Annotate',
         'btn_batch_inference': 'Infer All',
@@ -1497,7 +1514,7 @@ Google Cloud Console での OAuth設定手順
         'btn_load_yolo_annotation': 'Load YOLO',
         'btn_preset': 'Preset',
         'btn_apply': 'Apply',
-        'btn_train_yolo': 'Train & Save YOLO',
+        'btn_train_yolo': 'Train',
         'btn_yolo_auto_annotate': 'YOLO Auto',
 
         # --- Model Management ---
@@ -1585,11 +1602,11 @@ Google Cloud Console での OAuth設定手順
         # =====================================================================
         # chk_ : Checkboxes
         # =====================================================================
-        'chk_show_future_annotation': 'Show +5, +10 frames annotation (orange)',
-        'chk_show_inference': 'Show inference result (blue)',
-        'chk_show_diff_vector': 'Show diff vector (green arrow)',
-        'chk_show_detection_inference': 'Show Detection Inference',
-        'chk_show_segmentation_inference': 'Show Segmentation Inference',
+        'chk_show_future_annotation': '+5, +10 frames(orange)',
+        'chk_show_inference': 'Inference result (blue)',
+        'chk_show_diff_vector': 'Diff vector (green arrow)',
+        'chk_show_detection_inference': 'Detection Inference',
+        'chk_show_segmentation_inference': 'Segmentation Inference',
         'chk_dark_mode': 'Dark Mode',
 
         # =====================================================================
@@ -1831,6 +1848,23 @@ Google Cloud Console での OAuth設定手順
         # =====================================================================
         'label_driving_annotation_info': 'Driving Annotation Info:',
         'label_location_inference_result': 'Location Inference Result:',
+        'label_driving_inference_header': 'Driving Inference Result:',
+        'label_inference_result_header': 'Inference Result:',
+        'label_detection_inference_header': 'Detection Inference Result:',
+        'label_detected_objects': 'Detected Objects:',
+        'label_object_count': '{0}',
+        'label_total_objects': 'Total: {0} objects',
+        'label_segmentation_inference_header': 'Segmentation Inference Result:',
+        'label_position_rank': '{0}. Position {1}: {2}',
+        'label_pretrained': 'pre-trained',
+        'dlg_inference_recalculate': 'Inference Recalculation',
+        'msg_inference_recalculate_body': "Currently, {0} inference results are stored.\nBatch inference will recalculate all results using the current model '{1}'.\n\nContinue?",
+        'msg_inference_all_running': 'Running inference on all images...',
+        'msg_inference_running': 'Running inference...',
+        'dlg_inference_complete': 'Inference Complete',
+        'msg_inference_complete_body': 'Inference completed for {0} images.\n{1} new results added, {2} results updated.\n\nModel: {3}{4}',
+        'msg_inference_processing_error': 'Error during inference: {0}',
+        'msg_location_inference_auto_on': '\n\nLocation inference display has been automatically enabled.',
 
         # =====================================================================
         # Annotation Mode

@@ -1174,6 +1174,24 @@ if __name__ == "__main__":
 2. **画像読み込みの問題**: 画像形式の互換性を確認（JPG、PNG、BMPがサポートされています）
 3. **MLflowエラー**: MLflowはオプションです。問題が発生した場合は、その機能を無効にできます
 
+### MLflow AIアシスタント機能について
+
+MLflow UIを起動すると、以下のようなエラーがコンソールに表示される場合があります：
+
+```
+GET /ajax-api/3.0/mlflow/assistant/providers/claude_code/health HTTP/1.1" 500 Internal Server Error
+FileNotFoundError: [WinError 2] 指定されたファイルが見つかりません。
+```
+
+**これは無視して問題ありません。**
+
+このエラーは、MLflowの新しいAIアシスタント機能が「Claude Code CLI」への接続を確認しようとして発生しています。Claude Code CLIがインストールされていない環境では、このヘルスチェックが失敗しますが、MLflow UIの基本機能（学習結果の記録・比較・グラフ表示など）には影響しません。
+
+**補足:**
+- MLflow 2.x以降で追加されたAIアシスタント機能は、実験結果の分析などをAIに依頼する機能です
+- 本ツールではこの機能を使用していないため、エラーが出ても問題ありません
+- エラーログを抑制したい場合は、環境変数 `MLFLOW_ENABLE_ASSISTANT=false` を設定してください
+
 ### エラー報告
 
 バグが見つかった場合は、以下の情報を含む問題を開いてください:
