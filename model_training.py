@@ -613,7 +613,8 @@ def train_model(
     optimizer_name: str = 'Adam',
     scheduler_name: str = 'ReduceLROnPlateau',
     custom_model_name: Optional[str] = None,
-    num_outputs: int = 2
+    num_outputs: int = 2,
+    input_size: Optional[Tuple[int, int]] = None
 ) -> Dict[str, Any]:
     """モデルをトレーニングする
 
@@ -635,6 +636,7 @@ def train_model(
         optimizer_name: 最適化アルゴリズム名（Adam, AdamW, SGD）
         scheduler_name: 学習率スケジューラ名（ReduceLROnPlateau, StepLR, CosineAnnealingLR, None）
         num_outputs: 出力数（2=angle/throttle, 3=angle/throttle/speed）
+        input_size: 入力画像サイズ (高さ, 幅)。Noneの場合はデータローダーから推定
 
     Returns:
         トレーニング結果の辞書
@@ -643,21 +645,21 @@ def train_model(
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    # input_sizeが未指定の場合、データローダーから推定
+    if input_size is None:
+        sample_batch = next(iter(train_loader))
+        input_size = (sample_batch[0].shape[2], sample_batch[0].shape[3])  # (H, W)
+        print(f"データローダーから入力サイズを推定: {input_size}")
+
     # モデルのロード
     if progress_callback:
         progress_callback(0, num_epochs, "モデルをロード中...")
 
     # まず事前学習済みの重みでモデルを初期化（またはランダム初期化）
-    model = get_model(model_name, pretrained=pretrained, num_outputs=num_outputs)
-    
-    # 入力サイズをモデルまたはデータローダーから取得
-    model_input_size = None
-    if hasattr(model, 'input_size'):
-        model_input_size = model.input_size
-    else:
-        # データローダーから推定
-        sample_batch = next(iter(train_loader))
-        model_input_size = (sample_batch[0].shape[2], sample_batch[0].shape[3])  # (H, W)
+    model = get_model(model_name, pretrained=pretrained, input_size=input_size, num_outputs=num_outputs)
+
+    # 入力サイズをモデルから確認
+    model_input_size = model.input_size if hasattr(model, 'input_size') else input_size
     print(f"Model input size: {model_input_size}")
     
     # 特定のモデルファイルから重みをロードする場合
@@ -2088,7 +2090,8 @@ if __name__ == "__main__":
             train_loader=train_loader,
             val_loader=val_loader,
             num_epochs=args.epochs,
-            save_dir=os.path.join(args.data_dir, "annotation", "annotation_models")
+            save_dir=os.path.join(args.data_dir, "annotation", "annotation_models"),
+            input_size=dataset_info.get('actual_image_size')
         )
         
         print(f"トレーニング結果: {training_results}")

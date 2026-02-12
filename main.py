@@ -15823,7 +15823,7 @@ class ImageAnnotationTool(QMainWindow):
             QApplication.processEvents()
             
             # モデルを明示的に読み込み（self.modelに保存）
-            from model_catalog import get_model, load_model_weights, detect_num_outputs_from_checkpoint
+            from model_catalog import get_model, load_model_weights, detect_num_outputs_from_checkpoint, detect_input_size_from_checkpoint
 
             # モデルファイル名から実際のモデルタイプを判定
             model_filename = os.path.basename(model_path)
@@ -15837,12 +15837,13 @@ class ImageAnnotationTool(QMainWindow):
                 # YOLOモデルの場合
                 raise ValueError(f"選択されたファイルはYOLOモデルです。自動運転モデルを選択してください。\nファイル: {model_filename}")
 
-            # チェックポイントから出力数を検出
+            # チェックポイントから出力数と入力サイズを検出
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             num_outputs = detect_num_outputs_from_checkpoint(model_path, device)
+            input_size = detect_input_size_from_checkpoint(model_path, device)
 
-            # モデルインスタンスを作成（検出した出力数で）
-            self.model = get_model(actual_model_type, pretrained=False, num_outputs=num_outputs)
+            # モデルインスタンスを作成（検出した出力数と入力サイズで）
+            self.model = get_model(actual_model_type, pretrained=False, input_size=input_size, num_outputs=num_outputs)
 
             # 重みを読み込み
             load_model_weights(self.model, model_path, device)
@@ -18210,8 +18211,7 @@ class ImageAnnotationTool(QMainWindow):
         # 学習設定ダイアログを表示
         training_settings = QDialog(self)
         training_settings.setWindowTitle(get_text('dlg_training_settings'))
-        training_settings.setMinimumWidth(700)  # 横並び用に幅を広げる
-        training_settings.setMinimumHeight(600)
+        training_settings.setMinimumWidth(1000)  # 2カラムレイアウト用に幅を広げる
 
         settings_layout = QVBoxLayout(training_settings)
 
@@ -18220,7 +18220,9 @@ class ImageAnnotationTool(QMainWindow):
 
         # 基本設定タブ
         basic_tab = QWidget()
-        basic_layout = QVBoxLayout(basic_tab)
+        basic_layout = QHBoxLayout(basic_tab)
+        left_column = QVBoxLayout()
+        right_column = QVBoxLayout()
 
         # 初期化設定グループ（モデル選択と重みの読み込み）
         init_group = QGroupBox(get_text('label_init_settings'))
@@ -18400,7 +18402,7 @@ class ImageAnnotationTool(QMainWindow):
         model_type_combo.currentIndexChanged.connect(update_finetune_model_list)
 
         init_group.setLayout(init_layout)
-        basic_layout.addWidget(init_group)
+        left_column.addWidget(init_group)
 
         # 出力設定グループ（Speed出力と将来予測を統合）
         output_settings_group = QGroupBox(get_text('label_output_settings'))
@@ -18430,14 +18432,14 @@ class ImageAnnotationTool(QMainWindow):
             speed_row_layout.addWidget(speed_normalize_spin)
 
             speed_normalize_info = QLabel(get_text('label_speed_normalize_note'))
-            speed_normalize_info.setStyleSheet("color: #666; font-size: 11px;")
+            speed_normalize_info.setStyleSheet("color: #666;")
             speed_row_layout.addWidget(speed_normalize_info)
 
             speed_row_layout.addStretch()
             output_settings_layout.addLayout(speed_row_layout)
 
             speed_info_label = QLabel(get_text('label_speed_data_info', speed_count))
-            speed_info_label.setStyleSheet("color: #666; font-size: 11px;")
+            speed_info_label.setStyleSheet("color: #666;")
             output_settings_layout.addWidget(speed_info_label)
 
             # セクション間のスペース
@@ -18449,17 +18451,17 @@ class ImageAnnotationTool(QMainWindow):
         output_settings_layout.addWidget(future_output_check)
 
         future_info_label = QLabel(get_text('label_future_info'))
-        future_info_label.setStyleSheet("color: #666; font-size: 11px;")
+        future_info_label.setStyleSheet("color: #666;")
         output_settings_layout.addWidget(future_info_label)
 
         future_detail_label = QLabel(get_text('label_future_detail'))
-        future_detail_label.setStyleSheet("color: #888; font-size: 11px;")
+        future_detail_label.setStyleSheet("color: #888;")
         future_detail_label.setWordWrap(True)
         output_settings_layout.addWidget(future_detail_label)
 
         output_settings_layout.addStretch()
         output_settings_group.setLayout(output_settings_layout)
-        basic_layout.addWidget(output_settings_group)
+        left_column.addWidget(output_settings_group)
 
         # 学習パラメータグループ
         training_params_group = QGroupBox(get_text('label_training_params'))
@@ -18575,7 +18577,7 @@ class ImageAnnotationTool(QMainWindow):
         training_params_layout.addLayout(optimizer_scheduler_layout)
 
         training_params_group.setLayout(training_params_layout)
-        basic_layout.addWidget(training_params_group)
+        right_column.addWidget(training_params_group)
 
         # 学習対象データ選択グループボックス
         data_selection_group = QGroupBox(get_text('label_training_data_selection'))
@@ -18734,7 +18736,10 @@ class ImageAnnotationTool(QMainWindow):
         update_data_selection_ui()
 
         data_selection_group.setLayout(data_selection_layout)
-        basic_layout.addWidget(data_selection_group)
+        right_column.addWidget(data_selection_group)
+
+        basic_layout.addLayout(left_column)
+        basic_layout.addLayout(right_column)
 
         # タブに追加
         tabs.addTab(basic_tab, get_text('tab_basic_settings'))
@@ -18922,8 +18927,8 @@ class ImageAnnotationTool(QMainWindow):
         # タブをレイアウトに追加
         settings_layout.addWidget(tabs)
 
-        # モデル名とコメント欄を追加
-        settings_layout.addWidget(QLabel(""))  # スペース追加
+        # モデル名とコメント欄を横並びで追加
+        name_comment_layout = QHBoxLayout()
 
         # モデル名編集欄
         model_name_group = QGroupBox(get_text('label_model_name_settings'))
@@ -18951,7 +18956,7 @@ class ImageAnnotationTool(QMainWindow):
         model_name_layout.addLayout(name_input_layout)
 
         model_name_note = QLabel(get_text('label_model_name_note_pth', model_type))
-        model_name_note.setStyleSheet("color: #888; font-style: italic; font-size: 10px;")
+        model_name_note.setStyleSheet("color: #888; font-style: italic;")
         model_name_layout.addWidget(model_name_note)
 
         # モデルタイプが変更されたらプレフィックスと注釈を更新
@@ -18962,7 +18967,7 @@ class ImageAnnotationTool(QMainWindow):
 
         model_type_combo.currentIndexChanged.connect(update_model_name_prefix)
 
-        settings_layout.addWidget(model_name_group)
+        name_comment_layout.addWidget(model_name_group)
 
         # コメント欄
         comment_group = QGroupBox(get_text('label_training_comment'))
@@ -18974,7 +18979,9 @@ class ImageAnnotationTool(QMainWindow):
         comment_input.setMaximumHeight(80)
         comment_layout.addWidget(comment_input)
 
-        settings_layout.addWidget(comment_group)
+        name_comment_layout.addWidget(comment_group)
+
+        settings_layout.addLayout(name_comment_layout)
 
         # ボタンの配置
         button_box = QDialogButtonBox(QDialogButtonBox.Cancel)
@@ -19234,7 +19241,8 @@ class ImageAnnotationTool(QMainWindow):
                 optimizer_name=optimizer_name,  # 最適化アルゴリズム
                 scheduler_name=scheduler_name,  # 学習率スケジューラ
                 custom_model_name=model_name if model_name else None,  # カスタムモデル名
-                num_outputs=num_outputs  # 出力数を指定
+                num_outputs=num_outputs,  # 出力数を指定
+                input_size=input_size  # 実際の画像サイズを渡す
             )
             
             progress.close()
@@ -19459,36 +19467,72 @@ class ImageAnnotationTool(QMainWindow):
             avg_epoch_time_str = format_time(training_results.get('avg_epoch_time', 0))
             time_info = f"学習時間: {total_time_str} (平均エポック時間: {avg_epoch_time_str})\n"
         
-        # 成功メッセージを表示
-        msg_box = QMessageBox(self)
-        msg_box.setWindowTitle(get_text('dlg_training_complete'))
-        msg_box.setIcon(QMessageBox.Information)
-        msg_box.setText(
-            f"{model_type} モデルを学習し保存しました: {os.path.basename(training_results['model_path'])}\n" +
-            f"最良検証損失: {training_results['best_val_loss']:.6f}\n" +
-            f"実施エポック数: {training_results.get('completed_epochs', training_params['num_epochs'])}/{training_params['num_epochs']}\n" +
-            early_stopping_info +
-            time_info +
-            f"学習データ数: {dataset_info['image_paths_count']}枚 {dataset_info['sampling_info']}\n" +
-            input_size_info +
-            weights_info +
-            f"学習率: {training_params['learning_rate']}, Weight Decay: {training_params['weight_decay']}\n" +
-            f"バッチサイズ: {training_params['batch_size']}, 検証データ割合: {training_params['val_split']:.0%}\n" +
-            f"Optimizer: {training_params['optimizer']}, Scheduler: {training_params['scheduler']}\n" +
-            aug_details +
-            f"\n{mlflow_info}"
-        )
+        # 成功メッセージを表示（2カラムレイアウト）
+        dialog = QDialog(self)
+        dialog.setWindowTitle(get_text('dlg_training_complete'))
+        dialog.setMinimumWidth(800)
+        dlg_layout = QVBoxLayout(dialog)
 
-        # OKボタン
-        ok_button = msg_box.addButton(QMessageBox.Ok)
+        title_label = QLabel(f"{model_type} モデルを学習し保存しました: {os.path.basename(training_results['model_path'])}")
+        title_label.setStyleSheet("font-weight: bold;")
+        dlg_layout.addWidget(title_label)
 
-        # MLflow を開くボタンを追加
-        mlflow_button = msg_box.addButton(get_text('btn_open_mlflow'), QMessageBox.ActionRole)
+        columns_layout = QHBoxLayout()
 
-        msg_box.exec_()
+        # 左カラム: 学習結果
+        left_group = QGroupBox("学習結果")
+        left_layout = QVBoxLayout(left_group)
+        left_layout.addWidget(QLabel(f"最良検証損失: {training_results['best_val_loss']:.6f}"))
+        left_layout.addWidget(QLabel(f"実施エポック数: {training_results.get('completed_epochs', training_params['num_epochs'])}/{training_params['num_epochs']}"))
+        if early_stopping_info:
+            left_layout.addWidget(QLabel(early_stopping_info.strip()))
+        if time_info:
+            left_layout.addWidget(QLabel(time_info.strip()))
+        left_layout.addWidget(QLabel(f"学習データ数: {dataset_info['image_paths_count']}枚 {dataset_info['sampling_info']}"))
+        left_layout.addWidget(QLabel(input_size_info.strip()))
+        left_layout.addStretch()
 
-        # MLflowボタンがクリックされた場合
-        if msg_box.clickedButton() == mlflow_button:
+        # 右カラム: 学習設定
+        right_group = QGroupBox("学習設定")
+        right_layout = QVBoxLayout(right_group)
+        right_layout.addWidget(QLabel(weights_info.strip()))
+        right_layout.addWidget(QLabel(f"学習率: {training_params['learning_rate']}, Weight Decay: {training_params['weight_decay']}"))
+        right_layout.addWidget(QLabel(f"バッチサイズ: {training_params['batch_size']}, 検証データ割合: {training_params['val_split']:.0%}"))
+        right_layout.addWidget(QLabel(f"Optimizer: {training_params['optimizer']}, Scheduler: {training_params['scheduler']}"))
+        aug_label = QLabel(aug_details.strip())
+        aug_label.setWordWrap(True)
+        right_layout.addWidget(aug_label)
+        right_layout.addStretch()
+
+        columns_layout.addWidget(left_group)
+        columns_layout.addWidget(right_group)
+        dlg_layout.addLayout(columns_layout)
+
+        if mlflow_info:
+            mlflow_label = QLabel(mlflow_info)
+            mlflow_label.setWordWrap(True)
+            dlg_layout.addWidget(mlflow_label)
+
+        # ボタン
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        mlflow_button = QPushButton(get_text('btn_open_mlflow'))
+        ok_button = QPushButton("OK")
+        ok_button.setDefault(True)
+        ok_button.clicked.connect(dialog.accept)
+        button_layout.addWidget(mlflow_button)
+        button_layout.addWidget(ok_button)
+        dlg_layout.addLayout(button_layout)
+
+        clicked_mlflow = [False]
+        def on_mlflow_clicked():
+            clicked_mlflow[0] = True
+            dialog.accept()
+        mlflow_button.clicked.connect(on_mlflow_clicked)
+
+        dialog.exec_()
+
+        if clicked_mlflow[0]:
             self.mlflow_manager.open_ui()
         
 
@@ -21889,29 +21933,69 @@ class ImageAnnotationTool(QMainWindow):
             avg_epoch_time_str = format_time(training_results.get('avg_epoch_time', 0))
             time_info = f"学習時間: {total_time_str} (平均エポック時間: {avg_epoch_time_str})\n"
         
-        # 学習完了メッセージ
-        msg_box = QMessageBox(self)
-        msg_box.setWindowTitle(get_text('dlg_training_complete'))
-        msg_box.setIcon(QMessageBox.Information)
-        msg_box.setText(
-            f"{model_type} 位置モデルを学習し保存しました: {os.path.basename(training_results['best_model_path'])}\n" +
-            f"最良検証損失: {training_results['best_val_loss']:.6f}\n" +
-            f"最良検証精度: {training_results['best_val_acc']:.2f}%\n" +
-            f"実施エポック数: {training_results['completed_epochs']}/{training_config['num_epochs']}\n" +
-            early_stopping_info +
-            time_info +
-            f"出力クラス数: {dataset_info['num_classes']} (実際の位置クラス数: {dataset_info['actual_classes']})\n" +
-            f"学習データ数: {dataset_info['image_paths_count']}枚\n" +
-            f"学習率: {training_config['learning_rate']}\n" +
-            f"バッチサイズ: {training_config['batch_size']}\n" +
-            f"データオーグメンテーション: {'有効' if training_config['use_augmentation'] else '無効'}\n\n" +
-            f"{mlflow_info}"
-        )
-        ok_button = msg_box.addButton(QMessageBox.Ok)
-        mlflow_button = msg_box.addButton(get_text('btn_open_mlflow'), QMessageBox.ActionRole)
-        msg_box.exec_()
+        # 学習完了メッセージ（2カラムレイアウト）
+        dialog = QDialog(self)
+        dialog.setWindowTitle(get_text('dlg_training_complete'))
+        dialog.setMinimumWidth(700)
+        dlg_layout = QVBoxLayout(dialog)
 
-        if msg_box.clickedButton() == mlflow_button:
+        title_label = QLabel(f"{model_type} 位置モデルを学習し保存しました: {os.path.basename(training_results['best_model_path'])}")
+        title_label.setStyleSheet("font-weight: bold;")
+        dlg_layout.addWidget(title_label)
+
+        columns_layout = QHBoxLayout()
+
+        # 左カラム: 学習結果
+        left_group = QGroupBox("学習結果")
+        left_layout = QVBoxLayout(left_group)
+        left_layout.addWidget(QLabel(f"最良検証損失: {training_results['best_val_loss']:.6f}"))
+        left_layout.addWidget(QLabel(f"最良検証精度: {training_results['best_val_acc']:.2f}%"))
+        left_layout.addWidget(QLabel(f"実施エポック数: {training_results['completed_epochs']}/{training_config['num_epochs']}"))
+        if early_stopping_info:
+            left_layout.addWidget(QLabel(early_stopping_info.strip()))
+        if time_info:
+            left_layout.addWidget(QLabel(time_info.strip()))
+        left_layout.addWidget(QLabel(f"学習データ数: {dataset_info['image_paths_count']}枚"))
+        left_layout.addStretch()
+
+        # 右カラム: 学習設定
+        right_group = QGroupBox("学習設定")
+        right_layout = QVBoxLayout(right_group)
+        right_layout.addWidget(QLabel(f"出力クラス数: {dataset_info['num_classes']} (実際の位置クラス数: {dataset_info['actual_classes']})"))
+        right_layout.addWidget(QLabel(f"学習率: {training_config['learning_rate']}"))
+        right_layout.addWidget(QLabel(f"バッチサイズ: {training_config['batch_size']}"))
+        right_layout.addWidget(QLabel(f"データオーグメンテーション: {'有効' if training_config['use_augmentation'] else '無効'}"))
+        right_layout.addStretch()
+
+        columns_layout.addWidget(left_group)
+        columns_layout.addWidget(right_group)
+        dlg_layout.addLayout(columns_layout)
+
+        if mlflow_info:
+            mlflow_label = QLabel(mlflow_info)
+            mlflow_label.setWordWrap(True)
+            dlg_layout.addWidget(mlflow_label)
+
+        # ボタン
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        mlflow_button = QPushButton(get_text('btn_open_mlflow'))
+        ok_button = QPushButton("OK")
+        ok_button.setDefault(True)
+        ok_button.clicked.connect(dialog.accept)
+        button_layout.addWidget(mlflow_button)
+        button_layout.addWidget(ok_button)
+        dlg_layout.addLayout(button_layout)
+
+        clicked_mlflow = [False]
+        def on_mlflow_clicked():
+            clicked_mlflow[0] = True
+            dialog.accept()
+        mlflow_button.clicked.connect(on_mlflow_clicked)
+
+        dialog.exec_()
+
+        if clicked_mlflow[0]:
             self.mlflow_manager.open_ui()
 
 
@@ -22437,28 +22521,68 @@ class ImageAnnotationTool(QMainWindow):
             avg_epoch_time_str = format_time(training_results.get('avg_epoch_time', 0))
             time_info = f"学習時間: {total_time_str} (平均エポック時間: {avg_epoch_time_str})\n"
 
-        # 学習完了メッセージ
-        msg_box = QMessageBox(self)
-        msg_box.setWindowTitle(get_text('dlg_training_complete'))
-        msg_box.setIcon(QMessageBox.Information)
-        msg_box.setText(
-            f"{model_type} ウェイポイントモデルを学習し保存しました: {os.path.basename(training_results['best_model_path'])}\n" +
-            f"最良検証損失: {training_results['best_val_loss']:.6f}\n" +
-            f"実施エポック数: {training_results['completed_epochs']}/{training_config['num_epochs']}\n" +
-            early_stopping_info +
-            time_info +
-            f"ウェイポイント数: {dataset_info['num_waypoints']}\n" +
-            f"学習データ数: {dataset_info['image_paths_count']}枚\n" +
-            f"学習率: {training_config['learning_rate']}\n" +
-            f"バッチサイズ: {training_config['batch_size']}\n" +
-            f"データオーグメンテーション: {'有効' if training_config['use_augmentation'] else '無効'}\n\n" +
-            f"{mlflow_info}"
-        )
-        ok_button = msg_box.addButton(QMessageBox.Ok)
-        mlflow_button = msg_box.addButton(get_text('btn_open_mlflow'), QMessageBox.ActionRole)
-        msg_box.exec_()
+        # 学習完了メッセージ（2カラムレイアウト）
+        dialog = QDialog(self)
+        dialog.setWindowTitle(get_text('dlg_training_complete'))
+        dialog.setMinimumWidth(700)
+        dlg_layout = QVBoxLayout(dialog)
 
-        if msg_box.clickedButton() == mlflow_button:
+        title_label = QLabel(f"{model_type} ウェイポイントモデルを学習し保存しました: {os.path.basename(training_results['best_model_path'])}")
+        title_label.setStyleSheet("font-weight: bold;")
+        dlg_layout.addWidget(title_label)
+
+        columns_layout = QHBoxLayout()
+
+        # 左カラム: 学習結果
+        left_group = QGroupBox("学習結果")
+        left_layout = QVBoxLayout(left_group)
+        left_layout.addWidget(QLabel(f"最良検証損失: {training_results['best_val_loss']:.6f}"))
+        left_layout.addWidget(QLabel(f"実施エポック数: {training_results['completed_epochs']}/{training_config['num_epochs']}"))
+        if early_stopping_info:
+            left_layout.addWidget(QLabel(early_stopping_info.strip()))
+        if time_info:
+            left_layout.addWidget(QLabel(time_info.strip()))
+        left_layout.addWidget(QLabel(f"学習データ数: {dataset_info['image_paths_count']}枚"))
+        left_layout.addStretch()
+
+        # 右カラム: 学習設定
+        right_group = QGroupBox("学習設定")
+        right_layout = QVBoxLayout(right_group)
+        right_layout.addWidget(QLabel(f"ウェイポイント数: {dataset_info['num_waypoints']}"))
+        right_layout.addWidget(QLabel(f"学習率: {training_config['learning_rate']}"))
+        right_layout.addWidget(QLabel(f"バッチサイズ: {training_config['batch_size']}"))
+        right_layout.addWidget(QLabel(f"データオーグメンテーション: {'有効' if training_config['use_augmentation'] else '無効'}"))
+        right_layout.addStretch()
+
+        columns_layout.addWidget(left_group)
+        columns_layout.addWidget(right_group)
+        dlg_layout.addLayout(columns_layout)
+
+        if mlflow_info:
+            mlflow_label = QLabel(mlflow_info)
+            mlflow_label.setWordWrap(True)
+            dlg_layout.addWidget(mlflow_label)
+
+        # ボタン
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        mlflow_button = QPushButton(get_text('btn_open_mlflow'))
+        ok_button = QPushButton("OK")
+        ok_button.setDefault(True)
+        ok_button.clicked.connect(dialog.accept)
+        button_layout.addWidget(mlflow_button)
+        button_layout.addWidget(ok_button)
+        dlg_layout.addLayout(button_layout)
+
+        clicked_mlflow = [False]
+        def on_mlflow_clicked():
+            clicked_mlflow[0] = True
+            dialog.accept()
+        mlflow_button.clicked.connect(on_mlflow_clicked)
+
+        dialog.exec_()
+
+        if clicked_mlflow[0]:
             self.mlflow_manager.open_ui()
 
     def update_location_inference_display(self):

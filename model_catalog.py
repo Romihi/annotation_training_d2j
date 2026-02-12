@@ -68,6 +68,29 @@ def detect_num_outputs_from_checkpoint(weights_path, device='cpu'):
     return num_outputs
 
 
+def detect_input_size_from_checkpoint(weights_path, device='cpu'):
+    """
+    チェックポイントファイルから入力サイズを検出する
+
+    Args:
+        weights_path: 重みファイルのパス
+        device: 読み込みに使用するデバイス
+
+    Returns:
+        tuple or None: 検出された入力サイズ (height, width)、検出できない場合はNone
+    """
+    try:
+        checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
+        if isinstance(checkpoint, dict) and 'input_size' in checkpoint:
+            input_size = checkpoint['input_size']
+            print(f"チェックポイントから入力サイズを検出: {input_size}")
+            return tuple(input_size)
+    except Exception as e:
+        print(f"入力サイズの検出に失敗: {e}")
+
+    return None
+
+
 def load_model_weights(model, weights_path, device):
     """
     モデルの重みを読み込み、指定されたデバイスに移動する

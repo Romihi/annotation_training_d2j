@@ -2,11 +2,14 @@
 # -*- coding: utf-8 -*-
 
 import os
+import sys
 import argparse
 import torch
 import numpy as np
 from pathlib import Path
 import time
+import glob as glob_module
+import re
 
 
 def verify_model_precision(xml_path, expected_precision='FP16'):
@@ -244,16 +247,15 @@ def convert_onnx_to_openvino(onnx_path, output_path=None, precision='FP16'):
         
         # OpenVINOへの変換
         try:
-            from openvino.tools import mo
-            from openvino.runtime import serialize
+            import openvino as ov
         except ImportError:
             print("OpenVINOがインストールされていません。以下のコマンドでインストールしてください:")
-            print("pip install openvino-dev")
+            print("pip install openvino")
             return None
-        
+
         # OpenVINOモデルへの変換
         print("OpenVINO形式に変換しています...")
-        
+
         # Model Optimizerのパラメータ設定
         mo_args = [
             '--input_model', actual_onnx_path,
@@ -308,34 +310,9 @@ def convert_onnx_to_openvino(onnx_path, output_path=None, precision='FP16'):
         else:
             # APIを使用
             try:
-                # 新しいOpenVINO OVC APIを使用（2023.2以降推奨）
-                try:
-                    import openvino as ov
-                    use_ovc = True
-                except ImportError:
-                    from openvino.tools import mo
-                    use_ovc = False
-                
-                from openvino.runtime import Core
-                
-                if use_ovc:
-                    # OVC（新しいAPI）を使用
-                    print(f"OVC APIを使用して変換しています（精度: {precision}）...")
-                    ov_model = ov.convert_model(actual_onnx_path)
-                    
-                    from openvino import save_model
-                    save_model(ov_model, f"{output_path}.xml", compress_to_fp16=(precision == 'FP16'))
-                else:
-                    # 旧API（mo.convert_model）を使用
-                    print(f"MO APIを使用して変換しています（精度: {precision}）...")
-                    mo_result = mo.convert_model(
-                        actual_onnx_path,
-                        compress_to_fp16=(precision == 'FP16')
-                    )
-                    
-                    # モデルを保存
-                    from openvino.runtime import serialize
-                    serialize(mo_result, f"{output_path}.xml", f"{output_path}.bin")
+                print(f"OVC APIを使用して変換しています（精度: {precision}）...")
+                ov_model = ov.convert_model(actual_onnx_path)
+                ov.save_model(ov_model, f"{output_path}.xml", compress_to_fp16=(precision == 'FP16'))
                 
             except Exception as e:
                 # CLIコマンド経由での実行を試みる
@@ -618,13 +595,12 @@ def convert_pytorch_to_openvino(model_path, model_type, output_path=None, input_
         
         # OpenVINOへの変換
         try:
-            from openvino.tools import mo
-            from openvino.runtime import serialize
+            import openvino as ov
         except ImportError:
             print("OpenVINOがインストールされていません。以下のコマンドでインストールしてください:")
-            print("pip install openvino-dev")
+            print("pip install openvino")
             return None
-        
+
         # 一時的にONNXファイルを作成（OpenVINOはONNX経由で変換）
         temp_onnx_path = os.path.splitext(model_path)[0] + "_temp.onnx"
         
@@ -646,7 +622,8 @@ def convert_pytorch_to_openvino(model_path, model_type, output_path=None, input_
             do_constant_folding=True,
             input_names=['input'],
             output_names=['output'],
-            dynamic_axes=dynamic_axes
+            dynamic_axes=dynamic_axes,
+            dynamo=False
         )
         
         print("ONNX中間ファイルを作成しました")
@@ -744,34 +721,9 @@ def convert_pytorch_to_openvino(model_path, model_type, output_path=None, input_
         else:
             # APIを使用
             try:
-                # 新しいOpenVINO OVC APIを使用（2023.2以降推奨）
-                try:
-                    import openvino as ov
-                    use_ovc = True
-                except ImportError:
-                    from openvino.tools import mo
-                    use_ovc = False
-                
-                from openvino.runtime import Core
-                
-                if use_ovc:
-                    # OVC（新しいAPI）を使用
-                    print(f"OVC APIを使用して変換しています（精度: {precision}）...")
-                    ov_model = ov.convert_model(temp_onnx_path)
-                    
-                    from openvino import save_model
-                    save_model(ov_model, f"{output_path}.xml", compress_to_fp16=(precision == 'FP16'))
-                else:
-                    # 旧API（mo.convert_model）を使用
-                    print(f"MO APIを使用して変換しています（精度: {precision}）...")
-                    mo_result = mo.convert_model(
-                        temp_onnx_path,
-                        compress_to_fp16=(precision == 'FP16')
-                    )
-                    
-                    # モデルを保存
-                    from openvino.runtime import serialize
-                    serialize(mo_result, f"{output_path}.xml", f"{output_path}.bin")
+                print(f"OVC APIを使用して変換しています（精度: {precision}）...")
+                ov_model = ov.convert_model(temp_onnx_path)
+                ov.save_model(ov_model, f"{output_path}.xml", compress_to_fp16=(precision == 'FP16'))
                 
             except Exception as e:
                 # CLIコマンド経由での実行を試みる
@@ -1462,7 +1414,409 @@ def quantize_to_int8(model_path, output_path, calibration_dir, input_size=(224, 
     return xml_path
 
 
+def detect_model_type_from_filename(filename):
+    """
+    ファイル名からモデルタイプを自動検出する
+
+    Args:
+        filename: モデルファイル名（パスでも可）
+
+    Returns:
+        検出されたモデルタイプ文字列、検出できない場合はNone
+    """
+    basename = os.path.basename(filename).lower()
+
+    # MODEL_REGISTRYのキーを長い順にソートして、最長一致で検出する
+    # （例: "edgenext_xx_small" が "edgenext_x_small" より先にマッチするように）
+    known_types = [
+        # 長いキーを先に（部分一致を避けるため）
+        "swin_moe_tiny_patch4_window7_224",
+        "swin_tiny_patch4_window7_224",
+        "swinv2_cr_tiny_ns_224",
+        "mobilenetv4_conv_small",
+        "mobilenetv3_small_100",
+        "mobilenetv3_large_100",
+        "shufflenetv2_x0_5",
+        "swin_s3_tiny_224",
+        "efficientformer_l1",
+        "edgenext_xx_small",
+        "edgenext_x_small",
+        "efficientnet_lite0",
+        "efficientnetv2_s",
+        "resnet18_location",
+        "resnet18_waypoint",
+        "donkey_waypoint",
+        "donkey_location",
+        "mobilevitv2_050",
+        "mobilevit_xxs",
+        "mobilevit_xs",
+        "efficientnet_b0",
+        "convnext_nano",
+        "convnext_tiny",
+        "mobileone_s0",
+        "ghostnet_050",
+        "mobilevit_s",
+        "donkeycar",
+        "donkey_fcn",
+        "swin_tiny",
+        "resnet18",
+        "resnet34",
+        "yolo11n",
+        "yolo11s",
+        "yolo11m",
+        "yolo11l",
+        "yolo11x",
+    ]
+
+    for model_type in known_types:
+        # ファイル名の先頭部分にモデルタイプが含まれているかチェック
+        # 例: "edgenext_xx_small_20260207_144757.pth" → "edgenext_xx_small"
+        if basename.startswith(model_type):
+            return model_type
+
+    # "donkeycar" の短縮形として "donkey" で始まるファイル名もチェック
+    # （donkey_location, donkey_waypoint, donkey_fcn に該当しなかった場合）
+    if basename.startswith("donkey"):
+        return "donkeycar"
+
+    return None
+
+
+def interactive_mode():
+    """
+    引数なしで実行された場合のインタラクティブモード
+    modelsフォルダからモデルを選択し、変換パラメータをユーザーに入力させる
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_dir = os.path.dirname(script_dir)
+    models_dir = os.path.join(project_dir, "models")
+
+    print("=" * 60)
+    print("  OpenVINO変換ツール（インタラクティブモード）")
+    print("=" * 60)
+
+    # modelsフォルダの存在確認
+    if not os.path.isdir(models_dir):
+        print(f"\nエラー: modelsフォルダが見つかりません: {models_dir}")
+        print("modelsフォルダを作成してモデルファイルを配置してください。")
+        return
+
+    # 対象ファイルの収集
+    supported_extensions = ['.pth', '.pt', '.onnx', '.xml']
+    model_files = []
+    for ext in supported_extensions:
+        model_files.extend(glob_module.glob(os.path.join(models_dir, f"*{ext}")))
+
+    # ファイル名でソート
+    model_files.sort(key=lambda f: os.path.basename(f).lower())
+
+    if not model_files:
+        print(f"\nエラー: modelsフォルダにモデルファイルが見つかりません: {models_dir}")
+        print(f"サポートされている形式: {', '.join(supported_extensions)}")
+        return
+
+    # モデルファイル一覧の表示
+    print(f"\nmodelsフォルダ: {models_dir}")
+    print(f"見つかったモデルファイル: {len(model_files)}個\n")
+
+    for i, filepath in enumerate(model_files, 1):
+        basename = os.path.basename(filepath)
+        ext = os.path.splitext(basename)[1]
+        size_mb = os.path.getsize(filepath) / 1024 / 1024
+        detected_type = detect_model_type_from_filename(basename)
+        type_str = f"  [{detected_type}]" if detected_type else ""
+        print(f"  {i:3d}. {basename}  ({size_mb:.1f} MB){type_str}")
+
+    # モデル選択
+    print()
+    while True:
+        try:
+            choice = input("変換するモデルの番号を入力してください (q=終了): ").strip()
+            if choice.lower() == 'q':
+                print("終了します。")
+                return
+            choice_num = int(choice)
+            if 1 <= choice_num <= len(model_files):
+                break
+            print(f"1〜{len(model_files)} の番号を入力してください。")
+        except ValueError:
+            print("数字を入力してください。")
+
+    selected_path = model_files[choice_num - 1]
+    selected_name = os.path.basename(selected_path)
+    file_ext = os.path.splitext(selected_name)[1].lower()
+
+    print(f"\n選択されたモデル: {selected_name}")
+
+    # モデルタイプの自動検出・入力（PyTorchモデルの場合）
+    model_type = None
+    if file_ext in ['.pth', '.pt']:
+        detected_type = detect_model_type_from_filename(selected_name)
+        if detected_type:
+            print(f"モデルタイプを自動検出しました: {detected_type}")
+            confirm = input(f"このモデルタイプで続行しますか？ (Y/n): ").strip()
+            if confirm.lower() not in ('n', 'no'):
+                model_type = detected_type
+
+        if model_type is None:
+            print("\nモデルタイプを入力してください。")
+            print("利用可能なモデルタイプの例:")
+            print("  donkeycar, resnet18, resnet34, edgenext_xx_small,")
+            print("  mobilevit_xxs, efficientnet_lite0, convnext_nano,")
+            print("  yolo11n, yolo11s, donkey_location, resnet18_location, ...")
+            while True:
+                model_type = input("モデルタイプ: ").strip()
+                if model_type:
+                    break
+                print("モデルタイプを入力してください。")
+
+    # YOLOモデル判定
+    is_yolo = False
+    if model_type and 'yolo' in model_type.lower():
+        is_yolo = True
+    elif 'yolo' in selected_name.lower():
+        is_yolo = True
+
+    # 精度の選択
+    print("\n変換精度を選択してください:")
+    print("  1. FP16（推奨 - 高速・省メモリ）")
+    print("  2. FP32（高精度）")
+    print("  3. INT8（最高速・要キャリブレーションデータ）")
+
+    precision_map = {'1': 'FP16', '2': 'FP32', '3': 'INT8'}
+    while True:
+        precision_choice = input("精度 [1=FP16(デフォルト)/2=FP32/3=INT8]: ").strip()
+        if precision_choice == '':
+            precision = 'FP16'
+            break
+        if precision_choice in precision_map:
+            precision = precision_map[precision_choice]
+            break
+        print("1, 2, 3 のいずれかを入力してください。")
+
+    print(f"選択された精度: {precision}")
+
+    # INT8の場合、キャリブレーションディレクトリを要求
+    calibration_dir = None
+    num_calibration_samples = 100
+    sample_interval = 10
+    if precision == 'INT8':
+        print("\nINT8量子化にはキャリブレーション画像が必要です。")
+        while True:
+            calibration_dir = input("キャリブレーション画像のディレクトリパス: ").strip()
+            if calibration_dir and os.path.isdir(calibration_dir):
+                break
+            if calibration_dir:
+                print(f"ディレクトリが見つかりません: {calibration_dir}")
+            else:
+                print("パスを入力してください。")
+
+        samples_input = input(f"キャリブレーションサンプル数 [{num_calibration_samples}]: ").strip()
+        if samples_input:
+            try:
+                num_calibration_samples = int(samples_input)
+            except ValueError:
+                print(f"無効な入力です。デフォルト値 {num_calibration_samples} を使用します。")
+
+        interval_input = input(f"サンプリング間隔 [{sample_interval}]: ").strip()
+        if interval_input:
+            try:
+                sample_interval = int(interval_input)
+            except ValueError:
+                print(f"無効な入力です。デフォルト値 {sample_interval} を使用します。")
+
+    # 入力サイズの取得
+    width = 224
+    height = 224
+    yolo_input_size = 640
+
+    if is_yolo:
+        size_input = input(f"\nYOLO入力画像サイズ [{yolo_input_size}]: ").strip()
+        if size_input:
+            try:
+                yolo_input_size = int(size_input)
+            except ValueError:
+                print(f"無効な入力です。デフォルト値 {yolo_input_size} を使用します。")
+    elif file_ext in ['.pth', '.pt']:
+        # チェックポイントから学習時の入力サイズを読み取る
+        checkpoint_input_size = None
+        try:
+            checkpoint = torch.load(selected_path, map_location='cpu', weights_only=False)
+            if isinstance(checkpoint, dict):
+                if 'input_size' in checkpoint:
+                    checkpoint_input_size = tuple(checkpoint['input_size'])
+                elif 'model_input_size' in checkpoint:
+                    checkpoint_input_size = tuple(checkpoint['model_input_size'])
+        except Exception:
+            pass
+
+        if checkpoint_input_size:
+            height, width = checkpoint_input_size
+            print(f"\nチェックポイントから入力サイズを検出: {height}x{width}")
+        else:
+            # フォールバック: model_infoからデフォルトサイズを取得
+            try:
+                sys.path.insert(0, project_dir)
+                from model_info import get_model_input_size
+                default_size = get_model_input_size(model_type)
+                height, width = default_size
+                print(f"\nモデルのデフォルト入力サイズ: {height}x{width}")
+            except Exception:
+                pass
+
+        size_input = input(f"入力画像サイズ (高さx幅) [{height}x{width}]: ").strip()
+        if size_input:
+            try:
+                parts = re.split(r'[x,\s]+', size_input)
+                if len(parts) == 2:
+                    height = int(parts[0])
+                    width = int(parts[1])
+                elif len(parts) == 1:
+                    height = width = int(parts[0])
+            except ValueError:
+                print(f"無効な入力です。デフォルト値 {height}x{width} を使用します。")
+
+    # 変換確認
+    print("\n" + "=" * 60)
+    print("変換設定の確認")
+    print("=" * 60)
+    print(f"  モデルファイル: {selected_name}")
+    if model_type:
+        print(f"  モデルタイプ:   {model_type}")
+    print(f"  精度:           {precision}")
+    if is_yolo:
+        print(f"  入力サイズ:     {yolo_input_size}")
+    elif file_ext in ['.pth', '.pt']:
+        print(f"  入力サイズ:     {height}x{width}")
+    if calibration_dir:
+        print(f"  キャリブレーション: {calibration_dir}")
+        print(f"  サンプル数:     {num_calibration_samples}")
+        print(f"  サンプリング間隔: {sample_interval}")
+    print("=" * 60)
+
+    confirm = input("\nこの設定で変換を開始しますか？ (Y/n): ").strip()
+    if confirm.lower() in ('n', 'no'):
+        print("変換を中止しました。")
+        return
+
+    print()
+
+    # 変換実行（既存のロジックと同等）
+    output_path = None
+
+    if file_ext == '.xml':
+        if precision != 'INT8':
+            print("OpenVINOモデル（.xml）が指定されました。")
+            print("既存のOpenVINOモデルに対しては、INT8量子化のみサポートしています。")
+            return
+
+        quantize_to_int8(
+            model_path=selected_path,
+            output_path=output_path,
+            calibration_dir=calibration_dir,
+            input_size=(height, width),
+            num_samples=num_calibration_samples,
+            sample_interval=sample_interval
+        )
+    elif file_ext == '.onnx':
+        if precision == 'INT8':
+            print("ONNXモデルをINT8に変換します（FP16変換 → INT8量子化）")
+            fp16_output = os.path.splitext(selected_path)[0] + "_openvino"
+            xml_path = convert_onnx_to_openvino(
+                onnx_path=selected_path,
+                output_path=fp16_output,
+                precision='FP16'
+            )
+            if xml_path:
+                int8_output = fp16_output + "_int8"
+                quantize_to_int8(
+                    model_path=xml_path,
+                    output_path=int8_output,
+                    calibration_dir=calibration_dir,
+                    input_size=(height, width),
+                    num_samples=num_calibration_samples,
+                    sample_interval=sample_interval
+                )
+        else:
+            convert_onnx_to_openvino(
+                onnx_path=selected_path,
+                output_path=output_path,
+                precision=precision
+            )
+    elif file_ext in ['.pth', '.pt']:
+        if is_yolo:
+            print("YOLOモデルを検出しました。")
+            if precision == 'INT8':
+                print("YOLOモデルをINT8に変換します（FP16変換 → INT8量子化）")
+                fp16_output = os.path.splitext(selected_path)[0] + "_openvino"
+                xml_path = convert_yolo_to_openvino(
+                    model_path=selected_path,
+                    output_path=fp16_output,
+                    input_size=yolo_input_size,
+                    precision='FP16'
+                )
+                if xml_path:
+                    int8_output = fp16_output + "_int8"
+                    quantize_to_int8(
+                        model_path=xml_path,
+                        output_path=int8_output,
+                        calibration_dir=calibration_dir,
+                        input_size=(yolo_input_size, yolo_input_size),
+                        num_samples=num_calibration_samples,
+                        sample_interval=sample_interval
+                    )
+            else:
+                convert_yolo_to_openvino(
+                    model_path=selected_path,
+                    output_path=output_path,
+                    input_size=yolo_input_size,
+                    precision=precision
+                )
+        else:
+            print("PyTorchモデルを検出しました。")
+            if not model_type:
+                print("エラー: PyTorchモデルの場合はモデルタイプが必須です。")
+                return
+
+            if precision == 'INT8':
+                print("PyTorchモデルをINT8に変換します（FP16変換 → INT8量子化）")
+                fp16_output = os.path.splitext(selected_path)[0] + "_openvino"
+                xml_path = convert_pytorch_to_openvino(
+                    model_path=selected_path,
+                    model_type=model_type,
+                    output_path=fp16_output,
+                    input_size=(height, width),
+                    precision='FP16'
+                )
+                if xml_path:
+                    int8_output = fp16_output + "_int8"
+                    quantize_to_int8(
+                        model_path=xml_path,
+                        output_path=int8_output,
+                        calibration_dir=calibration_dir,
+                        input_size=(height, width),
+                        num_samples=num_calibration_samples,
+                        sample_interval=sample_interval
+                    )
+            else:
+                convert_pytorch_to_openvino(
+                    model_path=selected_path,
+                    model_type=model_type,
+                    output_path=output_path,
+                    input_size=(height, width),
+                    precision=precision
+                )
+    else:
+        print(f"エラー: サポートされていないファイル形式です: {file_ext}")
+        print("サポートされている形式: .pth, .pt, .onnx, .xml")
+
+
 def main():
+    # 引数なしで実行された場合はインタラクティブモードを起動
+    if len(sys.argv) == 1:
+        interactive_mode()
+        return
+
     parser = argparse.ArgumentParser(description='PyTorch、YOLO、またはONNXモデルをOpenVINO形式に変換するスクリプト')
     parser.add_argument('--model_path', type=str, required=True, help='変換するモデルのパス（.pth, .pt, .onnx, .xml）')
     parser.add_argument('--model_type', type=str, help='モデルタイプ (例: resnet18, yolo) - PyTorchモデルの場合は必須')
@@ -1512,7 +1866,7 @@ def main():
             print("\n使用例:")
             print(f"  python {os.path.basename(__file__)} --model_path {args.model_path} --precision INT8 --calibration_dir /path/to/images")
             return
-        
+
         quantize_to_int8(
             model_path=args.model_path,
             output_path=args.output_path,

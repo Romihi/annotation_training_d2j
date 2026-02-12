@@ -13,7 +13,7 @@ APP_DIR_PATH = os.path.dirname(os.path.abspath(__file__))
 # 言語設定
 # ===========================================
 # 'ja' = 日本語, 'en' = English
-LANGUAGE = 'en'
+LANGUAGE = 'ja'
 
 # ディレクトリ名
 SESSION_DIR_NAME = "sessions"
