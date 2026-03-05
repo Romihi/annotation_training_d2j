@@ -136,7 +136,7 @@ TRANSLATIONS = {
         'btn_create_video': 'アノテーション動画作成',
 
         # --- 自動運転モデル ---
-        'btn_train_save': 'モデル学習・保存',
+        'btn_train_save': '学習・保存',
         'btn_load_model': 'モデル読込',
         'btn_auto_annotate': 'オートアノテーション実行',
         'btn_batch_inference': '全画像を推論',
@@ -145,8 +145,8 @@ TRANSLATIONS = {
         'btn_load_yolo_annotation': 'YOLOアノテーション読込',
         'btn_preset': 'プリセット',
         'btn_apply': '反映',
-        'btn_train_yolo': 'YOLO学習・保存',
-        'btn_yolo_auto_annotate': 'YOLO オートアノテーション実行',
+        'btn_train_yolo': '学習・保存',
+        'btn_yolo_auto_annotate': 'YOLO オートアノテーション',
 
         # --- モデル管理 ---
         'btn_open_mlflow': 'MLflowを開く',
@@ -200,6 +200,8 @@ TRANSLATIONS = {
         'label_colab_integration': 'Google Colab連携',
 
         # --- ナビゲーション ---
+        'label_canvas_zoom_label': 'ズーム',
+        'label_canvas_zoom_tooltip': 'キャンバスのズーム倍率を調整',
         'label_image_seek': '画像シーク:',
         'label_play': '再生:',
         'label_delete_restore': '削除/復元:',
@@ -1569,6 +1571,8 @@ Google Cloud Console での OAuth設定手順
         'label_colab_integration': 'Google Colab Integration',
 
         # --- Navigation ---
+        'label_canvas_zoom_label': 'Zoom',
+        'label_canvas_zoom_tooltip': 'Adjust canvas zoom level',
         'label_image_seek': 'Image Seek:',
         'label_play': 'Play:',
         'label_delete_restore': 'Delete/Restore:',
@@ -2909,6 +2913,8 @@ _KEY_MAPPING = {
     'mlflow_local': 'label_mlflow_local',
     'databricks_integration': 'label_databricks_integration',
     'colab_integration': 'label_colab_integration',
+    'canvas_zoom_label': 'label_canvas_zoom_label',
+    'canvas_zoom_tooltip': 'label_canvas_zoom_tooltip',
     'image_seek': 'label_image_seek',
     'play': 'label_play',
     'delete_restore': 'label_delete_restore',

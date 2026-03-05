@@ -936,16 +936,16 @@ class ImageLabel(QLabel):
             elif i % 2 == 0:
                 painter.drawText(int(x_pos) - 15, target_rect.y() - 5, f"{value:.1f}")
 
-        painter.drawText(target_rect.x() - 35, target_rect.y() + 15, "1")
-        painter.drawText(target_rect.x() - 35, target_rect.y() + target_rect.height(), "-1")
+        painter.drawText(target_rect.x() - 50, target_rect.y() + 15, "1")
+        painter.drawText(target_rect.x() - 50, target_rect.y() + target_rect.height(), "-1")
 
         for i in range(1, grid_size):
             value = 1 - (2.0 * i / grid_size)
             y_pos = target_rect.y() + i * step_y
             if abs(value) < 0.1:
-                painter.drawText(target_rect.x() - 35, int(y_pos) + 5, "0")
+                painter.drawText(target_rect.x() - 50, int(y_pos) + 5, "0")
             elif i % 2 == 0:
-                painter.drawText(target_rect.x() - 35, int(y_pos) + 5, f"{value:.1f}")
+                painter.drawText(target_rect.x() - 50, int(y_pos) + 5, f"{value:.1f}")
 
     def draw_control_points(self, painter: QPainter, target_rect: QRect):
         """アノテーション点、推論点、ベクトル矢印を描画"""
@@ -956,7 +956,7 @@ class ImageLabel(QLabel):
         pix_height = self.pixmap().height()
 
         # 赤：アノテーション点（教師データ）- 現在のフレーム（最初に描画）
-        if self.annotation_point:
+        if self.annotation_point is not None:
             rel_x = self.annotation_point.x() / pix_width
             rel_y = self.annotation_point.y() / pix_height
             scaled_x = int(target_rect.x() + rel_x * target_rect.width())
@@ -1028,7 +1028,7 @@ class ImageLabel(QLabel):
                         painter.drawEllipse(future_scaled_x - size // 2, future_scaled_y - size // 2, size, size)
 
         # 明るい水色：推論点（推論結果）
-        if self.show_inference and self.inference_point:
+        if self.show_inference and self.inference_point is not None:
             rel_x = self.inference_point.x() / pix_width
             rel_y = self.inference_point.y() / pix_height
             scaled_x = int(target_rect.x() + rel_x * target_rect.width())
@@ -1040,7 +1040,7 @@ class ImageLabel(QLabel):
 
             # 緑のベクトル：教師 → 推論
             if (
-                self.annotation_point and
+                self.annotation_point is not None and
                 hasattr(self.main_window, 'inference_diff_vectors') and
                 hasattr(self.main_window, 'show_diff_vectors') and
                 self.main_window.show_diff_vectors
@@ -3580,24 +3580,16 @@ class ImageAnnotationTool(QMainWindow):
         self.folder_input.setMaximumWidth(400)
         toolbar.addWidget(self.folder_input)
 
-        # 参照ボタン
-        browse_button = QPushButton("...")
-        browse_button.setMaximumWidth(30)
-        browse_button.clicked.connect(self.browse_folder)
-        browse_button.setToolTip(get_text('browse'))
-        toolbar.addWidget(browse_button)
-
-        # 画像を読込ボタン
+        # 画像を読込ボタン（フォルダ選択→画像読み込みを統合）
         self.load_button = QPushButton(f"📂 {get_text('load_images')}")
-        self.load_button.clicked.connect(self.load_images)
-        self.load_button.setEnabled(False)
+        self.load_button.clicked.connect(self.browse_folder)
         self.load_button.setStyleSheet("padding: 4px 8px;")
         apply_style(self.load_button, 'primary')
         toolbar.addWidget(self.load_button)
 
         # アノテーションデータを読込ボタン
         self.load_annotation_button = QPushButton(f"🔴 {get_text('load_annotations')}")
-        self.load_annotation_button.clicked.connect(self.load_annotations)
+        self.load_annotation_button.clicked.connect(self._show_load_menu)
         self.load_annotation_button.setEnabled(False)
         self.load_annotation_button.setStyleSheet("padding: 4px 8px;")
         apply_style(self.load_annotation_button, 'primary')
@@ -3753,6 +3745,21 @@ class ImageAnnotationTool(QMainWindow):
             self.folder_input.setText(folder)
             self.load_images()
 
+    def _show_load_menu(self):
+        """読み込みメニューを表示"""
+        from PyQt5.QtWidgets import QMenu
+        menu = QMenu(self)
+
+        driving_action = menu.addAction(f"🔴 {get_text('load_annotations')}")
+        driving_action.triggered.connect(self.load_annotations)
+
+        yolo_action = menu.addAction(f"📦 {get_text('load_yolo_annotation')}")
+        yolo_action.triggered.connect(self.load_yolo_annotations)
+
+        # ボタンの下にメニューを表示
+        button = self.load_annotation_button
+        menu.exec_(button.mapToGlobal(button.rect().bottomLeft()))
+
     def _show_save_menu(self):
         """保存メニューを表示"""
         from PyQt5.QtWidgets import QMenu
@@ -3901,16 +3908,11 @@ class ImageAnnotationTool(QMainWindow):
 
         pilot_layout.addLayout(inference_layout)
 
-        # 差分ベクトル表示オプション
-        diff_vector_layout = QHBoxLayout()
+        # 差分ベクトル表示チェックボックス（UIには表示しないが内部で参照されるため保持）
         self.diff_vector_checkbox = QCheckBox(get_text('show_diff_vector'))
         self.diff_vector_checkbox.setChecked(False)
-        self.diff_vector_checkbox.setEnabled(False)  # 初期状態は無効
-        self.diff_vector_checkbox.setToolTip(get_text('model_not_loaded'))
+        self.diff_vector_checkbox.setEnabled(False)
         self.diff_vector_checkbox.stateChanged.connect(self.toggle_diff_vector_display)
-        diff_vector_layout.addWidget(self.diff_vector_checkbox)
-
-        pilot_layout.addLayout(diff_vector_layout)
 
         # CAM表示オプション - 1行レイアウト
         gradcam_row = QHBoxLayout()
@@ -3977,12 +3979,6 @@ class ImageAnnotationTool(QMainWindow):
         obj_detection_label.setStyleSheet("font-weight: bold")
         obj_detection_layout.addWidget(obj_detection_label)
 
-        # YOLOアノテーション読み込みボタン
-        load_yolo_btn = QPushButton(get_text('load_yolo_annotation'))
-        load_yolo_btn.clicked.connect(self.load_yolo_annotations)
-        apply_style(load_yolo_btn, 'primary')
-        obj_detection_layout.addWidget(load_yolo_btn)
-
         # クラス入力フィールド
         classes_layout = QHBoxLayout()
         class_label = QLabel(get_text('detection_classes'))
@@ -4026,7 +4022,7 @@ class ImageAnnotationTool(QMainWindow):
 
         self.yolo_unified_model_combo = QComboBox()
         self.yolo_unified_model_combo.setMinimumWidth(180)
-        self.yolo_unified_model_combo.setStyleSheet("combobox-popup: 0; font-size: 12px;")
+        self.yolo_unified_model_combo.setStyleSheet("combobox-popup: 0;")
         obj_detection_layout.addWidget(self.yolo_unified_model_combo)
 
         # 初期モデルリストを読み込み
@@ -4058,16 +4054,13 @@ class ImageAnnotationTool(QMainWindow):
         apply_style(self.yolo_auto_annotate_btn, 'special')
         obj_detection_layout.addWidget(self.yolo_auto_annotate_btn)
 
-        # 推論結果表示オプション
-        inference_layout = QHBoxLayout()
-
         # 物体検知推論結果表示チェックボックス
         self.detection_inference_checkbox = QCheckBox(get_text('show_detection_inference'))
         self.detection_inference_checkbox.setChecked(False)
         self.detection_inference_checkbox.setEnabled(False)
         self.detection_inference_checkbox.setToolTip(get_text('detection_model_not_loaded'))
         self.detection_inference_checkbox.stateChanged.connect(self.toggle_detection_inference_display)
-        inference_layout.addWidget(self.detection_inference_checkbox)
+        obj_detection_layout.addWidget(self.detection_inference_checkbox)
 
         # セグメンテーション推論結果表示チェックボックス
         self.segmentation_inference_checkbox = QCheckBox(get_text('show_segmentation_inference'))
@@ -4075,18 +4068,16 @@ class ImageAnnotationTool(QMainWindow):
         self.segmentation_inference_checkbox.setEnabled(False)
         self.segmentation_inference_checkbox.setToolTip(get_text('segmentation_model_not_loaded'))
         self.segmentation_inference_checkbox.stateChanged.connect(self.toggle_segmentation_inference_display)
-        inference_layout.addWidget(self.segmentation_inference_checkbox)
+        obj_detection_layout.addWidget(self.segmentation_inference_checkbox)
 
-        obj_detection_layout.addLayout(inference_layout)
+        # 物体検知コンテナを追加
+        left_layout.addWidget(self.object_detection_container)
 
-        # 位置推論モデル追加（left_layoutが確実に存在する段階で呼び出し）
+        # 位置推論モデル追加
         self.add_location_model_section()
 
         # ウェイポイントモデル追加
         self.add_waypoint_model_section()
-
-        # 物体検知コンテナを追加
-        left_layout.addWidget(self.object_detection_container)
 
         # --- モデル管理セクションは右上ツールバーに移動済み ---
         # 内部で使用する変数のみ初期化（UIには表示しない）
@@ -4222,11 +4213,40 @@ class ImageAnnotationTool(QMainWindow):
         # メインイメージの周りにマージンを調整 - 左側マージンを0に変更（情報パネルを別ウィジェットにしたため）
         main_image_container = QVBoxLayout()
         main_image_container.setContentsMargins(0, 0, 0, 0)  # マージンを0に変更
-        
+
+        # 画像とズームスライダーを横に並べるレイアウト
+        image_and_slider_layout = QHBoxLayout()
+        image_and_slider_layout.setContentsMargins(0, 0, 0, 0)
+        image_and_slider_layout.setSpacing(2)
+
         self.main_image_view = ImageLabel(main_window=self)
         self.main_image_view.setMinimumSize(800, 600)
         self.main_image_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        main_image_container.addWidget(self.main_image_view, 1)  # ストレッチファクター1で拡張
+        image_and_slider_layout.addWidget(self.main_image_view, 1)  # ストレッチファクター1で拡張
+
+        # キャンバスサイズ調整用の縦スライダー（画像の右側）
+        zoom_slider_container = QVBoxLayout()
+        zoom_slider_container.setContentsMargins(0, 0, 0, 0)
+        zoom_slider_container.setSpacing(2)
+
+        zoom_label = QLabel(get_text('canvas_zoom_label'))
+        zoom_label.setAlignment(Qt.AlignCenter)
+        zoom_slider_container.addWidget(zoom_label)
+
+        self.canvas_zoom_slider = QSlider(Qt.Vertical)
+        self.canvas_zoom_slider.setMinimum(10)   # zoom_factor 1.0
+        self.canvas_zoom_slider.setMaximum(50)   # zoom_factor 5.0
+        self.canvas_zoom_slider.setValue(int(DEFAULT_ZOOM_FACTOR * 10))  # デフォルト値
+        self.canvas_zoom_slider.setTickPosition(QSlider.TicksLeft)
+        self.canvas_zoom_slider.setTickInterval(5)
+        self.canvas_zoom_slider.setFixedWidth(30)
+        self.canvas_zoom_slider.setToolTip(get_text('canvas_zoom_tooltip'))
+        self.canvas_zoom_slider.valueChanged.connect(self._on_canvas_zoom_changed)
+        zoom_slider_container.addWidget(self.canvas_zoom_slider)
+
+        image_and_slider_layout.addLayout(zoom_slider_container)
+
+        main_image_container.addLayout(image_and_slider_layout, 1)
 
         # ナビゲーションコントロールをメイン画像の下に配置
         nav_container = QWidget()
@@ -4350,21 +4370,26 @@ class ImageAnnotationTool(QMainWindow):
 
         nav_container_layout.addLayout(clip_layout)
 
-        # ダウンサンプリング機能（直進時データの間引き）
-        downsample_layout = QHBoxLayout()
-        downsample_layout.addWidget(QLabel(get_text('downsampling')))
+        # ダウンサンプリング機能（直進時データの間引き）- GridLayoutで縦位置を揃える
+        downsample_grid = QGridLayout()
+        downsample_grid.setSpacing(4)
 
-        # angle範囲設定
-        downsample_layout.addWidget(QLabel(get_text('angle_range')))
+        # --- Row 0: Angle ---
+        col = 0
+        downsample_grid.addWidget(QLabel(get_text('downsampling')), 0, col); col += 1
+
+        downsample_grid.addWidget(QLabel(get_text('angle_range')), 0, col); col += 1
         self.downsample_angle_min = QDoubleSpinBox()
         self.downsample_angle_min.setRange(-1.0, 1.0)
         self.downsample_angle_min.setValue(-0.05)
         self.downsample_angle_min.setSingleStep(0.05)
         self.downsample_angle_min.setDecimals(2)
         self.downsample_angle_min.setFixedWidth(60)
-        downsample_layout.addWidget(self.downsample_angle_min)
+        downsample_grid.addWidget(self.downsample_angle_min, 0, col); col += 1
 
-        downsample_layout.addWidget(QLabel("~"))
+        tilde_label_angle = QLabel("~")
+        tilde_label_angle.setAlignment(Qt.AlignCenter)
+        downsample_grid.addWidget(tilde_label_angle, 0, col); col += 1
 
         self.downsample_angle_max = QDoubleSpinBox()
         self.downsample_angle_max.setRange(-1.0, 1.0)
@@ -4372,27 +4397,24 @@ class ImageAnnotationTool(QMainWindow):
         self.downsample_angle_max.setSingleStep(0.05)
         self.downsample_angle_max.setDecimals(2)
         self.downsample_angle_max.setFixedWidth(60)
-        downsample_layout.addWidget(self.downsample_angle_max)
+        downsample_grid.addWidget(self.downsample_angle_max, 0, col); col += 1
 
-        # 連続フレーム数
-        downsample_layout.addWidget(QLabel(get_text('consecutive')))
+        downsample_grid.addWidget(QLabel(get_text('consecutive')), 0, col); col += 1
         self.downsample_consecutive = QSpinBox()
         self.downsample_consecutive.setRange(2, 100)
         self.downsample_consecutive.setValue(10)
         self.downsample_consecutive.setFixedWidth(50)
         self.downsample_consecutive.setToolTip(get_text('consecutive_tooltip'))
-        downsample_layout.addWidget(self.downsample_consecutive)
+        downsample_grid.addWidget(self.downsample_consecutive, 0, col); col += 1
 
-        # 残す間隔
-        downsample_layout.addWidget(QLabel(get_text('interval')))
+        downsample_grid.addWidget(QLabel(get_text('interval')), 0, col); col += 1
         self.downsample_keep_every = QSpinBox()
         self.downsample_keep_every.setRange(0, 20)
         self.downsample_keep_every.setValue(3)
         self.downsample_keep_every.setFixedWidth(50)
         self.downsample_keep_every.setToolTip(get_text('interval_tooltip'))
-        downsample_layout.addWidget(self.downsample_keep_every)
+        downsample_grid.addWidget(self.downsample_keep_every, 0, col); col += 1
 
-        # 検出ボタン
         self.detect_downsample_button = QPushButton(get_text('detect'))
         self.detect_downsample_button.clicked.connect(self.detect_downsampling_targets)
         self.detect_downsample_button.setToolTip(get_text('detect_tooltip'))
@@ -4409,33 +4431,27 @@ class ImageAnnotationTool(QMainWindow):
                 background-color: #3a7fc8;
             }
         """)
-        downsample_layout.addWidget(self.detect_downsample_button)
+        downsample_grid.addWidget(self.detect_downsample_button, 0, col); col += 1
 
-        # ダウンサンプリング数表示ラベル
         self.downsample_count_label = QLabel(get_text('items', 0))
         self.downsample_count_label.setStyleSheet("color: #3366ff;")
-        downsample_layout.addWidget(self.downsample_count_label)
+        downsample_grid.addWidget(self.downsample_count_label, 0, col); col += 1
 
-        # 左揃えにするためストレッチを追加
-        downsample_layout.addStretch()
+        # --- Row 1: Throttle ---
+        col = 1  # col 0 は空（"ダウンサンプリング"ラベルの下）
 
-        nav_container_layout.addLayout(downsample_layout)
-
-        # Throttleダウンサンプリング機能（低速走行時データの間引き）
-        throttle_downsample_layout = QHBoxLayout()
-        throttle_downsample_layout.addWidget(QLabel("                  "))
-
-        # throttle範囲設定
-        throttle_downsample_layout.addWidget(QLabel(get_text('throttle_range')))
+        downsample_grid.addWidget(QLabel(get_text('throttle_range')), 1, col); col += 1
         self.downsample_throttle_min = QDoubleSpinBox()
         self.downsample_throttle_min.setRange(-1.0, 1.0)
         self.downsample_throttle_min.setValue(-0.05)
         self.downsample_throttle_min.setSingleStep(0.05)
         self.downsample_throttle_min.setDecimals(2)
         self.downsample_throttle_min.setFixedWidth(60)
-        throttle_downsample_layout.addWidget(self.downsample_throttle_min)
+        downsample_grid.addWidget(self.downsample_throttle_min, 1, col); col += 1
 
-        throttle_downsample_layout.addWidget(QLabel("〜"))
+        tilde_label_throttle = QLabel("~")
+        tilde_label_throttle.setAlignment(Qt.AlignCenter)
+        downsample_grid.addWidget(tilde_label_throttle, 1, col); col += 1
 
         self.downsample_throttle_max = QDoubleSpinBox()
         self.downsample_throttle_max.setRange(-1.0, 1.0)
@@ -4443,27 +4459,24 @@ class ImageAnnotationTool(QMainWindow):
         self.downsample_throttle_max.setSingleStep(0.05)
         self.downsample_throttle_max.setDecimals(2)
         self.downsample_throttle_max.setFixedWidth(60)
-        throttle_downsample_layout.addWidget(self.downsample_throttle_max)
+        downsample_grid.addWidget(self.downsample_throttle_max, 1, col); col += 1
 
-        # 連続フレーム数
-        throttle_downsample_layout.addWidget(QLabel(get_text('consecutive')))
+        downsample_grid.addWidget(QLabel(get_text('consecutive')), 1, col); col += 1
         self.downsample_throttle_consecutive = QSpinBox()
         self.downsample_throttle_consecutive.setRange(2, 100)
         self.downsample_throttle_consecutive.setValue(3)
         self.downsample_throttle_consecutive.setFixedWidth(50)
         self.downsample_throttle_consecutive.setToolTip(get_text('consecutive_tooltip'))
-        throttle_downsample_layout.addWidget(self.downsample_throttle_consecutive)
+        downsample_grid.addWidget(self.downsample_throttle_consecutive, 1, col); col += 1
 
-        # 残す間隔
-        throttle_downsample_layout.addWidget(QLabel(get_text('interval')))
+        downsample_grid.addWidget(QLabel(get_text('interval')), 1, col); col += 1
         self.downsample_throttle_keep_every = QSpinBox()
         self.downsample_throttle_keep_every.setRange(0, 20)
         self.downsample_throttle_keep_every.setValue(0)
         self.downsample_throttle_keep_every.setFixedWidth(50)
         self.downsample_throttle_keep_every.setToolTip(get_text('interval_tooltip'))
-        throttle_downsample_layout.addWidget(self.downsample_throttle_keep_every)
+        downsample_grid.addWidget(self.downsample_throttle_keep_every, 1, col); col += 1
 
-        # 検出ボタン
         self.detect_throttle_downsample_button = QPushButton(get_text('detect'))
         self.detect_throttle_downsample_button.clicked.connect(self.detect_throttle_downsampling_targets)
         self.detect_throttle_downsample_button.setToolTip(get_text('detect_tooltip'))
@@ -4480,23 +4493,21 @@ class ImageAnnotationTool(QMainWindow):
                 background-color: #3a7fc8;
             }
         """)
-        throttle_downsample_layout.addWidget(self.detect_throttle_downsample_button)
+        downsample_grid.addWidget(self.detect_throttle_downsample_button, 1, col); col += 1
 
-        # ダウンサンプリング数表示ラベル（throttle用）
         self.throttle_downsample_count_label = QLabel(f"({get_text('items', 0)})")
         self.throttle_downsample_count_label.setStyleSheet("color: #3366ff;")
-        throttle_downsample_layout.addWidget(self.throttle_downsample_count_label)
+        downsample_grid.addWidget(self.throttle_downsample_count_label, 1, col); col += 1
 
-        # 解除ボタン（全てのダウンサンプリング対象を解除）
         clear_throttle_downsample_button = QPushButton(get_text('clear'))
         clear_throttle_downsample_button.clicked.connect(self.clear_downsampling_targets)
         clear_throttle_downsample_button.setToolTip(get_text('clear_downsampling_tooltip'))
-        throttle_downsample_layout.addWidget(clear_throttle_downsample_button)
+        downsample_grid.addWidget(clear_throttle_downsample_button, 1, col); col += 1
 
-        # 左揃えにするためストレッチを追加
-        throttle_downsample_layout.addStretch()
+        # グリッドの右側に余白を寄せる
+        downsample_grid.setColumnStretch(col, 1)
 
-        nav_container_layout.addLayout(throttle_downsample_layout)
+        nav_container_layout.addLayout(downsample_grid)
 
         # ナビゲーションコンテナをメイン画像コンテナに追加
         main_image_container.addWidget(nav_container)
@@ -9206,7 +9217,8 @@ class ImageAnnotationTool(QMainWindow):
         
         classes_layout = QHBoxLayout()
         classes_layout.addWidget(QLabel(get_text('label_detection_classes')))
-        classes_input = QLineEdit("car,red_sign,green_sign,dog")
+        current_classes = self.classes_input.text() if hasattr(self, 'classes_input') and self.classes_input.text().strip() else "car,red_sign,green_sign,dog"
+        classes_input = QLineEdit(current_classes)
         classes_input.setPlaceholderText(get_text('placeholder_classes'))
         classes_layout.addWidget(classes_input)
         class_layout.addLayout(classes_layout)
@@ -11375,14 +11387,14 @@ class ImageAnnotationTool(QMainWindow):
         dialog = QDialog(self)
         dialog.setWindowTitle(get_text('dlg_class_preset_select'))
         dialog.setMinimumWidth(500)
-        
+
         layout = QVBoxLayout(dialog)
-        
+
         # タイトル
         title_label = QLabel(get_text('dlg_select_preset'))
         title_label.setStyleSheet("font-weight: bold;")
         layout.addWidget(title_label)
-        
+
         # プリセット定義
         presets = {
             "基本セット": "car,person,bicycle,motorcycle",
@@ -11392,58 +11404,77 @@ class ImageAnnotationTool(QMainWindow):
             "ミニカー用": "car,person,sign,cone,obstacle,barrier",
             "屋内ロボット": "person,chair,table,laptop,cell_phone,book,bottle,cup",
             "建設現場": "person,truck,excavator,cone,barrier,hard_hat,safety_vest",
-            "カスタム": ""  # 空文字列でカスタム入力を示す
         }
-        
+
+        # カスタム値の初期化（未設定なら現在の入力値を使用）
+        if not hasattr(self, '_custom_preset_classes'):
+            self._custom_preset_classes = self.classes_input.text().strip()
+
+        # 共通の入力フィールド（先に作成してプリセットボタンから参照する）
+        classes_input = QLineEdit()
+        classes_input.setPlaceholderText(get_text('placeholder_comma_separated_classes'))
+        classes_input.setText(self.classes_input.text())
+
+        # ボタンスタイル定義
+        normal_style = "text-align: left; padding: 4px 8px;"
+        selected_style = "text-align: left; padding: 4px 8px; background-color: #4a90d9; color: white; font-weight: bold;"
+
+        # 全プリセットボタンのリスト（ハイライト更新用）
+        all_preset_buttons = []  # (btn, classes_value) のリスト
+
+        def update_highlight(current_text):
+            """入力欄の値に一致するボタンをハイライト"""
+            text = current_text.strip()
+            for b, val in all_preset_buttons:
+                if val == text:
+                    b.setStyleSheet(selected_style)
+                else:
+                    b.setStyleSheet(normal_style)
+
         # プリセットボタンを作成
-        preset_buttons = QButtonGroup(dialog)
-        preset_buttons.setExclusive(True)
-        
         for preset_name, preset_classes in presets.items():
-            radio = QRadioButton(preset_name)
-            radio.setProperty("preset_classes", preset_classes)
-            
-            # 説明を追加
-            if preset_classes:
-                description = f"({preset_classes})"
-                radio.setToolTip(description)
-            else:
-                radio.setToolTip(get_text('tip_keep_current_input'))
-            
-            preset_buttons.addButton(radio)
-            layout.addWidget(radio)
-            
-            # 現在の設定と一致するものがあれば選択
-            current_classes = self.classes_input.text().strip()
-            if preset_classes == current_classes:
-                radio.setChecked(True)
-        
-        # カスタム入力フィールド
-        custom_layout = QHBoxLayout()
-        custom_layout.addWidget(QLabel(get_text('label_custom')))
-        custom_input = QLineEdit()
-        custom_input.setPlaceholderText(get_text('placeholder_comma_separated_classes'))
-        custom_input.setText(self.classes_input.text())
-        custom_layout.addWidget(custom_input)
-        layout.addLayout(custom_layout)
-        
+            btn = QPushButton(preset_name)
+            btn.setToolTip(preset_classes)
+            btn.setStyleSheet(normal_style)
+            btn.clicked.connect(lambda checked, c=preset_classes: classes_input.setText(c))
+            layout.addWidget(btn)
+            all_preset_buttons.append((btn, preset_classes))
+
+        # カスタムボタン
+        custom_btn = QPushButton(get_text('label_custom'))
+        custom_tooltip = self._custom_preset_classes if self._custom_preset_classes else get_text('placeholder_comma_separated_classes')
+        custom_btn.setToolTip(custom_tooltip)
+        custom_btn.setStyleSheet(normal_style)
+        custom_btn.clicked.connect(lambda: classes_input.setText(self._custom_preset_classes))
+        layout.addWidget(custom_btn)
+        all_preset_buttons.append((custom_btn, self._custom_preset_classes))
+
+        # 入力欄変更時にハイライトを更新
+        classes_input.textChanged.connect(update_highlight)
+
+        # 初期ハイライト
+        update_highlight(classes_input.text())
+
+        # 入力フィールド
+        input_layout = QHBoxLayout()
+        input_layout.addWidget(QLabel(get_text('detection_classes')))
+        input_layout.addWidget(classes_input)
+        layout.addLayout(input_layout)
+
         # ボタン
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(dialog.accept)
         button_box.rejected.connect(dialog.reject)
         layout.addWidget(button_box)
-        
+
         # ダイアログを表示
         if dialog.exec_():
-            # 選択されたプリセットを適用
-            for button in preset_buttons.buttons():
-                if button.isChecked():
-                    preset_classes = button.property("preset_classes")
-                    if preset_classes is None:  # カスタムが選択された場合
-                        preset_classes = custom_input.text().strip()
-                    if preset_classes:
-                        self.classes_input.setText(preset_classes)
-                    break
+            result_classes = classes_input.text().strip()
+            if result_classes:
+                self.classes_input.setText(result_classes)
+                # 既存プリセットと一致しなければカスタム値として記録
+                if result_classes not in presets.values():
+                    self._custom_preset_classes = result_classes
 
     def apply_classes(self):
         """クラス設定を確認してから反映"""
@@ -14136,7 +14167,6 @@ class ImageAnnotationTool(QMainWindow):
         """フォルダパスが変更されたときの処理"""
         # パスが入力されているかどうかでボタンの有効/無効を切り替え
         has_path = bool(text.strip())
-        self.load_button.setEnabled(has_path)
         self.load_annotation_button.setEnabled(has_path)
         
         # アノテーション関連ボタンは画像が読み込まれるまで無効化
@@ -14220,6 +14250,32 @@ class ImageAnnotationTool(QMainWindow):
                     button.setText("⏪")
                 elif button.text() == "⏵":
                     button.setText("⏵")
+
+    def _update_canvas_zoom_slider_max(self):
+        """画像がキャンバスからはみ出ない最大ズーム値を計算してスライダーに設定"""
+        if not hasattr(self, 'main_image_view') or not self.main_image_view.pixmap():
+            return
+        pix_w = self.main_image_view.pixmap().width()
+        pix_h = self.main_image_view.pixmap().height()
+        canvas_w = self.main_image_view.width()
+        canvas_h = self.main_image_view.height()
+        if pix_w <= 0 or pix_h <= 0:
+            return
+        max_zoom = min(canvas_w / pix_w, canvas_h / pix_h)
+        max_slider = max(10, int(max_zoom * 10))  # 最低1.0x
+        self.canvas_zoom_slider.blockSignals(True)
+        self.canvas_zoom_slider.setMaximum(max_slider)
+        # 現在値が最大値を超えている場合はクランプ
+        if self.canvas_zoom_slider.value() > max_slider:
+            self.canvas_zoom_slider.setValue(max_slider)
+            self.main_image_view.zoom_factor = max_slider / 10.0
+        self.canvas_zoom_slider.blockSignals(False)
+
+    def _on_canvas_zoom_changed(self, value):
+        """キャンバスズームスライダーの値が変更されたときの処理"""
+        zoom = value / 10.0
+        self.main_image_view.zoom_factor = zoom
+        self.main_image_view.update()
 
     def slider_changed(self, value):
         """スライダーの値が変更されたときの処理"""
@@ -16499,6 +16555,9 @@ class ImageAnnotationTool(QMainWindow):
                 if hasattr(self, 'segmentation_annotations') and current_image_path in self.segmentation_annotations:
                     # セグメンテーションデータを設定する処理を追加（今後の拡張用）
                     pass
+
+                # ズームスライダーの最大値を更新
+                self._update_canvas_zoom_slider_max()
 
                 # 運転アノテーションポイント（赤丸）の設定
                 self._set_annotation_point_on_canvas()
@@ -20606,16 +20665,10 @@ class ImageAnnotationTool(QMainWindow):
         # 位置モデルマネージャーの初期化
         self.location_model_manager = LocationModelManager(APP_DIR_PATH, MODELS_DIR_NAME)
 
-        # YOLOモデル領域の上に位置推論モデルセクションを配置するため、
-        # オリジナルのレイアウトを取得
         left_layout = self.get_left_layout()
         if left_layout is None:
             print("警告: left_layoutが見つかりません")
             return
-        
-        # 位置推論モデルを現在のレイアウトの末尾に追加する
-        # （呼び出し順序を調整済みなので、物体検知コンテナより前に配置される）
-        insert_index = left_layout.count()
         
         # 位置推論モデルコンテナを作成
         self.location_model_container = QWidget()
@@ -20670,7 +20723,6 @@ class ImageAnnotationTool(QMainWindow):
         location_inference_layout.addWidget(self.location_inference_checkbox)
         location_model_layout.addLayout(location_inference_layout)
         
-        # 位置モデルコンテナを追加（物体検知コンテナより前に配置される）
         left_layout.addWidget(self.location_model_container)
         
         # 推論結果格納用の辞書を初期化
@@ -23022,19 +23074,26 @@ class DeletedIndexesSlider(QSlider):
                 QStyle.CC_Slider, option, QStyle.SC_SliderGroove, self
             )
 
-            track_length = groove_rect.width()
-            track_start = groove_rect.x()
+            # ハンドルの矩形を取得してハンドル幅を算出
+            handle_rect = self.style().subControlRect(
+                QStyle.CC_Slider, option, QStyle.SC_SliderHandle, self
+            )
+            handle_half = handle_rect.width() / 2
+
+            # ハンドル中心が移動する有効範囲（溝の両端からハンドル半幅分を引く）
+            effective_start = groove_rect.x() + handle_half
+            effective_length = groove_rect.width() - handle_rect.width()
             track_height = groove_rect.height()
 
             # ダウンサンプリングインデックス描画（青マーク）- 先に描画（下層）
-            if self.downsampled_indexes and self.total_count > 0:
+            if self.downsampled_indexes and self.total_count > 1:
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QBrush(QColor(50, 100, 255, 180)))
 
                 for idx in self.downsampled_indexes:
                     if 0 <= idx < self.total_count:
-                        position = track_start + (idx / (self.total_count - 1)) * track_length
-                        mark_width = max(3, track_length / self.total_count)
+                        position = effective_start + (idx / (self.total_count - 1)) * effective_length
+                        mark_width = max(3, effective_length / self.total_count)
                         mark_height = track_height + 6
 
                         painter.drawRect(
@@ -23045,14 +23104,14 @@ class DeletedIndexesSlider(QSlider):
                         )
 
             # 削除インデックス描画（赤マーク）- 後に描画（上層）
-            if self.deleted_indexes and self.total_count > 0:
+            if self.deleted_indexes and self.total_count > 1:
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QBrush(QColor(255, 50, 50, 180)))
 
                 for idx in self.deleted_indexes:
                     if 0 <= idx < self.total_count:
-                        position = track_start + (idx / (self.total_count - 1)) * track_length
-                        mark_width = max(3, track_length / self.total_count)
+                        position = effective_start + (idx / (self.total_count - 1)) * effective_length
+                        mark_width = max(3, effective_length / self.total_count)
                         mark_height = track_height + 6
 
                         painter.drawRect(
