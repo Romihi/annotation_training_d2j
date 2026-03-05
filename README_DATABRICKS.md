@@ -22,13 +22,28 @@ Databricks連携を有効にすると、学習結果をローカルとDatabricks
 pip install databricks-sdk mlflow
 ```
 
-### 2. Databricksアクセストークンの取得
+### 2. Databricksパーソナルアクセストークン（PAT）の取得
+
+本ツールでは **Personal Access Token (PAT)** を使用します。Fine-grained tokenなど他のタイプのトークンは使用できません。
 
 1. Databricksワークスペースにログイン
 2. 右上のユーザーアイコン → **Settings**
 3. **Developer** → **Access tokens**
 4. **Generate new token** をクリック
-5. トークンをコピー（一度しか表示されません）
+5. **Comment** に用途を入力（例: `annotation_tool`）
+6. **Lifetime** にトークンの有効期限を設定（空欄で無期限）
+7. **Generate** をクリック
+8. 表示されたトークン（`dapi` で始まる文字列）をコピー（**一度しか表示されません**）
+
+> **重要**: トークンには十分な権限（スコープ）が必要です。ワークスペース管理者がトークンの権限を制限している場合、以下のスコープを付与してください：
+>
+> | スコープ | 用途 |
+> |---|---|
+> | **workspace** | ワークスペース内のディレクトリ・実験の作成・読み取り |
+> | **mlflow** | MLflow実験・Runの作成・記録 |
+> | **files** | アーティファクト（モデルファイル）のアップロード・同期 |
+>
+> 権限不足のエラーが出る場合は、ワークスペース管理者に相談してください。
 
 ### 3. 環境変数の設定
 
@@ -40,7 +55,7 @@ pip install databricks-sdk mlflow
 $env:DATABRICKS_ENABLED = "true"
 $env:DATABRICKS_HOST = "https://your-workspace.cloud.databricks.com"
 $env:DATABRICKS_TOKEN = "dapi..."
-$env:DATABRICKS_EXPERIMENT_PREFIX = "/Users/your-email@example.com/experiments"
+$env:DATABRICKS_EXPERIMENT_PREFIX = "/Users/your-email@example.com/annotation_training_d2j"
 ```
 
 #### Windows (コマンドプロンプト)
@@ -49,7 +64,7 @@ $env:DATABRICKS_EXPERIMENT_PREFIX = "/Users/your-email@example.com/experiments"
 set DATABRICKS_ENABLED=true
 set DATABRICKS_HOST=https://your-workspace.cloud.databricks.com
 set DATABRICKS_TOKEN=dapi...
-set DATABRICKS_EXPERIMENT_PREFIX=/Users/your-email@example.com/experiments
+set DATABRICKS_EXPERIMENT_PREFIX=/Users/your-email@example.com/annotation_training_d2j
 ```
 
 #### Linux/Mac
@@ -58,7 +73,7 @@ set DATABRICKS_EXPERIMENT_PREFIX=/Users/your-email@example.com/experiments
 export DATABRICKS_ENABLED="true"
 export DATABRICKS_HOST="https://your-workspace.cloud.databricks.com"
 export DATABRICKS_TOKEN="dapi..."
-export DATABRICKS_EXPERIMENT_PREFIX="/Users/your-email@example.com/experiments"
+export DATABRICKS_EXPERIMENT_PREFIX="/Users/your-email@example.com/annotation_training_d2j"
 ```
 
 ### 4. 永続的な設定
@@ -160,8 +175,9 @@ export DATABRICKS_TOKEN="dapi..."
    ```
 
 2. **トークンの確認**
+   - トークンが **Personal Access Token (PAT)** であることを確認（`dapi` で始まる）
    - トークンが有効か確認（期限切れの場合は再生成）
-   - トークンに適切な権限があるか確認
+   - トークンに十分な権限（workspace, mlflow スコープ）があるか確認
 
 3. **ホストURLの確認**
    - `https://` で始まっているか
@@ -177,6 +193,8 @@ Databricksへの接続に失敗した場合、自動的にローカルのみに�
 | メッセージ | 対処法 |
 |-----------|--------|
 | `Invalid access token` | トークンを再生成 |
+| `does not have required scopes: workspace` | トークンの権限不足。PATを再生成するか、管理者にworkspaceスコープの付与を依頼 |
+| `Reading Databricks credential configuration failed` | 認証情報が正しく設定されていない。環境変数を確認 |
 | `環境変数 DATABRICKS_HOST が設定されていません` | 環境変数を設定 |
 | `環境変数 DATABRICKS_TOKEN が設定されていません` | 環境変数を設定 |
 

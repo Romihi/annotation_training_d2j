@@ -957,6 +957,16 @@ TRANSLATIONS = {
         'tip_batch_inference': '全ての画像に対して推論を実行します',
         'tip_gradcam_heatmap': 'モデルの注目領域をヒートマップで表示',
 
+        # 追加モデルスロット
+        'btn_add_model': '＋ モデル追加',
+        'tip_add_model': '追加の走行モデルスロットを追加します（最大3個）',
+        'btn_remove_model': '－ モデル削除',
+        'tip_remove_model': '最後に追加した走行モデルスロットを削除します',
+        'label_driving_model_n': '走行モデル{0}',
+        'chk_inference_result_n': '推論結果{0}表示',
+        'tip_extra_model_not_loaded': 'モデル未読込',
+        'label_driving_model_n_inference': '走行モデル{0}推論',
+
         # ウェイポイントモデル関連
         'dlg_waypoint_training_settings': 'ウェイポイントモデル学習設定',
         'label_waypoint_stats': '<b>学習データ統計:</b><br>総読み込み画像数: {0}枚<br>ウェイポイントアノテーション済み画像数: {1}枚<br><b style="color: #2E7D32; font-size: 14px;">実際の学習使用枚数: {2}枚</b><br>({1}枚 - 削除済み{3}枚)<br><span style="color: #FF6600;">{4}</span>',
@@ -1104,6 +1114,9 @@ TRANSLATIONS = {
         'dlg_sync_cancelled': '同期キャンセル',
         'dlg_sync_complete': '同期完了',
         'dlg_sync_complete_with_errors': '同期完了（一部エラー）',
+        'sync_progress': '同期中 {0}/{1}',
+        'sync_already_running': '同期が実行中です',
+        'btn_cancel_sync': '同期キャンセル',
         'dlg_connection_test': '接続テスト',
         'dlg_transfer_complete': '転送完了',
         'dlg_add_complete': '追加完了',
@@ -1438,6 +1451,7 @@ Google Cloud Console での OAuth設定手順
         'msg_mlflow_ui_failed': 'MLflow UIの起動に失敗しました:\n\n{0}\n\nMLflowがインストールされているか確認してください: pip install mlflow',
         'dlg_databricks_not_enabled': 'Databricks未有効',
         'msg_databricks_not_enabled': 'Databricks連携が有効になっていません。\n\n「Databricks連携」チェックボックスをONにしてください。',
+        'msg_databricks_enable_confirm': 'Databricks連携が有効になっていません。\n\n有効にして接続しますか？',
         'dlg_databricks_connection_failed': 'Databricks接続失敗',
         'msg_databricks_connection_failed': 'Databricksへの接続に失敗しました。\n\n環境変数の設定を確認してください。',
         'dlg_databricks_connection_success': 'Databricks接続成功',
@@ -2328,6 +2342,16 @@ Google Cloud Console での OAuth設定手順
         'tip_batch_inference': 'Run inference on all images',
         'tip_gradcam_heatmap': 'Display model attention regions as heatmap',
 
+        # Extra Model Slots
+        'btn_add_model': '+ Add Model',
+        'tip_add_model': 'Add an extra driving model slot (up to 3)',
+        'btn_remove_model': '- Remove Model',
+        'tip_remove_model': 'Remove the last added driving model slot',
+        'label_driving_model_n': 'Driving Model {0}',
+        'chk_inference_result_n': 'Inference Result {0}',
+        'tip_extra_model_not_loaded': 'Model not loaded',
+        'label_driving_model_n_inference': 'Driving Model {0} Inference',
+
         # Waypoint Model
         'dlg_waypoint_training_settings': 'Waypoint Model Training Settings',
         'label_waypoint_stats': '<b>Training Data Statistics:</b><br>Total loaded images: {0}<br>Waypoint annotated images: {1}<br><b style="color: #2E7D32; font-size: 14px;">Actual training count: {2}</b><br>({1} - {3} deleted)<br><span style="color: #FF6600;">{4}</span>',
@@ -2475,6 +2499,9 @@ Google Cloud Console での OAuth設定手順
         'dlg_sync_cancelled': 'Sync Cancelled',
         'dlg_sync_complete': 'Sync Complete',
         'dlg_sync_complete_with_errors': 'Sync Complete (Some Errors)',
+        'sync_progress': 'Syncing {0}/{1}',
+        'sync_already_running': 'Sync is already running',
+        'btn_cancel_sync': 'Cancel Sync',
         'dlg_connection_test': 'Connection Test',
         'dlg_transfer_complete': 'Transfer Complete',
         'dlg_add_complete': 'Add Complete',
@@ -2811,6 +2838,7 @@ Notes
         'msg_mlflow_ui_failed': 'Failed to start MLflow UI:\n\n{0}\n\nPlease verify MLflow is installed: pip install mlflow',
         'dlg_databricks_not_enabled': 'Databricks Not Enabled',
         'msg_databricks_not_enabled': 'Databricks integration is not enabled.\n\nPlease turn ON the "Databricks Integration" checkbox.',
+        'msg_databricks_enable_confirm': 'Databricks integration is not enabled.\n\nWould you like to enable and connect?',
         'dlg_databricks_connection_failed': 'Databricks Connection Failed',
         'msg_databricks_connection_failed': 'Failed to connect to Databricks.\n\nPlease check your environment variable settings.',
         'dlg_databricks_connection_success': 'Databricks Connection Success',

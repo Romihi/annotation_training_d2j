@@ -97,10 +97,19 @@ class MLflowManager:
             print("警告: config_databricks.py が見つかりません")
             return False
 
-        # 設定の検証
+        # 設定の検証（validate_databricks_configはDATABRICKS_ENABLEDフラグに依存するため、
+        # UIから有効化した場合も考慮してHOST/TOKENを直接チェックする）
         errors = validate_databricks_config()
         if errors:
             print(f"Databricks設定エラー: {errors}")
+            return False
+
+        # HOST/TOKENが空の場合はエラー（環境変数未設定でUIから有効化した場合）
+        if not DATABRICKS_HOST:
+            print("Databricks設定エラー: DATABRICKS_HOST が設定されていません")
+            return False
+        if not DATABRICKS_TOKEN:
+            print("Databricks設定エラー: DATABRICKS_TOKEN が設定されていません")
             return False
 
         try:
@@ -126,6 +135,8 @@ class MLflowManager:
                     return False
 
             # 実験を作成（Databricksワークスペース内）
+            experiment_failures = 0
+            total_experiments = len(self.EXPERIMENT_NAMES)
             for model_type, experiment_name in self.EXPERIMENT_NAMES.items():
                 # Databricksでは実験パスを使用
                 experiment_path = f"{DATABRICKS_EXPERIMENT_PREFIX}/{experiment_name}"
@@ -135,7 +146,14 @@ class MLflowManager:
                         mlflow.create_experiment(experiment_path)
                         print(f"Databricks実験を作成: {experiment_path}")
                 except Exception as exp_error:
+                    experiment_failures += 1
                     print(f"実験作成警告 ({experiment_path}): {exp_error}")
+
+            # 全ての実験操作が失敗した場合は接続失敗とみなす
+            if experiment_failures == total_experiments:
+                print("Databricks接続失敗: 全ての実験操作が失敗しました（認証情報を確認してください）")
+                self._databricks_connected = False
+                return False
 
             self._databricks_connected = True
             self.is_initialized = True

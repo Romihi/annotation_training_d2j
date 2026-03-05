@@ -12,7 +12,8 @@
 # COMMAND ----------
 
 # 展開済みデータのパス
-DATA_PATH = "/Volumes/workspace/default/annotation_data/annotation_20251201_001802"
+DATA_PATH = EXTRACT_PATH #"/Volumes/workspace/default/annotation_data/annotation_20251201_001802"
+# DATA_PATH = EXTRACT_PATH ## 展開先パスを指定
 
 print(f"データパス: {DATA_PATH}")
 

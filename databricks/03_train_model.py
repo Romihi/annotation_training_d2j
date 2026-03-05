@@ -9,6 +9,8 @@
 # MAGIC %md
 # MAGIC ## 設定
 
+%pip install torch torchvision
+
 # COMMAND ----------
 
 # 展開済みデータのパス
@@ -123,8 +125,8 @@ print(f"検証データ数: {len(val_annotations)}")
 train_dataset = DonkeyDataset(train_annotations, images_dir, IMAGE_COLUMN)
 val_dataset = DonkeyDataset(val_annotations, images_dir, IMAGE_COLUMN)
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
 # COMMAND ----------
 
@@ -183,9 +185,16 @@ print(f"モデルパラメータ数: {sum(p.numel() for p in model.parameters())
 
 import mlflow
 import mlflow.pytorch
+import getpass
 
-# MLflow実験を設定
-mlflow.set_experiment("/Users/your-email@example.com/donkey_training")
+# MLflow実験を設定（ユーザー名を自動取得してパスを生成）
+user_email = (
+    dbutils.notebook.entry_point.getDbutils()
+    .notebook().getContext().userName().get()
+)
+experiment_path = f"/Users/{user_email}/annotation_training_d2j/autonomous_driving_models"
+mlflow.set_experiment(experiment_path)
+
 
 # 損失関数とオプティマイザ
 criterion = nn.MSELoss()

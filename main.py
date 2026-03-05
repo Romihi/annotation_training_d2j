@@ -102,8 +102,9 @@ class ImageLabel(QLabel):
         self.annotation_point = None
         self.show_grid = True  
         self.grid_size = DEFAULT_GRID_SIZE    
-        self.inference_point = None 
-        self.show_inference = False 
+        self.inference_point = None
+        self.show_inference = False
+        self.extra_inference_points = []  # 追加モデルの推論ポイントリスト [(QPoint, QColor, show_flag), ...]
         self.zoom_factor = DEFAULT_ZOOM_FACTOR  
         self.is_deleted = False
         self.is_downsampled = False  # ダウンサンプリング対象フラグ
@@ -1054,6 +1055,17 @@ class ImageLabel(QLabel):
 
                     self.draw_vector_arrow(painter, anno_scaled_x, anno_scaled_y, scaled_x, scaled_y)
 
+        # 追加モデルの推論点を青系の色で描画
+        for extra_point, extra_color, extra_show in self.extra_inference_points:
+            if extra_show and extra_point is not None:
+                rel_x = extra_point.x() / pix_width
+                rel_y = extra_point.y() / pix_height
+                scaled_x = int(target_rect.x() + rel_x * target_rect.width())
+                scaled_y = int(target_rect.y() + rel_y * target_rect.height())
+
+                painter.setPen(QPen(extra_color, 4))
+                painter.setBrush(QBrush())
+                painter.drawEllipse(scaled_x - 15, scaled_y - 15, 30, 30)
 
     def draw_vector_arrow(self, painter, start_x, start_y, end_x, end_y):
         """教師データから推論結果への矢印を描画する"""
@@ -3527,7 +3539,20 @@ class ImageAnnotationTool(QMainWindow):
         # 推論結果のキャッシュ
         self.inference_results = {}
         self.inference_diff_vectors = {}
-        self.show_diff_vectors = False  
+        self.show_diff_vectors = False
+
+        # 追加モデルスロット（最大3個）
+        self.extra_model_slots = []
+        self.extra_model_colors = [
+            '#4169E1',   # Royal Blue
+            '#1E90FF',   # Dodger Blue
+            '#7B68EE',   # Medium Slate Blue
+        ]
+        self.extra_model_qcolors = [
+            QColor(65, 105, 225),   # Royal Blue
+            QColor(30, 144, 255),   # Dodger Blue
+            QColor(123, 104, 238),  # Medium Slate Blue
+        ]
 
         # YOLO関連の初期化を追加
         self.yolo_model = None  # YOLOモデルのインスタンス
@@ -3656,6 +3681,11 @@ class ImageAnnotationTool(QMainWindow):
         toolbar.addWidget(cloud_button)
         self.toolbar_cloud_button = cloud_button
 
+        # 同期進捗ラベル
+        self.sync_progress_label = QLabel("")
+        self.sync_progress_label.setStyleSheet("font-size: 11px; color: #4a90d9;")
+        toolbar.addWidget(self.sync_progress_label)
+
         # セパレーター
         toolbar.addSeparator()
 
@@ -3708,8 +3738,12 @@ class ImageAnnotationTool(QMainWindow):
         db_open = menu.addAction(f"🔗 {get_text('open_databricks')}")
         db_open.triggered.connect(self._open_databricks_ui)
 
-        db_sync = menu.addAction(f"🔄 {get_text('sync')}")
-        db_sync.triggered.connect(self._sync_to_databricks)
+        if hasattr(self, '_sync_worker') and self._sync_worker is not None and self._sync_worker.isRunning():
+            db_sync = menu.addAction(f"❌ {get_text('btn_cancel_sync')}")
+            db_sync.triggered.connect(lambda: self._sync_worker.cancel())
+        else:
+            db_sync = menu.addAction(f"🔄 {get_text('sync')}")
+            db_sync.triggered.connect(self._sync_to_databricks)
 
         db_transfer = menu.addAction(f"📤 {get_text('transfer')}")
         db_transfer.triggered.connect(self._transfer_to_databricks)
@@ -3855,6 +3889,27 @@ class ImageAnnotationTool(QMainWindow):
         self.model_combo.setStyleSheet("combobox-popup: 0;")  # ドロップダウンリストの高さを自動調整
         pilot_layout.addWidget(self.model_combo)
 
+        # 追加モデルスロット用＋／－ボタン
+        extra_model_buttons_layout = QHBoxLayout()
+        self.add_model_button = QPushButton(get_text('btn_add_model'))
+        self.add_model_button.setToolTip(get_text('tip_add_model'))
+        self.add_model_button.clicked.connect(self._add_extra_model_slot)
+        self.add_model_button.setStyleSheet("QPushButton { padding: 2px 8px; }")
+        extra_model_buttons_layout.addWidget(self.add_model_button)
+
+        self.remove_model_button = QPushButton(get_text('btn_remove_model'))
+        self.remove_model_button.setToolTip(get_text('tip_remove_model'))
+        self.remove_model_button.clicked.connect(self._remove_extra_model_slot)
+        self.remove_model_button.setStyleSheet("QPushButton { padding: 2px 8px; }")
+        self.remove_model_button.setEnabled(False)
+        extra_model_buttons_layout.addWidget(self.remove_model_button)
+
+        pilot_layout.addLayout(extra_model_buttons_layout)
+
+        # 追加モデルスロットのコンテナ
+        self.extra_models_container = QVBoxLayout()
+        pilot_layout.addLayout(self.extra_models_container)
+
         # モデル操作ボタン（更新と読み込み - 横並び）
         model_buttons_layout = QHBoxLayout()
 
@@ -3907,6 +3962,10 @@ class ImageAnnotationTool(QMainWindow):
         inference_layout.addWidget(self.batch_inference_button)
 
         pilot_layout.addLayout(inference_layout)
+
+        # 追加モデル用推論表示チェックボックスのコンテナ
+        self.extra_inference_layout = QVBoxLayout()
+        pilot_layout.addLayout(self.extra_inference_layout)
 
         # 差分ベクトル表示チェックボックス（UIには表示しないが内部で参照されるため保持）
         self.diff_vector_checkbox = QCheckBox(get_text('show_diff_vector'))
@@ -4147,6 +4206,10 @@ class ImageAnnotationTool(QMainWindow):
         self.inference_info_label.setMinimumHeight(45)
         self.inference_info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         info_layout.addWidget(self.inference_info_label)
+
+        # 追加モデル用推論結果表示ラベルのコンテナ
+        self.extra_inference_info_layout = QVBoxLayout()
+        info_layout.addLayout(self.extra_inference_info_layout)
 
         # 位置推論結果表示ラベル（推論結果の直下）
         self.location_inference_info_label = QLabel("")
@@ -5081,6 +5144,9 @@ class ImageAnnotationTool(QMainWindow):
             # 推論結果がまだない場合のみ推論を実行
             if self.current_index not in self.inference_results:
                 self.run_inference_check(False)
+
+        # 追加モデルの逐次推論
+        self._run_extra_model_inference_for_current()
 
     def update_segmentation_stats(self):
         """セグメンテーションアノテーションの統計情報を更新"""
@@ -6366,6 +6432,214 @@ class ImageAnnotationTool(QMainWindow):
         # 保存済みのモデルリストを更新
         self.refresh_model_list()
 
+    def _add_extra_model_slot(self):
+        """追加モデルスロットを追加する（最大3個）"""
+        if len(self.extra_model_slots) >= 3:
+            return
+
+        slot_index = len(self.extra_model_slots)
+        slot_number = slot_index + 2  # 走行モデル2, 3, 4
+        color = self.extra_model_colors[slot_index]
+
+        # コンテナWidget
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 4, 0, 4)
+
+        # ラベル（色付き）
+        label = QLabel(get_text('label_driving_model_n', slot_number))
+        label.setStyleSheet(f"font-weight: bold; color: {color};")
+        container_layout.addWidget(label)
+
+        # モデルタイプ選択コンボ
+        method_combo = QComboBox()
+        from model_catalog import list_available_models
+        available_models = list_available_models()
+        method_combo.addItems(available_models)
+        # メインのモデルタイプと同じ初期選択
+        main_index = self.auto_method_combo.currentIndex()
+        if main_index >= 0 and main_index < method_combo.count():
+            method_combo.setCurrentIndex(main_index)
+        container_layout.addWidget(method_combo)
+
+        # 保存モデル選択コンボ
+        model_combo = QComboBox()
+        model_combo.setMinimumWidth(180)
+        model_combo.setStyleSheet("combobox-popup: 0;")
+        container_layout.addWidget(model_combo)
+
+        # モデルタイプ変更時にモデルリストを更新
+        method_combo.currentIndexChanged.connect(
+            lambda idx, mc=model_combo, mtc=method_combo: self._refresh_extra_model_list(mc, mtc)
+        )
+
+        # 初期モデルリストを設定
+        self._refresh_extra_model_list(model_combo, method_combo)
+
+        # 推論結果辞書
+        inference_results = {}
+
+        # 推論表示チェックボックス
+        checkbox = QCheckBox(get_text('chk_inference_result_n', slot_number))
+        checkbox.setChecked(False)
+        checkbox.setEnabled(False)
+        checkbox.setToolTip(get_text('tip_extra_model_not_loaded'))
+        checkbox.setStyleSheet(f"color: {color};")
+        checkbox.stateChanged.connect(
+            lambda state, si=slot_index: self._toggle_extra_inference_display(state, si)
+        )
+        self.extra_inference_layout.addWidget(checkbox)
+
+        # 情報パネルのラベル
+        info_label = QLabel("")
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet(f"color: {color};")
+        info_label.setMinimumHeight(30)
+        info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.extra_inference_info_layout.addWidget(info_label)
+
+        # スロット情報を保存
+        slot = {
+            'method_combo': method_combo,
+            'model_combo': model_combo,
+            'container': container,
+            'inference_results': inference_results,
+            'checkbox': checkbox,
+            'info_label': info_label,
+            'model': None,
+        }
+        self.extra_model_slots.append(slot)
+
+        # コンテナをUIに追加
+        self.extra_models_container.addWidget(container)
+
+        # ボタン有効/無効制御
+        self.add_model_button.setEnabled(len(self.extra_model_slots) < 3)
+        self.remove_model_button.setEnabled(len(self.extra_model_slots) > 0)
+
+    def _remove_extra_model_slot(self):
+        """最後に追加したモデルスロットを削除する"""
+        if not self.extra_model_slots:
+            return
+
+        slot = self.extra_model_slots.pop()
+
+        # UIからウィジェットを削除
+        self.extra_models_container.removeWidget(slot['container'])
+        slot['container'].deleteLater()
+
+        self.extra_inference_layout.removeWidget(slot['checkbox'])
+        slot['checkbox'].deleteLater()
+
+        self.extra_inference_info_layout.removeWidget(slot['info_label'])
+        slot['info_label'].deleteLater()
+
+        # キャンバスの推論ポイントを更新
+        self._update_extra_inference_points()
+        self.main_image_view.update()
+
+        # ボタン有効/無効制御
+        self.add_model_button.setEnabled(len(self.extra_model_slots) < 3)
+        self.remove_model_button.setEnabled(len(self.extra_model_slots) > 0)
+
+    def _run_extra_model_inference_for_current(self):
+        """現在の画像に対して追加モデルの推論を実行する（結果がない場合のみ）"""
+        if not self.images or not self.extra_model_slots:
+            return
+
+        current_index = self.current_index
+        current_img_path = self.images[current_index]
+        changed = False
+
+        for slot_idx, slot in enumerate(self.extra_model_slots):
+            # チェックボックスが有効でない（モデル未読込）ならスキップ
+            if slot['model'] is None:
+                continue
+            # すでに結果があればスキップ
+            if current_index in slot['inference_results']:
+                continue
+
+            extra_model_type = slot['method_combo'].currentText()
+            extra_selected = slot['model_combo'].currentText()
+            if extra_selected in [get_text('combo_model_not_found'), get_text('combo_select_folder')] or "not found" in extra_selected.lower():
+                continue
+            extra_model_path = os.path.join(models_dir, extra_selected)
+            if not os.path.exists(extra_model_path):
+                continue
+
+            try:
+                extra_results = batch_inference(
+                    [current_img_path],
+                    method="model",
+                    model_type=extra_model_type,
+                    model_path=extra_model_path,
+                    force_reload=False
+                )
+                for img_path_key, result in extra_results.items():
+                    try:
+                        idx = self.images.index(img_path_key)
+                        slot['inference_results'][idx] = result
+                        changed = True
+                    except ValueError:
+                        pass
+            except Exception as e:
+                print(f"追加モデル{slot_idx + 2}の逐次推論エラー: {e}")
+
+        if changed:
+            self._update_extra_inference_info_panels()
+            self._update_extra_inference_points()
+            self.main_image_view.update()
+
+    def _refresh_extra_model_list(self, model_combo, method_combo):
+        """追加モデルスロットのモデルリストを更新"""
+        model_combo.clear()
+        current_arch = method_combo.currentText()
+
+        import os
+        all_model_files = [f for f in os.listdir(models_dir) if f.endswith('.pth')]
+
+        model_files = []
+        for model_file in all_model_files:
+            if "_location_" in model_file or "yolo" in model_file.lower():
+                continue
+            if current_arch.lower() in model_file.lower():
+                model_files.append(model_file)
+
+        if not model_files:
+            model_combo.addItem(get_text('combo_model_not_found'))
+            return
+
+        model_files.sort(key=lambda f: os.path.getmtime(os.path.join(models_dir, f)), reverse=True)
+        for model_file in model_files:
+            model_combo.addItem(model_file)
+
+    def _toggle_extra_inference_display(self, state, slot_index):
+        """追加モデルの推論表示の切り替え"""
+        if slot_index >= len(self.extra_model_slots):
+            return
+        show = (state == Qt.Checked)
+        # キャンバスを更新
+        self._update_extra_inference_points()
+        self.main_image_view.update()
+
+    def _update_extra_inference_points(self):
+        """追加モデルの推論ポイントをImageLabelに設定する"""
+        if not self.images:
+            self.main_image_view.extra_inference_points = []
+            return
+
+        current_index = self.current_index
+        points = []
+        for i, slot in enumerate(self.extra_model_slots):
+            point = None
+            show = slot['checkbox'].isChecked()
+            color = self.extra_model_qcolors[i]
+            if current_index in slot['inference_results']:
+                inf = slot['inference_results'][current_index]
+                point = QPoint(inf['x'], inf['y'])
+            points.append((point, color, show))
+        self.main_image_view.extra_inference_points = points
+
     def refresh_model_list(self):
         """保存されているモデルのリストを更新 - モデルアーキによるフィルタリング機能付き"""
         self.model_combo.clear()
@@ -6733,26 +7007,34 @@ class ImageAnnotationTool(QMainWindow):
 
                 # ImageLabelに推論ポイントを設定
                 self.main_image_view.inference_point = QPoint(inference['x'], inference['y'])
-                
+
+                # 追加モデルの情報パネルとポイントも更新
+                self._update_extra_inference_info_panels()
+                self._update_extra_inference_points()
+
                 return True
-                
+
             elif hasattr(self, 'run_inference_check'):
                 # 推論結果がない場合は実行
                 self.run_inference_check(False)
-                
+
                 # 推論実行後に再度チェック
                 if current_img_path in self.inference_results:
                     # 再帰的に呼び出して情報パネルを更新
                     return self.update_driving_info_panel()
-                
+
                 return False
         else:
             # 表示がオフの場合は情報パネルをクリア
             if hasattr(self, 'inference_info_label'):
                 self.inference_info_label.setText(" ")  # スペースで高さを維持
-            
+
             self.main_image_view.inference_point = None
-            
+
+            # 追加モデルの表示もクリア
+            self._update_extra_inference_info_panels()
+            self._update_extra_inference_points()
+
             return False
 
     def update_location_info_panel(self):
@@ -7029,6 +7311,14 @@ class ImageAnnotationTool(QMainWindow):
                 self.gradcam_target_combo.setEnabled(False)
                 self.gradcam_method_combo.setEnabled(False)
                 self.gradcam_direction_combo.setEnabled(False)
+
+        # 追加モデルのチェックボックス状態更新
+        for slot in self.extra_model_slots:
+            if slot['model'] is not None:
+                slot['checkbox'].setEnabled(True)
+            else:
+                slot['checkbox'].setEnabled(False)
+                slot['checkbox'].setChecked(False)
 
     def add_segmentation_annotation(self, polygon_data):
         """セグメンテーションアノテーションを追加"""
@@ -11415,9 +11705,9 @@ class ImageAnnotationTool(QMainWindow):
         classes_input.setPlaceholderText(get_text('placeholder_comma_separated_classes'))
         classes_input.setText(self.classes_input.text())
 
-        # ボタンスタイル定義
-        normal_style = "text-align: left; padding: 4px 8px;"
-        selected_style = "text-align: left; padding: 4px 8px; background-color: #4a90d9; color: white; font-weight: bold;"
+        # ボタンスタイル定義（QPushButtonセレクタでツールチップへの影響を防止）
+        normal_style = "QPushButton { text-align: left; padding: 4px 8px; }"
+        selected_style = "QPushButton { text-align: left; padding: 4px 8px; background-color: #4a90d9; color: white; font-weight: bold; }"
 
         # 全プリセットボタンのリスト（ハイライト更新用）
         all_preset_buttons = []  # (btn, classes_value) のリスト
@@ -11935,15 +12225,32 @@ class ImageAnnotationTool(QMainWindow):
                 get_text('msg_mlflow_ui_failed', str(e))
             )
 
+    def _ensure_databricks_enabled(self):
+        """Databricks連携が無効なら有効化を提案し、有効化する。成功でTrue、キャンセルでFalse"""
+        if self.mlflow_manager.use_databricks:
+            return True
+
+        reply = QMessageBox.question(
+            self,
+            get_text('dlg_databricks_not_enabled'),
+            get_text('msg_databricks_enable_confirm'),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+        if reply != QMessageBox.Yes:
+            return False
+
+        # Databricks連携を有効化
+        self.databricks_checkbox.setChecked(True)
+        # _on_databricks_toggle が接続を試みる。失敗時はチェックが外される
+        if not self.mlflow_manager.use_databricks:
+            return False
+        return True
+
     def _open_databricks_ui(self):
         """Databricks MLflow UIを開く"""
-        # Databricksモードが有効か確認
-        if not self.mlflow_manager.use_databricks:
-            QMessageBox.warning(
-                self,
-                get_text('dlg_databricks_not_enabled'),
-                get_text('msg_databricks_not_enabled')
-            )
+        # Databricksモードが有効か確認（無効なら有効化を提案）
+        if not self._ensure_databricks_enabled():
             return
 
         # 未接続の場合、接続を試みる
@@ -11974,13 +12281,13 @@ class ImageAnnotationTool(QMainWindow):
 
     def _sync_to_databricks(self):
         """ローカルの学習記録をDatabricksに同期"""
-        # Databricksモードが有効か確認
-        if not self.mlflow_manager.use_databricks:
-            QMessageBox.warning(
-                self,
-                get_text('dlg_databricks_not_enabled'),
-                get_text('msg_databricks_not_enabled')
-            )
+        # 二重起動防止
+        if hasattr(self, '_sync_worker') and self._sync_worker is not None and self._sync_worker.isRunning():
+            QMessageBox.warning(self, get_text('dialog_warning'), get_text('sync_already_running'))
+            return
+
+        # Databricksモードが有効か確認（無効なら有効化を提案）
+        if not self._ensure_databricks_enabled():
             return
 
         # 同期状態を取得
@@ -12064,46 +12371,48 @@ class ImageAnnotationTool(QMainWindow):
             if confirm != QMessageBox.Yes:
                 return
 
-        # 進捗ダイアログを作成
-        progress = QProgressDialog(get_text('msg_syncing_to_databricks'), get_text('btn_cancel'), 0, 100, self)
-        progress.setWindowTitle(get_text('dlg_syncing'))
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
-        progress.show()
+        # ツールバーに進捗表示
+        self.sync_progress_label.setText(get_text('sync_progress', 0, '?'))
 
-        # キャンセルフラグ
-        cancelled = [False]
+        # バックグラウンドスレッドで同期を実行
+        from PyQt5.QtCore import QThread, pyqtSignal
 
-        def progress_callback(current, total, message):
-            QApplication.processEvents()
-            if progress.wasCanceled():
-                cancelled[0] = True
-                return
-            percent = int((current / total) * 100) if total > 0 else 0
-            progress.setValue(percent)
-            progress.setLabelText(f"{message}\n({current}/{total})")
-            QApplication.processEvents()
+        class SyncWorker(QThread):
+            progress_updated = pyqtSignal(int, int, str)  # current, total, message
+            finished_signal = pyqtSignal(dict)  # result
+            error_signal = pyqtSignal(str)  # error message
 
-        def cancel_check():
-            QApplication.processEvents()
-            return progress.wasCanceled() or cancelled[0]
+            def __init__(self, mlflow_manager, do_delete):
+                super().__init__()
+                self.mlflow_manager = mlflow_manager
+                self.do_delete = do_delete
+                self._cancelled = False
 
-        # 同期実行
-        try:
-            if do_upload or do_delete:
-                result = self.mlflow_manager.sync_local_to_databricks(
-                    parent_widget=self,
-                    progress_callback=progress_callback,
-                    cancel_check=cancel_check,
-                    delete_orphaned=do_delete
-                )
-            else:
-                result = {"synced": 0, "skipped": 0, "failed": 0, "deleted": 0, "errors": [], "cancelled": False}
+            def cancel(self):
+                self._cancelled = True
 
-            progress.close()
+            def run(self):
+                try:
+                    result = self.mlflow_manager.sync_local_to_databricks(
+                        parent_widget=None,
+                        progress_callback=lambda c, t, m: self.progress_updated.emit(c, t, m),
+                        cancel_check=lambda: self._cancelled,
+                        delete_orphaned=self.do_delete
+                    )
+                    self.finished_signal.emit(result)
+                except Exception as e:
+                    self.error_signal.emit(str(e))
 
-            # キャンセルされた場合
+        worker = SyncWorker(self.mlflow_manager, do_delete)
+
+        def on_progress(current, total, message):
+            self.sync_progress_label.setText(get_text('sync_progress', current, total))
+
+        def on_finished(result):
+            self.sync_progress_label.setText("")
+            self._sync_worker = None
+            worker.deleteLater()
+
             if result.get("cancelled"):
                 result_message = (
                     f"同期がキャンセルされました。\n\n"
@@ -12134,26 +12443,30 @@ class ImageAnnotationTool(QMainWindow):
                 else:
                     QMessageBox.information(self, get_text('dlg_sync_complete'), result_message)
 
-            # 状態を更新
             self._update_databricks_status_label()
 
-        except Exception as e:
-            progress.close()
+        def on_error(error_msg):
+            self.sync_progress_label.setText("")
+            self._sync_worker = None
+            worker.deleteLater()
             QMessageBox.critical(
                 self,
                 "同期エラー",
-                f"同期中にエラーが発生しました:\n\n{str(e)}"
+                f"同期中にエラーが発生しました:\n\n{error_msg}"
             )
+
+        worker.progress_updated.connect(on_progress)
+        worker.finished_signal.connect(on_finished)
+        worker.error_signal.connect(on_error)
+
+        # workerをインスタンス変数に保持してGC防止
+        self._sync_worker = worker
+        worker.start()
 
     def _transfer_to_databricks(self):
         """現在のアノテーションをDatabricksに転送"""
-        # Databricksモードが有効か確認
-        if not self.mlflow_manager.use_databricks:
-            QMessageBox.warning(
-                self,
-                get_text('dlg_databricks_not_enabled'),
-                get_text('msg_databricks_not_enabled')
-            )
+        # Databricksモードが有効か確認（無効なら有効化を提案）
+        if not self._ensure_databricks_enabled():
             return
 
         # アノテーションがあるか確認
@@ -13311,11 +13624,21 @@ class ImageAnnotationTool(QMainWindow):
 
         layout.addWidget(tab_widget)
 
+        # ボタンレイアウト
+        button_layout = QHBoxLayout()
+
         # 認証テストボタン
         if config_available and COLAB_ENABLED:
             test_button = QPushButton(get_text('btn_connection_test'))
             test_button.clicked.connect(lambda: self._test_colab_connection(dialog))
-            layout.addWidget(test_button)
+            button_layout.addWidget(test_button)
+
+        # READMEを開くボタン
+        open_readme_button = QPushButton(get_text('btn_open_readme'))
+        open_readme_button.clicked.connect(self._open_colab_readme)
+        button_layout.addWidget(open_readme_button)
+
+        layout.addLayout(button_layout)
 
         # 閉じるボタン
         close_button = QPushButton(get_text('btn_close'))
@@ -13390,6 +13713,27 @@ class ImageAnnotationTool(QMainWindow):
                 get_text('dlg_connection_test_error'),
                 get_text('msg_connection_test_error', str(e))
             )
+
+    def _open_colab_readme(self):
+        """README_COLAB.md を開く"""
+        import subprocess
+        import sys
+
+        readme_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "README_COLAB.md")
+
+        if not os.path.exists(readme_path):
+            QMessageBox.warning(self, get_text('dlg_error'), get_text('msg_readme_not_found', readme_path))
+            return
+
+        try:
+            if sys.platform.startswith('win'):
+                os.startfile(readme_path)
+            elif sys.platform.startswith('darwin'):
+                subprocess.Popen(['open', readme_path])
+            else:
+                subprocess.Popen(['xdg-open', readme_path])
+        except Exception as e:
+            QMessageBox.warning(self, get_text('dlg_error'), get_text('msg_file_open_failed', e))
 
     def toggle_dark_mode(self):
         """ダークモードを切り替える"""
@@ -14646,6 +14990,9 @@ class ImageAnnotationTool(QMainWindow):
             was_checked = self.inference_checkbox.isChecked()
             self.inference_checkbox.setChecked(True)
             
+            # 追加モデルの推論も実行
+            self._run_extra_model_inference_for_current()
+
             # 表示を更新
             self.update_inference_display()
             self.main_image_view.update()
@@ -14822,14 +15169,75 @@ class ImageAnnotationTool(QMainWindow):
                 progress.setValue(processed_count)
                 QApplication.processEvents()
             
+            # 追加モデルの一括推論
+            if self.extra_model_slots:
+                for slot_idx, slot in enumerate(self.extra_model_slots):
+                    if progress.wasCanceled():
+                        break
+                    extra_model_type = slot['method_combo'].currentText()
+                    extra_selected = slot['model_combo'].currentText()
+                    if extra_selected in [get_text('combo_model_not_found'), get_text('combo_select_folder')] or "not found" in extra_selected.lower():
+                        continue
+                    extra_model_path = os.path.join(models_dir, extra_selected)
+                    if not os.path.exists(extra_model_path):
+                        continue
+
+                    if clear_existing:
+                        slot['inference_results'] = {}
+
+                    progress.setLabelText(f"追加モデル{slot_idx + 2}の一括推論中...")
+                    QApplication.processEvents()
+
+                    for batch_idx in range(total_batches):
+                        if progress.wasCanceled():
+                            break
+                        start_idx = batch_idx * batch_size
+                        end_idx = min((batch_idx + 1) * batch_size, len(self.images))
+                        current_batch = self.images[start_idx:end_idx]
+
+                        if not clear_existing:
+                            batch_to_process = []
+                            for img_path in current_batch:
+                                try:
+                                    img_index = self.images.index(img_path)
+                                    if img_index not in slot['inference_results']:
+                                        batch_to_process.append(img_path)
+                                except ValueError:
+                                    batch_to_process.append(img_path)
+                        else:
+                            batch_to_process = current_batch
+
+                        if not batch_to_process:
+                            continue
+
+                        try:
+                            extra_batch_results = batch_inference(
+                                batch_to_process,
+                                method="model",
+                                model_type=extra_model_type,
+                                model_path=extra_model_path,
+                                force_reload=(batch_idx == 0)
+                            )
+                            for img_path_key, result in extra_batch_results.items():
+                                try:
+                                    idx = self.images.index(img_path_key)
+                                    slot['inference_results'][idx] = result
+                                except ValueError:
+                                    pass
+                        except Exception as e:
+                            print(f"追加モデル{slot_idx + 2} バッチ{batch_idx+1}エラー: {e}")
+
+                    slot['checkbox'].setEnabled(True)
+                    slot['checkbox'].setChecked(True)
+
             # 推論表示を自動的にONにする
             self.inference_checkbox.setChecked(True)
-            
+
             # 現在の画像の表示を更新
             self.update_inference_display()
             self.main_image_view.update()
             self.update_gallery()  # ギャラリー表示も更新
-            
+
             # 処理完了メッセージ
             if progress.wasCanceled():
                 QMessageBox.information(
@@ -14843,7 +15251,7 @@ class ImageAnnotationTool(QMainWindow):
                     get_text('dlg_complete'),
                     get_text('msg_batch_inference_complete', len(self.images), success_count, skipped_count)
                 )
-            
+
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -15042,7 +15450,34 @@ class ImageAnnotationTool(QMainWindow):
         # 推論表示のチェック状態を反映
         self.main_image_view.show_inference = self.inference_checkbox.isChecked()
 
-    ### 読み込み関連         
+        # 追加モデルの推論結果も更新
+        self._update_extra_inference_info_panels()
+        self._update_extra_inference_points()
+
+    def _update_extra_inference_info_panels(self):
+        """追加モデルの情報パネルラベルを更新する"""
+        if not self.images:
+            return
+        current_index = self.current_index
+        for i, slot in enumerate(self.extra_model_slots):
+            color = self.extra_model_colors[i]
+            if slot['checkbox'].isChecked() and current_index in slot['inference_results']:
+                inf = slot['inference_results'][current_index]
+                if "pilot/angle" in inf and "pilot/throttle" in inf:
+                    angle = inf["pilot/angle"]
+                    throttle = inf["pilot/throttle"]
+                else:
+                    angle = inf["angle"]
+                    throttle = inf["throttle"]
+                text = f"<b>{get_text('label_driving_model_n_inference', i+2)}</b><br>"
+                text += f"angle = <span style='color: {color};'>{angle:.4f}</span><br>"
+                text += f"throttle = <span style='color: {color};'>{throttle:.4f}</span>"
+                slot['info_label'].setText(text)
+                slot['info_label'].setTextFormat(Qt.RichText)
+            else:
+                slot['info_label'].setText(" ")
+
+    ### 読み込み関連
     def browse_folder(self):
         """
         画像フォルダを選択するダイアログを表示
@@ -15939,7 +16374,63 @@ class ImageAnnotationTool(QMainWindow):
             
             # モデル変更を検出するための状態を保持
             self._last_model_info = (model_type, model_path)
-            
+
+            # 追加モデルスロットの読み込みと推論
+            if self.extra_model_slots:
+                for slot_idx, slot in enumerate(self.extra_model_slots):
+                    extra_model_type = slot['method_combo'].currentText()
+                    extra_selected = slot['model_combo'].currentText()
+                    if extra_selected in [get_text('combo_model_not_found'), get_text('combo_select_folder')] or "not found" in extra_selected.lower():
+                        continue
+                    extra_model_path = os.path.join(models_dir, extra_selected)
+                    if not os.path.exists(extra_model_path):
+                        continue
+
+                    progress.setLabelText(f"追加モデル{slot_idx + 2}を読み込み中: {extra_selected}")
+                    progress.setValue(82 + slot_idx * 2)
+                    QApplication.processEvents()
+
+                    try:
+                        from model_catalog import get_model as get_model_fn, load_model_weights as load_weights_fn
+                        from model_catalog import detect_num_outputs_from_checkpoint as detect_outputs_fn
+                        from model_catalog import detect_input_size_from_checkpoint as detect_input_fn
+
+                        extra_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                        extra_num_outputs = detect_outputs_fn(extra_model_path, extra_device)
+                        extra_input_size = detect_input_fn(extra_model_path, extra_device)
+                        extra_model = get_model_fn(extra_model_type, pretrained=False, input_size=extra_input_size, num_outputs=extra_num_outputs)
+                        load_weights_fn(extra_model, extra_model_path, extra_device)
+                        extra_model.eval()
+                        slot['model'] = extra_model
+
+                        # 現在の画像に対して推論実行
+                        extra_inference_results = batch_inference(
+                            [current_img_path],
+                            method="model",
+                            model_type=extra_model_type,
+                            model_path=extra_model_path,
+                            force_reload=True
+                        )
+
+                        # 推論結果をインデックスベースで保存
+                        if clear_inference:
+                            slot['inference_results'] = {}
+                        for img_path_key, result in extra_inference_results.items():
+                            try:
+                                idx = self.images.index(img_path_key)
+                                slot['inference_results'][idx] = result
+                            except ValueError:
+                                pass
+
+                        # チェックボックスを有効化
+                        slot['checkbox'].setEnabled(True)
+                        slot['checkbox'].setToolTip(f"モデル{slot_idx + 2}読込済")
+                        slot['checkbox'].setChecked(True)
+
+                    except Exception as e:
+                        print(f"追加モデル{slot_idx + 2}の読み込みエラー: {e}")
+                        slot['model'] = None
+
             # 推論表示チェックボックスを有効にして自動的にオンにする
             progress.setLabelText(get_text('msg_updating_inference'))
             progress.setValue(90)
