@@ -76,7 +76,7 @@ from model_training import generate_augmentation_samples
 from styles import get_location_color, apply_style, set_theme, get_current_theme, PRIMARY_STYLE, MODEL_STYLE, TRAINING_STYLE, EXPORT_STYLE, SPECIAL_STYLE, DESTRUCTIVE_STYLE, NAV_STYLE
 
 
-from managers import AnnotationDataManager, MLflowManager, ModelType
+from managers import AnnotationDataManager, MLflowManager, ModelType, TrajectoryTrainingManager
 from utils.yolo_utils import train_yolo_with_ui, TrainingOutputDialog
 from data_analysis import DataAnalysisDialog
 from utils.databricks_transfer import DatabricksTransferManager
@@ -105,6 +105,8 @@ class ImageLabel(QLabel):
         self.inference_point = None
         self.show_inference = False
         self.extra_inference_points = []  # 追加モデルの推論ポイントリスト [(QPoint, QColor, show_flag), ...]
+        self.gru_prediction_trajectory = []  # 時系列予測軌道 [(QPoint, ...)]
+        self.show_gru_prediction = False  # 時系列予測表示フラグ
         self.zoom_factor = DEFAULT_ZOOM_FACTOR  
         self.is_deleted = False
         self.is_downsampled = False  # ダウンサンプリング対象フラグ
@@ -1066,6 +1068,72 @@ class ImageLabel(QLabel):
                 painter.setPen(QPen(extra_color, 4))
                 painter.setBrush(QBrush())
                 painter.drawEllipse(scaled_x - 15, scaled_y - 15, 30, 30)
+
+        # 時系列予測軌道を描画（中実三角＋矢印接続、t+1が最大で段階的に縮小）
+        if getattr(self, 'show_gru_prediction', False) and getattr(self, 'gru_prediction_trajectory', []):
+            traj_color = QColor(0, 200, 0)  # 緑
+            traj_border = QColor(0, 128, 0)  # 濃い緑
+            n_pts = len(self.gru_prediction_trajectory)
+            base_r = ANNOTATION_CIRCLE_SIZE - 1  # t+1のサイズ（アノテーション円より1pt小さい）
+            min_r = 3
+
+            scaled_points = []
+            for pt in self.gru_prediction_trajectory:
+                rel_x = pt.x() / pix_width
+                rel_y = pt.y() / pix_height
+                sx = int(target_rect.x() + rel_x * target_rect.width())
+                sy = int(target_rect.y() + rel_y * target_rect.height())
+                scaled_points.append((sx, sy))
+
+            # 矢印で接続（t+1 → t+2 → ...）
+            if len(scaled_points) >= 2:
+                painter.setPen(QPen(traj_color, 2))
+                painter.setBrush(QBrush(traj_color))
+                arrow_len = 8
+                arrow_angle = math.pi / 6
+                for i in range(len(scaled_points) - 1):
+                    x1, y1 = scaled_points[i]
+                    x2, y2 = scaled_points[i + 1]
+                    painter.drawLine(x1, y1, x2, y2)
+                    dx = x2 - x1
+                    dy = y2 - y1
+                    dist = math.sqrt(dx * dx + dy * dy)
+                    if dist > 10:
+                        ang = math.atan2(dy, dx)
+                        ax1 = x2 - arrow_len * math.cos(ang - arrow_angle)
+                        ay1 = y2 - arrow_len * math.sin(ang - arrow_angle)
+                        ax2 = x2 - arrow_len * math.cos(ang + arrow_angle)
+                        ay2 = y2 - arrow_len * math.sin(ang + arrow_angle)
+                        painter.drawPolygon(QPolygon([
+                            QPoint(int(x2), int(y2)),
+                            QPoint(int(ax1), int(ay1)),
+                            QPoint(int(ax2), int(ay2))
+                        ]))
+
+            # 中実三角を描画（t+1が最大、段階的に縮小、次の点の方向を向く）
+            for i, (sx, sy) in enumerate(scaled_points):
+                r = max(min_r, int(base_r - (base_r - min_r) * i / max(n_pts - 1, 1)))
+                # 三角の向きを決定（次の点方向、最後の点は前の点からの方向を継続）
+                if i < len(scaled_points) - 1:
+                    ang = math.atan2(scaled_points[i + 1][1] - sy, scaled_points[i + 1][0] - sx)
+                elif len(scaled_points) >= 2:
+                    ang = math.atan2(sy - scaled_points[i - 1][1], sx - scaled_points[i - 1][0])
+                else:
+                    ang = -math.pi / 2  # 上向きデフォルト
+                # 三角の3頂点（先端が進行方向）
+                tip_x = sx + int(r * math.cos(ang))
+                tip_y = sy + int(r * math.sin(ang))
+                left_x = sx + int(r * math.cos(ang + 2.4))
+                left_y = sy + int(r * math.sin(ang + 2.4))
+                right_x = sx + int(r * math.cos(ang - 2.4))
+                right_y = sy + int(r * math.sin(ang - 2.4))
+                painter.setPen(QPen(traj_border, 1))
+                painter.setBrush(QBrush(traj_color))
+                painter.drawPolygon(QPolygon([
+                    QPoint(tip_x, tip_y),
+                    QPoint(left_x, left_y),
+                    QPoint(right_x, right_y)
+                ]))
 
     def draw_vector_arrow(self, painter, start_x, start_y, end_x, end_y):
         """教師データから推論結果への矢印を描画する"""
@@ -4012,6 +4080,9 @@ class ImageAnnotationTool(QMainWindow):
         pilot_layout.addLayout(gradcam_row)
 
         left_layout.addWidget(self.pilot_container)
+
+        # 時系列モデル追加（自動運転モデルの直下）
+        self.add_gru_model_section()
 
         # 物体検知推論結果表示フラグの初期化
         self.show_detection_inference = False
@@ -15439,15 +15510,17 @@ class ImageAnnotationTool(QMainWindow):
                 
         current_index = self.current_index
         
-        # 自動運転推論表示がOFFの場合は表示をクリア
+        # 自動運転推論表示がOFFの場合は自動運転推論をクリア（GRU予測は独立処理）
         if not hasattr(self, 'inference_checkbox') or not self.inference_checkbox.isChecked():
             if hasattr(self, 'inference_info_label'):
                 self.inference_info_label.setText(" ")  # スペースで高さを維持
-            
+
             # 推論ポイントをクリア
             if hasattr(self, 'main_image_view'):
                 self.main_image_view.inference_point = None
-            
+
+            # GRU予測結果は独立して表示
+            self._update_gru_prediction_display(current_index)
             return
                 
         # 推論結果がある場合、表示を更新（インデックスベースで探す）
@@ -15506,6 +15579,9 @@ class ImageAnnotationTool(QMainWindow):
         # 追加モデルの推論結果も更新
         self._update_extra_inference_info_panels()
         self._update_extra_inference_points()
+
+        # GRU予測結果の表示
+        self._update_gru_prediction_display(current_index)
 
     def _update_extra_inference_info_panels(self):
         """追加モデルの情報パネルラベルを更新する"""
@@ -19941,6 +20017,654 @@ class ImageAnnotationTool(QMainWindow):
                 f"モデル学習中にエラーが発生しました: {str(e)}"
             )
 
+    def _update_gru_prediction_display(self, current_index):
+        """時系列予測結果を表示（info_panel + 画像上に全軌道点を描画）"""
+        if not hasattr(self, 'main_image_view'):
+            return
+
+        if not getattr(self, 'show_gru_predictions', False):
+            self.main_image_view.gru_prediction_trajectory = []
+            self.main_image_view.show_gru_prediction = False
+            self.main_image_view.update()
+            return
+
+        predictions = getattr(self, 'gru_predictions', {})
+        if current_index not in predictions:
+            self.main_image_view.gru_prediction_trajectory = []
+            self.main_image_view.show_gru_prediction = False
+            self.main_image_view.update()
+            return
+
+        trajectory = predictions[current_index]
+
+        # テキスト構築
+        gru_text = f"<b style='color:#00C800;'>{get_text('label_traj_inference_result')}</b>"
+        gru_text += "<table style='margin:0; padding:0; border-spacing:0;'>"
+        for step, (s, t) in enumerate(trajectory):
+            gru_text += (
+                f"<tr><td>t+{step+1}:&nbsp;</td>"
+                f"<td style='color:#00C800;'>{s:+.3f},&nbsp;</td>"
+                f"<td style='color:#008000;'>{t:+.3f}</td></tr>"
+            )
+        gru_text += "</table>"
+
+        if hasattr(self, 'inference_info_label'):
+            current_text = self.inference_info_label.text()
+            if current_text.strip():
+                self.inference_info_label.setText(current_text + gru_text)
+            else:
+                self.inference_info_label.setText(gru_text)
+            self.inference_info_label.setTextFormat(Qt.RichText)
+
+        # 画像上に全軌道点を設定
+        img_w = self.main_image_view.pixmap().width() if self.main_image_view.pixmap() else 0
+        img_h = self.main_image_view.pixmap().height() if self.main_image_view.pixmap() else 0
+        if img_w > 0 and img_h > 0 and trajectory:
+            points = []
+            for s, t in trajectory:
+                x = int((s + 1) / 2 * img_w)
+                y = int((1 - t) / 2 * img_h)
+                points.append(QPoint(x, y))
+            self.main_image_view.gru_prediction_trajectory = points
+            self.main_image_view.show_gru_prediction = True
+        else:
+            self.main_image_view.gru_prediction_trajectory = []
+            self.main_image_view.show_gru_prediction = False
+
+        self.main_image_view.update()
+
+    def train_gru_trajectory_model(self):
+        """時系列モデルの学習設定ダイアログを表示し学習を実行"""
+        if not self.annotations:
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_need_annotations_to_train'))
+            return
+
+        # === 設定ダイアログ構築 ===
+        training_settings = QDialog(self)
+        training_settings.setWindowTitle(get_text('dlg_traj_training_settings'))
+        training_settings.setMinimumWidth(1000)
+
+        settings_layout = QVBoxLayout(training_settings)
+
+        # 2カラムレイアウト
+        columns_layout = QHBoxLayout()
+        left_column = QVBoxLayout()
+        right_column = QVBoxLayout()
+
+        # ===== 左カラム =====
+
+        # --- アーキテクチャ選択グループ ---
+        arch_group = QGroupBox(get_text('label_arch_params'))
+        arch_layout = QVBoxLayout()
+
+        # アーキテクチャ選択
+        arch_select_layout = QHBoxLayout()
+        arch_select_layout.addWidget(QLabel(get_text('label_model_arch')))
+        arch_combo = QComboBox()
+        arch_combo.setMinimumWidth(200)
+        arch_combo.addItem("GRU", "gru")
+        arch_combo.addItem("TCN", "tcn")
+        arch_combo.addItem("CausalCNN", "causal_cnn")
+        arch_select_layout.addWidget(arch_combo)
+        arch_select_layout.addStretch()
+        arch_layout.addLayout(arch_select_layout)
+
+        arch_layout.addSpacing(10)
+
+        # シーケンス設定（同じ行に配置）
+        seq_layout = QHBoxLayout()
+        seq_layout.addWidget(QLabel(get_text('label_seq_len')))
+        seq_len_spin = QSpinBox()
+        seq_len_spin.setRange(1, 100)
+        seq_len_spin.setValue(TRAJ_DEFAULT_SEQ_LEN)
+        seq_layout.addWidget(seq_len_spin)
+
+        seq_layout.addWidget(QLabel(get_text('label_pred_horizon')))
+        pred_horizon_spin = QSpinBox()
+        pred_horizon_spin.setRange(1, 100)
+        pred_horizon_spin.setValue(TRAJ_DEFAULT_PRED_HORIZON)
+        seq_layout.addWidget(pred_horizon_spin)
+
+        seq_layout.addWidget(QLabel(get_text('label_stride')))
+        stride_spin = QSpinBox()
+        stride_spin.setRange(1, 50)
+        stride_spin.setValue(TRAJ_DEFAULT_STRIDE)
+        seq_layout.addWidget(stride_spin)
+
+        seq_layout.addStretch()
+        arch_layout.addLayout(seq_layout)
+
+        # Hidden Dim・Dropout（同じ行に配置）
+        hidden_layout = QHBoxLayout()
+        hidden_layout.addWidget(QLabel(get_text('label_hidden_dim')))
+        hidden_dim_combo = QComboBox()
+        for h in [64, 128, 256, 512]:
+            hidden_dim_combo.addItem(str(h))
+        hidden_dim_combo.setCurrentText(str(TRAJ_DEFAULT_HIDDEN_DIM))
+        hidden_layout.addWidget(hidden_dim_combo)
+
+        hidden_layout.addWidget(QLabel(get_text('label_dropout')))
+        dropout_spin = QDoubleSpinBox()
+        dropout_spin.setRange(0.0, 0.5)
+        dropout_spin.setSingleStep(0.05)
+        dropout_spin.setValue(TRAJ_DEFAULT_DROPOUT)
+        hidden_layout.addWidget(dropout_spin)
+
+        hidden_layout.addStretch()
+        arch_layout.addLayout(hidden_layout)
+
+        # アーキテクチャ固有パラメータ（同じ行に配置）
+        arch_specific_layout = QHBoxLayout()
+
+        gru_layers_label = QLabel(get_text('label_gru_layers'))
+        arch_specific_layout.addWidget(gru_layers_label)
+        gru_layers_spin = QSpinBox()
+        gru_layers_spin.setRange(1, 4)
+        gru_layers_spin.setValue(TRAJ_GRU_DEFAULT_NUM_LAYERS)
+        arch_specific_layout.addWidget(gru_layers_spin)
+
+        tcn_kernel_label = QLabel(get_text('label_tcn_kernel_size'))
+        arch_specific_layout.addWidget(tcn_kernel_label)
+        tcn_kernel_spin = QSpinBox()
+        tcn_kernel_spin.setRange(2, 7)
+        tcn_kernel_spin.setValue(TRAJ_TCN_DEFAULT_KERNEL_SIZE)
+        arch_specific_layout.addWidget(tcn_kernel_spin)
+
+        cnn_kernel_label = QLabel(get_text('label_cnn_kernel_size'))
+        arch_specific_layout.addWidget(cnn_kernel_label)
+        cnn_kernel_spin = QSpinBox()
+        cnn_kernel_spin.setRange(2, 7)
+        cnn_kernel_spin.setValue(TRAJ_CAUSAL_CNN_DEFAULT_KERNEL_SIZE)
+        arch_specific_layout.addWidget(cnn_kernel_spin)
+
+        arch_specific_layout.addStretch()
+        arch_layout.addLayout(arch_specific_layout)
+
+        def update_arch_widgets():
+            arch = arch_combo.currentData()
+            gru_layers_spin.setVisible(arch == "gru")
+            gru_layers_label.setVisible(arch == "gru")
+            tcn_kernel_spin.setVisible(arch == "tcn")
+            tcn_kernel_label.setVisible(arch == "tcn")
+            cnn_kernel_spin.setVisible(arch == "causal_cnn")
+            cnn_kernel_label.setVisible(arch == "causal_cnn")
+
+        arch_combo.currentIndexChanged.connect(update_arch_widgets)
+        update_arch_widgets()
+
+        # シーケンス情報ラベル
+        seq_info_label = QLabel(get_text('label_traj_seq_info', TRAJ_DEFAULT_SEQ_LEN, TRAJ_DEFAULT_PRED_HORIZON))
+        seq_info_label.setStyleSheet("color: #666;")
+        arch_layout.addWidget(seq_info_label)
+
+        def update_seq_info():
+            seq_info_label.setText(get_text('label_traj_seq_info', seq_len_spin.value(), pred_horizon_spin.value()))
+
+        seq_len_spin.valueChanged.connect(update_seq_info)
+        pred_horizon_spin.valueChanged.connect(update_seq_info)
+
+        arch_group.setLayout(arch_layout)
+        left_column.addWidget(arch_group)
+
+        # --- 画像ソース選択グループ ---
+        source_group = QGroupBox(get_text('label_image_sources'))
+        source_layout = QVBoxLayout()
+
+        source_checkboxes = {}
+        if hasattr(self, 'source_images_map') and self.source_images_map:
+            for variant in self.source_images_map.keys():
+                cb = QCheckBox(variant)
+                if variant == 'cam':
+                    cb.setChecked(True)
+                source_checkboxes[variant] = cb
+                source_layout.addWidget(cb)
+        else:
+            cb = QCheckBox('cam')
+            cb.setChecked(True)
+            source_checkboxes['cam'] = cb
+            source_layout.addWidget(cb)
+
+        sources_label = QLabel(get_text('label_sources_selected', sum(1 for cb in source_checkboxes.values() if cb.isChecked())))
+        source_layout.addWidget(sources_label)
+
+        def update_sources_label():
+            count = sum(1 for cb in source_checkboxes.values() if cb.isChecked())
+            sources_label.setText(get_text('label_sources_selected', count))
+            start_button.setEnabled(count > 0)
+
+        for cb in source_checkboxes.values():
+            cb.stateChanged.connect(update_sources_label)
+
+        source_group.setLayout(source_layout)
+        left_column.addWidget(source_group)
+        left_column.addStretch()
+
+        # ===== 右カラム =====
+
+        # --- 学習パラメータグループ ---
+        training_group = QGroupBox(get_text('label_training_params'))
+        training_layout = QVBoxLayout()
+
+        # エポック数・学習率（同じ行に配置）
+        epoch_lr_layout = QHBoxLayout()
+        epoch_lr_layout.addWidget(QLabel(get_text('label_epochs')))
+        epoch_spin = QSpinBox()
+        epoch_spin.setRange(1, 500)
+        epoch_spin.setValue(TRAJ_DEFAULT_EPOCHS)
+        epoch_lr_layout.addWidget(epoch_spin)
+
+        epoch_lr_layout.addWidget(QLabel(get_text('label_learning_rate')))
+        lr_combo = QComboBox()
+        for lr in ['0.001', '0.0005', '0.0001', '0.00005', '0.00001']:
+            lr_combo.addItem(lr)
+        lr_combo.setCurrentIndex(0)
+        epoch_lr_layout.addWidget(lr_combo)
+
+        epoch_lr_layout.addStretch()
+        training_layout.addLayout(epoch_lr_layout)
+
+        # バッチサイズ・検証データ割合（同じ行に配置）
+        batch_val_layout = QHBoxLayout()
+        batch_val_layout.addWidget(QLabel(get_text('label_batch_size')))
+        batch_size_combo = QComboBox()
+        for bs in ['8', '16', '32', '64', '128']:
+            batch_size_combo.addItem(bs)
+        batch_size_combo.setCurrentIndex(2)  # デフォルト: 32
+        batch_val_layout.addWidget(batch_size_combo)
+
+        batch_val_layout.addWidget(QLabel(get_text('label_val_split')))
+        val_split_spin = QDoubleSpinBox()
+        val_split_spin.setRange(0.1, 0.5)
+        val_split_spin.setSingleStep(0.05)
+        val_split_spin.setDecimals(2)
+        val_split_spin.setValue(0.2)
+        batch_val_layout.addWidget(val_split_spin)
+
+        batch_val_layout.addStretch()
+        training_layout.addLayout(batch_val_layout)
+
+        # データ拡張チェックボックス
+        aug_check = QCheckBox(get_text('chk_augmentation'))
+        aug_check.setChecked(True)
+        training_layout.addWidget(aug_check)
+
+        training_group.setLayout(training_layout)
+        right_column.addWidget(training_group)
+
+        # --- 学習対象データ選択グループ ---
+        data_selection_group = QGroupBox(get_text('label_training_data_selection'))
+        data_selection_layout = QVBoxLayout()
+
+        data_radio_all = QRadioButton(get_text('label_use_all_annotations'))
+        data_radio_all.setChecked(True)
+        data_selection_layout.addWidget(data_radio_all)
+
+        # スキップ設定（同じ行に配置）
+        skip_layout = QHBoxLayout()
+        data_radio_skip = QRadioButton(get_text('label_use_skip'))
+        skip_layout.addWidget(data_radio_skip)
+        skip_layout.addWidget(QLabel(get_text('label_skip_count')))
+        custom_skip_spin = QSpinBox()
+        custom_skip_spin.setRange(2, 100)
+        custom_skip_spin.setValue(5)
+        custom_skip_spin.setEnabled(False)
+        skip_layout.addWidget(custom_skip_spin)
+        skip_layout.addStretch()
+        data_selection_layout.addLayout(skip_layout)
+
+        # インデックス範囲指定（同じ行に配置）
+        range_layout = QHBoxLayout()
+        data_radio_range = QRadioButton(get_text('label_specify_index_range'))
+        range_layout.addWidget(data_radio_range)
+        range_start_spin = QSpinBox()
+        range_start_spin.setRange(0, 99999)
+        range_start_spin.setValue(0)
+        range_start_spin.setEnabled(False)
+        range_end_spin = QSpinBox()
+        range_end_spin.setRange(0, 99999)
+        max_index = len(self.images) - 1 if hasattr(self, 'images') and self.images else 0
+        range_end_spin.setValue(max_index)
+        range_end_spin.setEnabled(False)
+        range_layout.addWidget(range_start_spin)
+        range_layout.addWidget(QLabel(get_text('label_range_separator')))
+        range_layout.addWidget(range_end_spin)
+        range_layout.addStretch()
+        data_selection_layout.addLayout(range_layout)
+
+        # データサンプル数の表示ラベル
+        data_sample_label = QLabel("")
+        data_selection_layout.addWidget(data_sample_label)
+
+        def update_data_selection_ui():
+            custom_skip_spin.setEnabled(data_radio_skip.isChecked())
+            range_start_spin.setEnabled(data_radio_range.isChecked())
+            range_end_spin.setEnabled(data_radio_range.isChecked())
+
+            # サンプル数の計算と表示
+            if data_radio_all.isChecked():
+                total = len(self.annotations)
+                deleted = sum(1 for idx in self.annotations if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes)
+                sample_count = total - deleted
+                data_sample_label.setText(get_text('label_data_count_all_detail', sample_count, total, get_text('label_excluded_deleted', deleted)))
+            elif data_radio_skip.isChecked():
+                skip = custom_skip_spin.value()
+                total_skipped = sum(1 for idx in self.annotations if idx % skip == 0)
+                deleted = sum(1 for idx in self.annotations if idx % skip == 0 and hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes)
+                sample_count = total_skipped - deleted
+                data_sample_label.setText(get_text('label_data_count_skip_detail', sample_count, skip, total_skipped, get_text('label_excluded_deleted', deleted)))
+            elif data_radio_range.isChecked():
+                start = range_start_spin.value()
+                end = range_end_spin.value()
+                total_in_range = sum(1 for idx in self.annotations if start <= idx <= end)
+                deleted = sum(1 for idx in self.annotations if start <= idx <= end and hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes)
+                sample_count = total_in_range - deleted
+                data_sample_label.setText(get_text('label_data_count_range_detail', sample_count, start, end, total_in_range, get_text('label_excluded_deleted', deleted)))
+            data_sample_label.setStyleSheet("color: #2E7D32; font-weight: bold; font-size: 13px;")
+
+        data_radio_all.toggled.connect(update_data_selection_ui)
+        data_radio_skip.toggled.connect(update_data_selection_ui)
+        data_radio_range.toggled.connect(update_data_selection_ui)
+        custom_skip_spin.valueChanged.connect(update_data_selection_ui)
+        range_start_spin.valueChanged.connect(update_data_selection_ui)
+        range_end_spin.valueChanged.connect(update_data_selection_ui)
+
+        # 初期表示を設定
+        update_data_selection_ui()
+
+        data_selection_group.setLayout(data_selection_layout)
+        right_column.addWidget(data_selection_group)
+        right_column.addStretch()
+
+        # カラムをメインレイアウトに追加
+        columns_layout.addLayout(left_column)
+        columns_layout.addLayout(right_column)
+        settings_layout.addLayout(columns_layout)
+
+        # --- ボタン ---
+        button_box = QDialogButtonBox(QDialogButtonBox.Cancel)
+        start_button = button_box.addButton(get_text('btn_start_training'), QDialogButtonBox.AcceptRole)
+        button_box.accepted.connect(training_settings.accept)
+        button_box.rejected.connect(training_settings.reject)
+        settings_layout.addWidget(button_box)
+
+        # ダイアログ表示
+        if not training_settings.exec_():
+            return
+
+        # === 設定値の取得 ===
+        selected_sources = [name for name, cb in source_checkboxes.items() if cb.isChecked()]
+        if not selected_sources:
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_select_at_least_one_source'))
+            return
+
+        use_all = data_radio_all.isChecked()
+        use_skip = data_radio_skip.isChecked()
+        use_range = data_radio_range.isChecked()
+        skip_count = custom_skip_spin.value() if use_skip else 1
+        range_start = range_start_spin.value() if use_range else 0
+        range_end = range_end_spin.value() if use_range else (len(self.images) - 1)
+
+        # === valid_indexes構築 ===
+        valid_indexes = []
+        for idx in self.annotations.keys():
+            if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
+                continue
+            if not isinstance(idx, int) or idx < 0 or idx >= len(self.images):
+                continue
+            if use_all:
+                valid_indexes.append(idx)
+            elif use_skip:
+                if idx % skip_count == 0:
+                    valid_indexes.append(idx)
+            elif use_range:
+                if range_start <= idx <= range_end:
+                    valid_indexes.append(idx)
+
+        if not valid_indexes:
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_training_data'))
+            return
+
+        selected_arch = arch_combo.currentData()
+        config = {
+            'model_arch': selected_arch,
+            'seq_len': seq_len_spin.value(),
+            'pred_horizon': pred_horizon_spin.value(),
+            'stride': stride_spin.value(),
+            'hidden_dim': int(hidden_dim_combo.currentText()),
+            'dropout': dropout_spin.value(),
+            'img_size': TRAJ_DEFAULT_IMG_SIZE,
+            'epochs': epoch_spin.value(),
+            'batch_size': int(batch_size_combo.currentText()),
+            'learning_rate': float(lr_combo.currentText()),
+            'val_split': val_split_spin.value(),
+            'augment': aug_check.isChecked(),
+        }
+
+        # アーキテクチャ固有パラメータ
+        if selected_arch == 'gru':
+            config['num_layers'] = gru_layers_spin.value()
+        elif selected_arch == 'tcn':
+            config['kernel_size'] = tcn_kernel_spin.value()
+            config['tcn_channels'] = TRAJ_TCN_DEFAULT_CHANNELS
+        elif selected_arch == 'causal_cnn':
+            config['kernel_size'] = cnn_kernel_spin.value()
+            config['cnn_channels'] = TRAJ_CAUSAL_CNN_DEFAULT_CHANNELS
+
+        try:
+            # 進捗ダイアログ
+            progress = QProgressDialog(
+                f"モデル '{selected_arch.upper()}' の学習中...",
+                "キャンセル", 0, 100, self
+            )
+            progress.setWindowTitle(get_text('dlg_traj_model_training'))
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+
+            def update_progress(current, total, message=None):
+                value = int(current * 100 / total) if total > 0 else 0
+                progress.setValue(value)
+                if message:
+                    progress.setLabelText(message)
+                QApplication.processEvents()
+                return not progress.wasCanceled()
+
+            mlflow_mgr = None
+            if hasattr(self, 'mlflow_manager'):
+                mlflow_mgr = self.mlflow_manager
+
+            manager = TrajectoryTrainingManager(models_dir, mlflow_manager=mlflow_mgr)
+            result = manager.train(
+                valid_indexes=valid_indexes,
+                annotations=self.annotations,
+                images=self.images,
+                source_images_map=getattr(self, 'source_images_map', None),
+                selected_sources=selected_sources,
+                config=config,
+                progress_callback=update_progress
+            )
+
+            progress.close()
+
+            if result.get('status') == 'error':
+                if result.get('message') == 'no_sequences':
+                    QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_traj_no_sequences'))
+                else:
+                    QMessageBox.warning(self, get_text('dlg_warning'), result.get('message', 'Unknown error'))
+                return
+
+            if result.get('status') == 'cancelled':
+                self.statusBar().showMessage(get_text('status_training_cancelled'), 5000)
+                return
+
+            # 学習曲線グラフを保存
+            if result.get('model_path') and result.get('train_losses') and result.get('val_losses'):
+                self._save_traj_training_curve(
+                    result['model_path'],
+                    result['train_losses'],
+                    result['val_losses'],
+                    selected_arch
+                )
+
+            arch_label = selected_arch.upper()
+            msg = (
+                f"{get_text('msg_traj_training_complete')}\n\n"
+                f"Architecture: {arch_label}\n"
+                f"Best Val Loss: {result.get('best_val_loss', 0):.6f}\n"
+                f"Epochs: {result.get('epochs_trained', 0)}\n"
+                f"Sequences: {result.get('total_sequences', 0)} "
+                f"(Train: {result.get('train_samples', 0)}, Val: {result.get('val_samples', 0)})\n"
+                f"Time: {result.get('total_time', 0):.1f}s\n"
+                f"Model: {os.path.basename(result.get('model_path', ''))}"
+            )
+            QMessageBox.information(self, get_text('dlg_traj_model_training'), msg)
+
+            # モデルリストを更新
+            self.refresh_traj_model_list()
+
+        except Exception as e:
+            if 'progress' in locals():
+                progress.close()
+            QMessageBox.critical(
+                self,
+                get_text('dlg_error'),
+                f"時系列モデル学習中にエラーが発生しました: {str(e)}"
+            )
+
+    def _save_traj_training_curve(self, model_path, train_losses, val_losses, model_arch):
+        """時系列モデルの学習曲線をグラフとして保存"""
+        try:
+            import matplotlib.pyplot as plt
+
+            graph_path = model_path.replace('.pth', '_training_curve.png')
+            epochs = range(1, len(train_losses) + 1)
+
+            fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+
+            ax.plot(epochs, train_losses, 'b-', label='Training Loss', linewidth=2)
+            ax.plot(epochs, val_losses, 'r-', label='Validation Loss', linewidth=2)
+
+            # 最小検証損失のエポックをマーク
+            min_val_loss_epoch = val_losses.index(min(val_losses)) + 1
+            min_val_loss = min(val_losses)
+            ax.axvline(x=min_val_loss_epoch, color='g', linestyle='--', alpha=0.7,
+                       label=f'Best (Epoch {min_val_loss_epoch}, Loss {min_val_loss:.6f})')
+
+            ax.set_title(f'{model_arch.upper()} Trajectory Model Training Curve', fontsize=14, fontweight='bold')
+            ax.set_xlabel('Epoch', fontsize=11)
+            ax.set_ylabel('Loss (MSE)', fontsize=11)
+            ax.legend(fontsize=10, loc='upper right')
+            ax.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            plt.savefig(graph_path, dpi=150, bbox_inches='tight')
+            plt.close()
+
+            print(f"学習曲線を保存しました: {graph_path}")
+
+        except Exception as e:
+            print(f"学習曲線の保存に失敗しました: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def run_gru_prediction(self):
+        """時系列モデルの推論を実行（コンボボックスで選択されたモデルを使用）"""
+        if not self.annotations:
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_need_annotations_to_train'))
+            return
+
+        # コンボボックスから選択されたモデルを取得
+        selected_model_name = self.traj_model_combo.currentText()
+        if not selected_model_name or selected_model_name == get_text('combo_model_not_found'):
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_traj_models'))
+            return
+
+        selected_model_path = os.path.join(models_dir, selected_model_name)
+        if not os.path.exists(selected_model_path):
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_traj_models'))
+            return
+
+        # valid_indexes構築
+        valid_indexes = []
+        for idx in self.annotations.keys():
+            if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
+                continue
+            if not isinstance(idx, int) or idx < 0 or idx >= len(self.images):
+                continue
+            valid_indexes.append(idx)
+
+        if not valid_indexes:
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_training_data'))
+            return
+
+        try:
+            progress = QProgressDialog(
+                get_text('msg_traj_predicting'),
+                get_text('btn_cancel') if 'btn_cancel' in dir() else "キャンセル",
+                0, 100, self
+            )
+            progress.setWindowTitle(get_text('dlg_traj_prediction'))
+            progress.setWindowModality(Qt.WindowModal)
+            progress.show()
+
+            def update_progress(current, total, message=None):
+                value = int(current * 100 / total) if total > 0 else 0
+                progress.setValue(value)
+                if message:
+                    progress.setLabelText(message)
+                QApplication.processEvents()
+                return not progress.wasCanceled()
+
+            manager = TrajectoryTrainingManager(models_dir)
+            result = manager.predict(
+                model_path=selected_model_path,
+                valid_indexes=valid_indexes,
+                annotations=self.annotations,
+                images=self.images,
+                source_images_map=getattr(self, 'source_images_map', None),
+                progress_callback=update_progress
+            )
+
+            progress.close()
+
+            if result.get('status') == 'error':
+                if result.get('message') == 'no_sequences':
+                    QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_traj_no_sequences'))
+                else:
+                    QMessageBox.warning(self, get_text('dlg_warning'), result.get('message', 'Unknown error'))
+                return
+
+            if result.get('status') == 'cancelled':
+                self.statusBar().showMessage(get_text('status_training_cancelled'), 5000)
+                return
+
+            self.gru_predictions = result.get('predictions', {})
+            self.gru_prediction_config = result.get('config', {})
+            self.show_gru_predictions = True
+
+            if hasattr(self, 'gru_prediction_checkbox'):
+                self.gru_prediction_checkbox.setChecked(True)
+
+            # 現在の画像で推論結果を即座に表示
+            current_index = getattr(self, 'current_index', 0)
+            self._update_gru_prediction_display(current_index)
+
+            msg = (
+                f"{get_text('msg_traj_prediction_complete')}\n\n"
+                f"{get_text('msg_traj_prediction_count', result.get('total_predictions', 0))}\n"
+                f"seq_len={self.gru_prediction_config.get('seq_len', '?')}, "
+                f"pred_horizon={self.gru_prediction_config.get('pred_horizon', '?')}"
+            )
+            QMessageBox.information(self, get_text('dlg_traj_prediction'), msg)
+
+        except Exception as e:
+            if 'progress' in locals():
+                progress.close()
+            QMessageBox.critical(
+                self,
+                get_text('dlg_error'),
+                f"時系列推論中にエラーが発生しました: {str(e)}"
+            )
+
     def _log_autonomous_driving_training(self, model_type, training_results, training_params, dataset_info, image_paths):
         """自動運転モデルの学習結果をMLflowに記録"""
         
@@ -21293,10 +22017,32 @@ class ImageAnnotationTool(QMainWindow):
         self.waypoint_model_container = QWidget()
         waypoint_model_layout = QVBoxLayout(self.waypoint_model_container)
 
-        # ヘッダータイトル
+        # ヘッダー: タイトル + 開発中ラベル + 展開ボタン
+        header_layout = QHBoxLayout()
         waypoint_model_label = QLabel(get_text('label_waypoint_model'))
         waypoint_model_label.setStyleSheet("font-weight: bold")
-        waypoint_model_layout.addWidget(waypoint_model_label)
+        header_layout.addWidget(waypoint_model_label)
+
+        waypoint_dev_label = QLabel(get_text('label_dev_in_progress'))
+        waypoint_dev_label.setStyleSheet(
+            "color: #FF6600; font-size: 10px; font-weight: bold; "
+            "border: 1px solid #FF6600; border-radius: 3px; padding: 1px 4px;"
+        )
+        header_layout.addWidget(waypoint_dev_label)
+        header_layout.addStretch()
+
+        self.waypoint_expand_button = QPushButton("▶")
+        self.waypoint_expand_button.setFixedSize(24, 24)
+        self.waypoint_expand_button.setStyleSheet("font-size: 10px; padding: 0px;")
+        self.waypoint_expand_button.clicked.connect(self._toggle_waypoint_section)
+        header_layout.addWidget(self.waypoint_expand_button)
+
+        waypoint_model_layout.addLayout(header_layout)
+
+        # 展開可能な中身コンテナ
+        self.waypoint_content_widget = QWidget()
+        waypoint_content_layout = QVBoxLayout(self.waypoint_content_widget)
+        waypoint_content_layout.setContentsMargins(0, 0, 0, 0)
 
         # モデル選択
         model_type_layout = QHBoxLayout()
@@ -21305,13 +22051,13 @@ class ImageAnnotationTool(QMainWindow):
         self.waypoint_model_combo.addItems(["donkey_waypoint", "resnet18_waypoint"])
         self.waypoint_model_combo.currentIndexChanged.connect(self.on_waypoint_model_type_changed)
         model_type_layout.addWidget(self.waypoint_model_combo)
-        waypoint_model_layout.addLayout(model_type_layout)
+        waypoint_content_layout.addLayout(model_type_layout)
 
         # 事前学習済みモデル選択
         self.waypoint_saved_model_combo = QComboBox()
         self.waypoint_saved_model_combo.setMinimumWidth(180)
         self.waypoint_saved_model_combo.setStyleSheet("combobox-popup: 0;")
-        waypoint_model_layout.addWidget(self.waypoint_saved_model_combo)
+        waypoint_content_layout.addWidget(self.waypoint_saved_model_combo)
 
         # モデル操作ボタン
         waypoint_model_buttons_layout = QHBoxLayout()
@@ -21329,7 +22075,7 @@ class ImageAnnotationTool(QMainWindow):
         apply_style(self.waypoint_load_button, 'model')
         waypoint_model_buttons_layout.addWidget(self.waypoint_load_button)
 
-        waypoint_model_layout.addLayout(waypoint_model_buttons_layout)
+        waypoint_content_layout.addLayout(waypoint_model_buttons_layout)
 
         # ウェイポイント推論表示チェックボックス
         waypoint_inference_layout = QHBoxLayout()
@@ -21339,7 +22085,12 @@ class ImageAnnotationTool(QMainWindow):
         self.waypoint_inference_checkbox.setToolTip(get_text('tip_waypoint_model_not_loaded'))
         self.waypoint_inference_checkbox.stateChanged.connect(self.toggle_waypoint_inference_display)
         waypoint_inference_layout.addWidget(self.waypoint_inference_checkbox)
-        waypoint_model_layout.addLayout(waypoint_inference_layout)
+        waypoint_content_layout.addLayout(waypoint_inference_layout)
+
+        waypoint_model_layout.addWidget(self.waypoint_content_widget)
+
+        # 初期状態: 折りたたみ
+        self.waypoint_content_widget.setVisible(False)
 
         # ウェイポイントモデルコンテナを追加
         left_layout.addWidget(self.waypoint_model_container)
@@ -21349,6 +22100,161 @@ class ImageAnnotationTool(QMainWindow):
 
         # モデルリストの取得
         self.refresh_waypoint_model_list()
+
+    def _toggle_waypoint_section(self):
+        """ウェイポイントセクションの展開/折りたたみ"""
+        visible = not self.waypoint_content_widget.isVisible()
+        self.waypoint_content_widget.setVisible(visible)
+        self.waypoint_expand_button.setText("▼" if visible else "▶")
+
+    def add_gru_model_section(self):
+        """時系列モデルのセクションを追加する"""
+        left_layout = self.get_left_layout()
+        if left_layout is None:
+            return
+
+        # コンテナ
+        self.gru_model_container = QWidget()
+        gru_model_layout = QVBoxLayout(self.gru_model_container)
+
+        # ヘッダー: タイトル + 開発中ラベル + 展開ボタン
+        header_layout = QHBoxLayout()
+        traj_title = QLabel(get_text('label_traj_section_title'))
+        traj_title.setStyleSheet("font-weight: bold")
+        header_layout.addWidget(traj_title)
+
+        dev_label = QLabel(get_text('label_dev_in_progress'))
+        dev_label.setStyleSheet(
+            "color: #FF6600; font-size: 10px; font-weight: bold; "
+            "border: 1px solid #FF6600; border-radius: 3px; padding: 1px 4px;"
+        )
+        header_layout.addWidget(dev_label)
+        header_layout.addStretch()
+
+        self.gru_expand_button = QPushButton("▶")
+        self.gru_expand_button.setFixedSize(24, 24)
+        self.gru_expand_button.setStyleSheet("font-size: 10px; padding: 0px;")
+        self.gru_expand_button.clicked.connect(self._toggle_gru_section)
+        header_layout.addWidget(self.gru_expand_button)
+
+        gru_model_layout.addLayout(header_layout)
+
+        # 展開可能な中身コンテナ
+        self.gru_content_widget = QWidget()
+        gru_content_layout = QVBoxLayout(self.gru_content_widget)
+        gru_content_layout.setContentsMargins(0, 0, 0, 0)
+
+        # アーキテクチャ選択
+        traj_method_layout = QHBoxLayout()
+        traj_method_layout.addWidget(QLabel(get_text('label_model_arch')))
+        self.traj_arch_combo = QComboBox()
+        self.traj_arch_combo.addItems(["GRU", "TCN", "CausalCNN", get_text('label_all')])
+        self.traj_arch_combo.setCurrentIndex(3)  # デフォルト: すべて
+        self.traj_arch_combo.currentIndexChanged.connect(self.refresh_traj_model_list)
+        traj_method_layout.addWidget(self.traj_arch_combo)
+        gru_content_layout.addLayout(traj_method_layout)
+
+        # モデルファイル選択コンボボックス
+        self.traj_model_combo = QComboBox()
+        self.traj_model_combo.setMinimumWidth(180)
+        self.traj_model_combo.setStyleSheet("combobox-popup: 0;")
+        gru_content_layout.addWidget(self.traj_model_combo)
+
+        # ボタン
+        traj_buttons_layout = QHBoxLayout()
+
+        traj_train_button = QPushButton(get_text('btn_traj_train'))
+        traj_train_button.clicked.connect(self.train_gru_trajectory_model)
+        apply_style(traj_train_button, 'training')
+        traj_buttons_layout.addWidget(traj_train_button)
+
+        traj_predict_button = QPushButton(get_text('btn_traj_predict'))
+        traj_predict_button.clicked.connect(self.run_gru_prediction)
+        apply_style(traj_predict_button, 'model')
+        traj_buttons_layout.addWidget(traj_predict_button)
+
+        gru_content_layout.addLayout(traj_buttons_layout)
+
+        # 予測表示チェックボックス
+        self.gru_prediction_checkbox = QCheckBox(get_text('chk_show_traj_prediction'))
+        self.gru_prediction_checkbox.setChecked(False)
+        self.gru_prediction_checkbox.stateChanged.connect(self._toggle_gru_prediction_display)
+        gru_content_layout.addWidget(self.gru_prediction_checkbox)
+
+        gru_model_layout.addWidget(self.gru_content_widget)
+
+        # 初期状態: 折りたたみ
+        self.gru_content_widget.setVisible(False)
+
+        left_layout.addWidget(self.gru_model_container)
+
+        # 予測結果格納用
+        self.gru_predictions = {}
+        self.gru_prediction_config = {}
+        self.show_gru_predictions = False
+
+        # モデルリストを初期化
+        self.refresh_traj_model_list()
+
+    def refresh_traj_model_list(self):
+        """時系列モデルのリストを更新"""
+        self.traj_model_combo.clear()
+
+        if not os.path.isdir(models_dir):
+            self.traj_model_combo.addItem(get_text('combo_model_not_found'))
+            return
+
+        # フィルタ用アーキテクチャ取得
+        arch_filter = self.traj_arch_combo.currentText().lower()
+        show_all = arch_filter == get_text('label_all').lower()
+
+        # アーキ名→ファイル名キーワードのマッピング
+        arch_to_keyword = {
+            "gru": "gru",
+            "tcn": "tcn",
+            "causalcnn": "causal_cnn",
+        }
+        filter_keyword = arch_to_keyword.get(arch_filter, "")
+
+        model_files = []
+        for f in os.listdir(models_dir):
+            if not f.endswith('.pth'):
+                continue
+            if not (f.startswith('traj_') or f.startswith('gru_')):
+                continue
+            # アーキテクチャでフィルタリング
+            if not show_all and filter_keyword:
+                if filter_keyword not in f.lower():
+                    continue
+            model_files.append(f)
+
+        if not model_files:
+            self.traj_model_combo.addItem(get_text('combo_model_not_found'))
+            return
+
+        # 新しいものが上に来るようにソート
+        model_files.sort(key=lambda f: os.path.getmtime(os.path.join(models_dir, f)), reverse=True)
+
+        for model_file in model_files:
+            self.traj_model_combo.addItem(model_file)
+
+    def _toggle_gru_section(self):
+        """時系列セクションの展開/折りたたみ"""
+        visible = not self.gru_content_widget.isVisible()
+        self.gru_content_widget.setVisible(visible)
+        self.gru_expand_button.setText("▼" if visible else "▶")
+
+    def _toggle_gru_prediction_display(self, state):
+        """時系列予測表示の切り替え"""
+        self.show_gru_predictions = (state == Qt.Checked)
+        if not self.show_gru_predictions:
+            if hasattr(self, 'main_image_view'):
+                self.main_image_view.gru_prediction_trajectory = []
+                self.main_image_view.show_gru_prediction = False
+        if hasattr(self, 'update_inference_display'):
+            self.update_inference_display()
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
 
     def refresh_waypoint_model_list(self):
         """保存されているウェイポイントモデルのリストを更新"""
