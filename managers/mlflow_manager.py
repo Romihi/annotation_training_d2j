@@ -9,7 +9,7 @@ from enum import Enum
 
 # Databricks設定をインポート
 try:
-    from config_databricks import (
+    from databricks.config_databricks import (
         DATABRICKS_ENABLED,
         DATABRICKS_HOST,
         DATABRICKS_TOKEN,

@@ -37,13 +37,13 @@ COLAB_ENABLED = _get_bool_env("COLAB_ENABLED", False)
 # Google OAuth2設定
 GOOGLE_CLIENT_SECRETS = os.environ.get(
     "GOOGLE_CLIENT_SECRETS",
-    str(Path(__file__).parent / "client_secrets.json")
+    str(Path(__file__).parent.parent / "client_secrets.json")
 )
 
 # 認証トークン保存パス
 GOOGLE_CREDENTIALS_PATH = os.environ.get(
     "GOOGLE_CREDENTIALS_PATH",
-    str(Path(__file__).parent / ".google_credentials.json")
+    str(Path(__file__).parent.parent / ".google_credentials.json")
 )
 
 # Google Drive設定

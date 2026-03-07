@@ -51,6 +51,15 @@ DATABRICKS_EXPERIMENT_PREFIX = os.environ.get(
 DATABRICKS_MODEL_REGISTRY_CATALOG = os.environ.get("DATABRICKS_CATALOG", "main")
 DATABRICKS_MODEL_REGISTRY_SCHEMA = os.environ.get("DATABRICKS_SCHEMA", "default")
 
+# Databricksクラスター設定（自動学習パイプライン用）
+DATABRICKS_CLUSTER_ID = os.environ.get("DATABRICKS_CLUSTER_ID", "")
+
+# ノートブックのワークスペースパス
+DATABRICKS_NOTEBOOK_PATH = os.environ.get(
+    "DATABRICKS_NOTEBOOK_PATH",
+    "/Workspace/Users/{user}/annotation_training_d2j/databricks"
+)
+
 # Unity Catalog Volumes パス（データ保存用）
 # 形式: /Volumes/{catalog}/{schema}/{volume_name}
 # 例: /Volumes/workspace/default/annotation_data

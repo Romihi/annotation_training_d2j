@@ -16,7 +16,7 @@ from typing import Dict, Any, List, Optional, Callable, Union
 from pathlib import Path
 
 from utils.export_utils import export_to_donkey
-import config_colab
+from colab import config_colab
 
 
 def debug_print(message: str):

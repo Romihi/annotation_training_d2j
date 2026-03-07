@@ -12498,7 +12498,7 @@ class ImageAnnotationTool(QMainWindow):
             zip_name += '.zip'
 
         # 転送先を確認
-        from config_databricks import DATABRICKS_VOLUMES_PATH
+        from databricks.config_databricks import DATABRICKS_VOLUMES_PATH
 
         # Volumesパスの存在確認
         print("[転送] Volumesパスの存在確認中...")
@@ -12515,16 +12515,31 @@ class ImageAnnotationTool(QMainWindow):
             )
             return
 
-        confirm = QMessageBox.question(
-            self,
-            get_text('dlg_transfer_confirm'),
-            get_text('msg_transfer_confirm_databricks', len(self.annotations), zip_name, DATABRICKS_VOLUMES_PATH),
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes
-        )
+        # カスタム転送確認ダイアログ（自動学習チェックボックス付き）
+        from databricks.config_databricks import DATABRICKS_CLUSTER_ID, DATABRICKS_NOTEBOOK_PATH
+        confirm_dialog = QDialog(self)
+        confirm_dialog.setWindowTitle(get_text('dlg_transfer_confirm'))
+        confirm_layout = QVBoxLayout(confirm_dialog)
 
-        if confirm != QMessageBox.Yes:
+        confirm_label = QLabel(get_text('msg_transfer_confirm_databricks', len(self.annotations), zip_name, DATABRICKS_VOLUMES_PATH))
+        confirm_label.setWordWrap(True)
+        confirm_layout.addWidget(confirm_label)
+
+        auto_train_checkbox = QCheckBox(get_text('chk_auto_train_after_transfer'))
+        if not DATABRICKS_CLUSTER_ID:
+            auto_train_checkbox.setEnabled(False)
+            auto_train_checkbox.setToolTip(get_text('tip_auto_train_cluster_required'))
+        confirm_layout.addWidget(auto_train_checkbox)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(confirm_dialog.accept)
+        button_box.rejected.connect(confirm_dialog.reject)
+        confirm_layout.addWidget(button_box)
+
+        if confirm_dialog.exec_() != QDialog.Accepted:
             return
+
+        do_auto_train = auto_train_checkbox.isChecked()
 
         # 進捗ダイアログを作成
         progress = QProgressDialog(get_text('msg_preparing_transfer'), get_text('btn_cancel'), 0, 100, self)
@@ -12637,11 +12652,31 @@ class ImageAnnotationTool(QMainWindow):
             if result['success']:
                 # サイズをMBに変換
                 size_mb = result['zip_size'] / (1024 * 1024)
-                QMessageBox.information(
-                    self,
-                    get_text('dlg_transfer_complete'),
-                    get_text('msg_transfer_complete_databricks', result['annotation_count'], size_mb, result['remote_path'])
-                )
+
+                if do_auto_train:
+                    try:
+                        run_result = transfer_manager.submit_training_workflow(
+                            zip_remote_path=result['remote_path'],
+                            notebook_base_path=DATABRICKS_NOTEBOOK_PATH,
+                            cluster_id=DATABRICKS_CLUSTER_ID
+                        )
+                        QMessageBox.information(
+                            self,
+                            get_text('dlg_transfer_complete'),
+                            get_text('msg_transfer_and_train_complete', result['annotation_count'], size_mb, result['remote_path'], run_result['run_id'])
+                        )
+                    except Exception as e:
+                        QMessageBox.warning(
+                            self,
+                            get_text('dlg_transfer_complete'),
+                            get_text('msg_auto_train_failed', str(e))
+                        )
+                else:
+                    QMessageBox.information(
+                        self,
+                        get_text('dlg_transfer_complete'),
+                        get_text('msg_transfer_complete_databricks', result['annotation_count'], size_mb, result['remote_path'])
+                    )
             else:
                 error_msg = result.get('error', get_text('msg_unknown_error'))
                 if 'キャンセル' in error_msg or 'cancel' in error_msg.lower():
@@ -12664,7 +12699,7 @@ class ImageAnnotationTool(QMainWindow):
     def _show_databricks_settings(self):
         """Databricks設定ダイアログを表示"""
         try:
-            from config_databricks import (
+            from databricks.config_databricks import (
                 DATABRICKS_ENABLED, DATABRICKS_HOST, DATABRICKS_TOKEN,
                 DATABRICKS_EXPERIMENT_PREFIX, get_databricks_status, get_env_template
             )
@@ -12709,6 +12744,24 @@ class ImageAnnotationTool(QMainWindow):
 
         env_group.setLayout(env_layout)
         layout.addWidget(env_group)
+
+        # 自動学習パイプライン設定
+        train_group = QGroupBox(get_text('label_auto_train_settings'))
+        train_layout = QFormLayout()
+
+        env_cluster_id = os.environ.get("DATABRICKS_CLUSTER_ID", "")
+        env_notebook_path = os.environ.get("DATABRICKS_NOTEBOOK_PATH", "")
+
+        cluster_label = QLabel(env_cluster_id or get_text('label_not_set'))
+        cluster_label.setToolTip(get_text('label_set_via_env'))
+        train_layout.addRow(get_text('label_cluster_id') + ":", cluster_label)
+
+        notebook_label = QLabel(env_notebook_path or get_text('label_using_default'))
+        notebook_label.setToolTip(get_text('label_set_via_env'))
+        train_layout.addRow(get_text('label_notebook_path') + ":", notebook_label)
+
+        train_group.setLayout(train_layout)
+        layout.addWidget(train_group)
 
         # 設定方法の説明
         help_group = QGroupBox(get_text('section_env_setup'))
@@ -12778,7 +12831,7 @@ class ImageAnnotationTool(QMainWindow):
     def _is_colab_enabled(self) -> bool:
         """Colab連携が有効かどうかを返す"""
         try:
-            from config_colab import COLAB_ENABLED
+            from colab.config_colab import COLAB_ENABLED
             return COLAB_ENABLED
         except ImportError:
             return False
@@ -12791,7 +12844,7 @@ class ImageAnnotationTool(QMainWindow):
     def _update_colab_status_label(self):
         """Colabステータスラベルを更新"""
         try:
-            from config_colab import get_colab_status
+            from colab.config_colab import get_colab_status
             status = get_colab_status()
             if status['enabled']:
                 if status.get('authenticated'):
@@ -12853,7 +12906,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # 転送確認ダイアログ
         try:
-            from config_colab import COLAB_DRIVE_FOLDER_NAME
+            from colab.config_colab import COLAB_DRIVE_FOLDER_NAME
         except ImportError:
             COLAB_DRIVE_FOLDER_NAME = "annotation_data"
 
@@ -12940,7 +12993,7 @@ class ImageAnnotationTool(QMainWindow):
 
             # 認証成功 - 転送確認ダイアログを表示
             try:
-                from config_colab import COLAB_DRIVE_FOLDER_NAME
+                from colab.config_colab import COLAB_DRIVE_FOLDER_NAME
             except ImportError:
                 COLAB_DRIVE_FOLDER_NAME = "annotation_data"
 
@@ -13556,7 +13609,7 @@ class ImageAnnotationTool(QMainWindow):
     def _show_colab_settings(self):
         """Colab設定ダイアログを表示"""
         try:
-            from config_colab import (
+            from colab.config_colab import (
                 COLAB_ENABLED, GOOGLE_CLIENT_SECRETS,
                 COLAB_DRIVE_FOLDER_NAME, get_colab_status, get_env_template,
                 get_oauth_setup_guide
@@ -13654,7 +13707,7 @@ class ImageAnnotationTool(QMainWindow):
 
             # 認証が必要な場合の事前通知
             try:
-                from config_colab import GOOGLE_CREDENTIALS_PATH
+                from colab.config_colab import GOOGLE_CREDENTIALS_PATH
                 import os
                 if not os.path.exists(GOOGLE_CREDENTIALS_PATH):
                     reply = QMessageBox.question(

@@ -778,8 +778,8 @@ TRANSLATIONS = {
         'msg_no_annotations_found_fallback': 'アノテーションが見つかりませんでした',
         'label_env_status': '環境変数の状態',
         'label_env_tab': '環境変数',
-        'msg_config_databricks_not_found': 'config_databricks.py が見つかりません',
-        'msg_config_colab_not_found': 'config_colab.py が見つかりません',
+        'msg_config_databricks_not_found': 'databricks/config_databricks.py が見つかりません',
+        'msg_config_colab_not_found': 'colab/config_colab.py が見つかりません',
         'label_status_message': '状態: {0}\n{1}',
         'dlg_no_models': 'モデルなし',
         'msg_google_drive_no_models': 'Google Driveにモデルファイルが見つかりませんでした。\n\nColabでモデルを学習し、Google Driveに保存してください。',
@@ -1482,6 +1482,17 @@ Google Cloud Console での OAuth設定手順
         'msg_unknown_error': '不明なエラー',
         'label_google_drive_models': 'Google Drive上のモデル: {0}件',
         'label_unknown_date': '不明',
+
+        # 自動学習パイプライン
+        'chk_auto_train_after_transfer': '転送後に自動学習を開始する',
+        'tip_auto_train_cluster_required': '自動学習にはクラスターIDの設定が必要です（環境変数: DATABRICKS_CLUSTER_ID）',
+        'msg_auto_train_started': '自動学習を開始しました (Run ID: {0})',
+        'msg_auto_train_failed': '転送は成功しましたが学習の起動に失敗しました:\n{0}',
+        'msg_transfer_and_train_complete': 'Databricksへの転送が完了しました。\n\nアノテーション数: {0}\nZIPサイズ: {1:.1f} MB\n転送先: {2}\n\n自動学習を開始しました (Run ID: {3})',
+        'label_cluster_id': 'クラスターID',
+        'label_notebook_path': 'ノートブックパス',
+        'label_auto_train_settings': '自動学習パイプライン設定',
+        'label_set_via_env': '環境変数で設定してください',
     },
 
     # =========================================================================
@@ -2163,8 +2174,8 @@ Google Cloud Console での OAuth設定手順
         'msg_no_annotations_found_fallback': 'No annotations found',
         'label_env_status': 'Environment Variable Status',
         'label_env_tab': 'Environment Variables',
-        'msg_config_databricks_not_found': 'config_databricks.py not found',
-        'msg_config_colab_not_found': 'config_colab.py not found',
+        'msg_config_databricks_not_found': 'databricks/config_databricks.py not found',
+        'msg_config_colab_not_found': 'colab/config_colab.py not found',
         'label_status_message': 'Status: {0}\n{1}',
         'dlg_no_models': 'No Models',
         'msg_google_drive_no_models': 'No model files found on Google Drive.\n\nPlease train a model on Colab and save it to Google Drive.',
@@ -2869,6 +2880,17 @@ Notes
         'msg_unknown_error': 'Unknown error',
         'label_google_drive_models': 'Models on Google Drive: {0}',
         'label_unknown_date': 'Unknown',
+
+        # Auto-training pipeline
+        'chk_auto_train_after_transfer': 'Start auto-training after transfer',
+        'tip_auto_train_cluster_required': 'Cluster ID is required for auto-training (env: DATABRICKS_CLUSTER_ID)',
+        'msg_auto_train_started': 'Auto-training started (Run ID: {0})',
+        'msg_auto_train_failed': 'Transfer succeeded but failed to start training:\n{0}',
+        'msg_transfer_and_train_complete': 'Transfer to Databricks completed.\n\nAnnotations: {0}\nZIP size: {1:.1f} MB\nDestination: {2}\n\nAuto-training started (Run ID: {3})',
+        'label_cluster_id': 'Cluster ID',
+        'label_notebook_path': 'Notebook Path',
+        'label_auto_train_settings': 'Auto-training Pipeline Settings',
+        'label_set_via_env': 'Set via environment variable',
     },
 }
 
