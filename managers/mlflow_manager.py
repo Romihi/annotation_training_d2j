@@ -29,7 +29,8 @@ class ModelType(Enum):
     WAYPOINT_REGRESSION = "waypoint_regression"
     YOLO_DETECTION = "yolo_detection"
     YOLO_SEGMENTATION = "yolo_segmentation"
-    GRU_TRAJECTORY = "gru_trajectory"
+    SEQUENCE = "sequence"
+    GRU_TRAJECTORY = "gru_trajectory"  # 後方互換
 
 class MLflowManager:
     """実験別MLflow統合管理クラス（Databricks対応・ローカル併用記録）"""
@@ -41,7 +42,8 @@ class MLflowManager:
         ModelType.WAYPOINT_REGRESSION: "waypoint_regression_models",
         ModelType.YOLO_DETECTION: "yolo_detection_models",
         ModelType.YOLO_SEGMENTATION: "yolo_segmentation_models",
-        ModelType.GRU_TRAJECTORY: "gru_trajectory_models"
+        ModelType.SEQUENCE: "sequence_models",
+        ModelType.GRU_TRAJECTORY: "gru_trajectory_models"  # 後方互換
     }
 
     def __init__(self, folder_path=None, use_databricks=None):
@@ -1059,18 +1061,21 @@ class MLflowManager:
         else:
             return {"status": "error", "message": "記録に失敗しました"}
 
-    def log_gru_trajectory_model(self, model_path, training_params, metrics, dataset_info):
-        """GRU軌道予測モデルの学習結果を記録（ローカル併用記録対応）"""
+    def log_sequence_model(self, model_path, training_params, metrics, dataset_info):
+        """時系列モデルの学習結果を記録（ローカル併用記録対応）"""
+
+        arch = training_params.get("model_arch", "gru")
 
         params = {
             "framework": "pytorch",
-            "model_type": "gru_trajectory",
+            "model_type": "sequence",
+            "model_arch": arch,
             "data_folder": training_params.get("data_folder", "unknown"),
-            "task_type": "trajectory_prediction",
+            "task_type": "sequence_prediction",
             "seq_len": training_params.get("seq_len", 8),
             "pred_horizon": training_params.get("pred_horizon", 10),
-            "gru_hidden": training_params.get("gru_hidden", 256),
-            "gru_layers": training_params.get("gru_layers", 1),
+            "hidden_size": training_params.get("gru_hidden", 256),
+            "num_layers": training_params.get("gru_layers", 1),
             "dropout": training_params.get("dropout", 0.1),
             "epochs": training_params.get("num_epochs", 0),
             "learning_rate": training_params.get("learning_rate", 0.001),
@@ -1090,8 +1095,9 @@ class MLflowManager:
         }
 
         tags = {
-            "model_category": "gru_trajectory",
-            "task_type": "trajectory_prediction",
+            "model_category": "sequence",
+            "model_arch": arch,
+            "task_type": "sequence_prediction",
             "framework": "pytorch",
             "status": metrics.get("status", "completed"),
             "image_sources": training_params.get("selected_sources", ""),
@@ -1105,10 +1111,10 @@ class MLflowManager:
                 "total_sequences": dataset_info.get("total_sequences", 0)
             })
 
-        run_name = f"gru_trajectory_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run_name = f"sequence_{arch}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
         success = self._log_with_local_fallback(
-            ModelType.GRU_TRAJECTORY, run_name, params, run_metrics, tags,
+            ModelType.SEQUENCE, run_name, params, run_metrics, tags,
             dataset_info if dataset_info else {}, metrics, model_path
         )
 

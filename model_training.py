@@ -19,7 +19,7 @@ import traceback
 
 
 from model_catalog import get_model, AnnotationDataset
-from managers.trajectory_training_manager import TrajectoryTrainingManager
+from managers.sequence_training_manager import SequenceTrainingManager
 
 import random
 from PIL import Image, ImageOps, ImageEnhance
@@ -2229,10 +2229,10 @@ def create_waypoint_datasets(
 
 
 # =========================================================================
-# 時系列軌道予測モデルの学習
+# 時系列モデルの学習
 # =========================================================================
 
-def train_trajectory_model(
+def train_sequence_model(
     valid_indexes,
     annotations,
     images,
@@ -2243,7 +2243,7 @@ def train_trajectory_model(
     mlflow_manager=None,
     progress_callback=None,
 ):
-    """時系列軌道予測モデルを学習する（TrajectoryTrainingManagerのラッパー）
+    """時系列モデルを学習する（SequenceTrainingManagerのラッパー）
 
     Args:
         valid_indexes: 有効なインデックスリスト
@@ -2265,7 +2265,7 @@ def train_trajectory_model(
     Returns:
         dict — 学習結果
     """
-    manager = TrajectoryTrainingManager(models_dir, mlflow_manager)
+    manager = SequenceTrainingManager(models_dir, mlflow_manager)
     return manager.train(
         valid_indexes=valid_indexes,
         annotations=annotations,
@@ -2277,7 +2277,7 @@ def train_trajectory_model(
     )
 
 
-def predict_trajectory_model(
+def predict_sequence_model(
     model_path,
     valid_indexes,
     annotations,
@@ -2286,7 +2286,7 @@ def predict_trajectory_model(
     models_dir='./saved_models',
     progress_callback=None,
 ):
-    """学習済み時系列モデルで予測を実行する（TrajectoryTrainingManagerのラッパー）
+    """学習済み時系列モデルで予測を実行する（SequenceTrainingManagerのラッパー）
 
     Args:
         model_path: モデルファイルパス
@@ -2300,7 +2300,7 @@ def predict_trajectory_model(
     Returns:
         dict — {"status", "predictions", "config", "total_predictions"}
     """
-    manager = TrajectoryTrainingManager(models_dir)
+    manager = SequenceTrainingManager(models_dir)
     return manager.predict(
         model_path=model_path,
         valid_indexes=valid_indexes,
@@ -2311,7 +2311,7 @@ def predict_trajectory_model(
     )
 
 
-def load_trajectory_model(model_path, device=None):
+def load_sequence_model(model_path, device=None):
     """保存済み時系列モデルをロードする（後方互換対応）
 
     Args:
@@ -2321,4 +2321,4 @@ def load_trajectory_model(model_path, device=None):
     Returns:
         tuple — (model, config_dict, selected_sources)
     """
-    return TrajectoryTrainingManager.load_model(model_path, device)
+    return SequenceTrainingManager.load_model(model_path, device)

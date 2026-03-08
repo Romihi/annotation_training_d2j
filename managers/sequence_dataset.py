@@ -13,7 +13,7 @@ from PIL import Image
 from torchvision import transforms
 
 
-class TrajectorySequenceDataset(Dataset):
+class SequenceDataset(Dataset):
     """時系列モデル用のシーケンスデータセット"""
 
     def __init__(self, valid_indexes, annotations, images,

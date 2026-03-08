@@ -21,11 +21,11 @@ from model_info import (
     get_model_compute,
     get_param_count,
     get_model_input_size,
-    TRAJECTORY_MODEL_INFO,
-    TRAJECTORY_PAPER_INFO,
-    get_trajectory_model_info,
-    get_trajectory_paper_info,
-    list_trajectory_architectures,
+    SEQUENCE_MODEL_INFO,
+    SEQUENCE_PAPER_INFO,
+    get_sequence_model_info,
+    get_sequence_paper_info,
+    list_sequence_architectures,
 )
 
 
@@ -1340,7 +1340,7 @@ class EgoStateEncoder(nn.Module):
         return self.relu(self.fc(x))
 
 
-class BaseTrajectoryModel(nn.Module):
+class BaseSequenceModel(nn.Module):
     """時系列モデルの共通ベース
 
     サブクラスは _build_temporal() と _forward_temporal() を実装する。
@@ -1366,7 +1366,7 @@ class BaseTrajectoryModel(nn.Module):
         self._build_temporal(hidden_dim, dropout)
 
         self.head_dropout = nn.Dropout(dropout)
-        self.trajectory_head = nn.Linear(hidden_dim, pred_horizon * 2)
+        self.sequence_head = nn.Linear(hidden_dim, pred_horizon * 2)
 
     def _build_temporal(self, hidden_dim, dropout):
         raise NotImplementedError
@@ -1390,12 +1390,12 @@ class BaseTrajectoryModel(nn.Module):
         temporal_out = self._forward_temporal(fused)
 
         out = self.head_dropout(temporal_out)
-        trajectory = self.trajectory_head(out)
-        trajectory = torch.tanh(trajectory)
-        return trajectory.reshape(B, self.pred_horizon, 2)
+        output = self.sequence_head(out)
+        output = torch.tanh(output)
+        return output.reshape(B, self.pred_horizon, 2)
 
 
-class GRUTrajectoryModel(BaseTrajectoryModel):
+class GRUSequenceModel(BaseSequenceModel):
     """GRUベース軌道予測モデル"""
 
     ARCH_NAME = "gru"
@@ -1457,7 +1457,7 @@ class _TCNBlock(nn.Module):
         return self.final_relu(out + res)
 
 
-class TCNTrajectoryModel(BaseTrajectoryModel):
+class TCNSequenceModel(BaseSequenceModel):
     """TCN (Temporal Convolutional Network) ベース軌道予測モデル"""
 
     ARCH_NAME = "tcn"
@@ -1501,7 +1501,7 @@ class _CausalChomp(nn.Module):
         return x
 
 
-class CausalCNNTrajectoryModel(BaseTrajectoryModel):
+class CausalCNNSequenceModel(BaseSequenceModel):
     """Causal CNN (TinyLidarNet風) 軽量軌道予測モデル"""
 
     ARCH_NAME = "causal_cnn"
@@ -1537,14 +1537,14 @@ class CausalCNNTrajectoryModel(BaseTrajectoryModel):
         return self.cnn_proj(x)
 
 
-TRAJECTORY_ARCHITECTURES = {
-    "gru": GRUTrajectoryModel,
-    "tcn": TCNTrajectoryModel,
-    "causal_cnn": CausalCNNTrajectoryModel,
+SEQUENCE_ARCHITECTURES = {
+    "gru": GRUSequenceModel,
+    "tcn": TCNSequenceModel,
+    "causal_cnn": CausalCNNSequenceModel,
 }
 
 
-def create_trajectory_model(model_arch, num_image_sources, config):
+def create_sequence_model(model_arch, num_image_sources, config):
     """アーキテクチャ名からモデルを生成する
 
     Args:
@@ -1553,11 +1553,11 @@ def create_trajectory_model(model_arch, num_image_sources, config):
         config: dict — アーキテクチャ固有パラメータ
 
     Returns:
-        BaseTrajectoryModel のサブクラスインスタンス
+        BaseSequenceModel のサブクラスインスタンス
     """
-    if model_arch not in TRAJECTORY_ARCHITECTURES:
+    if model_arch not in SEQUENCE_ARCHITECTURES:
         raise ValueError(f"Unknown architecture: {model_arch}. "
-                         f"Available: {list(TRAJECTORY_ARCHITECTURES.keys())}")
+                         f"Available: {list(SEQUENCE_ARCHITECTURES.keys())}")
 
     common = dict(
         num_image_sources=num_image_sources,
@@ -1567,30 +1567,30 @@ def create_trajectory_model(model_arch, num_image_sources, config):
     )
 
     if model_arch == "gru":
-        return GRUTrajectoryModel(**common, num_layers=config.get('num_layers', 1))
+        return GRUSequenceModel(**common, num_layers=config.get('num_layers', 1))
     elif model_arch == "tcn":
-        return TCNTrajectoryModel(
+        return TCNSequenceModel(
             **common,
             tcn_channels=config.get('tcn_channels', [128, 128, 256]),
             kernel_size=config.get('kernel_size', 3),
         )
     elif model_arch == "causal_cnn":
-        return CausalCNNTrajectoryModel(
+        return CausalCNNSequenceModel(
             **common,
             cnn_channels=config.get('cnn_channels', [64, 128, 256]),
             kernel_size=config.get('kernel_size', 3),
         )
 
 
-TRAJECTORY_MODEL_REGISTRY = TRAJECTORY_ARCHITECTURES
+SEQUENCE_MODEL_REGISTRY = SEQUENCE_ARCHITECTURES
 
 
-def list_available_trajectory_models():
+def list_available_sequence_models():
     """利用可能な時系列軌道予測モデルのアーキテクチャ一覧を返す"""
-    return list(TRAJECTORY_MODEL_REGISTRY.keys())
+    return list(SEQUENCE_MODEL_REGISTRY.keys())
 
 
-def get_trajectory_model(arch_name, num_image_sources, config):
+def get_sequence_model(arch_name, num_image_sources, config):
     """時系列軌道予測モデルを生成する
 
     Args:
@@ -1599,9 +1599,9 @@ def get_trajectory_model(arch_name, num_image_sources, config):
         config: dict — アーキテクチャ固有パラメータ
 
     Returns:
-        BaseTrajectoryModel のサブクラスインスタンス
+        BaseSequenceModel のサブクラスインスタンス
     """
-    return create_trajectory_model(arch_name, num_image_sources, config)
+    return create_sequence_model(arch_name, num_image_sources, config)
 
     
 class AnnotationDataset(torch.utils.data.Dataset):

@@ -5,24 +5,24 @@ from .datasetmanager import YOLODatasetManager
 
 # 時系列モデル（model_catalog.py に統合済み）
 from model_catalog import (
-    ImageEncoder, BaseTrajectoryModel,
-    GRUTrajectoryModel, TCNTrajectoryModel, CausalCNNTrajectoryModel,
-    TRAJECTORY_ARCHITECTURES, create_trajectory_model,
+    ImageEncoder, BaseSequenceModel,
+    GRUSequenceModel, TCNSequenceModel, CausalCNNSequenceModel,
+    SEQUENCE_ARCHITECTURES, create_sequence_model,
 )
-from .trajectory_dataset import TrajectorySequenceDataset
-from .trajectory_training_manager import TrajectoryTrainingManager
+from .sequence_dataset import SequenceDataset
+from .sequence_training_manager import SequenceTrainingManager
 
 # 後方互換エイリアス
-GRUSequenceDataset = TrajectorySequenceDataset
-GRUTrainingManager = TrajectoryTrainingManager
+GRUSequenceDataset = SequenceDataset
+GRUTrainingManager = SequenceTrainingManager
 
 __all__ = [
     'AnnotationDataManager', 'MLflowManager', 'ModelType', 'YOLODatasetManager',
-    # trajectory (new)
-    'ImageEncoder', 'BaseTrajectoryModel',
-    'GRUTrajectoryModel', 'TCNTrajectoryModel', 'CausalCNNTrajectoryModel',
-    'TRAJECTORY_ARCHITECTURES', 'create_trajectory_model',
-    'TrajectorySequenceDataset', 'TrajectoryTrainingManager',
+    # sequence models
+    'ImageEncoder', 'BaseSequenceModel',
+    'GRUSequenceModel', 'TCNSequenceModel', 'CausalCNNSequenceModel',
+    'SEQUENCE_ARCHITECTURES', 'create_sequence_model',
+    'SequenceDataset', 'SequenceTrainingManager',
     # legacy aliases
     'GRUSequenceDataset', 'GRUTrainingManager',
 ]

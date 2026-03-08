@@ -177,29 +177,29 @@ def get_param_count(model_name):
 
 
 # =========================================================================
-# 時系列軌道予測モデル情報
+# 時系列シーケンスモデル情報
 # =========================================================================
 
-TRAJECTORY_MODEL_INFO = {
+SEQUENCE_MODEL_INFO = {
     'gru': {
-        'name': 'GRU Trajectory',
-        'description': 'GRUベース時系列軌道予測モデル',
+        'name': 'GRU Sequence',
+        'description': 'GRUベース時系列シーケンスモデル',
         'backbone': 'MobileNetV3-Small',
         'temporal': 'GRU (Gated Recurrent Unit)',
         'param_count': 3.2,  # 百万単位 (backbone ~2.5M + GRU + head)
         'gflops': 0.12,  # per-frame backbone + GRU overhead
     },
     'tcn': {
-        'name': 'TCN Trajectory',
-        'description': 'Temporal Convolutional Networkベース時系列軌道予測モデル',
+        'name': 'TCN Sequence',
+        'description': 'Temporal Convolutional Networkベース時系列シーケンスモデル',
         'backbone': 'MobileNetV3-Small',
         'temporal': 'TCN (Dilated Causal Conv1D + Residual)',
         'param_count': 3.5,
         'gflops': 0.15,
     },
     'causal_cnn': {
-        'name': 'CausalCNN Trajectory',
-        'description': '軽量Causal CNNベース時系列軌道予測モデル (TinyLidarNet風)',
+        'name': 'CausalCNN Sequence',
+        'description': '軽量Causal CNNベース時系列シーケンスモデル (TinyLidarNet風)',
         'backbone': 'MobileNetV3-Small',
         'temporal': 'Causal Conv1D Stack',
         'param_count': 3.0,
@@ -207,7 +207,7 @@ TRAJECTORY_MODEL_INFO = {
     },
 }
 
-TRAJECTORY_PAPER_INFO = {
+SEQUENCE_PAPER_INFO = {
     'gru': {
         'title': 'Learning Phrase Representations using RNN Encoder-Decoder for Statistical Machine Translation',
         'authors': 'Kyunghyun Cho, Bart van Merrienboer, Caglar Gulcehre, Dzmitry Bahdanau, Fethi Bougares, Holger Schwenk, Yoshua Bengio',
@@ -238,14 +238,14 @@ TRAJECTORY_PAPER_INFO = {
 }
 
 
-def get_trajectory_model_info(arch_name):
+def get_sequence_model_info(arch_name):
     """時系列モデルの情報を取得する"""
-    return TRAJECTORY_MODEL_INFO.get(arch_name, None)
+    return SEQUENCE_MODEL_INFO.get(arch_name, None)
 
-def get_trajectory_paper_info(arch_name):
+def get_sequence_paper_info(arch_name):
     """時系列モデルの論文情報を取得する"""
-    return TRAJECTORY_PAPER_INFO.get(arch_name, None)
+    return SEQUENCE_PAPER_INFO.get(arch_name, None)
 
-def list_trajectory_architectures():
+def list_sequence_architectures():
     """利用可能な時系列モデルアーキテクチャ一覧を返す"""
-    return list(TRAJECTORY_MODEL_INFO.keys())
+    return list(SEQUENCE_MODEL_INFO.keys())

@@ -13,17 +13,17 @@ import torch.nn as nn
 from datetime import datetime, timedelta
 from torch.utils.data import DataLoader, random_split
 
-from model_catalog import create_trajectory_model, TRAJECTORY_ARCHITECTURES
-from .trajectory_dataset import TrajectorySequenceDataset
+from model_catalog import create_sequence_model, SEQUENCE_ARCHITECTURES
+from .sequence_dataset import SequenceDataset
 
 
-class TrajectoryTrainingManager:
+class SequenceTrainingManager:
     """時系列モデルの学習マネージャ"""
 
-    # モデルファイル名プレフィックス → model_type識別に使用
-    MODEL_FILE_PREFIX = "traj_"
-    # 後方互換: 旧GRUモデルのプレフィックス
-    LEGACY_GRU_PREFIX = "gru_"
+    # 時系列モデルファイル名プレフィックス (アーキテクチャ名がそのままプレフィックスになる)
+    SEQUENCE_PREFIXES = ("gru_", "tcn_", "causal_cnn_")
+    # 後方互換: 旧形式のプレフィックス
+    LEGACY_PREFIXES = ("traj_",)
 
     def __init__(self, models_dir, mlflow_manager=None):
         self.models_dir = models_dir
@@ -75,7 +75,7 @@ class TrajectoryTrainingManager:
             if cont is False:
                 return {"status": "cancelled"}
 
-        dataset = TrajectorySequenceDataset(
+        dataset = SequenceDataset(
             valid_indexes=valid_indexes,
             annotations=annotations,
             images=images,
@@ -96,7 +96,7 @@ class TrajectoryTrainingManager:
         train_size = len(dataset) - val_size
         train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 
-        val_dataset_no_aug = TrajectorySequenceDataset(
+        val_dataset_no_aug = SequenceDataset(
             valid_indexes=valid_indexes,
             annotations=annotations,
             images=images,
@@ -123,7 +123,7 @@ class TrajectoryTrainingManager:
 
         # 4. Model構築
         num_image_sources = len(selected_sources)
-        model = create_trajectory_model(model_arch, num_image_sources, config).to(device)
+        model = create_sequence_model(model_arch, num_image_sources, config).to(device)
 
         optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -260,7 +260,7 @@ class TrajectoryTrainingManager:
         if self.mlflow_manager:
             try:
                 training_params = {
-                    "model_type": "trajectory",
+                    "model_type": "sequence",
                     "model_arch": model_arch,
                     "data_folder": os.path.basename(self.models_dir),
                     "seq_len": seq_len,
@@ -288,7 +288,7 @@ class TrajectoryTrainingManager:
                     "val_samples": val_size,
                     "total_sequences": len(dataset)
                 }
-                self.mlflow_manager.log_gru_trajectory_model(
+                self.mlflow_manager.log_sequence_model(
                     model_path, training_params, metrics, dataset_info
                 )
             except Exception as e:
@@ -318,12 +318,12 @@ class TrajectoryTrainingManager:
         model_arch = config.get('model_arch', 'gru')
         seq_len = config.get('seq_len', 8)
         pred_horizon = config.get('pred_horizon', 10)
-        filename = f"traj_{model_arch}_{timestamp}_{seq_len}s_{pred_horizon}h.pth"
+        filename = f"{model_arch}_{timestamp}_{seq_len}s_{pred_horizon}h.pth"
         model_path = os.path.join(self.models_dir, filename)
 
         save_dict = {
             "model_state_dict": model_state_dict,
-            "model_type": "trajectory",
+            "model_type": "sequence",
             "model_arch": model_arch,
             "config": {
                 "num_image_sources": num_image_sources,
@@ -352,7 +352,7 @@ class TrajectoryTrainingManager:
             save_dict["config"]["kernel_size"] = config.get('kernel_size', 3)
 
         torch.save(save_dict, model_path)
-        print(f"Trajectory model ({model_arch}) saved to: {model_path}")
+        print(f"Sequence model ({model_arch}) saved to: {model_path}")
         return model_path
 
     @staticmethod
@@ -376,13 +376,13 @@ class TrajectoryTrainingManager:
             cfg.setdefault('model_arch', 'gru')
             cfg.setdefault('hidden_dim', cfg.pop('gru_hidden', 256))
             cfg.setdefault('num_layers', cfg.pop('gru_layers', 1))
-        elif model_type == 'trajectory':
+        elif model_type in ('sequence', 'trajectory'):
             model_arch = checkpoint.get('model_arch', 'gru')
             cfg = checkpoint['config']
         else:
             raise ValueError(f"未対応のモデルタイプ: {model_type}")
 
-        model = create_trajectory_model(model_arch, cfg['num_image_sources'], cfg).to(device)
+        model = create_sequence_model(model_arch, cfg['num_image_sources'], cfg).to(device)
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
 
@@ -407,7 +407,7 @@ class TrajectoryTrainingManager:
         pred_horizon = cfg.get('pred_horizon', 10)
         img_size = cfg.get('img_size', (128, 128))
 
-        dataset = TrajectorySequenceDataset(
+        dataset = SequenceDataset(
             valid_indexes=valid_indexes,
             annotations=annotations,
             images=images,

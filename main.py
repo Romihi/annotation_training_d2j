@@ -73,7 +73,7 @@ from model_training import generate_augmentation_samples
 from styles import get_location_color, apply_style, set_theme, get_current_theme, PRIMARY_STYLE, MODEL_STYLE, TRAINING_STYLE, EXPORT_STYLE, SPECIAL_STYLE, DESTRUCTIVE_STYLE, NAV_STYLE
 
 
-from managers import AnnotationDataManager, MLflowManager, ModelType, TrajectoryTrainingManager
+from managers import AnnotationDataManager, MLflowManager, ModelType, SequenceTrainingManager
 from utils.yolo_utils import train_yolo_with_ui, TrainingOutputDialog
 from data_analysis import DataAnalysisDialog
 from utils.databricks_transfer import DatabricksTransferManager
@@ -102,7 +102,7 @@ class ImageLabel(QLabel):
         self.inference_point = None
         self.show_inference = False
         self.extra_inference_points = []  # 追加モデルの推論ポイントリスト [(QPoint, QColor, show_flag), ...]
-        self.gru_prediction_trajectory = []  # 時系列予測軌道 [(QPoint, ...)]
+        self.sequence_prediction_points = []  # 時系列予測軌道 [(QPoint, ...)]
         self.show_gru_prediction = False  # 時系列予測表示フラグ
         self.zoom_factor = DEFAULT_ZOOM_FACTOR  
         self.is_deleted = False
@@ -1067,15 +1067,15 @@ class ImageLabel(QLabel):
                 painter.drawEllipse(scaled_x - 15, scaled_y - 15, 30, 30)
 
         # 時系列予測軌道を描画（中実三角＋矢印接続、t+1が最大で段階的に縮小）
-        if getattr(self, 'show_gru_prediction', False) and getattr(self, 'gru_prediction_trajectory', []):
+        if getattr(self, 'show_gru_prediction', False) and getattr(self, 'sequence_prediction_points', []):
             traj_color = QColor(0, 200, 0)  # 緑
             traj_border = QColor(0, 128, 0)  # 濃い緑
-            n_pts = len(self.gru_prediction_trajectory)
+            n_pts = len(self.sequence_prediction_points)
             base_r = ANNOTATION_CIRCLE_SIZE - 1  # t+1のサイズ（アノテーション円より1pt小さい）
             min_r = 3
 
             scaled_points = []
-            for pt in self.gru_prediction_trajectory:
+            for pt in self.sequence_prediction_points:
                 rel_x = pt.x() / pix_width
                 rel_y = pt.y() / pix_height
                 sx = int(target_rect.x() + rel_x * target_rect.width())
@@ -20022,14 +20022,14 @@ class ImageAnnotationTool(QMainWindow):
             return
 
         if not getattr(self, 'show_gru_predictions', False):
-            self.main_image_view.gru_prediction_trajectory = []
+            self.main_image_view.sequence_prediction_points = []
             self.main_image_view.show_gru_prediction = False
             self.main_image_view.update()
             return
 
         predictions = getattr(self, 'gru_predictions', {})
         if current_index not in predictions:
-            self.main_image_view.gru_prediction_trajectory = []
+            self.main_image_view.sequence_prediction_points = []
             self.main_image_view.show_gru_prediction = False
             self.main_image_view.update()
             return
@@ -20064,15 +20064,15 @@ class ImageAnnotationTool(QMainWindow):
                 x = int((s + 1) / 2 * img_w)
                 y = int((1 - t) / 2 * img_h)
                 points.append(QPoint(x, y))
-            self.main_image_view.gru_prediction_trajectory = points
+            self.main_image_view.sequence_prediction_points = points
             self.main_image_view.show_gru_prediction = True
         else:
-            self.main_image_view.gru_prediction_trajectory = []
+            self.main_image_view.sequence_prediction_points = []
             self.main_image_view.show_gru_prediction = False
 
         self.main_image_view.update()
 
-    def train_gru_trajectory_model(self):
+    def train_sequence_model(self):
         """時系列モデルの学習設定ダイアログを表示し学習を実行"""
         if not self.annotations:
             QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_need_annotations_to_train'))
@@ -20104,6 +20104,13 @@ class ImageAnnotationTool(QMainWindow):
         arch_combo.addItem("GRU", "gru")
         arch_combo.addItem("TCN", "tcn")
         arch_combo.addItem("CausalCNN", "causal_cnn")
+
+        # パネルで選択中のモデルタイプを初期値に連動
+        if hasattr(self, 'traj_arch_combo'):
+            panel_index = self.traj_arch_combo.currentIndex()
+            if 0 <= panel_index < arch_combo.count():
+                arch_combo.setCurrentIndex(panel_index)
+
         arch_select_layout.addWidget(arch_combo)
         arch_select_layout.addStretch()
         arch_layout.addLayout(arch_select_layout)
@@ -20115,19 +20122,19 @@ class ImageAnnotationTool(QMainWindow):
         seq_layout.addWidget(QLabel(get_text('label_seq_len')))
         seq_len_spin = QSpinBox()
         seq_len_spin.setRange(1, 100)
-        seq_len_spin.setValue(TRAJ_DEFAULT_SEQ_LEN)
+        seq_len_spin.setValue(SEQ_DEFAULT_SEQ_LEN)
         seq_layout.addWidget(seq_len_spin)
 
         seq_layout.addWidget(QLabel(get_text('label_pred_horizon')))
         pred_horizon_spin = QSpinBox()
         pred_horizon_spin.setRange(1, 100)
-        pred_horizon_spin.setValue(TRAJ_DEFAULT_PRED_HORIZON)
+        pred_horizon_spin.setValue(SEQ_DEFAULT_PRED_HORIZON)
         seq_layout.addWidget(pred_horizon_spin)
 
         seq_layout.addWidget(QLabel(get_text('label_stride')))
         stride_spin = QSpinBox()
         stride_spin.setRange(1, 50)
-        stride_spin.setValue(TRAJ_DEFAULT_STRIDE)
+        stride_spin.setValue(SEQ_DEFAULT_STRIDE)
         seq_layout.addWidget(stride_spin)
 
         seq_layout.addStretch()
@@ -20139,14 +20146,14 @@ class ImageAnnotationTool(QMainWindow):
         hidden_dim_combo = QComboBox()
         for h in [64, 128, 256, 512]:
             hidden_dim_combo.addItem(str(h))
-        hidden_dim_combo.setCurrentText(str(TRAJ_DEFAULT_HIDDEN_DIM))
+        hidden_dim_combo.setCurrentText(str(SEQ_DEFAULT_HIDDEN_DIM))
         hidden_layout.addWidget(hidden_dim_combo)
 
         hidden_layout.addWidget(QLabel(get_text('label_dropout')))
         dropout_spin = QDoubleSpinBox()
         dropout_spin.setRange(0.0, 0.5)
         dropout_spin.setSingleStep(0.05)
-        dropout_spin.setValue(TRAJ_DEFAULT_DROPOUT)
+        dropout_spin.setValue(SEQ_DEFAULT_DROPOUT)
         hidden_layout.addWidget(dropout_spin)
 
         hidden_layout.addStretch()
@@ -20159,21 +20166,21 @@ class ImageAnnotationTool(QMainWindow):
         arch_specific_layout.addWidget(gru_layers_label)
         gru_layers_spin = QSpinBox()
         gru_layers_spin.setRange(1, 4)
-        gru_layers_spin.setValue(TRAJ_GRU_DEFAULT_NUM_LAYERS)
+        gru_layers_spin.setValue(SEQ_GRU_DEFAULT_NUM_LAYERS)
         arch_specific_layout.addWidget(gru_layers_spin)
 
         tcn_kernel_label = QLabel(get_text('label_tcn_kernel_size'))
         arch_specific_layout.addWidget(tcn_kernel_label)
         tcn_kernel_spin = QSpinBox()
         tcn_kernel_spin.setRange(2, 7)
-        tcn_kernel_spin.setValue(TRAJ_TCN_DEFAULT_KERNEL_SIZE)
+        tcn_kernel_spin.setValue(SEQ_TCN_DEFAULT_KERNEL_SIZE)
         arch_specific_layout.addWidget(tcn_kernel_spin)
 
         cnn_kernel_label = QLabel(get_text('label_cnn_kernel_size'))
         arch_specific_layout.addWidget(cnn_kernel_label)
         cnn_kernel_spin = QSpinBox()
         cnn_kernel_spin.setRange(2, 7)
-        cnn_kernel_spin.setValue(TRAJ_CAUSAL_CNN_DEFAULT_KERNEL_SIZE)
+        cnn_kernel_spin.setValue(SEQ_CAUSAL_CNN_DEFAULT_KERNEL_SIZE)
         arch_specific_layout.addWidget(cnn_kernel_spin)
 
         arch_specific_layout.addStretch()
@@ -20192,7 +20199,7 @@ class ImageAnnotationTool(QMainWindow):
         update_arch_widgets()
 
         # シーケンス情報ラベル
-        seq_info_label = QLabel(get_text('label_traj_seq_info', TRAJ_DEFAULT_SEQ_LEN, TRAJ_DEFAULT_PRED_HORIZON))
+        seq_info_label = QLabel(get_text('label_traj_seq_info', SEQ_DEFAULT_SEQ_LEN, SEQ_DEFAULT_PRED_HORIZON))
         seq_info_label.setStyleSheet("color: #666;")
         arch_layout.addWidget(seq_info_label)
 
@@ -20221,7 +20228,7 @@ class ImageAnnotationTool(QMainWindow):
             for variant, img_list in available_sources.items():
                 cb = QCheckBox(f"{variant} ({len(img_list)} images)")
                 cb.setProperty("variant", variant)
-                if variant == 'cam':
+                if variant in ('cam', 'cam0'):
                     cb.setChecked(True)
                 source_checkboxes[variant] = cb
                 source_layout.addWidget(cb)
@@ -20265,7 +20272,7 @@ class ImageAnnotationTool(QMainWindow):
         epoch_lr_layout.addWidget(QLabel(get_text('label_epochs')))
         epoch_spin = QSpinBox()
         epoch_spin.setRange(1, 500)
-        epoch_spin.setValue(TRAJ_DEFAULT_EPOCHS)
+        epoch_spin.setValue(SEQ_DEFAULT_EPOCHS)
         epoch_lr_layout.addWidget(epoch_spin)
 
         epoch_lr_layout.addWidget(QLabel(get_text('label_learning_rate')))
@@ -20284,7 +20291,7 @@ class ImageAnnotationTool(QMainWindow):
         batch_size_combo = QComboBox()
         for bs in ['8', '16', '32', '64', '128']:
             batch_size_combo.addItem(bs)
-        batch_size_combo.setCurrentIndex(2)  # デフォルト: 32
+        batch_size_combo.setCurrentIndex(1)  # デフォルト: 16
         batch_val_layout.addWidget(batch_size_combo)
 
         batch_val_layout.addWidget(QLabel(get_text('label_val_split')))
@@ -20447,7 +20454,7 @@ class ImageAnnotationTool(QMainWindow):
             'stride': stride_spin.value(),
             'hidden_dim': int(hidden_dim_combo.currentText()),
             'dropout': dropout_spin.value(),
-            'img_size': TRAJ_DEFAULT_IMG_SIZE,
+            'img_size': SEQ_DEFAULT_IMG_SIZE,
             'epochs': epoch_spin.value(),
             'batch_size': int(batch_size_combo.currentText()),
             'learning_rate': float(lr_combo.currentText()),
@@ -20460,10 +20467,10 @@ class ImageAnnotationTool(QMainWindow):
             config['num_layers'] = gru_layers_spin.value()
         elif selected_arch == 'tcn':
             config['kernel_size'] = tcn_kernel_spin.value()
-            config['tcn_channels'] = TRAJ_TCN_DEFAULT_CHANNELS
+            config['tcn_channels'] = SEQ_TCN_DEFAULT_CHANNELS
         elif selected_arch == 'causal_cnn':
             config['kernel_size'] = cnn_kernel_spin.value()
-            config['cnn_channels'] = TRAJ_CAUSAL_CNN_DEFAULT_CHANNELS
+            config['cnn_channels'] = SEQ_CAUSAL_CNN_DEFAULT_CHANNELS
 
         try:
             # 進捗ダイアログ
@@ -20487,7 +20494,7 @@ class ImageAnnotationTool(QMainWindow):
             if hasattr(self, 'mlflow_manager'):
                 mlflow_mgr = self.mlflow_manager
 
-            manager = TrajectoryTrainingManager(models_dir, mlflow_manager=mlflow_mgr)
+            manager = SequenceTrainingManager(models_dir, mlflow_manager=mlflow_mgr)
             result = manager.train(
                 valid_indexes=valid_indexes,
                 annotations=self.annotations,
@@ -20564,7 +20571,7 @@ class ImageAnnotationTool(QMainWindow):
             ax.axvline(x=min_val_loss_epoch, color='g', linestyle='--', alpha=0.7,
                        label=f'Best (Epoch {min_val_loss_epoch}, Loss {min_val_loss:.6f})')
 
-            ax.set_title(f'{model_arch.upper()} Trajectory Model Training Curve', fontsize=14, fontweight='bold')
+            ax.set_title(f'{model_arch.upper()} Sequence Model Training Curve', fontsize=14, fontweight='bold')
             ax.set_xlabel('Epoch', fontsize=11)
             ax.set_ylabel('Loss (MSE)', fontsize=11)
             ax.legend(fontsize=10, loc='upper right')
@@ -20629,7 +20636,7 @@ class ImageAnnotationTool(QMainWindow):
                 QApplication.processEvents()
                 return not progress.wasCanceled()
 
-            manager = TrajectoryTrainingManager(models_dir)
+            manager = SequenceTrainingManager(models_dir)
             result = manager.predict(
                 model_path=selected_model_path,
                 valid_indexes=valid_indexes,
@@ -22163,8 +22170,8 @@ class ImageAnnotationTool(QMainWindow):
         traj_method_layout = QHBoxLayout()
         traj_method_layout.addWidget(QLabel(get_text('label_model_arch')))
         self.traj_arch_combo = QComboBox()
-        self.traj_arch_combo.addItems(["GRU", "TCN", "CausalCNN", get_text('label_all')])
-        self.traj_arch_combo.setCurrentIndex(3)  # デフォルト: すべて
+        self.traj_arch_combo.addItems(["GRU", "TCN", "CausalCNN"])
+        self.traj_arch_combo.setCurrentIndex(0)  # デフォルト: GRU
         self.traj_arch_combo.currentIndexChanged.connect(self.refresh_traj_model_list)
         traj_method_layout.addWidget(self.traj_arch_combo)
         gru_content_layout.addLayout(traj_method_layout)
@@ -22179,7 +22186,7 @@ class ImageAnnotationTool(QMainWindow):
         traj_buttons_layout = QHBoxLayout()
 
         traj_train_button = QPushButton(get_text('btn_traj_train'))
-        traj_train_button.clicked.connect(self.train_gru_trajectory_model)
+        traj_train_button.clicked.connect(self.train_sequence_model)
         apply_style(traj_train_button, 'training')
         traj_buttons_layout.addWidget(traj_train_button)
 
@@ -22219,29 +22226,23 @@ class ImageAnnotationTool(QMainWindow):
             self.traj_model_combo.addItem(get_text('combo_model_not_found'))
             return
 
-        # フィルタ用アーキテクチャ取得
+        # フィルタ用モデルタイプ取得
         arch_filter = self.traj_arch_combo.currentText().lower()
-        show_all = arch_filter == get_text('label_all').lower()
 
-        # アーキ名→ファイル名キーワードのマッピング
-        arch_to_keyword = {
-            "gru": "gru",
-            "tcn": "tcn",
-            "causalcnn": "causal_cnn",
+        # モデルタイプ名→ファイル名プレフィックスのマッピング
+        arch_to_prefix = {
+            "gru": "gru_",
+            "tcn": "tcn_",
+            "causalcnn": "causal_cnn_",
         }
-        filter_keyword = arch_to_keyword.get(arch_filter, "")
+        filter_prefix = arch_to_prefix.get(arch_filter, "")
 
         model_files = []
         for f in os.listdir(models_dir):
             if not f.endswith('.pth'):
                 continue
-            if not (f.startswith('traj_') or f.startswith('gru_')):
-                continue
-            # アーキテクチャでフィルタリング
-            if not show_all and filter_keyword:
-                if filter_keyword not in f.lower():
-                    continue
-            model_files.append(f)
+            if filter_prefix and f.startswith(filter_prefix):
+                model_files.append(f)
 
         if not model_files:
             self.traj_model_combo.addItem(get_text('combo_model_not_found'))
@@ -22264,7 +22265,7 @@ class ImageAnnotationTool(QMainWindow):
         self.show_gru_predictions = (state == Qt.Checked)
         if not self.show_gru_predictions:
             if hasattr(self, 'main_image_view'):
-                self.main_image_view.gru_prediction_trajectory = []
+                self.main_image_view.sequence_prediction_points = []
                 self.main_image_view.show_gru_prediction = False
         if hasattr(self, 'update_inference_display'):
             self.update_inference_display()
