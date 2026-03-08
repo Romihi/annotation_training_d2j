@@ -20,7 +20,7 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor
 
 # 日本語フォントの設定
-plt.rcParams['font.family'] = ['MS Gothic', 'Hiragino Sans', 'Yu Gothic', 'Meiryo', 'sans-serif']
+plt.rcParams['font.family'] = ['MS Gothic', 'Yu Gothic', 'Meiryo', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False
 
 # 色のパレット

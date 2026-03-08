@@ -96,13 +96,17 @@ class TrajectorySequenceDataset(Dataset):
 
         Returns:
             List[float] — [steering, throttle, vx, vy, omega]
+
+        TODO: vx, vy, omega は現在アノテーションに含まれていないため常に0。
+              IMU/オドメトリデータが利用可能になった場合に拡張する。
+              ego_dim を動的に変更する仕組み（EgoStateEncoder対応含む）も要検討。
         """
         ann = self.annotations.get(index, {})
         steering = float(ann.get("angle", 0.0))
         throttle = float(ann.get("throttle", 0.0))
         vx = float(ann.get("speed", 0.0))
-        vy = 0.0
-        omega = 0.0
+        vy = 0.0   # TODO: オドメトリ/IMUデータから取得
+        omega = 0.0  # TODO: ヨーレートセンサーデータから取得
         return [steering, throttle, vx, vy, omega]
 
     def _load_image(self, index, source_name):
@@ -184,7 +188,3 @@ class TrajectorySequenceDataset(Dataset):
             "ego_states": ego_states,
             "targets": targets
         }
-
-
-# 後方互換エイリアス
-GRUSequenceDataset = TrajectorySequenceDataset

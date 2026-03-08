@@ -13,7 +13,7 @@ import torch.nn as nn
 from datetime import datetime, timedelta
 from torch.utils.data import DataLoader, random_split
 
-from .trajectory_models import create_trajectory_model, TRAJECTORY_ARCHITECTURES
+from model_catalog import create_trajectory_model, TRAJECTORY_ARCHITECTURES
 from .trajectory_dataset import TrajectorySequenceDataset
 
 
@@ -463,7 +463,3 @@ class TrajectoryTrainingManager:
             "config": cfg,
             "total_predictions": len(predictions)
         }
-
-
-# 後方互換エイリアス
-GRUTrainingManager = TrajectoryTrainingManager

@@ -33,9 +33,6 @@ torch.cuda.empty_cache()
 from ultralytics import YOLO
 from ultralytics import settings
 
-import mlflow
-import mlflow.pytorch
-
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                             QLabel, QPushButton, QFileDialog, QMessageBox,
                             QScrollArea, QGridLayout, QFrame, QLineEdit, QProgressDialog,
@@ -3647,8 +3644,7 @@ class ImageAnnotationTool(QMainWindow):
         # セッション復元チェックを遅延実行（UIが完全に表示された後）
         QTimer.singleShot(500, self.add_session_check_to_init_ui)
 
-        # Databricks接続確認を遅延実行
-        QTimer.singleShot(1000, self._check_databricks_connection_on_startup)
+        # Databricks接続はCloudボタンから手動で行う（起動時の自動接続を無効化）
 
         QApplication.instance().installEventFilter(self)
 
@@ -15887,6 +15883,9 @@ class ImageAnnotationTool(QMainWindow):
             except Exception as e:
                 print(f"画像サイズの取得エラー: {e}")        
                 
+        # 時系列モデル用: variant_images をそのまま source_images_map として設定
+        self.source_images_map = dict(self.variant_images) if hasattr(self, 'variant_images') else {}
+
         # Reset state
         self.folder_path = valid_paths[0]  # 最初の親フォルダをメインフォルダとして設定
         self.folder_paths = valid_paths    # すべての有効な親フォルダパスを保存
@@ -20206,20 +20205,29 @@ class ImageAnnotationTool(QMainWindow):
         arch_group.setLayout(arch_layout)
         left_column.addWidget(arch_group)
 
-        # --- 画像ソース選択グループ ---
+        # --- 画像ソース選択グループ (最大5ソース) ---
+        MAX_IMAGE_SOURCES = 5
         source_group = QGroupBox(get_text('label_image_sources'))
         source_layout = QVBoxLayout()
 
         source_checkboxes = {}
+        available_sources = {}
         if hasattr(self, 'source_images_map') and self.source_images_map:
-            for variant in self.source_images_map.keys():
-                cb = QCheckBox(variant)
+            available_sources = self.source_images_map
+        elif hasattr(self, 'variant_images') and self.variant_images:
+            available_sources = self.variant_images
+
+        if available_sources:
+            for variant, img_list in available_sources.items():
+                cb = QCheckBox(f"{variant} ({len(img_list)} images)")
+                cb.setProperty("variant", variant)
                 if variant == 'cam':
                     cb.setChecked(True)
                 source_checkboxes[variant] = cb
                 source_layout.addWidget(cb)
         else:
             cb = QCheckBox('cam')
+            cb.setProperty("variant", "cam")
             cb.setChecked(True)
             source_checkboxes['cam'] = cb
             source_layout.addWidget(cb)
@@ -20228,9 +20236,16 @@ class ImageAnnotationTool(QMainWindow):
         source_layout.addWidget(sources_label)
 
         def update_sources_label():
-            count = sum(1 for cb in source_checkboxes.values() if cb.isChecked())
-            sources_label.setText(get_text('label_sources_selected', count))
-            start_button.setEnabled(count > 0)
+            checked = [name for name, cb in source_checkboxes.items() if cb.isChecked()]
+            count = len(checked)
+            if count > MAX_IMAGE_SOURCES:
+                sources_label.setText(get_text('label_sources_max_exceeded', MAX_IMAGE_SOURCES))
+                sources_label.setStyleSheet("color: red;")
+                start_button.setEnabled(False)
+            else:
+                sources_label.setText(get_text('label_sources_selected', count))
+                sources_label.setStyleSheet("")
+                start_button.setEnabled(count > 0)
 
         for cb in source_checkboxes.values():
             cb.stateChanged.connect(update_sources_label)

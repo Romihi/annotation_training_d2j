@@ -3,8 +3,8 @@ from .annotation_data_manager import AnnotationDataManager
 from .mlflow_manager import MLflowManager,ModelType
 from .datasetmanager import YOLODatasetManager
 
-# 時系列モデル（新API）
-from .trajectory_models import (
+# 時系列モデル（model_catalog.py に統合済み）
+from model_catalog import (
     ImageEncoder, BaseTrajectoryModel,
     GRUTrajectoryModel, TCNTrajectoryModel, CausalCNNTrajectoryModel,
     TRAJECTORY_ARCHITECTURES, create_trajectory_model,

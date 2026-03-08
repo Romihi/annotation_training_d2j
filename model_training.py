@@ -19,6 +19,7 @@ import traceback
 
 
 from model_catalog import get_model, AnnotationDataset
+from managers.trajectory_training_manager import TrajectoryTrainingManager
 
 import random
 from PIL import Image, ImageOps, ImageEnhance
@@ -2225,3 +2226,99 @@ def create_waypoint_datasets(
     }
 
     return train_loader, val_loader, dataset_info
+
+
+# =========================================================================
+# 時系列軌道予測モデルの学習
+# =========================================================================
+
+def train_trajectory_model(
+    valid_indexes,
+    annotations,
+    images,
+    source_images_map,
+    selected_sources,
+    config,
+    models_dir='./saved_models',
+    mlflow_manager=None,
+    progress_callback=None,
+):
+    """時系列軌道予測モデルを学習する（TrajectoryTrainingManagerのラッパー）
+
+    Args:
+        valid_indexes: 有効なインデックスリスト
+        annotations: Dict[int, dict]
+        images: List[str]
+        source_images_map: Dict[variant_name, List[str]]
+        selected_sources: List[str]
+        config: dict — 学習設定
+            model_arch: "gru" | "tcn" | "causal_cnn"
+            seq_len, pred_horizon, stride, hidden_dim, num_layers,
+            dropout, img_size, epochs, batch_size, learning_rate,
+            val_split, augment,
+            (TCN固有) tcn_channels, kernel_size
+            (CausalCNN固有) cnn_channels, kernel_size
+        models_dir: モデル保存ディレクトリ
+        mlflow_manager: MLflowManagerインスタンス（任意）
+        progress_callback: (current, total, message) -> bool
+
+    Returns:
+        dict — 学習結果
+    """
+    manager = TrajectoryTrainingManager(models_dir, mlflow_manager)
+    return manager.train(
+        valid_indexes=valid_indexes,
+        annotations=annotations,
+        images=images,
+        source_images_map=source_images_map,
+        selected_sources=selected_sources,
+        config=config,
+        progress_callback=progress_callback,
+    )
+
+
+def predict_trajectory_model(
+    model_path,
+    valid_indexes,
+    annotations,
+    images,
+    source_images_map,
+    models_dir='./saved_models',
+    progress_callback=None,
+):
+    """学習済み時系列モデルで予測を実行する（TrajectoryTrainingManagerのラッパー）
+
+    Args:
+        model_path: モデルファイルパス
+        valid_indexes: 有効なインデックスリスト
+        annotations: Dict[int, dict]
+        images: List[str]
+        source_images_map: Dict[variant_name, List[str]]
+        models_dir: モデル保存ディレクトリ
+        progress_callback: (current, total, message) -> bool
+
+    Returns:
+        dict — {"status", "predictions", "config", "total_predictions"}
+    """
+    manager = TrajectoryTrainingManager(models_dir)
+    return manager.predict(
+        model_path=model_path,
+        valid_indexes=valid_indexes,
+        annotations=annotations,
+        images=images,
+        source_images_map=source_images_map,
+        progress_callback=progress_callback,
+    )
+
+
+def load_trajectory_model(model_path, device=None):
+    """保存済み時系列モデルをロードする（後方互換対応）
+
+    Args:
+        model_path: モデルファイルパス
+        device: 使用するデバイス
+
+    Returns:
+        tuple — (model, config_dict, selected_sources)
+    """
+    return TrajectoryTrainingManager.load_model(model_path, device)
