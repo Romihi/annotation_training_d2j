@@ -6957,15 +6957,19 @@ class ImageAnnotationTool(QMainWindow):
         grid_layout = QHBoxLayout(grid_group)
         grid_button_group = QButtonGroup(dialog)
 
-        current_grid = getattr(self, '_combined_grid', '2x2')
-        rb_2x2 = QRadioButton("2 x 2")
-        rb_3x3 = QRadioButton("3 x 3")
-        rb_2x2.setChecked(current_grid == '2x2')
-        rb_3x3.setChecked(current_grid == '3x3')
-        grid_button_group.addButton(rb_2x2, 0)
-        grid_button_group.addButton(rb_3x3, 1)
-        grid_layout.addWidget(rb_2x2)
-        grid_layout.addWidget(rb_3x3)
+        current_grid = getattr(self, '_combined_grid', '2x1')
+        grid_options = [
+            ("2 x 1", '2x1'),
+            ("1 x 2", '1x2'),
+            ("2 x 2", '2x2'),
+            ("3 x 3", '3x3'),
+        ]
+        for i, (label, value) in enumerate(grid_options):
+            rb = QRadioButton(label)
+            rb.setChecked(current_grid == value)
+            rb.setProperty("grid_value", value)
+            grid_button_group.addButton(rb, i)
+            grid_layout.addWidget(rb)
         layout.addWidget(grid_group)
 
         # --- ソース順序選択 ---
@@ -7023,7 +7027,8 @@ class ImageAnnotationTool(QMainWindow):
 
         def on_ok():
             # グリッド設定を保存
-            self._combined_grid = '3x3' if rb_3x3.isChecked() else '2x2'
+            selected_rb = grid_button_group.checkedButton()
+            self._combined_grid = selected_rb.property("grid_value") if selected_rb else '2x1'
 
             # ソース順序を保存（チェック済みのみ）
             sources = []
@@ -17251,9 +17256,9 @@ class ImageAnnotationTool(QMainWindow):
             return None
 
         # ダイアログで選択されたグリッドサイズを使用
-        grid = getattr(self, '_combined_grid', '2x2')
-        cols = 3 if grid == '3x3' else 2
-        rows = cols
+        grid = getattr(self, '_combined_grid', '2x1')
+        grid_map = {'2x1': (2, 1), '1x2': (1, 2), '2x2': (2, 2), '3x3': (3, 3)}
+        cols, rows = grid_map.get(grid, (2, 1))
 
         # キャンバスサイズ（元の画像サイズ）
         canvas_w = getattr(self, 'original_image_width', 320)
