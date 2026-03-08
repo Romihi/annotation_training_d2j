@@ -159,6 +159,7 @@ TRANSLATIONS = {
 
         # --- 表示設定 ---
         'btn_window_font_settings': 'ウィンドウ・フォントサイズ設定',
+        'btn_display_settings': '表示設定',
 
         # --- ナビゲーション ---
         'btn_reverse_play': '◀逆再生',
@@ -1535,6 +1536,12 @@ Google Cloud Console での OAuth設定手順
         'label_traj_inference_result': '時系列推論結果(a,t)s:',
         'label_traj_section_title': '時系列モデル',
         'label_all': 'すべて',
+        'label_combined_view': '結合表示',
+        'dlg_combined_view': '結合表示設定',
+        'label_grid_layout': 'グリッドレイアウト',
+        'label_source_order': 'ソース選択・表示順',
+        'btn_move_up': '▲ 上へ',
+        'btn_move_down': '▼ 下へ',
         'label_dev_in_progress': '開発中',
 
         # 後方互換 (GRUキー)
@@ -1622,6 +1629,7 @@ Google Cloud Console での OAuth設定手順
 
         # --- Display Settings ---
         'btn_window_font_settings': 'Preference',
+        'btn_display_settings': 'Display Settings',
 
         # --- Navigation ---
         'btn_reverse_play': '◀ Reverse',
@@ -3000,6 +3008,12 @@ Notes
         'label_traj_inference_result': 'Sequence Inference:',
         'label_traj_section_title': 'Time-Series Sequence Model',
         'label_all': 'All',
+        'label_combined_view': 'Combined',
+        'dlg_combined_view': 'Combined View Settings',
+        'label_grid_layout': 'Grid Layout',
+        'label_source_order': 'Source Selection & Order',
+        'btn_move_up': '▲ Up',
+        'btn_move_down': '▼ Down',
         'label_dev_in_progress': 'Dev',
 
         # Legacy GRU keys
@@ -3075,6 +3089,7 @@ _KEY_MAPPING = {
     'open_colab': 'btn_open_colab',
     'download': 'btn_download',
     'window_font_settings': 'btn_window_font_settings',
+    'display_settings': 'btn_display_settings',
     'reverse_play': 'btn_reverse_play',
     'forward_play': 'btn_forward_play',
     'delete_current': 'btn_delete_current',

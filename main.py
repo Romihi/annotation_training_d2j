@@ -3665,8 +3665,9 @@ class ImageAnnotationTool(QMainWindow):
         self.folder_input = QLineEdit()
         self.folder_input.setPlaceholderText(get_text('folder_placeholder'))
         self.folder_input.textChanged.connect(self.on_folder_path_changed)
-        self.folder_input.setMinimumWidth(200)
-        self.folder_input.setMaximumWidth(400)
+        self.folder_input.setMinimumWidth(150)
+        self.folder_input.setMaximumWidth(300)
+        self.folder_input.setContentsMargins(8, 0, 8, 0)
         toolbar.addWidget(self.folder_input)
 
         # 画像を読込ボタン（フォルダ選択→画像読み込みを統合）
@@ -3697,16 +3698,6 @@ class ImageAnnotationTool(QMainWindow):
         # セパレーター
         toolbar.addSeparator()
 
-        # アノテーション済みカウント（枠付き）
-        stats_frame = QFrame()
-        stats_frame.setFrameShape(QFrame.StyledPanel)
-        stats_frame.setStyleSheet("QFrame { border: 1px solid #aaa; border-radius: 3px; padding: 2px 6px; }")
-        stats_frame_layout = QHBoxLayout(stats_frame)
-        stats_frame_layout.setContentsMargins(6, 2, 6, 2)
-        self.stats_label = QLabel(get_text('annotated_count', 0, 0))
-        stats_frame_layout.addWidget(self.stats_label)
-        toolbar.addWidget(stats_frame)
-
         # 画像ソース切替（枠付き）
         self.variant_box = QFrame()
         self.variant_box.setFrameShape(QFrame.StyledPanel)
@@ -3724,6 +3715,12 @@ class ImageAnnotationTool(QMainWindow):
             if var == self.current_variant:
                 rb.setChecked(True)
             rb.toggled.connect(lambda checked, v=var: self.on_variant_changed(v) if checked else None)
+        # 複数ソースがある場合は結合表示ボタンを追加
+        if len(self.available_variants) >= 2:
+            combined_button = QPushButton(get_text('label_combined_view'))
+            combined_button.setStyleSheet("padding: 2px 8px;")
+            combined_button.clicked.connect(self._show_combined_view_dialog)
+            variant_layout.addWidget(combined_button)
         toolbar.addWidget(self.variant_box)
 
         # 左側にスペーサーを追加して右寄せ
@@ -3754,17 +3751,10 @@ class ImageAnnotationTool(QMainWindow):
         toolbar.addSeparator()
 
         # 表示設定ボタン
-        settings_button = QPushButton(f"⚙ {get_text('window_font_settings')}")
+        settings_button = QPushButton(f"⚙ {get_text('display_settings')}")
         settings_button.clicked.connect(self.show_display_settings)
         settings_button.setStyleSheet("padding: 4px 8px;")
         toolbar.addWidget(settings_button)
-
-        # ダークモード切替ボタン
-        self.dark_mode_button = QPushButton(get_text('dark_mode'))
-        self.dark_mode_button.setCheckable(True)
-        self.dark_mode_button.clicked.connect(self.toggle_dark_mode)
-        self.dark_mode_button.setStyleSheet("padding: 4px 8px;")
-        toolbar.addWidget(self.dark_mode_button)
 
         # 言語切替ボタン
         current_lang = get_current_language()
@@ -6845,40 +6835,48 @@ class ImageAnnotationTool(QMainWindow):
             self.current_variant = variant  # キー名だけは保存しておく
             return
         
-        # 以前と同じキーが選択された場合は何もしない
-        if hasattr(self, 'current_variant') and self.current_variant == variant:
+        # 以前と同じキーが選択された場合は何もしない（結合表示は設定変更があるため常に更新）
+        if variant != '__combined__' and hasattr(self, 'current_variant') and self.current_variant == variant:
             return
         
         # 現在のキーを更新
         self.current_variant = variant
         print(f"キーを '{variant}' に変更しました")
-        
-        # キーに対応する画像リストを取得・更新
-        if hasattr(self, 'variant_images') and variant in self.variant_images:
+
+        # 結合表示モードの場合
+        if variant == '__combined__':
+            # 最初のバリアントの画像数をベースにする
+            base_variant = self.available_variants[0]
+            self.images = self.variant_images[base_variant]
+            print(f"結合表示モード: ベースキー '{base_variant}' の画像数: {len(self.images)}")
+        elif hasattr(self, 'variant_images') and variant in self.variant_images:
             # キー別の画像リストを設定
             self.images = self.variant_images[variant]
             print(f"キー '{variant}' の画像数: {len(self.images)}")
-            
-            # 同じインデックスを維持（可能であれば）
-            if self.current_index >= len(self.images):
-                self.current_index = 0
-            
-            # スライダーの設定を更新
-            if self.images:
-                self.image_slider.setMaximum(len(self.images) - 1)
-                self.image_slider.setValue(self.current_index)
-                self.slider_value_label.setText(f"{self.current_index + 1}/{len(self.images)}")
-            else:
-                self.image_slider.setMaximum(0)
-                self.image_slider.setValue(0)
-                self.slider_value_label.setText("0/0")
-            
-            # UI更新
-            self.display_current_image()
-            self.update_gallery()   
-            self.update_slider_deleted_indexes()
-            
-            # 画像ソース（キー）切り替え時の推論実行
+        else:
+            return
+
+        # 同じインデックスを維持（可能であれば）
+        if self.current_index >= len(self.images):
+            self.current_index = 0
+
+        # スライダーの設定を更新
+        if self.images:
+            self.image_slider.setMaximum(len(self.images) - 1)
+            self.image_slider.setValue(self.current_index)
+            self.slider_value_label.setText(f"{self.current_index + 1}/{len(self.images)}")
+        else:
+            self.image_slider.setMaximum(0)
+            self.image_slider.setValue(0)
+            self.slider_value_label.setText("0/0")
+
+        # UI更新
+        self.display_current_image()
+        self.update_gallery()
+        self.update_slider_deleted_indexes()
+
+        # 画像ソース（キー）切り替え時の推論実行
+        if variant != '__combined__':
             self.run_inference_after_image_source_change()
         
         # キーボタン群を更新
@@ -6936,6 +6934,123 @@ class ImageAnnotationTool(QMainWindow):
             if var == self.current_variant:
                 rb.setChecked(True)
             rb.toggled.connect(lambda checked, v=var: self.on_variant_changed(v) if checked else None)
+
+        # 複数ソースがある場合は結合表示ボタンを追加
+        if len(self.available_variants) >= 2:
+            combined_button = QPushButton(get_text('label_combined_view'))
+            combined_button.setStyleSheet("padding: 2px 8px;")
+            combined_button.clicked.connect(self._show_combined_view_dialog)
+            variant_layout.addWidget(combined_button)
+
+    def _show_combined_view_dialog(self):
+        """結合表示の設定ダイアログを表示"""
+        if not hasattr(self, 'available_variants') or len(self.available_variants) < 2:
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(get_text('dlg_combined_view'))
+        dialog.setMinimumWidth(350)
+        layout = QVBoxLayout(dialog)
+
+        # --- グリッドレイアウト選択 ---
+        grid_group = QGroupBox(get_text('label_grid_layout'))
+        grid_layout = QHBoxLayout(grid_group)
+        grid_button_group = QButtonGroup(dialog)
+
+        current_grid = getattr(self, '_combined_grid', '2x2')
+        rb_2x2 = QRadioButton("2 x 2")
+        rb_3x3 = QRadioButton("3 x 3")
+        rb_2x2.setChecked(current_grid == '2x2')
+        rb_3x3.setChecked(current_grid == '3x3')
+        grid_button_group.addButton(rb_2x2, 0)
+        grid_button_group.addButton(rb_3x3, 1)
+        grid_layout.addWidget(rb_2x2)
+        grid_layout.addWidget(rb_3x3)
+        layout.addWidget(grid_group)
+
+        # --- ソース順序選択 ---
+        order_group = QGroupBox(get_text('label_source_order'))
+        order_layout = QVBoxLayout(order_group)
+
+        # 現在の順序を取得
+        current_order = getattr(self, '_combined_sources', list(self.available_variants))
+
+        list_widget = QListWidget()
+        for var in current_order:
+            if var in self.available_variants:
+                item = QListWidgetItem(var)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked)
+                list_widget.addItem(item)
+        # current_orderに含まれないバリアントを追加（未チェック）
+        for var in self.available_variants:
+            if var not in current_order:
+                item = QListWidgetItem(var)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Unchecked)
+                list_widget.addItem(item)
+
+        list_widget.setDragDropMode(QListWidget.InternalMove)
+        order_layout.addWidget(list_widget)
+
+        # 上下ボタン
+        btn_layout = QHBoxLayout()
+        up_btn = QPushButton(get_text('btn_move_up'))
+        down_btn = QPushButton(get_text('btn_move_down'))
+
+        def move_item(direction):
+            row = list_widget.currentRow()
+            if row < 0:
+                return
+            new_row = row + direction
+            if 0 <= new_row < list_widget.count():
+                item = list_widget.takeItem(row)
+                list_widget.insertItem(new_row, item)
+                list_widget.setCurrentRow(new_row)
+
+        up_btn.clicked.connect(lambda: move_item(-1))
+        down_btn.clicked.connect(lambda: move_item(1))
+        btn_layout.addWidget(up_btn)
+        btn_layout.addWidget(down_btn)
+        btn_layout.addStretch()
+        order_layout.addLayout(btn_layout)
+        layout.addWidget(order_group)
+
+        # --- OK / キャンセル ---
+        dialog_buttons = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        cancel_btn = QPushButton(get_text('btn_cancel'))
+
+        def on_ok():
+            # グリッド設定を保存
+            self._combined_grid = '3x3' if rb_3x3.isChecked() else '2x2'
+
+            # ソース順序を保存（チェック済みのみ）
+            sources = []
+            for i in range(list_widget.count()):
+                item = list_widget.item(i)
+                if item.checkState() == Qt.Checked:
+                    sources.append(item.text())
+
+            if not sources:
+                QMessageBox.warning(dialog, get_text('dlg_warning'),
+                                    get_text('msg_select_at_least_one_source'))
+                return
+
+            self._combined_sources = sources
+
+            # 結合表示モードに切り替え
+            self.on_variant_changed('__combined__')
+            dialog.accept()
+
+        ok_btn.clicked.connect(on_ok)
+        cancel_btn.clicked.connect(dialog.reject)
+        dialog_buttons.addStretch()
+        dialog_buttons.addWidget(ok_btn)
+        dialog_buttons.addWidget(cancel_btn)
+        layout.addLayout(dialog_buttons)
+
+        dialog.exec_()
 
     def update_images_for_variant(self):
         """
@@ -12062,7 +12177,13 @@ class ImageAnnotationTool(QMainWindow):
         font_layout.addWidget(preview_label)
         
         layout.addWidget(font_group)
-        
+
+        # ダークモード設定
+        self.dark_mode_check = QCheckBox(get_text('dark_mode'))
+        self.dark_mode_check.setChecked(getattr(self, 'is_dark_mode', False))
+        self.dark_mode_check.stateChanged.connect(lambda state: self.toggle_dark_mode(state == Qt.Checked))
+        layout.addWidget(self.dark_mode_check)
+
         # 設定の保存オプション
         save_group = QGroupBox(get_text('section_save_settings'))
         save_layout = QVBoxLayout(save_group)
@@ -12178,8 +12299,6 @@ class ImageAnnotationTool(QMainWindow):
                 # ダークモード設定を適用
                 if "dark_mode" in settings:
                     self.is_dark_mode = settings["dark_mode"]
-                    if hasattr(self, 'dark_mode_button'):
-                        self.dark_mode_button.setChecked(self.is_dark_mode)
                     self.apply_dark_mode(self.is_dark_mode)
                     
             except Exception as e:
@@ -13855,27 +13974,19 @@ class ImageAnnotationTool(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, get_text('dlg_error'), get_text('msg_file_open_failed', e))
 
-    def toggle_dark_mode(self):
+    def toggle_dark_mode(self, checked=None):
         """ダークモードを切り替える"""
-        self.is_dark_mode = not self.is_dark_mode
-        self.dark_mode_button.setChecked(self.is_dark_mode)
-        self.apply_dark_mode(self.is_dark_mode)
-        
-        # 設定を保存
-        if hasattr(self, 'width_spin') and hasattr(self, 'height_spin'):
-            # 設定ダイアログが開いている場合
-            self.save_display_settings(
-                self.width_spin.value(), 
-                self.height_spin.value(), 
-                self.font().pointSize(),
-                self.is_dark_mode
-            )
+        if checked is not None:
+            self.is_dark_mode = checked
         else:
-            # 通常の場合
-            self.save_display_settings(
-                self.width(),
-                self.height(),
-                self.font().pointSize(),
+            self.is_dark_mode = not self.is_dark_mode
+        self.apply_dark_mode(self.is_dark_mode)
+
+        # 設定を保存
+        self.save_display_settings(
+            self.width(),
+            self.height(),
+            self.font().pointSize(),
                 self.is_dark_mode
             )
 
@@ -13998,7 +14109,6 @@ class ImageAnnotationTool(QMainWindow):
             current_size = self.size()
 
             self.setStyleSheet(dark_style)
-            self.dark_mode_button.setText(get_text('btn_light_mode'))
 
             # ラベルの色を明示的に更新
             if hasattr(self, 'idx_label'):
@@ -14018,7 +14128,6 @@ class ImageAnnotationTool(QMainWindow):
             current_size = self.size()
 
             self.setStyleSheet("")
-            self.dark_mode_button.setText(get_text('btn_dark_mode'))
 
             # ラベルの色を明示的に更新
             if hasattr(self, 'idx_label'):
@@ -17104,20 +17213,96 @@ class ImageAnnotationTool(QMainWindow):
 
         return bbox_info
 
+    def _create_combined_image(self):
+        """選択されたソースをグリッド配置した結合画像を作成（元キャンバスサイズに収める）"""
+        if not hasattr(self, 'image_groups') or not self.image_groups:
+            return None
+
+        # 現在の画像パスからグループインデックスを特定
+        current_path = self.images[self.current_index]
+        basename = os.path.basename(current_path)
+        jetracer_match = re.match(r'^\d+_\d+_(\d+)_([A-Za-z0-9]+)_image_array', basename)
+        if jetracer_match:
+            group_idx = int(jetracer_match.group(1))
+        else:
+            normal_match = re.match(r'^(\d+)_([A-Za-z0-9]+)_image_array', basename)
+            if normal_match:
+                group_idx = int(normal_match.group(1))
+            else:
+                return None
+
+        group = self.image_groups.get(group_idx, {})
+        if not group:
+            return None
+
+        # ダイアログで選択されたソース順序を使用
+        source_order = getattr(self, '_combined_sources', list(self.available_variants))
+
+        pil_images = []
+        for var in source_order:
+            if var in group:
+                img = load_image_safely(group[var])
+                if img is not None:
+                    if img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    pil_images.append(img)
+
+        if not pil_images:
+            return None
+
+        # ダイアログで選択されたグリッドサイズを使用
+        grid = getattr(self, '_combined_grid', '2x2')
+        cols = 3 if grid == '3x3' else 2
+        rows = cols
+
+        # キャンバスサイズ（元の画像サイズ）
+        canvas_w = getattr(self, 'original_image_width', 320)
+        canvas_h = getattr(self, 'original_image_height', 240)
+
+        cell_w = canvas_w // cols
+        cell_h = canvas_h // rows
+
+        combined = Image.new('RGB', (canvas_w, canvas_h), (32, 32, 32))
+
+        for i, img in enumerate(pil_images):
+            if i >= cols * rows:
+                break
+            row = i // cols
+            col = i % cols
+
+            # アスペクト比を維持してセル内にフィット
+            scale = min(cell_w / img.width, cell_h / img.height)
+            new_w = int(img.width * scale)
+            new_h = int(img.height * scale)
+            resized = img.resize((new_w, new_h), Image.LANCZOS)
+
+            # セル内で中央配置
+            x = col * cell_w + (cell_w - new_w) // 2
+            y = row * cell_h + (cell_h - new_h) // 2
+            combined.paste(resized, (x, y))
+
+        return combined
+
     def display_current_image(self):
         """現在の画像を表示（YOLOアノテーションも含む）"""
         if not self.images or self.current_index >= len(self.images):
             return
-        
+
         current_image_path = self.images[self.current_index]
-        
+
         try:
-            # 画像を読み込み
-            image = load_image_safely(current_image_path)
-            if image is None:
-                print(f"画像読み込み失敗: {current_image_path}")
-                return
-            
+            # 結合表示モードの場合
+            if getattr(self, 'current_variant', None) == '__combined__':
+                image = self._create_combined_image()
+                if image is None:
+                    return
+            else:
+                # 画像を読み込み
+                image = load_image_safely(current_image_path)
+                if image is None:
+                    print(f"画像読み込み失敗: {current_image_path}")
+                    return
+
             # PIL画像をQImageに変換してQPixmapに設定
             qimage = pil_to_qimage(image)
             pixmap = QPixmap.fromImage(qimage)
