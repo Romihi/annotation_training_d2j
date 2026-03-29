@@ -1886,8 +1886,9 @@ class ImageLabel(QLabel):
             painter.setBrush(QBrush(QColor(40, 40, 40, 200)))  # 半透明の暗い背景
         painter.drawRect(bar_x, bar_y, bar_width, bar_height)
 
-        # speed値を0-1の範囲に正規化（0～10の範囲を想定）
-        normalized_speed = speed / 10.0  # 0～10 -> 0～1
+        # speed値を0-1の範囲に正規化（MAX_SPEEDで除算）
+        _max_speed = globals().get('MAX_SPEED', 3.0)
+        normalized_speed = speed / _max_speed if _max_speed > 0 else 0.0
         normalized_speed = max(0, min(1, normalized_speed))  # 0-1にクランプ
 
         # speedバーの色を自動運転アノテーション（赤丸）と同じ色に
@@ -1925,7 +1926,7 @@ class ImageLabel(QLabel):
                     future_ann = self.main_window.annotations[future_index]
                     if 'speed' in future_ann:
                         future_speed = future_ann['speed']
-                        future_normalized = future_speed / 10.0
+                        future_normalized = future_speed / _max_speed if _max_speed > 0 else 0.0
                         future_normalized = max(0, min(1, future_normalized))
 
                         # サイズと色を取得
@@ -1992,9 +1993,7 @@ class ImageLabel(QLabel):
                         future_data = inference[future_key]
                         if 'speed' in future_data:
                             future_infer_speed = future_data['speed']
-                            future_infer_speed_display = future_infer_speed * 10.0
-                            future_normalized = future_infer_speed_display / 10.0
-                            future_normalized = max(0, min(1, future_normalized))
+                            future_normalized = max(0, min(1, future_infer_speed))
 
                             future_y = bar_y + bar_height - int(bar_height * future_normalized)
                             future_color = future_colors.get(offset, QColor(0, 200, 200))
@@ -2005,20 +2004,19 @@ class ImageLabel(QLabel):
 
             if 'speed' in inference:
                 infer_speed = inference['speed']
-                # 推論speed値を正規化（0～10 -> 0～1、学習時に10で正規化されているため10倍して戻す）
-                infer_speed_display = infer_speed * 10.0  # 正規化を元に戻す
-                normalized_infer_speed = infer_speed_display / 10.0
-                normalized_infer_speed = max(0, min(1, normalized_infer_speed))
+                # 推論speed値は正規化済み（0〜1）なのでそのまま使用
+                normalized_infer_speed = max(0, min(1, infer_speed))
 
                 # 推論結果の位置にシアン色の太い横線を描画（推論点と同色）
                 infer_y = bar_y + bar_height - int(bar_height * normalized_infer_speed)
                 painter.setPen(QPen(QColor(0, 255, 255), 4))  # 明るい水色（推論点と同色）
                 painter.drawLine(bar_x - 2, infer_y, bar_x + bar_width + 2, infer_y)
 
-                # 推論speed値を横線の右側に表示（少し暗めの色）
-                painter.setPen(QPen(QColor(0, 200, 200), 1))  # 少し暗めのシアン
+                # 推論speed値を横線の右側に表示（m/s実値に逆変換）
+                infer_speed_ms = infer_speed * _max_speed
+                painter.setPen(QPen(QColor(0, 200, 200), 1))
                 painter.setFont(QFont("Arial", 8, QFont.Bold))
-                painter.drawText(bar_x + bar_width + 25, infer_y + 4, f"({infer_speed_display:.2f})")
+                painter.drawText(bar_x + bar_width + 25, infer_y + 4, f"({infer_speed_ms:.2f})")
 
     def mousePressEvent(self, event):
         if self.pixmap() and self.main_window:
@@ -19292,7 +19290,8 @@ class ImageAnnotationTool(QMainWindow):
             speed_row_layout.addWidget(speed_normalize_label)
             speed_normalize_spin = QDoubleSpinBox()
             speed_normalize_spin.setRange(0.1, 100.0)
-            speed_normalize_spin.setValue(10.0)
+            _default_max_speed = globals().get('MAX_SPEED', 3.0)
+            speed_normalize_spin.setValue(_default_max_speed)
             speed_normalize_spin.setDecimals(1)
             speed_normalize_spin.setSingleStep(1.0)
             speed_normalize_spin.setToolTip(get_text('tip_speed_normalize'))
@@ -19902,7 +19901,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # Speed出力設定の取得
         use_speed_output = False
-        speed_normalize_value = 10.0
+        speed_normalize_value = globals().get('MAX_SPEED', 3.0)
         if has_speed_data and speed_output_check is not None:
             use_speed_output = speed_output_check.isChecked()
             if speed_normalize_spin is not None:
