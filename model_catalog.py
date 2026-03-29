@@ -228,8 +228,9 @@ class BaseModel(nn.Module):
         tensor_image = self._preprocess(pil_image)
         tensor_image = tensor_image.unsqueeze(0)
 
-        # 初期化時に決定したデバイスに直接転送
-        tensor_image = tensor_image.to(self.device)
+        # 初期化時に決定したデバイスに直接転送（モデルのdtypeに合わせる）
+        model_dtype = next(self.parameters()).dtype
+        tensor_image = tensor_image.to(device=self.device, dtype=model_dtype)
 
         # 勾配計算なしで推論を実行
         with torch.no_grad():
@@ -723,8 +724,9 @@ class DonkeyModel(BaseModel):
         tensor_image = self._preprocess(pil_image)
         tensor_image = tensor_image.unsqueeze(0)
 
-        # 初期化時に決定したデバイスに直接転送
-        tensor_image = tensor_image.to(self.device)
+        # 初期化時に決定したデバイスに直接転送（モデルのdtypeに合わせる）
+        model_dtype = next(self.parameters()).dtype
+        tensor_image = tensor_image.to(device=self.device, dtype=model_dtype)
 
         # 勾配計算なしで推論を実行
         with torch.no_grad():
@@ -884,9 +886,10 @@ class BaseWaypointModel(BaseModel):
         tensor_image = self._preprocess(pil_image)
         tensor_image = tensor_image.unsqueeze(0)
         
-        # デバイスに転送
-        tensor_image = tensor_image.to(self.device)
-                
+        # デバイスに転送（モデルのdtypeに合わせる）
+        model_dtype = next(self.parameters()).dtype
+        tensor_image = tensor_image.to(device=self.device, dtype=model_dtype)
+
         # 勾配計算なしで推論を実行
         with torch.no_grad():
             logits = self(tensor_image)
@@ -1271,8 +1274,12 @@ def list_available_location_models():
     return [model for model in MODEL_REGISTRY.keys() if model.endswith('_location')]
 
 def list_all_available_models():
-    """利用可能な全モデル一覧を返す（走行モデル + 位置推論モデル）"""
-    return list(MODEL_REGISTRY.keys())
+    """利用可能な全モデル一覧を返す（走行モデル + 位置推論モデル + 時系列モデル）"""
+    all_models = list(MODEL_REGISTRY.keys())
+    for arch_name in SEQUENCE_ARCHITECTURES:
+        if arch_name not in all_models:
+            all_models.append(arch_name)
+    return all_models
 
 
 def list_timm_models(keyword=None):

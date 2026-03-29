@@ -1,6 +1,10 @@
 # managers/__init__.py
 from .annotation_data_manager import AnnotationDataManager
-from .mlflow_manager import MLflowManager,ModelType
+try:
+    from .mlflow_manager import MLflowManager, ModelType
+except ImportError:
+    MLflowManager = None
+    ModelType = None
 from .datasetmanager import YOLODatasetManager
 
 # 時系列モデル（model_catalog.py に統合済み）
