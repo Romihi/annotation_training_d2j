@@ -60,7 +60,7 @@ class DataAnalysisDialog(QDialog):
         self.all_keys = self.base_keys + sorted(list(self.available_sensor_keys))
 
         self.setWindowTitle(get_text('dlg_data_analysis'))
-        self.setMinimumSize(900, 900)
+        self.setMinimumSize(1050, 900)
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
 
         self.init_ui()
@@ -136,51 +136,60 @@ class DataAnalysisDialog(QDialog):
         timeseries_group = QGroupBox(get_text('section_timeseries'))
         timeseries_layout = QVBoxLayout()
 
-        # 上部: 表示形式設定
-        settings_layout = QHBoxLayout()
+        # 上部1行目: 表示形式選択
+        mode_layout = QHBoxLayout()
 
-        settings_layout.addWidget(QLabel(get_text('label_display')))
+        mode_layout.addWidget(QLabel(get_text('label_display')))
 
         self.display_mode_group = QButtonGroup(self)
         self.raw_data_radio = QRadioButton(get_text('label_raw_data'))
         self.raw_data_radio.setChecked(True)
         self.display_mode_group.addButton(self.raw_data_radio, 0)
         self.raw_data_radio.toggled.connect(self.update_timeseries_graph)
-        settings_layout.addWidget(self.raw_data_radio)
+        mode_layout.addWidget(self.raw_data_radio)
 
         self.moving_avg_radio = QRadioButton(get_text('label_moving_avg'))
         self.display_mode_group.addButton(self.moving_avg_radio, 1)
         self.moving_avg_radio.toggled.connect(self.update_timeseries_graph)
-        settings_layout.addWidget(self.moving_avg_radio)
+        mode_layout.addWidget(self.moving_avg_radio)
 
         self.mean_hist_radio = QRadioButton(get_text('label_bin_avg'))
         self.display_mode_group.addButton(self.mean_hist_radio, 2)
         self.mean_hist_radio.toggled.connect(self.update_timeseries_graph)
-        settings_layout.addWidget(self.mean_hist_radio)
+        mode_layout.addWidget(self.mean_hist_radio)
 
-        settings_layout.addWidget(QLabel("|"))
+        self.normalized_radio = QRadioButton(get_text('label_normalized'))
+        self.display_mode_group.addButton(self.normalized_radio, 3)
+        self.normalized_radio.toggled.connect(self.update_timeseries_graph)
+        mode_layout.addWidget(self.normalized_radio)
+
+        mode_layout.addStretch()
+        timeseries_layout.addLayout(mode_layout)
+
+        # 上部2行目: パラメータ設定
+        params_layout = QHBoxLayout()
 
         # 移動平均の窓サイズ
-        settings_layout.addWidget(QLabel(get_text('label_window')))
+        params_layout.addWidget(QLabel(get_text('label_window')))
         self.moving_avg_spin = QSpinBox()
         self.moving_avg_spin.setRange(2, 300)
         self.moving_avg_spin.setValue(50)
         self.moving_avg_spin.setSingleStep(1)
         self.moving_avg_spin.valueChanged.connect(self.update_timeseries_graph)
-        settings_layout.addWidget(self.moving_avg_spin)
+        params_layout.addWidget(self.moving_avg_spin)
 
         # 区間平均の区間サイズ
-        settings_layout.addWidget(QLabel(get_text('label_bin')))
+        params_layout.addWidget(QLabel(get_text('label_bin')))
         self.bin_size_spin = QSpinBox()
         self.bin_size_spin.setRange(10, 1000)
         self.bin_size_spin.setValue(200)
         self.bin_size_spin.setSingleStep(10)
         self.bin_size_spin.setSuffix(" idx")
         self.bin_size_spin.valueChanged.connect(self.update_timeseries_graph)
-        settings_layout.addWidget(self.bin_size_spin)
+        params_layout.addWidget(self.bin_size_spin)
 
-        settings_layout.addStretch()
-        timeseries_layout.addLayout(settings_layout)
+        params_layout.addStretch()
+        timeseries_layout.addLayout(params_layout)
 
         # 2行目: 表示範囲設定
         range_layout = QHBoxLayout()
@@ -190,7 +199,7 @@ class DataAnalysisDialog(QDialog):
         self.idx_min_spin.setRange(0, 100000)
         self.idx_min_spin.setValue(0)
         self.idx_min_spin.setSingleStep(100)
-        self.idx_min_spin.valueChanged.connect(self.update_timeseries_graph)
+        self.idx_min_spin.valueChanged.connect(self._on_range_changed)
         range_layout.addWidget(self.idx_min_spin)
 
         range_layout.addWidget(QLabel("〜"))
@@ -200,7 +209,7 @@ class DataAnalysisDialog(QDialog):
         self.idx_max_spin.setValue(0)
         self.idx_max_spin.setSingleStep(100)
         self.idx_max_spin.setSpecialValueText(get_text('label_auto'))
-        self.idx_max_spin.valueChanged.connect(self.update_timeseries_graph)
+        self.idx_max_spin.valueChanged.connect(self._on_range_changed)
         range_layout.addWidget(self.idx_max_spin)
 
         range_layout.addStretch()
@@ -212,8 +221,15 @@ class DataAnalysisDialog(QDialog):
         # 時系列グラフ（左側）
         self.timeseries_figure = Figure(figsize=(8, 4), dpi=100)
         self.timeseries_canvas = FigureCanvas(self.timeseries_figure)
-        self.timeseries_canvas.mpl_connect('button_press_event', self.on_timeseries_click)
+        self.timeseries_canvas.mpl_connect('button_press_event', self._on_mouse_press)
+        self.timeseries_canvas.mpl_connect('button_release_event', self._on_mouse_release)
+        self.timeseries_canvas.mpl_connect('motion_notify_event', self._on_mouse_move)
+        self.timeseries_canvas.mpl_connect('scroll_event', self._on_scroll)
         self.timeseries_canvas.setMinimumHeight(300)
+        self._drag_start = None  # ドラッグ開始位置 (x_data, y_data)
+        self._is_dragging = False
+        self._zoom_xlim = None  # ズーム後のX範囲（Noneで自動）
+        self._zoom_ylim = None  # ズーム後のY範囲（Noneで自動）
         graph_layout.addWidget(self.timeseries_canvas, 4)
 
         # キー選択リスト（右側）
@@ -221,7 +237,8 @@ class DataAnalysisDialog(QDialog):
         key_select_layout.addWidget(QLabel(get_text('label_display_items')))
         self.key_list = QListWidget()
         self.key_list.setSelectionMode(QAbstractItemView.MultiSelection)
-        self.key_list.setMaximumWidth(120)
+        self.key_list.setMaximumWidth(180)
+        self.key_list.setMinimumWidth(140)
 
         # 基本キーを追加
         for key in self.all_keys:
@@ -237,10 +254,18 @@ class DataAnalysisDialog(QDialog):
 
         timeseries_layout.addLayout(graph_layout)
 
-        # 説明ラベル
-        info_label = QLabel(get_text('label_click_to_jump'))
+        # 説明ラベルとズームリセットボタン
+        info_bar = QHBoxLayout()
+        info_label = QLabel(get_text('label_click_to_jump') + "  |  " + get_text('label_zoom_hint'))
         info_label.setStyleSheet("color: gray;")
-        timeseries_layout.addWidget(info_label)
+        info_bar.addWidget(info_label)
+        info_bar.addStretch()
+        self.zoom_reset_btn = QPushButton(get_text('btn_zoom_reset'))
+        self.zoom_reset_btn.setFixedWidth(100)
+        self.zoom_reset_btn.setEnabled(False)
+        self.zoom_reset_btn.clicked.connect(self._reset_zoom)
+        info_bar.addWidget(self.zoom_reset_btn)
+        timeseries_layout.addLayout(info_bar)
 
         timeseries_group.setLayout(timeseries_layout)
         layout.addWidget(timeseries_group)
@@ -526,6 +551,28 @@ class DataAnalysisDialog(QDialog):
                     y_val = data_by_key[selected_keys[0]][self.current_index]
                     ax.scatter([self.current_index], [y_val], color='purple', s=100, zorder=5, marker='o')
 
+        elif self.normalized_radio.isChecked():
+            # 正規化表示（各センサーの絶対最大値で正規化）
+            for key_idx, key in enumerate(selected_keys):
+                key_indices = sorted(data_by_key[key].keys())
+                key_values = [data_by_key[key][i] for i in key_indices]
+
+                if key_values:
+                    color = COLORS[key_idx % len(COLORS)]
+                    abs_max = max(abs(v) for v in key_values)
+                    if abs_max > 0:
+                        norm_values = [v / abs_max for v in key_values]
+                        ax.plot(key_indices, norm_values, '-', color=color, alpha=0.7,
+                                label=f'{key} (max={abs_max:.3f})', linewidth=0.8)
+                    else:
+                        ax.plot(key_indices, key_values, '-', color=color, alpha=0.7,
+                                label=f'{key} (max=0)', linewidth=0.8)
+
+            ax.set_title(get_text('label_normalized_title'))
+
+            # 現在位置マーカー
+            ax.axvline(x=self.current_index, color='purple', linestyle='--', alpha=0.8, linewidth=2)
+
         else:
             # 生データ表示（線グラフ）
             for key_idx, key in enumerate(selected_keys):
@@ -552,7 +599,10 @@ class DataAnalysisDialog(QDialog):
         ax.grid(True, alpha=0.3)
 
         # X軸の範囲を設定
-        if indices:
+        if self._zoom_xlim is not None:
+            # ズーム状態を維持
+            ax.set_xlim(self._zoom_xlim)
+        elif indices:
             idx_min_setting = self.idx_min_spin.value()
             idx_max_setting = self.idx_max_spin.value()
 
@@ -566,35 +616,103 @@ class DataAnalysisDialog(QDialog):
 
             ax.set_xlim(x_min, x_max)
 
+        # Y軸のズーム状態を維持
+        if self._zoom_ylim is not None:
+            ax.set_ylim(self._zoom_ylim)
+
         self.timeseries_figure.tight_layout()
         self.timeseries_canvas.draw()
 
-    def on_timeseries_click(self, event):
-        """時系列グラフクリック時の処理"""
-        if event.inaxes is None:
+    def _on_mouse_press(self, event):
+        """マウスボタン押下"""
+        if event.inaxes is None or event.xdata is None:
             return
+        if event.button == 3:
+            # 右クリック: パン開始
+            self._drag_start = (event.xdata, event.ydata)
+            self._is_dragging = False
 
-        # クリック位置に最も近いインデックスを取得
-        click_x = event.xdata
-        if click_x is None:
+    def _on_mouse_move(self, event):
+        """マウス移動（右ドラッグでパン）"""
+        if self._drag_start is None or event.inaxes is None or event.xdata is None:
             return
+        self._is_dragging = True
+        ax = event.inaxes
+        dx = self._drag_start[0] - event.xdata
+        dy = self._drag_start[1] - event.ydata
+        x_lo, x_hi = ax.get_xlim()
+        y_lo, y_hi = ax.get_ylim()
+        ax.set_xlim(x_lo + dx, x_hi + dx)
+        ax.set_ylim(y_lo + dy, y_hi + dy)
+        self._zoom_xlim = ax.get_xlim()
+        self._zoom_ylim = ax.get_ylim()
+        self.zoom_reset_btn.setEnabled(True)
+        self.timeseries_canvas.draw_idle()
 
-        # 最も近いアノテーション済みインデックスを探す
-        min_dist = float('inf')
-        closest_idx = None
+    def _on_mouse_release(self, event):
+        """マウスボタンリリース"""
+        was_dragging = self._is_dragging
+        self._drag_start = None
+        self._is_dragging = False
 
-        for idx in self.annotations.keys():
-            if idx in self.deleted_indexes:
-                continue
-            dist = abs(idx - click_x)
-            if dist < min_dist:
-                min_dist = dist
-                closest_idx = idx
+        if was_dragging or event.button == 3:
+            return  # ドラッグ終了 or 右クリックはジャンプしない
 
-        if closest_idx is not None:
-            self.jump_to_image.emit(closest_idx)
-            self.current_index = closest_idx
-            self.update_timeseries_graph()
+        # 左クリック: 画像ジャンプ
+        if event.button == 1 and event.inaxes is not None and event.xdata is not None:
+            click_x = event.xdata
+            min_dist = float('inf')
+            closest_idx = None
+            for idx in self.annotations.keys():
+                if idx in self.deleted_indexes:
+                    continue
+                dist = abs(idx - click_x)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_idx = idx
+            if closest_idx is not None:
+                self.jump_to_image.emit(closest_idx)
+                self.current_index = closest_idx
+                self.update_timeseries_graph()
+
+    def _on_scroll(self, event):
+        """スクロールホイールでズーム"""
+        if event.inaxes is None or event.xdata is None:
+            return
+        ax = event.inaxes
+        # ズーム倍率
+        scale = 0.8 if event.button == 'up' else 1.25
+
+        # X軸ズーム（カーソル位置を中心）
+        x_lo, x_hi = ax.get_xlim()
+        x_center = event.xdata
+        new_x_half = (x_hi - x_lo) * scale / 2
+        ax.set_xlim(x_center - new_x_half, x_center + new_x_half)
+
+        # Y軸ズーム（カーソル位置を中心）
+        y_lo, y_hi = ax.get_ylim()
+        y_center = event.ydata
+        new_y_half = (y_hi - y_lo) * scale / 2
+        ax.set_ylim(y_center - new_y_half, y_center + new_y_half)
+
+        self._zoom_xlim = ax.get_xlim()
+        self._zoom_ylim = ax.get_ylim()
+        self.zoom_reset_btn.setEnabled(True)
+        self.timeseries_canvas.draw_idle()
+
+    def _on_range_changed(self):
+        """表示範囲が変更されたらズームをリセットしてグラフを更新"""
+        self._zoom_xlim = None
+        self._zoom_ylim = None
+        self.zoom_reset_btn.setEnabled(False)
+        self.update_timeseries_graph()
+
+    def _reset_zoom(self):
+        """ズームをリセットして全体表示に戻す"""
+        self._zoom_xlim = None
+        self._zoom_ylim = None
+        self.zoom_reset_btn.setEnabled(False)
+        self.update_timeseries_graph()
 
     def update_current_position(self, index):
         """現在位置を更新（外部から呼び出し用）"""

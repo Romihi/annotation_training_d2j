@@ -466,22 +466,39 @@ def create_datasets(
     use_augmentation: bool = False,
     use_speed: bool = False,
     use_future: bool = False,
-    num_outputs: int = 2
+    num_outputs: int = 2,
+    multi_source_paths: List[List[str]] = None,
+    num_sources: int = 1,
+    fusion_method: str = 'concat'
 ) -> Tuple[DataLoader, DataLoader, Dict[str, Any]]:
-    """トレーニングとバリデーション用のデータローダーを作成する"""
+    """トレーニングとバリデーション用のデータローダーを作成する
+
+    マルチソースモードの場合:
+        multi_source_paths: [[source1, source2, ...], ...] 形式のグループ化パス
+        num_sources: 画像ソース数 (>1 でマルチソースモード)
+        fusion_method: 融合方法 ('concat' or 'attention')
+    """
     # 引数チェック
     if image_paths is None or annotations is None or len(image_paths) == 0 or len(annotations) == 0:
         raise ValueError("有効な画像パスとアノテーションが必要です。")
 
+    is_multi_source = num_sources > 1 and multi_source_paths is not None
+
     # サンプル画像から実際のサイズを取得
-    sample_img = Image.open(image_paths[0]).convert('RGB')
+    if is_multi_source:
+        sample_path = multi_source_paths[0][0]
+    else:
+        sample_path = image_paths[0]
+    sample_img = Image.open(sample_path).convert('RGB')
     actual_size = (sample_img.height, sample_img.width)
     print(f"実際の画像サイズ: {actual_size}")
+    if is_multi_source:
+        print(f"マルチソースモード: {num_sources}ソース, 融合方法: {fusion_method}")
 
     # モデルの前処理を取得（実際のサイズとnum_outputsを指定）
     model = get_model(model_name, pretrained=False, input_size=actual_size, num_outputs=num_outputs)
     base_transform = model.get_preprocess()
-    
+
     # データオーグメンテーションの設定
     if use_augmentation:
         if isinstance(use_augmentation, dict):
@@ -489,11 +506,11 @@ def create_datasets(
             aug_params = use_augmentation
             # まず明示的にToTensorを入れる
             transform_list = [transforms.ToTensor()]
-            
+
             # 水平反転
             if aug_params.get('use_flip', True):
                 transform_list.append(transforms.RandomHorizontalFlip(p=aug_params.get('flip_prob', 0.5)))
-            
+
             # 色調整
             if aug_params.get('use_color', True):
                 transform_list.append(
@@ -503,30 +520,30 @@ def create_datasets(
                         saturation=aug_params.get('saturation', 0.2)
                     )
                 )
-            
+
             # 幾何変換
             if aug_params.get('use_geometry', True):
                 transform_list.append(
                     transforms.RandomAffine(
                         degrees=aug_params.get('rotation_degrees', 5),
-                        translate=(aug_params.get('translate_ratio', 0.1), 
+                        translate=(aug_params.get('translate_ratio', 0.1),
                                 aug_params.get('translate_ratio', 0.1))
                     )
                 )
-            
+
             # ランダムイレース（テンソル変換後に適用）
             if aug_params.get('use_erase', True):
                 transform_list.append(
                     transforms.RandomErasing(
                         p=aug_params.get('erase_prob', 0.5),
-                        scale=(aug_params.get('erase_min_ratio', 0.02), 
+                        scale=(aug_params.get('erase_min_ratio', 0.02),
                             aug_params.get('erase_max_ratio', 0.2)),
                         ratio=(0.3, 3.3),
                         value=0
                     )
                 )
-            
-            
+
+
             transform = transforms.Compose(transform_list)
         else:
             # 従来の単純な有効化の場合
@@ -545,8 +562,20 @@ def create_datasets(
             transforms.ToTensor()
         ])
 
-    # データセットの作成（use_speed, use_futureパラメータを追加）
-    dataset = AnnotationDataset(image_paths, annotations, transform=transform, use_speed=use_speed, use_future=use_future)
+    # データセットの作成
+    if is_multi_source:
+        from model_catalog import MultiSourceDataset
+        dataset = MultiSourceDataset(
+            grouped_image_paths=multi_source_paths,
+            annotations=annotations,
+            num_sources=num_sources,
+            transform=transform,
+            use_speed=use_speed,
+            use_future=use_future
+        )
+        print(f"MultiSourceDataset作成: {len(dataset)}サンプル, {num_sources}ソース")
+    else:
+        dataset = AnnotationDataset(image_paths, annotations, transform=transform, use_speed=use_speed, use_future=use_future)
 
     # バッチサイズが小さすぎる場合の対策
     if batch_size < 2:
@@ -591,7 +620,9 @@ def create_datasets(
         'use_augmentation': use_augmentation,
         'use_speed': use_speed,
         'use_future': use_future,
-        'actual_image_size': actual_size
+        'actual_image_size': actual_size,
+        'num_sources': num_sources,
+        'fusion_method': fusion_method if is_multi_source else None
     }
 
     return train_loader, val_loader, dataset_info
@@ -615,7 +646,10 @@ def train_model(
     scheduler_name: str = 'ReduceLROnPlateau',
     custom_model_name: Optional[str] = None,
     num_outputs: int = 2,
-    input_size: Optional[Tuple[int, int]] = None
+    input_size: Optional[Tuple[int, int]] = None,
+    num_sources: int = 1,
+    fusion_method: str = 'concat',
+    selected_sources: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """モデルをトレーニングする
 
@@ -652,12 +686,28 @@ def train_model(
         input_size = (sample_batch[0].shape[2], sample_batch[0].shape[3])  # (H, W)
         print(f"データローダーから入力サイズを推定: {input_size}")
 
+    # マルチソース判定
+    is_multi_source = num_sources > 1
+
     # モデルのロード
     if progress_callback:
         progress_callback(0, num_epochs, "モデルをロード中...")
 
-    # まず事前学習済みの重みでモデルを初期化（またはランダム初期化）
-    model = get_model(model_name, pretrained=pretrained, input_size=input_size, num_outputs=num_outputs)
+    if is_multi_source:
+        # マルチソースモデルを作成
+        from model_catalog import create_multi_source_model
+        model = create_multi_source_model(
+            base_model_name=model_name,
+            num_sources=num_sources,
+            fusion_method=fusion_method,
+            pretrained=pretrained,
+            num_outputs=num_outputs,
+            input_size=input_size
+        )
+        print(f"マルチソースモデル作成: {model.name} ({num_sources}ソース, {fusion_method}融合)")
+    else:
+        # まず事前学習済みの重みでモデルを初期化（またはランダム初期化）
+        model = get_model(model_name, pretrained=pretrained, input_size=input_size, num_outputs=num_outputs)
 
     # 入力サイズをモデルから確認
     model_input_size = model.input_size if hasattr(model, 'input_size') else input_size
@@ -931,13 +981,19 @@ def train_model(
         if improved:
             early_stopping_counter = 0  # カウンタをリセット
 
-            torch.save({
+            save_dict = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': best_val_loss,
                 'input_size': model_input_size,
-            }, best_model_path)
+            }
+            if is_multi_source:
+                save_dict['num_sources'] = num_sources
+                save_dict['fusion_method'] = fusion_method
+                save_dict['selected_sources'] = selected_sources
+                save_dict['base_model_name'] = model_name
+            torch.save(save_dict, best_model_path)
 
             if progress_callback:
                 progress_callback(epoch + 1, num_epochs,
@@ -994,7 +1050,7 @@ def train_model(
         return training_results
 
     # 最終モデルの保存
-    torch.save({
+    final_save_dict = {
         'epoch': completed_epochs,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
@@ -1004,7 +1060,13 @@ def train_model(
         'early_stopped': early_stopped,
         'stopped_epoch': stopped_epoch if early_stopped else completed_epochs,
         'input_size': model_input_size,
-    }, model_path)
+    }
+    if is_multi_source:
+        final_save_dict['num_sources'] = num_sources
+        final_save_dict['fusion_method'] = fusion_method
+        final_save_dict['selected_sources'] = selected_sources
+        final_save_dict['base_model_name'] = model_name
+    torch.save(final_save_dict, model_path)
 
     # トレーニング結果
     training_results = {

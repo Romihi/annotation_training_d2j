@@ -53,9 +53,11 @@ class MLflowManager:
         self.current_experiment = None
         self.is_initialized = False
 
-        # Databricks使用フラグ（Noneの場合はconfig_databricks.pyの設定を使用）
+        # Databricks使用フラグ
+        # デフォルトはFalse（ユーザーが設定画面から明示的に有効化する必要がある）
+        # use_databricks=Trueが明示的に渡された場合のみ有効化
         if use_databricks is None:
-            self.use_databricks = DATABRICKS_ENABLED if DATABRICKS_CONFIG_AVAILABLE else False
+            self.use_databricks = False
         else:
             self.use_databricks = use_databricks
 
@@ -308,6 +310,9 @@ class MLflowManager:
             print(f"ローカルMLflow初期化エラー: {e}")
             return False
 
+    # Databricks初期化のタイムアウト（秒）
+    DATABRICKS_INIT_TIMEOUT = 15
+
     def initialize(self, folder_path=None, parent_widget=None):
         """MLflowの初期化と設定を行う（ローカル併用記録対応）
 
@@ -322,12 +327,23 @@ class MLflowManager:
         # 常にローカルを初期化
         local_result = self._initialize_local(folder_path)
 
-        # Databricksモードの場合は追加で初期化
+        # Databricksモードの場合は追加で初期化（タイムアウト付き）
         if self.use_databricks:
-            databricks_result = self._initialize_databricks(parent_widget)
+            print(f"Databricks接続を試行中... (タイムアウト: {self.DATABRICKS_INIT_TIMEOUT}秒)")
+            databricks_result = self._initialize_databricks_with_timeout(parent_widget)
             if not databricks_result:
-                print("Databricks接続に失敗しました。ローカルのみに記録します。")
+                print("Databricks接続に失敗またはタイムアウトしました。ローカルのみに記録します。")
                 self._databricks_connected = False
+                if parent_widget:
+                    QMessageBox.warning(
+                        parent_widget,
+                        "Databricks接続",
+                        "Databricksへの接続に失敗またはタイムアウトしました。\n"
+                        "学習結果はローカルのみに記録されます。\n\n"
+                        "Databricks連携を使用するには、設定画面から明示的に有効化してください。"
+                    )
+            else:
+                print("Databricks接続成功 - ローカル＋Databricks併用モードで記録します")
 
         # ローカルに戻しておく
         if self.local_tracking_uri:
@@ -335,6 +351,29 @@ class MLflowManager:
 
         self.is_initialized = local_result
         return local_result
+
+    def _initialize_databricks_with_timeout(self, parent_widget=None):
+        """Databricks初期化をタイムアウト付きで実行（UIフリーズ防止）"""
+        import threading
+
+        result = [False]
+
+        def _do_init():
+            try:
+                result[0] = self._initialize_databricks(parent_widget)
+            except Exception as e:
+                print(f"Databricks初期化エラー（スレッド内）: {e}")
+                result[0] = False
+
+        thread = threading.Thread(target=_do_init, daemon=True)
+        thread.start()
+        thread.join(timeout=self.DATABRICKS_INIT_TIMEOUT)
+
+        if thread.is_alive():
+            print(f"Databricks初期化がタイムアウトしました ({self.DATABRICKS_INIT_TIMEOUT}秒)")
+            return False
+
+        return result[0]
     
     def set_experiment(self, model_type: ModelType, target: str = "local"):
         """指定されたモデルタイプの実験を設定
@@ -443,22 +482,59 @@ class MLflowManager:
             dataset_info, metrics, model_path
         )
 
-        # Databricks有効時は追加で記録
+        # Databricks有効時は追加で記録（タイムアウト付き）
         databricks_success = False
         if self.use_databricks and self._databricks_connected:
-            databricks_success = self._log_run_to_target(
-                "databricks", model_type, run_name, params, run_metrics, tags,
+            print(f"Databricksに記録中... (タイムアウト: {self.DATABRICKS_LOG_TIMEOUT}秒)")
+            databricks_success = self._log_to_databricks_with_timeout(
+                model_type, run_name, params, run_metrics, tags,
                 dataset_info, metrics, model_path
             )
             if databricks_success:
                 print(f"Databricksにも記録しました: {run_name}")
             else:
-                print(f"Databricksへの記録に失敗しましたが、ローカルには記録済みです")
+                print(f"Databricksへの記録に失敗またはタイムアウトしましたが、ローカルには記録済みです")
 
         # ローカルに戻す
         mlflow.set_tracking_uri(self.local_tracking_uri)
 
         return local_success
+
+    # Databricksログ記録のタイムアウト（秒）
+    DATABRICKS_LOG_TIMEOUT = 30
+
+    def _log_to_databricks_with_timeout(self, model_type, run_name, params,
+                                         run_metrics, tags, dataset_info, metrics,
+                                         model_path):
+        """Databricksへの記録をタイムアウト付きで実行（UIフリーズ防止）"""
+        import threading
+
+        result = [False]
+        error_msg = [None]
+
+        def _do_log():
+            try:
+                result[0] = self._log_run_to_target(
+                    "databricks", model_type, run_name, params, run_metrics, tags,
+                    dataset_info, metrics, model_path
+                )
+            except Exception as e:
+                error_msg[0] = str(e)
+                result[0] = False
+
+        thread = threading.Thread(target=_do_log, daemon=True)
+        thread.start()
+        thread.join(timeout=self.DATABRICKS_LOG_TIMEOUT)
+
+        if thread.is_alive():
+            print(f"Databricksへの記録がタイムアウトしました ({self.DATABRICKS_LOG_TIMEOUT}秒)")
+            self._databricks_connected = False
+            return False
+
+        if error_msg[0]:
+            print(f"Databricks記録エラー: {error_msg[0]}")
+
+        return result[0]
     
     def open_ui(self, parent_widget=None, model_type: ModelType = None):
         """MLflow UIを開く"""

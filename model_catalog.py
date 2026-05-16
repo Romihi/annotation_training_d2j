@@ -96,6 +96,36 @@ def detect_input_size_from_checkpoint(weights_path, device='cpu'):
     return None
 
 
+def detect_multi_source_from_checkpoint(weights_path, device='cpu'):
+    """
+    チェックポイントファイルからマルチソース情報を検出する
+
+    Args:
+        weights_path: 重みファイルのパス
+        device: 読み込みに使用するデバイス
+
+    Returns:
+        dict: {'num_sources': int, 'fusion_method': str or None, 'selected_sources': list or None, 'base_model_name': str or None}
+    """
+    result = {'num_sources': 1, 'fusion_method': None, 'selected_sources': None, 'base_model_name': None}
+    try:
+        checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
+        if isinstance(checkpoint, dict):
+            if 'num_sources' in checkpoint:
+                result['num_sources'] = checkpoint['num_sources']
+            if 'fusion_method' in checkpoint:
+                result['fusion_method'] = checkpoint['fusion_method']
+            if 'selected_sources' in checkpoint:
+                result['selected_sources'] = checkpoint['selected_sources']
+            if 'base_model_name' in checkpoint:
+                result['base_model_name'] = checkpoint['base_model_name']
+            if result['num_sources'] > 1:
+                print(f"マルチソースモデル検出: {result['num_sources']}ソース, 融合: {result['fusion_method']}, ソース: {result['selected_sources']}")
+    except Exception as e:
+        print(f"マルチソース情報の検出に失敗: {e}")
+    return result
+
+
 def load_model_weights(model, weights_path, device):
     """
     モデルの重みを読み込み、指定されたデバイスに移動する
@@ -1684,3 +1714,239 @@ class AnnotationDataset(torch.utils.data.Dataset):
         target = torch.tensor(target_values, dtype=torch.float)
 
         return img, target
+
+
+# =========================================================================
+# マルチソース画像入力モデル
+# =========================================================================
+
+class MultiSourceModel(BaseModel):
+    """任意の既存モデルを複数画像ソース入力に対応させるラッパー
+
+    入力テンソル形状: [batch, num_sources*3, H, W]
+    forward()内で各ソースの3チャネルに分割し、共有エンコーダで特徴抽出後、
+    指定された融合方法で結合して出力する。
+    """
+
+    FUSION_METHODS = ['concat', 'attention']
+
+    def __init__(self, base_model_name, num_sources=2, fusion_method='concat',
+                 pretrained=True, num_outputs=2, input_size=None):
+        display_name = f"multi{num_sources}_{fusion_method}_{base_model_name}"
+        super().__init__(name=display_name)
+        self.base_model_name = base_model_name
+        self.num_sources = num_sources
+        self.fusion_method = fusion_method
+        self.num_outputs = num_outputs
+
+        # ベースモデルからエンコーダを構築
+        base_model_class = MODEL_REGISTRY.get(base_model_name)
+        if base_model_class is None:
+            raise ValueError(f"Unknown base model: {base_model_name}")
+
+        if base_model_name in ("donkeycar", "donkey_fcn"):
+            if input_size is None:
+                input_size = (224, 224)
+            base = base_model_class(pretrained=pretrained, input_size=input_size, num_outputs=num_outputs)
+        elif issubclass(base_model_class, TIMMBasedModel):
+            base = base_model_class(pretrained=pretrained, num_outputs=num_outputs)
+        else:
+            base = base_model_class(pretrained=pretrained)
+
+        # エンコーダと特徴次元を抽出
+        if isinstance(base, TIMMBasedModel):
+            self.encoder = base.base_model
+            self.feature_dim = base.regressor.in_features
+            self.input_size = base._get_model_input_size()
+        elif isinstance(base, DonkeyModel):
+            self.encoder = nn.Sequential(base.features, base.dense_layers)
+            self.feature_dim = base.regressor.in_features  # 50
+            self.input_size = base.input_size
+        elif isinstance(base, DonkeyModel_FCN):
+            self.encoder = base.features
+            dummy = torch.zeros(1, 3, *(input_size or (224, 224)))
+            self.feature_dim = base.features(dummy).shape[1]
+            self.input_size = base.input_size
+        else:
+            raise ValueError(f"MultiSourceModel does not support base model type: {type(base)}")
+
+        # 融合方法ごとのレイヤーを構築
+        if fusion_method == 'concat':
+            fused_dim = self.feature_dim * num_sources
+            self.regressor = nn.Sequential(
+                nn.Linear(fused_dim, min(256, fused_dim)),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.2),
+                nn.Linear(min(256, fused_dim), num_outputs)
+            )
+        elif fusion_method == 'attention':
+            # アテンション融合: 各ソースの特徴にクロスアテンションを適用
+            num_heads = max(1, self.feature_dim // 64)
+            # feature_dimがnum_headsで割り切れることを保証
+            while self.feature_dim % num_heads != 0 and num_heads > 1:
+                num_heads -= 1
+            self.attention = nn.MultiheadAttention(
+                embed_dim=self.feature_dim, num_heads=num_heads, batch_first=True
+            )
+            self.norm = nn.LayerNorm(self.feature_dim)
+            self.regressor = nn.Sequential(
+                nn.Linear(self.feature_dim, min(256, self.feature_dim)),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.2),
+                nn.Linear(min(256, self.feature_dim), num_outputs)
+            )
+        else:
+            raise ValueError(f"Unknown fusion method: {fusion_method}. Use: {self.FUSION_METHODS}")
+
+        print(f"MultiSourceModel created: {display_name}")
+        print(f"  encoder feature_dim={self.feature_dim}, num_sources={num_sources}, fusion={fusion_method}")
+        print(f"  input_size={self.input_size}, num_outputs={num_outputs}")
+
+    def _encode(self, x):
+        """エンコーダで特徴抽出（テンソル形式を保証）"""
+        features = self.encoder(x)
+        if not isinstance(features, torch.Tensor):
+            features = next(iter(features.values()))
+        return features
+
+    def forward(self, x):
+        """順伝播 - 入力 [batch, num_sources*3, H, W] を分割してエンコード・融合"""
+        features_list = []
+        for i in range(self.num_sources):
+            src = x[:, i*3:(i+1)*3, :, :]
+            feat = self._encode(src)
+            features_list.append(feat)
+
+        if self.fusion_method == 'concat':
+            fused = torch.cat(features_list, dim=1)
+        elif self.fusion_method == 'attention':
+            # [batch, num_sources, feature_dim]
+            seq = torch.stack(features_list, dim=1)
+            attn_out, _ = self.attention(seq, seq, seq)
+            norm_out = self.norm(seq + attn_out)
+            fused = norm_out.mean(dim=1)
+
+        return self.regressor(fused)
+
+    def get_preprocess(self):
+        """各ソース画像に対する前処理を返す（個別適用後にチャネル連結する）"""
+        return transforms.Compose([
+            transforms.Resize((self.input_size[0], self.input_size[1])),
+            transforms.ToTensor()
+        ])
+
+    def run_multi(self, *img_arrs):
+        """複数画像で推論を実行
+
+        Args:
+            *img_arrs: num_sources個のuint8 numpy配列
+        Returns:
+            tuple: (angle, throttle, ...)
+        """
+        if len(img_arrs) != self.num_sources:
+            raise ValueError(
+                f"Expected {self.num_sources} images, got {len(img_arrs)}"
+            )
+
+        if self._preprocess is None:
+            self._preprocess = self.get_preprocess()
+
+        tensors = []
+        for img_arr in img_arrs:
+            pil_image = Image.fromarray(img_arr)
+            tensor = self._preprocess(pil_image)
+            tensors.append(tensor)
+
+        # チャネル連結: [num_sources*3, H, W] -> [1, num_sources*3, H, W]
+        stacked = torch.cat(tensors, dim=0).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            result = self(stacked)
+
+        if result.device.type != 'cpu':
+            result = result.cpu()
+        result = result.numpy().reshape(-1)
+
+        return tuple(result[:self.num_outputs])
+
+
+class MultiSourceDataset(torch.utils.data.Dataset):
+    """複数画像ソースのデータセット - チャネル連結テンソルを返す
+
+    grouped_image_paths: [[source1_path, source2_path, ...], ...]
+    各サンプルで全ソースの画像をチャネル方向に連結した [num_sources*3, H, W] テンソルを返す
+    """
+
+    def __init__(self, grouped_image_paths, annotations, num_sources,
+                 transform=None, use_speed=False, use_future=False):
+        self.grouped_paths = grouped_image_paths
+        self.annotations = annotations
+        self.num_sources = num_sources
+        self.transform = transform
+        self.use_speed = use_speed
+        self.use_future = use_future
+        self.future_offsets = [5, 10]
+
+    def __len__(self):
+        return len(self.grouped_paths)
+
+    def _get_annotation_values(self, annotation):
+        """アノテーションからangle, throttle, speedを取得"""
+        angle = annotation.get("angle", 0.0)
+        throttle = annotation.get("throttle", 0.0)
+        speed = annotation.get("speed", annotation.get("user/speed", annotation.get("pilot/speed", 0.0)))
+        return angle, throttle, speed
+
+    def __getitem__(self, idx):
+        paths = self.grouped_paths[idx]
+
+        # 各ソース画像を読み込み・変換
+        images = []
+        for path in paths:
+            img = Image.open(path).convert('RGB')
+            if self.transform:
+                try:
+                    img = self.transform(img)
+                except Exception:
+                    img = self.transform(np.array(img))
+            images.append(img)
+
+        # チャネル方向に連結: [num_sources*3, H, W]
+        stacked = torch.cat(images, dim=0)
+
+        # ターゲットテンソルを構築（AnnotationDatasetと同じロジック）
+        annotation = self.annotations[idx]
+        angle, throttle, speed = self._get_annotation_values(annotation)
+        target_values = [angle, throttle]
+
+        if self.use_speed:
+            target_values.append(speed)
+
+        if self.use_future:
+            for offset in self.future_offsets:
+                future_idx = idx + offset
+                if future_idx < len(self.annotations):
+                    future_ann = self.annotations[future_idx]
+                    f_angle, f_throttle, f_speed = self._get_annotation_values(future_ann)
+                else:
+                    f_angle, f_throttle, f_speed = angle, throttle, speed
+                if self.use_speed:
+                    target_values.extend([f_angle, f_throttle, f_speed])
+                else:
+                    target_values.extend([f_angle, f_throttle])
+
+        target = torch.tensor(target_values, dtype=torch.float)
+        return stacked, target
+
+
+def create_multi_source_model(base_model_name, num_sources=2, fusion_method='concat',
+                              pretrained=True, num_outputs=2, input_size=None):
+    """マルチソースモデルのファクトリ関数"""
+    return MultiSourceModel(
+        base_model_name=base_model_name,
+        num_sources=num_sources,
+        fusion_method=fusion_method,
+        pretrained=pretrained,
+        num_outputs=num_outputs,
+        input_size=input_size
+    )

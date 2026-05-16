@@ -122,6 +122,9 @@ SEGMENTATION_VERTEX_RADIUS = 8
 SEGMENTATION_VERTEX_HANDLE_RADIUS = 8
 SEGMENTATION_HOVER_VERTEX_RADIUS = 5
 
+# Speed
+MAX_SPEED = 5  # speed正規化の最大値 (m/s)
+
 # ===========================================
 # 色設定（QColorは使用側で生成）
 # ===========================================

@@ -168,6 +168,7 @@ class ImageLabel(QLabel):
         self.is_adjusting_speed = False  # speedバー調整中フラグ
         self.hovering_speed_bar = False  # speedバーにホバー中フラグ
         self.speed_bar_hover_y = None  # speedバー上のホバーY座標
+        self.max_speed = MAX_SPEED  # speed正規化用の最大速度
 
         # 将来アノテーション表示
         self.show_future_annotations = True  # デフォルトON
@@ -480,6 +481,9 @@ class ImageLabel(QLabel):
 
         # セグメンテーション走行方向矢印を描画
         self.draw_seg_driving_direction(self.pix_width, self.pix_height, painter, self.target_rect)
+
+        # 自動運転アノテーション走行軌跡を描画
+        self.draw_auto_driving_direction(self.pix_width, self.pix_height, painter, self.target_rect)
 
         # Speedバーを描画（画像の右側）
         self.draw_speed_bar(self.pix_width, self.pix_height, painter, self.target_rect)
@@ -1413,6 +1417,139 @@ class ImageLabel(QLabel):
                 info_text = f"({norm_x:.2f}, {norm_y:.2f}) 直進"
             painter.drawText(int(screen_target_x + 12), int(screen_target_y - 5), info_text)
 
+    def draw_auto_driving_direction(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
+        """自動運転アノテーションのangle値から走行軌跡を描画（等距離射影魚眼モデル）
+
+        等距離射影 r = f_fish * θ を使用し、160°魚眼レンズでの地面投影を正確に行う。
+        arc は車両直下 (gx=0,gy=0) からサンプリングし、clipping で画像下端以外を除外するため
+        直進・旋回問わず arc が画像下端中央付近からスタートする。
+        """
+        if not getattr(self.main_window, 'show_auto_driving_direction', False):
+            return
+
+        current_index = self.main_window.current_index
+        if current_index is None:
+            return
+        if not hasattr(self.main_window, 'annotations'):
+            return
+        if current_index not in self.main_window.annotations:
+            return
+
+        annotation = self.main_window.annotations[current_index]
+        if 'angle' not in annotation:
+            return
+        if self.annotation_point is None:
+            return
+
+        angle_val = annotation['angle']
+
+        # パラメータ取得
+        max_steering  = self.main_window.auto_max_steering_angle
+        cam_pitch_rad = math.radians(getattr(self.main_window, 'auto_cam_pitch_deg', 20.0))
+        fov_deg       = getattr(self.main_window, 'auto_fov_deg', 160.0)
+
+        cx = pix_width  / 2.0
+        cy = pix_height / 2.0
+
+        # 等距離射影の焦点距離: r_image = f_fish * θ
+        # 対角FOVから算出: f_fish = 半対角ピクセル / 半FOV(rad)
+        half_diag_px  = math.sqrt((pix_width / 2.0) ** 2 + (pix_height / 2.0) ** 2)
+        fov_half_rad  = math.radians(fov_deg / 2.0)
+        f_fish        = half_diag_px / fov_half_rad  # pixels / radian
+
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        painter.setOpacity(1.0)
+        traj_color = QColor(255, 120, 0, 220)
+
+        # ── 地面座標 → スクリーン座標（等距離射影魚眼）──────────────────
+        # 地面座標系: gx = 横方向(右正), gy = 前方距離。車両=原点、高さ正規化(h=1)
+        # カメラモデル (俯角 α = cam_pitch_rad):
+        #   X_c = gx
+        #   Y_c = -gy*sin(α) + cos(α)  [Y_c>0 = 画像下方]
+        #   Z_c = gy*cos(α) + sin(α)   [Z_c>0 = カメラ前方]
+        def ground_to_screen(gx, gy):
+            X_c = gx
+            Z_c = gy * math.cos(cam_pitch_rad) + math.sin(cam_pitch_rad)
+            Y_c = -gy * math.sin(cam_pitch_rad) + math.cos(cam_pitch_rad)
+            if Z_c < 1e-6:
+                return None
+            r3d = math.sqrt(X_c * X_c + Y_c * Y_c)
+            theta = math.atan2(r3d, Z_c)  # 光軸からの角度
+            if theta >= fov_half_rad:      # FOV外
+                return None
+            r_img = f_fish * theta         # 等距離射影: 画像中心からのピクセル距離
+            if r3d > 1e-9:
+                ix = cx + r_img * X_c / r3d
+                iy = cy + r_img * Y_c / r3d
+            else:
+                ix, iy = cx, cy
+            sx = target_rect.x() + (ix / pix_width)  * target_rect.width()
+            sy = target_rect.y() + (iy / pix_height) * target_rect.height()
+            return sx, sy
+
+        # ── ステア角から地面円弧の終点を算出 ────────────────────────────
+        steer_rad = math.radians(angle_val * max_steering)
+        # 正規化座標(h=1)で前方 4 単位が軌跡の到達点
+        gy_end   = 4.0
+        gx_end   = gy_end * math.tan(steer_rad)
+        gy_start = gy_end * 0.005  # 車両直近から開始(clippingで画像外を除去)
+
+        # ── 地面上の円弧サンプリング (gy_start → gy_end) ────────────────
+        N_PTS = 50
+        ground_pts = []
+        if abs(gx_end) > 1e-3:
+            R_g = (gx_end * gx_end + gy_end * gy_end) / (2.0 * gx_end)
+            # 正負どちらの旋回でも正しい終端角を求める
+            # gx(t)=R_g*(1-cos t), gy(t)=|R_g|*sin t より:
+            #   cos(θ) = (R_g - gx_end) / R_g,  sin(θ) = gy_end / |R_g|
+            cos_t_end = (R_g - gx_end) / R_g
+            sin_t_end = gy_end / abs(R_g)
+            theta_total = math.atan2(sin_t_end, cos_t_end)
+            if abs(R_g) > 1e-3 and theta_total > 0:
+                sin_arg = max(-1.0, min(1.0, gy_start / abs(R_g)))
+                t_start = math.asin(sin_arg)
+                for i in range(N_PTS + 1):
+                    t = t_start + (theta_total - t_start) * i / N_PTS
+                    ground_pts.append((R_g * (1.0 - math.cos(t)),
+                                       abs(R_g) * math.sin(t)))
+            else:
+                for i in range(N_PTS + 1):
+                    gy_i = gy_start + (gy_end - gy_start) * i / N_PTS
+                    ground_pts.append((0.0, gy_i))
+        else:
+            for i in range(N_PTS + 1):
+                gy_i = gy_start + (gy_end - gy_start) * i / N_PTS
+                ground_pts.append((0.0, gy_i))
+
+        screen_pts = [pt for gx, gy in ground_pts
+                      if (pt := ground_to_screen(gx, gy)) is not None]
+
+        # ── 画像領域にクリッピングして折れ線描画 ─────────────────────────
+        painter.setClipRect(target_rect)
+        painter.setPen(QPen(traj_color, 3))
+        painter.setBrush(Qt.NoBrush)
+        for i in range(len(screen_pts) - 1):
+            x1, y1 = screen_pts[i]
+            x2, y2 = screen_pts[i + 1]
+            painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+        painter.setClipping(False)
+
+        # ── 舵角テキスト (arc終点付近・黒縁白文字) ──────────────────────
+        actual_deg = angle_val * max_steering
+        info_text  = f"{angle_val:.2f} → {actual_deg:.1f}°"
+        if screen_pts:
+            tx_f, ty_f = screen_pts[-1]
+            tx, ty = int(tx_f + 6), int(ty_f - 8)
+        else:
+            tx = int(target_rect.x() + target_rect.width() * 0.5)
+            ty = int(target_rect.y() + 20)
+        painter.setFont(QFont("Arial", 9, QFont.Bold))
+        for odx, ody in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
+            painter.setPen(QPen(QColor(0, 0, 0)))
+            painter.drawText(tx + odx, ty + ody, info_text)
+        painter.setPen(QPen(QColor(255, 255, 255)))
+        painter.drawText(tx, ty, info_text)
+
     def draw_segmentation_inference_results(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
         """セグメンテーション推論結果の描画"""
         if not (hasattr(self.main_window, 'segmentation_inference_results') and 
@@ -1886,8 +2023,8 @@ class ImageLabel(QLabel):
             painter.setBrush(QBrush(QColor(40, 40, 40, 200)))  # 半透明の暗い背景
         painter.drawRect(bar_x, bar_y, bar_width, bar_height)
 
-        # speed値を0-1の範囲に正規化（MAX_SPEEDで除算）
-        _max_speed = globals().get('MAX_SPEED', 3.0)
+        # speed値を0-1の範囲に正規化（max_speedで除算）
+        _max_speed = self.max_speed
         normalized_speed = speed / _max_speed if _max_speed > 0 else 0.0
         normalized_speed = max(0, min(1, normalized_speed))  # 0-1にクランプ
 
@@ -1946,21 +2083,23 @@ class ImageLabel(QLabel):
         is_dark = self.main_window.is_dark_mode if self.main_window else False
         text_color = QColor(200, 200, 200) if is_dark else QColor(50, 50, 50)
 
-        # 目盛りを描画（0～10の範囲、11段階）- 右側に配置
+        # 目盛りを描画（0～max_speed m/sの範囲）- 右側に配置
+        num_ticks = 11
         painter.setFont(QFont("Arial", 8))
-        for i in range(11):  # 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
-            tick_y = bar_y + bar_height - int(bar_height * i / 10)
+        for i in range(num_ticks):
+            tick_y = bar_y + bar_height - int(bar_height * i / (num_ticks - 1))
             # 目盛り線（バーの右側に描画）
             painter.setPen(QPen(text_color, 1))
             painter.drawLine(bar_x + bar_width, tick_y, bar_x + bar_width + 3, tick_y)
-            # 目盛り値（0～10の範囲で表示、バーの右側、2刻みで表示）
-            tick_value = i
-            if i % 2 == 0:  # 0, 2, 4, 6, 8, 10のみ表示
-                painter.drawText(bar_x + bar_width + 6, tick_y + 4, f"{tick_value}")
+            # 目盛り値（m/s実値で表示、偶数インデックスのみ）
+            if i % 2 == 0:
+                tick_value = _max_speed * i / (num_ticks - 1)
+                tick_label = f"{tick_value:.1f}" if tick_value != int(tick_value) else f"{int(tick_value)}"
+                painter.drawText(bar_x + bar_width + 6, tick_y + 4, tick_label)
 
         # 現在のspeed値をテキストで表示（バーの上部）
-        painter.setPen(QPen(text_color, 2))
-        painter.setFont(QFont("Arial", 10, QFont.Bold))
+        painter.setPen(QPen(text_color, 1))
+        painter.setFont(QFont("Arial", 7))
         speed_text = f"{speed:.2f}"
         text_rect = painter.fontMetrics().boundingRect(speed_text)
         painter.drawText(
@@ -1969,9 +2108,14 @@ class ImageLabel(QLabel):
             speed_text
         )
 
-        # ラベル "SPEED" を下部に表示
-        painter.setFont(QFont("Arial", 9, QFont.Bold))
-        painter.drawText(bar_x, bar_y + bar_height + 20, "SPEED")  # 少し下に移動
+        # ラベル "SPEED(m/s)" を下部に表示
+        label_text = "SPEED(m/s)"
+        label_rect = painter.fontMetrics().boundingRect(label_text)
+        painter.drawText(
+            bar_x + bar_width // 2 - label_rect.width() // 2 + 28,
+            bar_y + bar_height + 22,
+            label_text
+        )
 
         # 推論結果のspeedがある場合は太い横線で表示
         if (hasattr(self.main_window, 'inference_checkbox') and
@@ -3545,6 +3689,10 @@ class ImageAnnotationTool(QMainWindow):
         self.show_seg_driving_direction = False  # 走行方向矢印の表示フラグ
         self.seg_max_steering_angle = 30.0  # 最大舵角（度）
         self.seg_display_mode = 'trajectory'  # 表示モード: 'trajectory' or 'waypoint'
+        self.show_auto_driving_direction = False  # 自動運転アノテーション走行軌跡表示フラグ
+        self.auto_max_steering_angle = 25.0  # 自動運転走行軌跡の最大舵角（度）
+        self.auto_cam_pitch_deg = 20.0        # カメラ俯角（度）※spinbox初期値と一致させること
+        self.auto_fov_deg = 160.0             # カメラ対角FOV（度）※spinbox初期値と一致させること
 
         # waypoint関連の初期化
         self.waypoint_annotations = {}  # waypointアノテーション用 {image_index: [(x, y), ...]}
@@ -4675,6 +4823,66 @@ class ImageAnnotationTool(QMainWindow):
 
         location_layout.addLayout(mode_layout)
 
+        # 自動運転走行軌跡制御パネル
+        self.auto_driving_control_widget = QWidget()
+        auto_driving_control_layout = QVBoxLayout(self.auto_driving_control_widget)
+        auto_driving_control_layout.setContentsMargins(0, 2, 0, 2)
+        auto_driving_control_layout.setSpacing(3)
+
+        # 行1: [✓ 走行軌跡を表示]  最大舵角: [25.0°]
+        traj_row = QHBoxLayout()
+        traj_row.setSpacing(4)
+        self.show_auto_driving_direction_checkbox = QCheckBox(get_text('chk_show_auto_driving_direction'))
+        self.show_auto_driving_direction_checkbox.setChecked(False)
+        self.show_auto_driving_direction_checkbox.setToolTip(get_text('tip_auto_driving_direction'))
+        self.show_auto_driving_direction_checkbox.stateChanged.connect(self.toggle_auto_driving_direction)
+        self.show_auto_driving_direction_checkbox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.show_auto_driving_direction_checkbox.setMinimumWidth(145)
+        traj_row.addWidget(self.show_auto_driving_direction_checkbox)
+        traj_row.addSpacing(6)
+        traj_row.addWidget(QLabel(get_text('label_auto_max_steering')))
+        self.auto_max_steering_spin = QDoubleSpinBox()
+        self.auto_max_steering_spin.setRange(0.1, 90.0)
+        self.auto_max_steering_spin.setSuffix("°")
+        self.auto_max_steering_spin.setDecimals(1)
+        self.auto_max_steering_spin.setFixedWidth(76)
+        self.auto_max_steering_spin.setToolTip(get_text('tip_auto_max_steering'))
+        self.auto_max_steering_spin.valueChanged.connect(self.update_auto_max_steering_angle)
+        self.auto_max_steering_spin.setValue(25.0)
+        traj_row.addWidget(self.auto_max_steering_spin)
+        traj_row.addStretch()
+        auto_driving_control_layout.addLayout(traj_row)
+
+        # 行2: 俯角:[°]  FOV:[°]  ←stretch
+        cam_row = QHBoxLayout()
+        cam_row.setSpacing(3)
+        cam_row.addWidget(QLabel(get_text('label_auto_cam_pitch')))
+        self.auto_cam_pitch_spin = QDoubleSpinBox()
+        self.auto_cam_pitch_spin.setRange(0.0, 89.0)
+        self.auto_cam_pitch_spin.setSuffix("°")
+        self.auto_cam_pitch_spin.setDecimals(1)
+        self.auto_cam_pitch_spin.setFixedWidth(76)
+        self.auto_cam_pitch_spin.setToolTip(get_text('tip_auto_cam_pitch'))
+        self.auto_cam_pitch_spin.valueChanged.connect(self.update_auto_cam_pitch)
+        self.auto_cam_pitch_spin.setValue(20.0)
+        cam_row.addWidget(self.auto_cam_pitch_spin)
+        cam_row.addSpacing(6)
+        cam_row.addWidget(QLabel(get_text('label_auto_fov')))
+        self.auto_fov_spin = QDoubleSpinBox()
+        self.auto_fov_spin.setRange(60.0, 220.0)
+        self.auto_fov_spin.setSuffix("°")
+        self.auto_fov_spin.setDecimals(0)
+        self.auto_fov_spin.setFixedWidth(76)
+        self.auto_fov_spin.setToolTip(get_text('tip_auto_fov'))
+        self.auto_fov_spin.valueChanged.connect(self.update_auto_fov_deg)
+        self.auto_fov_spin.setValue(160.0)
+        cam_row.addWidget(self.auto_fov_spin)
+        cam_row.addStretch()
+        auto_driving_control_layout.addLayout(cam_row)
+
+        self.auto_driving_control_widget.setVisible(True)  # 初期は自動運転モードで表示
+        location_layout.addWidget(self.auto_driving_control_widget)
+
         # waypoint制御パネル
         self.waypoint_control_widget = QWidget()
         waypoint_control_layout = QVBoxLayout(self.waypoint_control_widget)
@@ -5001,6 +5209,7 @@ class ImageAnnotationTool(QMainWindow):
                 "last_folder_paths": self.folder_paths if hasattr(self, 'folder_paths') else [],
                 "last_model_arch": self.auto_method_combo.currentText() if hasattr(self, 'auto_method_combo') else "",
                 "last_model_name": self.model_combo.currentText() if hasattr(self, 'model_combo') else "",
+                "max_speed": self.main_image_view.max_speed if hasattr(self, 'main_image_view') else MAX_SPEED,
                 "timestamp": int(time.time())
             }
             
@@ -5725,6 +5934,30 @@ class ImageAnnotationTool(QMainWindow):
             self.auto_advance_waypoint = True
             if hasattr(self, 'statusBar'):
                 self.statusBar().showMessage(get_text('status_auto_advance_mode'), 2000)
+
+    def toggle_auto_driving_direction(self, state):
+        """自動運転モード走行軌跡の表示/非表示を切り替え"""
+        self.show_auto_driving_direction = (state == Qt.Checked)
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def update_auto_max_steering_angle(self, value):
+        """自動運転走行軌跡の最大舵角を更新"""
+        self.auto_max_steering_angle = value
+        if hasattr(self, 'main_image_view') and self.show_auto_driving_direction:
+            self.main_image_view.update()
+
+    def update_auto_cam_pitch(self, value):
+        """カメラ俯角補正を更新"""
+        self.auto_cam_pitch_deg = value
+        if hasattr(self, 'main_image_view') and self.show_auto_driving_direction:
+            self.main_image_view.update()
+
+    def update_auto_fov_deg(self, value):
+        """カメラ対角FOVを更新"""
+        self.auto_fov_deg = value
+        if hasattr(self, 'main_image_view') and self.show_auto_driving_direction:
+            self.main_image_view.update()
 
     def toggle_seg_driving_direction(self, state):
         """走行方向矢印の表示/非表示を切り替え"""
@@ -6695,6 +6928,13 @@ class ImageAnnotationTool(QMainWindow):
             points.append((point, color, show))
         self.main_image_view.extra_inference_points = points
 
+    def get_selected_model_filename(self):
+        """model_comboから実際のファイル名を取得する（マルチソースマーカー付き表示名に対応）"""
+        data = self.model_combo.currentData()
+        if data:
+            return data
+        return self.model_combo.currentText()
+
     def refresh_model_list(self):
         """保存されているモデルのリストを更新 - モデルアーキによるフィルタリング機能付き"""
         self.model_combo.clear()
@@ -6731,10 +6971,20 @@ class ImageAnnotationTool(QMainWindow):
         # カスタムサフィックスが追加された場合でも正しくソートされるよう、mtimeを使用
         model_files.sort(key=lambda f: os.path.getmtime(os.path.join(models_dir, f)), reverse=True)
         
-        # コンボボックスに追加
+        # コンボボックスに追加（マルチソースモデルはマーカー付き）
+        from model_catalog import detect_multi_source_from_checkpoint
         for model_file in model_files:
-            self.model_combo.addItem(model_file)
-                
+            model_full_path = os.path.join(models_dir, model_file)
+            ms_info = detect_multi_source_from_checkpoint(model_full_path)
+            if ms_info['num_sources'] > 1:
+                marker = get_text('label_multi_source_model_marker',
+                                  ms_info['num_sources'],
+                                  ms_info['fusion_method'] or '?')
+                display_name = f"{model_file} {marker}"
+            else:
+                display_name = model_file
+            self.model_combo.addItem(display_name, model_file)  # userData=実ファイル名
+
         # 更新完了メッセージ
         self.statusBar().showMessage(get_text('status_models_loaded', len(model_files), current_arch), 3000)
 
@@ -6924,9 +7174,22 @@ class ImageAnnotationTool(QMainWindow):
             self.variant_button_group = QButtonGroup(self)
             self.variant_button_group.setExclusive(True)
 
+        # 推論対象ソースを判定（結合表示時のみ赤線表示）
+        inference_sources = set()
+        is_combined = getattr(self, 'current_variant', None) == '__combined__'
+        if is_combined:
+            ms_config = getattr(self, '_multi_source_config', None)
+            if ms_config:
+                inference_sources = set(ms_config.get('sources', []))
+            elif self.available_variants:
+                inference_sources = {self.available_variants[0]}
+
         # 新しいキーボタンを追加
         for var in self.available_variants:
             rb = QRadioButton(var)
+            # 結合表示中の推論対象ソースに赤い下線を付ける
+            if is_combined and var in inference_sources:
+                rb.setStyleSheet("QRadioButton { border-bottom: 3px solid red; padding-bottom: 2px; }")
             variant_layout.addWidget(rb)
             self.variant_button_group.addButton(rb)
             if var == self.current_variant:
@@ -6959,6 +7222,7 @@ class ImageAnnotationTool(QMainWindow):
         grid_options = [
             ("2 x 1", '2x1'),
             ("1 x 2", '1x2'),
+            ("3 x 1", '3x1'),
             ("2 x 2", '2x2'),
             ("3 x 3", '3x3'),
         ]
@@ -7318,8 +7582,9 @@ class ImageAnnotationTool(QMainWindow):
             self.detection_mode_button.setChecked(False)
             self.segmentation_mode_button.setChecked(False)
             self.waypoint_mode_button.setChecked(False)
-            self.waypoint_control_widget.setVisible(False)  # waypoint制御パネルを非表示
-            self.segmentation_control_widget.setVisible(False)  # セグメンテーション制御パネルを非表示
+            self.auto_driving_control_widget.setVisible(True)
+            self.waypoint_control_widget.setVisible(False)
+            self.segmentation_control_widget.setVisible(False)
             self.statusBar().showMessage(get_text('status_switched_to_auto_driving'), 3000)
         elif sender == self.detection_mode_button:
             self.current_mode = 1
@@ -7327,26 +7592,29 @@ class ImageAnnotationTool(QMainWindow):
             self.detection_mode_button.setChecked(True)
             self.segmentation_mode_button.setChecked(False)
             self.waypoint_mode_button.setChecked(False)
-            self.waypoint_control_widget.setVisible(False)  # waypoint制御パネルを非表示
-            self.segmentation_control_widget.setVisible(False)  # セグメンテーション制御パネルを非表示
+            self.auto_driving_control_widget.setVisible(False)
+            self.waypoint_control_widget.setVisible(False)
+            self.segmentation_control_widget.setVisible(False)
             self.statusBar().showMessage(get_text('status_switched_to_detection'), 3000)
         elif sender == self.segmentation_mode_button:
-            self.current_mode = 2  # 新規追加
+            self.current_mode = 2
             self.auto_mode_button.setChecked(False)
             self.detection_mode_button.setChecked(False)
             self.segmentation_mode_button.setChecked(True)
             self.waypoint_mode_button.setChecked(False)
-            self.waypoint_control_widget.setVisible(False)  # waypoint制御パネルを非表示
-            self.segmentation_control_widget.setVisible(True)  # セグメンテーション制御パネルを表示
+            self.auto_driving_control_widget.setVisible(False)
+            self.waypoint_control_widget.setVisible(False)
+            self.segmentation_control_widget.setVisible(True)
             self.statusBar().showMessage(get_text('status_switched_to_segmentation'), 3000)
         elif sender == self.waypoint_mode_button:
-            self.current_mode = 3  # waypoint mode
+            self.current_mode = 3
             self.auto_mode_button.setChecked(False)
             self.detection_mode_button.setChecked(False)
             self.segmentation_mode_button.setChecked(False)
             self.waypoint_mode_button.setChecked(True)
-            self.waypoint_control_widget.setVisible(True)  # waypoint制御パネルを表示
-            self.segmentation_control_widget.setVisible(False)  # セグメンテーション制御パネルを非表示
+            self.auto_driving_control_widget.setVisible(False)
+            self.waypoint_control_widget.setVisible(True)
+            self.segmentation_control_widget.setVisible(False)
             self.statusBar().showMessage(get_text('status_switched_to_waypoint'), 3000)
         else:
             # Bキーでの切り替え（4つのモードをサイクル）
@@ -7356,6 +7624,7 @@ class ImageAnnotationTool(QMainWindow):
                 self.detection_mode_button.setChecked(False)
                 self.segmentation_mode_button.setChecked(False)
                 self.waypoint_mode_button.setChecked(False)
+                self.auto_driving_control_widget.setVisible(True)
                 self.waypoint_control_widget.setVisible(False)
                 self.segmentation_control_widget.setVisible(False)
                 self.statusBar().showMessage(get_text('status_switched_to_auto_driving'), 3000)
@@ -7364,6 +7633,7 @@ class ImageAnnotationTool(QMainWindow):
                 self.detection_mode_button.setChecked(True)
                 self.segmentation_mode_button.setChecked(False)
                 self.waypoint_mode_button.setChecked(False)
+                self.auto_driving_control_widget.setVisible(False)
                 self.waypoint_control_widget.setVisible(False)
                 self.segmentation_control_widget.setVisible(False)
                 self.statusBar().showMessage(get_text('status_switched_to_detection'), 3000)
@@ -7372,6 +7642,7 @@ class ImageAnnotationTool(QMainWindow):
                 self.detection_mode_button.setChecked(False)
                 self.segmentation_mode_button.setChecked(True)
                 self.waypoint_mode_button.setChecked(False)
+                self.auto_driving_control_widget.setVisible(False)
                 self.waypoint_control_widget.setVisible(False)
                 self.segmentation_control_widget.setVisible(True)
                 self.statusBar().showMessage(get_text('status_switched_to_segmentation'), 3000)
@@ -7380,6 +7651,7 @@ class ImageAnnotationTool(QMainWindow):
                 self.detection_mode_button.setChecked(False)
                 self.segmentation_mode_button.setChecked(False)
                 self.waypoint_mode_button.setChecked(True)
+                self.auto_driving_control_widget.setVisible(False)
                 self.waypoint_control_widget.setVisible(True)
                 self.segmentation_control_widget.setVisible(False)
                 self.statusBar().showMessage(get_text('status_switched_to_waypoint'), 3000)
@@ -12312,13 +12584,15 @@ class ImageAnnotationTool(QMainWindow):
     # ===========================================
 
     def _check_databricks_connection_on_startup(self):
-        """起動時にDatabricks接続を確認"""
+        """起動時にDatabricks接続を確認
+        注意: Databricksはデフォルト無効。ユーザーが設定画面から有効化した場合のみ接続を試行する。
+        """
         try:
             # Databricks連携が有効な場合のみ接続確認
             if self.mlflow_manager.use_databricks:
                 print("起動時Databricks接続確認中...")
 
-                # 接続を試みる（ダイアログなしでバックグラウンドで実行）
+                # 接続を試みる（タイムアウト付きで実行）
                 self.mlflow_manager.is_initialized = False
                 success = self.mlflow_manager.initialize(self.mlflow_manager.folder_path, parent_widget=None)
 
@@ -12329,6 +12603,8 @@ class ImageAnnotationTool(QMainWindow):
 
                 # ステータスラベルを更新
                 self._update_databricks_status_label()
+            else:
+                print("Databricks連携: 無効（設定画面から有効化できます）")
         except Exception as e:
             print(f"起動時Databricks接続確認エラー: {e}")
 
@@ -12341,19 +12617,35 @@ class ImageAnnotationTool(QMainWindow):
 
         # 有効にした場合は接続を試みる
         if enabled:
+            self.statusBar().showMessage("Databricks接続を試行中...", 0)
+            QApplication.processEvents()
+
             self.mlflow_manager.is_initialized = False
             success = self.mlflow_manager.initialize(self.mlflow_manager.folder_path, parent_widget=self)
-            if not success:
+
+            self.statusBar().clearMessage()
+
+            if not self.mlflow_manager._databricks_connected:
                 QMessageBox.warning(
                     self,
                     get_text('dlg_databricks_connection_error'),
-                    get_text('msg_databricks_connection_error_env')
+                    get_text('msg_databricks_connection_error_env') +
+                    "\n\nDatabricksへの接続に失敗しました。\n"
+                    "環境変数 DATABRICKS_HOST と DATABRICKS_TOKEN が正しく設定されているか確認してください。"
                 )
                 self.databricks_checkbox.setChecked(False)
+            else:
+                QMessageBox.information(
+                    self,
+                    "Databricks接続",
+                    "Databricksに接続しました。\n"
+                    "学習結果はローカルとDatabricksの両方に記録されます。"
+                )
         else:
             # ローカルモードに戻す
             self.mlflow_manager.is_initialized = False
             self.mlflow_manager.initialize(self.mlflow_manager.folder_path, parent_widget=self)
+            self.statusBar().showMessage("Databricks連携を無効化しました。ローカルのみに記録します。", 3000)
 
         # 状態ラベルを更新
         self._update_databricks_status_label()
@@ -14184,6 +14476,10 @@ class ImageAnnotationTool(QMainWindow):
         # 保存されたセッション情報を読み込む
         session_info = self.load_session_info()
         
+        # max_speedの復元
+        if session_info and "max_speed" in session_info:
+            self.main_image_view.max_speed = session_info["max_speed"]
+
         # 複数フォルダを優先的に使用
         has_folders = False
         
@@ -15129,11 +15425,11 @@ class ImageAnnotationTool(QMainWindow):
         """推論を実行するメソッド - モデル情報表示を強化、推論実行後に推論表示をオン"""
         if not self.images:
             return
-        
+
         # 現在のモデル情報を取得
         model_type = self.auto_method_combo.currentText()
-        selected_model = self.model_combo.currentText()
-        
+        selected_model = self.get_selected_model_filename()
+
         # 推論対象の画像を決定
         if all_images:
             # 既存の推論結果がある場合は確認ダイアログを表示
@@ -15145,21 +15441,21 @@ class ImageAnnotationTool(QMainWindow):
                     QMessageBox.Yes | QMessageBox.No,
                     QMessageBox.Yes
                 )
-                
+
                 if reply == QMessageBox.No:
                     return  # 操作をキャンセル
-            
+
             target_images = self.images
             progress_title = get_text('msg_inference_all_running')
         else:
             target_images = [self.images[self.current_index]]
             progress_title = get_text('msg_inference_running')
-        
+
         # モデルのパスを取得 (コンボボックスから選択されたモデル)
         model_path = None
-        if hasattr(self, 'model_combo') and self.model_combo.currentText() not in [get_text('combo_model_not_found'), get_text('combo_select_folder')] and "not found" not in self.model_combo.currentText().lower():
-            # アノテーションフォルダ内のモデルのフルパスを作成
-            selected_model = self.model_combo.currentText()
+        if hasattr(self, 'model_combo') and selected_model not in [get_text('combo_model_not_found'), get_text('combo_select_folder')] and "not found" not in selected_model.lower():
+            # アノテーションフォルダ内のモデルのフルパスを作成（マルチソースマーカー対応）
+            selected_model = self.get_selected_model_filename()
             # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
             model_path = os.path.join(models_dir, selected_model)
             
@@ -15183,12 +15479,23 @@ class ImageAnnotationTool(QMainWindow):
             self.statusBar().showMessage(get_text('status_inference_processing', model_type, model_desc))
             QApplication.processEvents()
 
-            # 推論を実行
-            if model_type in list_available_models():
-                # モデルを使用した推論 - force_reloadはモデル変更時のみTrue
+            # マルチソースモデルかどうかを判定
+            ms_config = getattr(self, '_multi_source_config', None)
+
+            if ms_config and model_path:
+                # マルチソース推論
+                if all_images:
+                    target_indices = list(range(len(self.images)))
+                else:
+                    target_indices = [self.current_index]
+                inference_results = self._run_multi_source_inference(
+                    target_indices, model_path, force_reload=force_reload
+                )
+            elif model_type in list_available_models():
+                # 通常のシングルソース推論 - force_reloadはモデル変更時のみTrue
                 inference_results = batch_inference(
-                    target_images, 
-                    method="model", 
+                    target_images,
+                    method="model",
                     model_type=model_type,
                     model_path=model_path,
                     force_reload=force_reload
@@ -15196,25 +15503,27 @@ class ImageAnnotationTool(QMainWindow):
             else:
                 QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_inference_method_not_supported'))
                 return
-            
+
             # 推論結果を保存（インデックスベースに変換）
             old_count = len(self.inference_results)
-            
-            # 画像パスからインデックスに変換して保存
-            for img_path, result in inference_results.items():
-                # 画像パスから対応するインデックスを取得
-                try:
-                    img_index = self.images.index(img_path)
-                    self.inference_results[img_index] = result
-                    print(f"推論結果保存: インデックス{img_index} <- {os.path.basename(img_path)}")
-                    
-                    # 差分ベクトルの計算と保存
-                    self.calculate_and_store_diff_vector(img_index)
-                    
-                except ValueError:
-                    print(f"警告: 画像パス {img_path} がself.imagesに見つかりません")
-                    # パスでも保存（後方互換性のため）
-                    self.inference_results[img_path] = result
+
+            # 画像パスまたはインデックスから変換して保存
+            for key, result in inference_results.items():
+                if isinstance(key, int):
+                    # マルチソース推論: キーはすでにインデックス
+                    self.inference_results[key] = result
+                    print(f"推論結果保存: インデックス{key}")
+                    self.calculate_and_store_diff_vector(key)
+                else:
+                    # 通常推論: キーは画像パス
+                    try:
+                        img_index = self.images.index(key)
+                        self.inference_results[img_index] = result
+                        print(f"推論結果保存: インデックス{img_index} <- {os.path.basename(key)}")
+                        self.calculate_and_store_diff_vector(img_index)
+                    except ValueError:
+                        print(f"警告: 画像パス {key} がself.imagesに見つかりません")
+                        self.inference_results[key] = result
             
             new_count = len(self.inference_results)
             
@@ -15258,16 +15567,148 @@ class ImageAnnotationTool(QMainWindow):
                 get_text('msg_inference_processing_error', str(e))
             )
 
+    def _run_multi_source_inference(self, target_indices, model_path=None, force_reload=False):
+        """マルチソースモデルで推論を実行する
+
+        Args:
+            target_indices: 推論対象のインデックスリスト
+            model_path: モデルファイルのパス（キャッシュ更新用）
+            force_reload: キャッシュを無視して再読み込みするか
+
+        Returns:
+            dict: {index: {angle, throttle, x, y, ...}} 推論結果
+        """
+        config = getattr(self, '_multi_source_config', None)
+        if not config:
+            print("マルチソース推論設定がありません")
+            return {}
+
+        sources = config['sources']
+        num_sources = config['num_sources']
+        image_groups = getattr(self, 'image_groups', {})
+        variant_images = getattr(self, 'variant_images', {})
+
+        if not image_groups:
+            print("image_groupsが空です - マルチソース推論不可")
+            return {}
+
+        # モデルを取得（self.modelから）
+        model = getattr(self, 'model', None)
+        if model is None:
+            print("モデルが読み込まれていません")
+            return {}
+
+        device = next(model.parameters()).device
+        transform = model.get_preprocess()
+
+        results = {}
+        with torch.no_grad():
+            for idx in target_indices:
+                try:
+                    group = image_groups.get(idx, {})
+
+                    # 全ソースの画像パスを取得
+                    img_paths = []
+                    missing_source = False
+                    for src in sources:
+                        if src in group:
+                            img_paths.append(group[src])
+                        else:
+                            missing_source = True
+                            break
+
+                    if missing_source or len(img_paths) != num_sources:
+                        continue
+
+                    # 各ソース画像を読み込み・前処理してチャネル連結
+                    tensors = []
+                    first_img_size = None
+                    for path in img_paths:
+                        img = Image.open(path).convert('RGB')
+                        if first_img_size is None:
+                            first_img_size = img.size  # (width, height)
+                        t = transform(img)
+                        tensors.append(t)
+
+                    # [num_sources*3, H, W] -> [1, num_sources*3, H, W]
+                    stacked = torch.cat(tensors, dim=0).unsqueeze(0).to(device)
+
+                    # 推論
+                    output = model(stacked)
+                    output_values = output[0].cpu().numpy()
+                    output_values = np.clip(output_values, -1.0, 1.0)
+
+                    img_width, img_height = first_img_size
+                    num_out = len(output_values)
+                    angle = output_values[0]
+                    throttle = output_values[1]
+
+                    speed = None
+                    if num_out == 3 or num_out >= 9:
+                        speed = output_values[2]
+
+                    x = int((angle + 1) / 2 * img_width)
+                    y = int((1 - throttle) / 2 * img_height)
+                    x = max(0, min(x, img_width - 1))
+                    y = max(0, min(y, img_height - 1))
+
+                    results[idx] = {
+                        "angle": float(angle),
+                        "throttle": float(throttle),
+                        "x": x,
+                        "y": y
+                    }
+
+                    if speed is not None:
+                        results[idx]["speed"] = float(speed)
+
+                    # 将来予測の出力
+                    if num_out >= 9:
+                        for fi, offset in enumerate([5, 10]):
+                            base = 3 + fi * 3
+                            f_angle = output_values[base]
+                            f_throttle = output_values[base + 1]
+                            f_speed = output_values[base + 2]
+                            f_x = int((f_angle + 1) / 2 * img_width)
+                            f_y = int((1 - f_throttle) / 2 * img_height)
+                            f_x = max(0, min(f_x, img_width - 1))
+                            f_y = max(0, min(f_y, img_height - 1))
+                            results[idx][f"future_{offset}"] = {
+                                "angle": float(f_angle),
+                                "throttle": float(f_throttle),
+                                "speed": float(f_speed),
+                                "x": f_x, "y": f_y
+                            }
+                    elif num_out == 6:
+                        for fi, offset in enumerate([5, 10]):
+                            base = 2 + fi * 2
+                            f_angle = output_values[base]
+                            f_throttle = output_values[base + 1]
+                            f_x = int((f_angle + 1) / 2 * img_width)
+                            f_y = int((1 - f_throttle) / 2 * img_height)
+                            f_x = max(0, min(f_x, img_width - 1))
+                            f_y = max(0, min(f_y, img_height - 1))
+                            results[idx][f"future_{offset}"] = {
+                                "angle": float(f_angle),
+                                "throttle": float(f_throttle),
+                                "x": f_x, "y": f_y
+                            }
+
+                except Exception as e:
+                    print(f"マルチソース推論エラー (index={idx}): {e}")
+
+        return results
+
     def run_batch_inference(self):
         """全ての画像に対して推論を実行する"""
         if not self.images:
             QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_no_images'))
             return
-        
+
         # 現在のモデル情報を取得
         model_type = self.auto_method_combo.currentText()
-        selected_model = self.model_combo.currentText()
-        
+        selected_model = self.get_selected_model_filename()
+
         # モデルのパスを取得
         model_path = None
         if selected_model not in [get_text('combo_model_not_found'), get_text('combo_select_folder')] and "not found" not in selected_model.lower():
@@ -15368,31 +15809,44 @@ class ImageAnnotationTool(QMainWindow):
                 
                 # 推論を実行
                 try:
-                    batch_results = batch_inference(
-                        batch_to_process, 
-                        method="model", 
-                        model_type=model_type,
-                        model_path=model_path,
-                        force_reload=(batch_idx == 0)  # 最初のバッチのみ強制再読込
-                    )
-                    
-                    # 結果をインデックスベースで保存（ここが重要な修正点）
-                    for img_path, result in batch_results.items():
-                        # 画像パスから対応するインデックスを取得
-                        try:
-                            img_index = self.images.index(img_path)
-                            self.inference_results[img_index] = result
+                    ms_config = getattr(self, '_multi_source_config', None)
+                    if ms_config and model_path:
+                        # マルチソース推論（インデックスベースで実行）
+                        batch_indices = []
+                        for img_path in batch_to_process:
+                            try:
+                                batch_indices.append(self.images.index(img_path))
+                            except ValueError:
+                                pass
+                        batch_results = self._run_multi_source_inference(
+                            batch_indices, model_path, force_reload=(batch_idx == 0)
+                        )
+                    else:
+                        batch_results = batch_inference(
+                            batch_to_process,
+                            method="model",
+                            model_type=model_type,
+                            model_path=model_path,
+                            force_reload=(batch_idx == 0)  # 最初のバッチのみ強制再読込
+                        )
+
+                    # 結果をインデックスベースで保存
+                    for key, result in batch_results.items():
+                        if isinstance(key, int):
+                            self.inference_results[key] = result
                             success_count += 1
-                            print(f"推論結果保存: インデックス{img_index} <- {os.path.basename(img_path)}")
-                            
-                            # 差分ベクトルの計算と保存
-                            self.calculate_and_store_diff_vector(img_index)
-                            
-                        except ValueError:
-                            print(f"警告: 画像パス {img_path} がself.imagesに見つかりません")
-                            # パスでも保存（後方互換性のため）
-                            self.inference_results[img_path] = result
-                            success_count += 1
+                            self.calculate_and_store_diff_vector(key)
+                        else:
+                            try:
+                                img_index = self.images.index(key)
+                                self.inference_results[img_index] = result
+                                success_count += 1
+                                print(f"推論結果保存: インデックス{img_index} <- {os.path.basename(key)}")
+                                self.calculate_and_store_diff_vector(img_index)
+                            except ValueError:
+                                print(f"警告: 画像パス {key} がself.imagesに見つかりません")
+                                self.inference_results[key] = result
+                                success_count += 1
                     
                 except Exception as e:
                     print(f"バッチ {batch_idx+1} 処理中にエラー: {e}")
@@ -15499,11 +15953,11 @@ class ImageAnnotationTool(QMainWindow):
         """位置推論を実行するメソッド"""
         if not self.images:
             return
-        
+
         # 現在のモデル情報を取得
         model_type = self.auto_method_combo.currentText()
-        selected_model = self.model_combo.currentText()
-        
+        selected_model = self.get_selected_model_filename()
+
         # 推論対象の画像を決定
         if all_images:
             target_images = self.images
@@ -15511,10 +15965,10 @@ class ImageAnnotationTool(QMainWindow):
         else:
             target_images = [self.images[self.current_index]]
             progress_title = get_text('msg_location_inference_running')
-        
+
         # モデルのパスを取得
         model_path = None
-        if hasattr(self, 'model_combo') and self.model_combo.currentText() not in [get_text('combo_model_not_found'), get_text('combo_select_folder')] and "not found" not in self.model_combo.currentText().lower():
+        if hasattr(self, 'model_combo') and selected_model not in [get_text('combo_model_not_found'), get_text('combo_select_folder')] and "not found" not in selected_model.lower():
             # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
             model_path = os.path.join(models_dir, selected_model)
             
@@ -16458,15 +16912,15 @@ class ImageAnnotationTool(QMainWindow):
         if not self.images:
             QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_no_images'))
             return
-        
-        # モデル情報を取得
+
+        # モデル情報を取得（マルチソースマーカー対応）
         model_type = self.auto_method_combo.currentText()
-        selected_model = self.model_combo.currentText()
-        
+        selected_model = self.get_selected_model_filename()
+
         if selected_model == get_text('combo_model_not_found') or selected_model == get_text('combo_select_folder') or "not found" in selected_model.lower():
             QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_valid_model_selected'))
             return
-        
+
         # モデルのパスを取得
         # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
         model_path = os.path.join(models_dir, selected_model)
@@ -16475,7 +16929,100 @@ class ImageAnnotationTool(QMainWindow):
         if not os.path.exists(model_path):
             QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_selected_model_not_found', selected_model))
             return
-        
+
+        # マルチソースモデル検出
+        from model_catalog import detect_multi_source_from_checkpoint
+        ms_info = detect_multi_source_from_checkpoint(model_path)
+        is_multi_source = ms_info['num_sources'] > 1
+        multi_source_selected = None  # マルチソース推論用に選択されたソース名リスト
+
+        if is_multi_source:
+            # マルチソースモデルの場合、ソース選択ダイアログを表示
+            ms_dialog = QDialog(self)
+            ms_dialog.setWindowTitle(get_text('dlg_multi_source_select'))
+            ms_dialog.setMinimumWidth(400)
+            ms_layout = QVBoxLayout(ms_dialog)
+
+            # モデル情報
+            info_label = QLabel(get_text('label_multi_source_model_info',
+                                         ms_info['num_sources'],
+                                         ms_info['fusion_method'] or '?'))
+            info_label.setWordWrap(True)
+            ms_layout.addWidget(info_label)
+
+            # 学習時のソース情報
+            if ms_info['selected_sources']:
+                trained_label = QLabel(get_text('label_multi_source_trained_sources',
+                                                ', '.join(ms_info['selected_sources'])))
+                trained_label.setStyleSheet("color: #888; font-style: italic;")
+                ms_layout.addWidget(trained_label)
+
+            # ソース選択
+            ms_layout.addWidget(QLabel(get_text('label_multi_source_select_sources')))
+
+            available = getattr(self, 'available_variants', [])
+            trained_sources = ms_info['selected_sources'] or []
+            ms_checkboxes = []
+            for var in available:
+                cb = QCheckBox(var)
+                # 学習時のソースと一致する場合はデフォルトでチェック
+                if var in trained_sources:
+                    cb.setChecked(True)
+                ms_checkboxes.append(cb)
+                ms_layout.addWidget(cb)
+
+            # 選択数の表示ラベル
+            count_label = QLabel(get_text('msg_multi_source_need_sources',
+                                          ms_info['num_sources'], 0))
+            count_label.setStyleSheet("color: #cc6600;")
+            ms_layout.addWidget(count_label)
+
+            def update_count():
+                checked = sum(1 for cb in ms_checkboxes if cb.isChecked())
+                count_label.setText(get_text('msg_multi_source_need_sources',
+                                             ms_info['num_sources'], checked))
+                if checked == ms_info['num_sources']:
+                    count_label.setStyleSheet("color: #00aa00;")
+                else:
+                    count_label.setStyleSheet("color: #cc6600;")
+
+            for cb in ms_checkboxes:
+                cb.toggled.connect(lambda _: update_count())
+            update_count()
+
+            # 結合表示リンクチェックボックス
+            link_combined_cb = QCheckBox(get_text('label_multi_source_link_combined'))
+            link_combined_cb.setChecked(True)
+            ms_layout.addWidget(link_combined_cb)
+
+            # OK / キャンセル
+            ms_btn_layout = QHBoxLayout()
+            ms_ok_btn = QPushButton("OK")
+            ms_cancel_btn = QPushButton(get_text('btn_cancel'))
+            ms_btn_layout.addStretch()
+            ms_btn_layout.addWidget(ms_ok_btn)
+            ms_btn_layout.addWidget(ms_cancel_btn)
+            ms_layout.addLayout(ms_btn_layout)
+
+            ms_ok_btn.clicked.connect(ms_dialog.accept)
+            ms_cancel_btn.clicked.connect(ms_dialog.reject)
+
+            if ms_dialog.exec_() != QDialog.Accepted:
+                return
+
+            # 選択されたソースを取得
+            multi_source_selected = [cb.text() for cb in ms_checkboxes if cb.isChecked()]
+            if len(multi_source_selected) != ms_info['num_sources']:
+                QMessageBox.warning(self, get_text('dlg_warning'),
+                                    get_text('msg_multi_source_need_sources',
+                                             ms_info['num_sources'], len(multi_source_selected)))
+                return
+
+            # 結合表示に連携
+            if link_combined_cb.isChecked() and len(multi_source_selected) >= 2:
+                self._combined_sources = list(multi_source_selected)
+                self.on_variant_changed('__combined__')
+
         # 進捗ダイアログを表示
         progress = QProgressDialog(
             get_text('msg_loading_model', model_type, selected_model),
@@ -16505,16 +17052,16 @@ class ImageAnnotationTool(QMainWindow):
                 QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
                 QMessageBox.Yes
             )
-            
+
             if reply == QMessageBox.Cancel:
                 progress.cancel()
                 return  # 操作をキャンセル
-            
+
             clear_inference = (reply == QMessageBox.Yes)
-            
+
             # 進捗ダイアログを再表示
             progress.show()
-        
+
         try:
             # 推論結果をクリアする場合
             if clear_inference:
@@ -16552,7 +17099,7 @@ class ImageAnnotationTool(QMainWindow):
             progress.setLabelText(get_text('msg_running_inference', os.path.basename(current_img_path)))
             progress.setValue(70)
             QApplication.processEvents()
-            
+
             # モデルを明示的に読み込み（self.modelに保存）
             from model_catalog import get_model, load_model_weights, detect_num_outputs_from_checkpoint, detect_input_size_from_checkpoint
 
@@ -16573,21 +17120,50 @@ class ImageAnnotationTool(QMainWindow):
             num_outputs = detect_num_outputs_from_checkpoint(model_path, device)
             input_size = detect_input_size_from_checkpoint(model_path, device)
 
-            # モデルインスタンスを作成（検出した出力数と入力サイズで）
-            self.model = get_model(actual_model_type, pretrained=False, input_size=input_size, num_outputs=num_outputs)
+            if is_multi_source:
+                # マルチソースモデルの読み込み
+                from model_catalog import create_multi_source_model
+                base_model_name = ms_info['base_model_name'] or actual_model_type
+                self.model = create_multi_source_model(
+                    base_model_name=base_model_name,
+                    num_sources=ms_info['num_sources'],
+                    fusion_method=ms_info['fusion_method'] or 'concat',
+                    pretrained=False,
+                    num_outputs=num_outputs,
+                    input_size=input_size
+                )
+                load_model_weights(self.model, model_path, device)
+                self.model.eval()
 
-            # 重みを読み込み
-            load_model_weights(self.model, model_path, device)
-            self.model.eval()
-            
-            # モデルを強制的に再読み込み（現在表示中の画像だけ推論）
-            inference_results = batch_inference(
-                [current_img_path],
-                method="model", 
-                model_type=model_type,
-                model_path=model_path,
-                force_reload=True  # 強制再読み込み
-            )
+                # マルチソース推論設定を保存
+                self._multi_source_config = {
+                    'sources': multi_source_selected,
+                    'num_sources': ms_info['num_sources'],
+                    'fusion_method': ms_info['fusion_method'] or 'concat',
+                    'base_model_name': base_model_name,
+                }
+
+                # マルチソース推論を実行（現在の画像）
+                inference_results = self._run_multi_source_inference(
+                    [self.current_index], model_path, force_reload=True
+                )
+            else:
+                # 通常のシングルソースモデルの読み込み
+                self.model = get_model(actual_model_type, pretrained=False, input_size=input_size, num_outputs=num_outputs)
+                load_model_weights(self.model, model_path, device)
+                self.model.eval()
+
+                # マルチソース設定をクリア
+                self._multi_source_config = None
+
+                # モデルを強制的に再読み込み（現在表示中の画像だけ推論）
+                inference_results = batch_inference(
+                    [current_img_path],
+                    method="model",
+                    model_type=model_type,
+                    model_path=model_path,
+                    force_reload=True  # 強制再読み込み
+                )
             
             progress.setLabelText(get_text('msg_saving_inference'))
             progress.setValue(80)
@@ -16595,23 +17171,26 @@ class ImageAnnotationTool(QMainWindow):
             
             # 推論結果を保存（インデックスベースに変換）
             old_count = len(self.inference_results)
-            
-            # 画像パスからインデックスに変換して保存
-            for img_path, result in inference_results.items():
-                # 画像パスから対応するインデックスを取得
-                try:
-                    img_index = self.images.index(img_path)
+
+            # 画像パスまたはインデックスから変換して保存
+            for key, result in inference_results.items():
+                if isinstance(key, int):
+                    # マルチソース推論: キーはすでにインデックス
+                    img_index = key
                     self.inference_results[img_index] = result
-                    print(f"推論結果保存: インデックス{img_index} <- {os.path.basename(img_path)}")
-                    
-                    # 差分ベクトルの計算と保存
+                    print(f"推論結果保存: インデックス{img_index}")
                     self.calculate_and_store_diff_vector(img_index)
-                    
-                except ValueError:
-                    print(f"警告: 画像パス {img_path} がself.imagesに見つかりません")
-                    # パスでも保存（後方互換性のため）
-                    self.inference_results[img_path] = result
-            
+                else:
+                    # 通常推論: キーは画像パス
+                    try:
+                        img_index = self.images.index(key)
+                        self.inference_results[img_index] = result
+                        print(f"推論結果保存: インデックス{img_index} <- {os.path.basename(key)}")
+                        self.calculate_and_store_diff_vector(img_index)
+                    except ValueError:
+                        print(f"警告: 画像パス {key} がself.imagesに見つかりません")
+                        self.inference_results[key] = result
+
             # モデル変更を検出するための状態を保持
             self._last_model_info = (model_type, model_path)
 
@@ -16710,10 +17289,17 @@ class ImageAnnotationTool(QMainWindow):
             message_suffix = ""
             if clear_inference:
                 message_suffix = get_text('msg_model_loaded_suffix')
-            self.statusBar().showMessage(get_text('msg_model_loaded', model_type, selected_model, message_suffix), 3000)
+            if is_multi_source:
+                self.statusBar().showMessage(
+                    get_text('status_multi_source_model_loaded',
+                             ms_info['num_sources'], ms_info['fusion_method'] or '?'), 5000)
+            else:
+                self.statusBar().showMessage(get_text('msg_model_loaded', model_type, selected_model, message_suffix), 3000)
 
             # 確認ダイアログ
             confirm_message = get_text('msg_model_loaded_detail', model_type, selected_model)
+            if is_multi_source and multi_source_selected:
+                confirm_message += f"\n[{ms_info['num_sources']}src:{ms_info['fusion_method']}] sources: {', '.join(multi_source_selected)}"
             if clear_inference:
                 confirm_message += get_text('msg_new_inference_available', len(self.inference_results))
             else:
@@ -17242,6 +17828,7 @@ class ImageAnnotationTool(QMainWindow):
         source_order = getattr(self, '_combined_sources', list(self.available_variants))
 
         pil_images = []
+        source_names = []
         for var in source_order:
             if var in group:
                 img = load_image_safely(group[var])
@@ -17249,13 +17836,23 @@ class ImageAnnotationTool(QMainWindow):
                     if img.mode != 'RGB':
                         img = img.convert('RGB')
                     pil_images.append(img)
+                    source_names.append(var)
 
         if not pil_images:
             return None
 
+        # 推論対象のソースを判定
+        ms_config = getattr(self, '_multi_source_config', None)
+        if ms_config:
+            inference_sources = set(ms_config.get('sources', []))
+        else:
+            # シングルソース: self.imagesのベースバリアント
+            base_variant = self.available_variants[0] if self.available_variants else None
+            inference_sources = {base_variant} if base_variant else set()
+
         # ダイアログで選択されたグリッドサイズを使用
         grid = getattr(self, '_combined_grid', '2x1')
-        grid_map = {'2x1': (2, 1), '1x2': (1, 2), '2x2': (2, 2), '3x3': (3, 3)}
+        grid_map = {'2x1': (2, 1), '1x2': (1, 2), '3x1': (3, 1), '2x2': (2, 2), '3x3': (3, 3)}
         cols, rows = grid_map.get(grid, (2, 1))
 
         # キャンバスサイズ（元の画像サイズ）
@@ -17266,12 +17863,13 @@ class ImageAnnotationTool(QMainWindow):
         cell_h = canvas_h // rows
 
         combined = Image.new('RGB', (canvas_w, canvas_h), (32, 32, 32))
+        draw = ImageDraw.Draw(combined)
 
         for i, img in enumerate(pil_images):
             if i >= cols * rows:
                 break
-            row = i // cols
-            col = i % cols
+            r = i // cols
+            c = i % cols
 
             # アスペクト比を維持してセル内にフィット
             scale = min(cell_w / img.width, cell_h / img.height)
@@ -17280,9 +17878,22 @@ class ImageAnnotationTool(QMainWindow):
             resized = img.resize((new_w, new_h), Image.LANCZOS)
 
             # セル内で中央配置
-            x = col * cell_w + (cell_w - new_w) // 2
-            y = row * cell_h + (cell_h - new_h) // 2
+            x = c * cell_w + (cell_w - new_w) // 2
+            y = r * cell_h + (cell_h - new_h) // 2
             combined.paste(resized, (x, y))
+
+            # 推論対象ソースの場合、赤枠を描画
+            if i < len(source_names) and source_names[i] in inference_sources:
+                border_w = max(2, min(canvas_w, canvas_h) // 120)
+                cell_x0 = c * cell_w
+                cell_y0 = r * cell_h
+                cell_x1 = cell_x0 + cell_w - 1
+                cell_y1 = cell_y0 + cell_h - 1
+                for b in range(border_w):
+                    draw.rectangle(
+                        [cell_x0 + b, cell_y0 + b, cell_x1 - b, cell_y1 - b],
+                        outline=(255, 0, 0)
+                    )
 
         return combined
 
@@ -19213,7 +19824,7 @@ class ImageAnnotationTool(QMainWindow):
             if filtered:
                 finetune_model_combo.addItems(filtered)
                 # 現在選択されているモデルがリストにあればデフォルトにする
-                current_model = self.model_combo.currentText()
+                current_model = self.get_selected_model_filename()
                 if current_model in filtered:
                     finetune_model_combo.setCurrentText(current_model)
                 # ファインチューニングオプションを有効化
@@ -19237,7 +19848,7 @@ class ImageAnnotationTool(QMainWindow):
         # 初期リストを設定
         if has_valid_models:
             finetune_model_combo.addItems(filtered_models)
-            current_model = self.model_combo.currentText()
+            current_model = self.get_selected_model_filename()
             if current_model in filtered_models:
                 finetune_model_combo.setCurrentText(current_model)
         else:
@@ -19290,7 +19901,7 @@ class ImageAnnotationTool(QMainWindow):
             speed_row_layout.addWidget(speed_normalize_label)
             speed_normalize_spin = QDoubleSpinBox()
             speed_normalize_spin.setRange(0.1, 100.0)
-            _default_max_speed = globals().get('MAX_SPEED', 3.0)
+            _default_max_speed = MAX_SPEED
             speed_normalize_spin.setValue(_default_max_speed)
             speed_normalize_spin.setDecimals(1)
             speed_normalize_spin.setSingleStep(1.0)
@@ -19329,6 +19940,112 @@ class ImageAnnotationTool(QMainWindow):
         output_settings_layout.addStretch()
         output_settings_group.setLayout(output_settings_layout)
         left_column.addWidget(output_settings_group)
+
+        # 入力画像ソース選択グループ
+        image_source_group = QGroupBox(get_text('label_training_image_sources'))
+        image_source_layout = QVBoxLayout()
+
+        # 説明ラベル
+        image_source_info = QLabel(get_text('label_training_image_sources_info'))
+        image_source_info.setStyleSheet("color: #666;")
+        image_source_info.setWordWrap(True)
+        image_source_layout.addWidget(image_source_info)
+
+        # 画像ソースチェックボックスを作成
+        training_source_checkboxes = {}
+        available_sources = {}
+        if hasattr(self, 'source_images_map') and self.source_images_map:
+            available_sources = self.source_images_map
+        elif hasattr(self, 'variant_images') and self.variant_images:
+            available_sources = self.variant_images
+
+        current_var = getattr(self, 'current_variant', None)
+
+        if available_sources:
+            for variant, img_list in available_sources.items():
+                img_count = len(img_list)
+                if variant == current_var:
+                    label_text = get_text('label_current_source_marker', variant, img_count)
+                else:
+                    label_text = get_text('label_other_source_marker', variant, img_count)
+                cb = QCheckBox(label_text)
+                cb.setProperty("variant", variant)
+                # 現在表示中のソースはデフォルトでチェック
+                if variant == current_var:
+                    cb.setChecked(True)
+                training_source_checkboxes[variant] = cb
+                image_source_layout.addWidget(cb)
+        else:
+            # 単一ソースの場合（バリアント情報なし）
+            cb = QCheckBox(get_text('label_current_source_marker', 'cam', len(self.images)))
+            cb.setProperty("variant", "cam")
+            cb.setChecked(True)
+            cb.setEnabled(False)
+            training_source_checkboxes['cam'] = cb
+            image_source_layout.addWidget(cb)
+
+        # 選択状況ラベル
+        training_sources_count_label = QLabel("")
+        training_sources_count_label.setStyleSheet("color: #2E7D32; font-weight: bold;")
+        image_source_layout.addWidget(training_sources_count_label)
+
+        def update_training_sources_count():
+            checked_sources = [name for name, cb in training_source_checkboxes.items() if cb.isChecked()]
+            # 推定画像数を計算
+            estimated_count = 0
+            for src_name in checked_sources:
+                if src_name in available_sources:
+                    estimated_count += len(available_sources[src_name])
+                else:
+                    estimated_count += len(self.images)
+            training_sources_count_label.setText(
+                get_text('label_training_sources_count', len(checked_sources), estimated_count)
+            )
+            # データ選択のサンプル数も更新
+            if 'update_data_selection_ui' in dir():
+                update_data_selection_ui()
+
+        for cb in training_source_checkboxes.values():
+            cb.stateChanged.connect(update_training_sources_count)
+
+        update_training_sources_count()
+
+        image_source_group.setLayout(image_source_layout)
+        left_column.addWidget(image_source_group)
+
+        # 特徴融合設定グループ（マルチソース時のみ表示）
+        fusion_group = QGroupBox(get_text('label_fusion_settings'))
+        fusion_layout = QVBoxLayout()
+
+        fusion_info = QLabel(get_text('label_fusion_info'))
+        fusion_info.setStyleSheet("color: #666;")
+        fusion_info.setWordWrap(True)
+        fusion_layout.addWidget(fusion_info)
+
+        fusion_method_layout = QHBoxLayout()
+        fusion_method_layout.addWidget(QLabel(get_text('label_fusion_method')))
+        fusion_combo = QComboBox()
+        fusion_combo.addItem(get_text('fusion_concat'), 'concat')
+        fusion_combo.addItem(get_text('fusion_attention'), 'attention')
+        fusion_method_layout.addWidget(fusion_combo)
+        fusion_method_layout.addStretch()
+        fusion_layout.addLayout(fusion_method_layout)
+
+        fusion_note = QLabel(get_text('label_multi_source_note'))
+        fusion_note.setStyleSheet("color: #E65100; font-weight: bold;")
+        fusion_note.setWordWrap(True)
+        fusion_layout.addWidget(fusion_note)
+
+        fusion_group.setLayout(fusion_layout)
+        fusion_group.setVisible(False)  # 初期状態では非表示
+        left_column.addWidget(fusion_group)
+
+        def update_fusion_visibility():
+            checked_count = sum(1 for cb in training_source_checkboxes.values() if cb.isChecked())
+            fusion_group.setVisible(checked_count > 1)
+
+        for cb in training_source_checkboxes.values():
+            cb.stateChanged.connect(update_fusion_visibility)
 
         # 学習パラメータグループ
         training_params_group = QGroupBox(get_text('label_training_params'))
@@ -19901,7 +20618,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # Speed出力設定の取得
         use_speed_output = False
-        speed_normalize_value = globals().get('MAX_SPEED', 3.0)
+        speed_normalize_value = MAX_SPEED
         if has_speed_data and speed_output_check is not None:
             use_speed_output = speed_output_check.isChecked()
             if speed_normalize_spin is not None:
@@ -19940,11 +20657,27 @@ class ImageAnnotationTool(QMainWindow):
             'erase_max_ratio': aug_erase_max_ratio.value()
         }
 
+        # 選択された画像ソースを取得
+        selected_sources = [name for name, cb in training_source_checkboxes.items() if cb.isChecked()]
+        if not selected_sources:
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_select_at_least_one_source'))
+            return
+
+        # マルチソースモード判定と融合方法の取得
+        is_multi_source = len(selected_sources) > 1
+        training_fusion_method = fusion_combo.currentData() if is_multi_source else None
+        training_num_sources = len(selected_sources) if is_multi_source else 1
+
         try:
             # 学習データの準備（データ選択設定を適用）
             image_paths = []
+            annotation_values = []
+            multi_source_paths = []  # マルチソースモード用: [[src1, src2, ...], ...]
             downsampled_set = set(getattr(self, 'downsampled_indexes', []))
+            has_image_groups = hasattr(self, 'image_groups') and self.image_groups
 
+            # まず有効なインデックスを収集
+            valid_indexes = []
             for idx in self.annotations.keys():
                 # 削除済みインデックスをスキップ（actual_indexで判定）
                 if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
@@ -19954,32 +20687,56 @@ class ImageAnnotationTool(QMainWindow):
                 if exclude_downsampled and idx in downsampled_set:
                     continue
 
-                if isinstance(idx, int) and 0 <= idx < len(self.images):
-                    # データ選択条件に基づいてフィルタリング
-                    if use_all:
-                        # 全データ使用
+                if not isinstance(idx, int) or idx < 0 or idx >= len(self.images):
+                    continue
+
+                # データ選択条件に基づいてフィルタリング
+                if use_all:
+                    valid_indexes.append(idx)
+                elif use_skip:
+                    if idx % skip_count == 0:
+                        valid_indexes.append(idx)
+                elif use_range:
+                    if range_start <= idx <= range_end:
+                        valid_indexes.append(idx)
+
+            # 各有効インデックスについて画像パスを収集
+            for idx in valid_indexes:
+                ann = deepcopy(self.annotations[idx])
+
+                if is_multi_source and has_image_groups:
+                    # マルチソースモード: 全ソースの画像が揃っているインデックスのみ使用
+                    group = self.image_groups.get(idx, {})
+                    paths_for_idx = []
+                    all_found = True
+                    for source in selected_sources:
+                        if source in group:
+                            paths_for_idx.append(group[source])
+                        else:
+                            all_found = False
+                            break
+                    if all_found:
+                        multi_source_paths.append(paths_for_idx)
+                        image_paths.append(paths_for_idx[0])  # 代表パス（サイズ検出用）
+                        annotation_values.append(deepcopy(ann))
+                elif has_image_groups:
+                    # シングルソースモード（image_groupsあり）
+                    group = self.image_groups.get(idx, {})
+                    source = selected_sources[0]
+                    if source in group:
+                        image_paths.append(group[source])
+                        annotation_values.append(deepcopy(ann))
+                    elif source == getattr(self, 'current_variant', None):
                         image_paths.append(self.images[idx])
-                    elif use_skip:
-                        # スキップ設定による間引き
-                        if idx % skip_count == 0:
-                            image_paths.append(self.images[idx])
-                    elif use_range:
-                        # インデックス範囲フィルタリング
-                        if range_start <= idx <= range_end:
-                            image_paths.append(self.images[idx]) 
-                                            
+                        annotation_values.append(deepcopy(ann))
+                else:
+                    # image_groupsがない場合は従来どおり
+                    image_paths.append(self.images[idx])
+                    annotation_values.append(deepcopy(ann))
+
             if not image_paths:
                 QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_training_data'))
                 return
-            
-            # 対応するアノテーション値を取得
-            annotation_values = []
-            for img_path in image_paths:
-                # パスからインデックスを逆引き
-                idx = self.images.index(img_path)
-                if idx in self.annotations:
-                    # ディープコピーして元のデータを変更しないようにする
-                    annotation_values.append(deepcopy(self.annotations[idx]))
 
             # Speed値の正規化（speedが含まれている場合）
             if use_speed_output and speed_normalize_value > 0:
@@ -20021,7 +20778,12 @@ class ImageAnnotationTool(QMainWindow):
             print(f"  Speed出力: {use_speed_output}")
             print(f"  将来予測出力: {use_future_output}")
             print(f"[データ設定]")
-            print(f"  学習データ数: {len(image_paths)}枚")
+            print(f"  画像ソース: {selected_sources}")
+            if is_multi_source:
+                print(f"  マルチソースモード: {training_num_sources}ソース, 融合方法: {training_fusion_method}")
+                print(f"  学習データ数: {len(multi_source_paths)}サンプル ({training_num_sources}画像/サンプル)")
+            else:
+                print(f"  学習データ数: {len(image_paths)}枚")
             print(f"  データ選択: {'全て' if use_all else ('スキップ' if use_skip else 'インデックス範囲')}")
             if use_skip:
                 print(f"  スキップ枚数: {skip_count}")
@@ -20075,7 +20837,10 @@ class ImageAnnotationTool(QMainWindow):
                 val_split=val_split,  # 検証データ割合
                 use_speed=use_speed_output,  # Speed出力を使用するかどうか
                 use_future=use_future_output,  # 将来予測出力を使用するかどうか
-                num_outputs=num_outputs  # 出力数を指定
+                num_outputs=num_outputs,  # 出力数を指定
+                multi_source_paths=multi_source_paths if is_multi_source else None,
+                num_sources=training_num_sources,
+                fusion_method=training_fusion_method or 'concat'
             )
 
             # 最初の画像から実際のサイズを取得
@@ -20098,7 +20863,7 @@ class ImageAnnotationTool(QMainWindow):
                 save_dir=models_dir,
                 progress_callback=update_progress,
                 pretrained=use_pretrained,  # 事前学習済みの重みを使用するか
-                model_path=model_path if load_weights else None,  # ファインチューニングの場合はパスを指定
+                model_path=model_path if load_weights and not is_multi_source else None,  # マルチソース時はファインチューニング不可
                 num_epochs=num_epochs,  # 指定されたエポック数
                 learning_rate=learning_rate,  # 指定された学習率
                 weight_decay=weight_decay,  # L2正則化
@@ -20109,7 +20874,10 @@ class ImageAnnotationTool(QMainWindow):
                 scheduler_name=scheduler_name,  # 学習率スケジューラ
                 custom_model_name=model_name if model_name else None,  # カスタムモデル名
                 num_outputs=num_outputs,  # 出力数を指定
-                input_size=input_size  # 実際の画像サイズを渡す
+                input_size=input_size,  # 実際の画像サイズを渡す
+                num_sources=training_num_sources,
+                fusion_method=training_fusion_method or 'concat',
+                selected_sources=selected_sources if is_multi_source else None
             )
             
             progress.close()
@@ -21195,14 +21963,14 @@ class ImageAnnotationTool(QMainWindow):
 
         # 選択された学習方法（モデル）を取得
         model_type = self.auto_method_combo.currentText()
-        selected_model = self.model_combo.currentText()
-        
+        selected_model = self.get_selected_model_filename()
+
         # モデルのパスを取得
         model_path = None
         if hasattr(self, 'model_combo') and selected_model not in [get_text('combo_model_not_found'), get_text('combo_select_folder')] and "not found" not in selected_model.lower():
             # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
             model_path = os.path.join(models_dir, selected_model)
-            
+
             # モデルが存在するか確認
             if not os.path.exists(model_path):
                 model_path = None
@@ -21276,13 +22044,20 @@ class ImageAnnotationTool(QMainWindow):
 
                 # 推論を実行
                 try:
-                    inference_results = batch_inference(
-                        current_batch_paths,
-                        method="model",
-                        model_type=model_type,
-                        model_path=model_path,
-                        force_reload=(batch_idx == 0)  # 最初のバッチのみ強制再読込
-                    )
+                    ms_config = getattr(self, '_multi_source_config', None)
+                    if ms_config and model_path:
+                        # マルチソース推論
+                        inference_results = self._run_multi_source_inference(
+                            current_batch_indices, model_path, force_reload=(batch_idx == 0)
+                        )
+                    else:
+                        inference_results = batch_inference(
+                            current_batch_paths,
+                            method="model",
+                            model_type=model_type,
+                            model_path=model_path,
+                            force_reload=(batch_idx == 0)  # 最初のバッチのみ強制再読込
+                        )
 
                     # サブ進捗表示
                     current_batch_size = len(current_batch_indices)
@@ -21290,8 +22065,9 @@ class ImageAnnotationTool(QMainWindow):
                         if progress.wasCanceled():
                             break
 
+                        # マルチソース推論はインデックスキー、通常はパスキー
                         img_path = self.images[img_index]
-                        result = inference_results.get(img_path, {})
+                        result = inference_results.get(img_index, inference_results.get(img_path, {}))
 
                         if not result:
                             continue
