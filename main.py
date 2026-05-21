@@ -63,7 +63,7 @@ from utils.image_utils import (
 )
 
 # カスタムモジュールのインポート
-from model_catalog import get_model, list_available_models
+from model_catalog import get_model, list_available_models, VirtualSourceDataset
 from utils.inference_utils import batch_inference
 from utils.export_utils import export_to_donkey, export_to_jetracer, export_to_video, export_to_video_multi_source
 from model_training import train_model, create_datasets
@@ -6795,6 +6795,8 @@ class ImageAnnotationTool(QMainWindow):
             'checkbox': checkbox,
             'info_label': info_label,
             'model': None,
+            'ms_info': None,          # マルチソースメタ情報 (num_sources, selected_sources, fusion_method)
+            'selected_sources': [],   # 学習に使ったソース名リスト（単一・複数問わず常に保持）
         }
         self.extra_model_slots.append(slot)
 
@@ -6855,21 +6857,44 @@ class ImageAnnotationTool(QMainWindow):
             if not os.path.exists(extra_model_path):
                 continue
 
+            ms_info = slot.get('ms_info')
+            virtual_type = ms_info.get('virtual_source_type') if ms_info else None
+
             try:
-                extra_results = batch_inference(
-                    [current_img_path],
-                    method="model",
-                    model_type=extra_model_type,
-                    model_path=extra_model_path,
-                    force_reload=False
-                )
-                for img_path_key, result in extra_results.items():
-                    try:
-                        idx = self.images.index(img_path_key)
-                        slot['inference_results'][idx] = result
+                if ms_info is not None and virtual_type:
+                    # 仮想ソース推論
+                    device = next(slot['model'].parameters()).device
+                    results = self._run_extra_virtual_source_inference(
+                        [current_index], slot['model'], ms_info, device
+                    )
+                    for idx_key, result in results.items():
+                        slot['inference_results'][idx_key] = result
                         changed = True
-                    except ValueError:
-                        pass
+                elif ms_info is not None:
+                    # マルチソース推論
+                    device = next(slot['model'].parameters()).device
+                    results = self._run_extra_multi_source_inference(
+                        [current_index], slot['model'], ms_info, device
+                    )
+                    for idx_key, result in results.items():
+                        slot['inference_results'][idx_key] = result
+                        changed = True
+                else:
+                    # シングルソース推論
+                    extra_results = batch_inference(
+                        [current_img_path],
+                        method="model",
+                        model_type=extra_model_type,
+                        model_path=extra_model_path,
+                        force_reload=False
+                    )
+                    for img_path_key, result in extra_results.items():
+                        try:
+                            idx = self.images.index(img_path_key)
+                            slot['inference_results'][idx] = result
+                            changed = True
+                        except ValueError:
+                            pass
             except Exception as e:
                 print(f"追加モデル{slot_idx + 2}の逐次推論エラー: {e}")
 
@@ -6877,6 +6902,157 @@ class ImageAnnotationTool(QMainWindow):
             self._update_extra_inference_info_panels()
             self._update_extra_inference_points()
             self.main_image_view.update()
+
+    def _run_extra_multi_source_inference(self, target_indices, model, ms_info, device):
+        """追加スロット用マルチソース推論
+
+        Args:
+            target_indices: 推論対象インデックスリスト
+            model: 読み込み済みマルチソースモデル
+            ms_info: detect_multi_source_from_checkpoint() の返値
+            device: torch.device
+
+        Returns:
+            dict: {index: {angle, throttle, x, y, [attention_weights]}}
+        """
+        sources = ms_info.get('selected_sources') or []
+        num_sources = ms_info['num_sources']
+        image_groups = getattr(self, 'image_groups', {})
+
+        if not image_groups or not sources:
+            print(f"追加スロットマルチソース推論: image_groups または sources が空 (sources={sources})")
+            return {}
+
+        transform = model.get_preprocess()
+        results = {}
+
+        with torch.no_grad():
+            for idx in target_indices:
+                try:
+                    group = image_groups.get(idx, {})
+                    img_paths = []
+                    missing = False
+                    for src in sources:
+                        if src in group:
+                            img_paths.append(group[src])
+                        else:
+                            missing = True
+                            break
+
+                    if missing or len(img_paths) != num_sources:
+                        continue
+
+                    tensors = []
+                    first_img_size = None
+                    for path in img_paths:
+                        img = Image.open(path).convert('RGB')
+                        if first_img_size is None:
+                            first_img_size = img.size
+                        tensors.append(transform(img))
+
+                    stacked = torch.cat(tensors, dim=0).unsqueeze(0).to(device)
+                    output = model(stacked)
+                    output_values = output[0].cpu().numpy()
+                    output_values = np.clip(output_values, -1.0, 1.0)
+
+                    # Attention 重みの取得
+                    attn_scores = None
+                    raw_weights = getattr(model, 'last_attn_weights', None)
+                    if raw_weights is not None:
+                        col_mean = raw_weights[0].mean(dim=0).cpu().numpy()
+                        total = col_mean.sum()
+                        if total > 0:
+                            col_mean = col_mean / total
+                        attn_scores = {src: float(col_mean[i]) for i, src in enumerate(sources)}
+
+                    img_width, img_height = first_img_size
+                    angle = float(output_values[0])
+                    throttle = float(output_values[1])
+                    x = max(0, min(int((angle + 1) / 2 * img_width), img_width - 1))
+                    y = max(0, min(int((1 - throttle) / 2 * img_height), img_height - 1))
+
+                    results[idx] = {"angle": angle, "throttle": throttle, "x": x, "y": y}
+                    if attn_scores is not None:
+                        results[idx]["attention_weights"] = attn_scores
+
+                except Exception as e:
+                    print(f"追加スロットマルチソース推論エラー (index={idx}): {e}")
+
+        return results
+
+    def _run_extra_virtual_source_inference(self, target_indices, model, ms_info, device):
+        """追加スロット用仮想ソース推論 (crop/scale/temporal)"""
+        virtual_type = ms_info.get('virtual_source_type')
+        num_sources = ms_info['num_sources']
+        source_names = (ms_info.get('selected_sources') or
+                        VirtualSourceDataset.source_names(virtual_type, num_sources))
+
+        transform = model.get_preprocess()
+        results = {}
+
+        with torch.no_grad():
+            for idx in target_indices:
+                try:
+                    if idx < 0 or idx >= len(self.images):
+                        continue
+                    img_path = self.images[idx]
+                    img = Image.open(img_path).convert('RGB')
+                    W, H = img.size
+
+                    if virtual_type == 'crop':
+                        step = W / num_sources
+                        overlap = step * 0.15
+                        source_imgs = []
+                        for i in range(num_sources):
+                            x0 = max(0, int(step * i - overlap))
+                            x1 = min(W, int(step * (i + 1) + overlap))
+                            source_imgs.append(img.crop((x0, 0, x1, H)))
+                    elif virtual_type == 'scale':
+                        source_imgs = [img]
+                        scale = 0.55
+                        for _ in range(num_sources - 1):
+                            cw = max(1, int(W * scale))
+                            ch = max(1, int(H * scale))
+                            x0, y0 = (W - cw) // 2, (H - ch) // 2
+                            cropped = img.crop((x0, y0, x0 + cw, y0 + ch))
+                            source_imgs.append(cropped.resize((W, H), Image.LANCZOS))
+                            scale *= 0.55
+                    elif virtual_type == 'temporal':
+                        source_imgs = []
+                        for k in range(num_sources):
+                            prev_idx = max(0, idx - k)
+                            source_imgs.append(Image.open(self.images[prev_idx]).convert('RGB'))
+                    else:
+                        source_imgs = [img] * num_sources
+
+                    tensors = [transform(s) for s in source_imgs]
+                    stacked = torch.cat(tensors, dim=0).unsqueeze(0).to(device)
+                    output = model(stacked)
+                    output_values = output[0].cpu().numpy()
+                    output_values = np.clip(output_values, -1.0, 1.0)
+
+                    attn_scores = None
+                    raw_weights = getattr(model, 'last_attn_weights', None)
+                    if raw_weights is not None:
+                        col_mean = raw_weights[0].mean(dim=0).cpu().numpy()
+                        total = col_mean.sum()
+                        if total > 0:
+                            col_mean = col_mean / total
+                        attn_scores = {src: float(col_mean[i]) for i, src in enumerate(source_names)}
+
+                    angle = float(output_values[0])
+                    throttle = float(output_values[1])
+                    x = max(0, min(int((angle + 1) / 2 * W), W - 1))
+                    y = max(0, min(int((1 - throttle) / 2 * H), H - 1))
+
+                    results[idx] = {"angle": angle, "throttle": throttle, "x": x, "y": y}
+                    if attn_scores:
+                        results[idx]["attention_weights"] = attn_scores
+
+                except Exception as e:
+                    print(f"追加スロット仮想ソース推論エラー (index={idx}): {e}")
+
+        return results
 
     def _refresh_extra_model_list(self, model_combo, method_combo):
         """追加モデルスロットのモデルリストを更新"""
@@ -6905,10 +7081,14 @@ class ImageAnnotationTool(QMainWindow):
         """追加モデルの推論表示の切り替え"""
         if slot_index >= len(self.extra_model_slots):
             return
-        show = (state == Qt.Checked)
         # キャンバスを更新
         self._update_extra_inference_points()
-        self.main_image_view.update()
+        # ラジオボタン下線と結合画像の枠色を再描画
+        self.update_variant_buttons()
+        if getattr(self, 'current_variant', None) == '__combined__':
+            self.display_current_image()
+        else:
+            self.main_image_view.update()
 
     def _update_extra_inference_points(self):
         """追加モデルの推論ポイントをImageLabelに設定する"""
@@ -7174,22 +7354,38 @@ class ImageAnnotationTool(QMainWindow):
             self.variant_button_group = QButtonGroup(self)
             self.variant_button_group.setExclusive(True)
 
-        # 推論対象ソースを判定（結合表示時のみ赤線表示）
-        inference_sources = set()
+        # 推論対象ソースとモデルカラーを収集（結合表示時のみ）
         is_combined = getattr(self, 'current_variant', None) == '__combined__'
+        source_colors = {}  # {source_name: [color_hex, ...]}
         if is_combined:
+            # メインモデル (#009999)
             ms_config = getattr(self, '_multi_source_config', None)
             if ms_config:
-                inference_sources = set(ms_config.get('sources', []))
+                for src in ms_config.get('sources', []):
+                    source_colors.setdefault(src, []).append('#009999')
             elif self.available_variants:
-                inference_sources = {self.available_variants[0]}
+                source_colors.setdefault(self.available_variants[0], []).append('#009999')
+            # 追加スロット（チェック済みのみ）
+            for i, slot in enumerate(getattr(self, 'extra_model_slots', [])):
+                if slot.get('model') is None or not slot['checkbox'].isChecked():
+                    continue
+                slot_color = self.extra_model_colors[i]
+                for src in slot.get('selected_sources', []):
+                    source_colors.setdefault(src, []).append(slot_color)
 
         # 新しいキーボタンを追加
         for var in self.available_variants:
             rb = QRadioButton(var)
-            # 結合表示中の推論対象ソースに赤い下線を付ける
-            if is_combined and var in inference_sources:
-                rb.setStyleSheet("QRadioButton { border-bottom: 3px solid red; padding-bottom: 2px; }")
+            colors = source_colors.get(var, []) if is_combined else []
+            if colors:
+                if len(colors) == 1:
+                    style = f"QRadioButton {{ border-bottom: 3px solid {colors[0]}; padding-bottom: 2px; }}"
+                else:
+                    n = len(colors)
+                    stops = " ".join(f"stop:{i/(n-1):.2f} {c}" for i, c in enumerate(colors))
+                    style = (f"QRadioButton {{ border-bottom: 3px solid "
+                             f"qlineargradient(x1:0, y1:0, x2:1, y2:0, {stops}); padding-bottom: 2px; }}")
+                rb.setStyleSheet(style)
             variant_layout.addWidget(rb)
             self.variant_button_group.addButton(rb)
             if var == self.current_variant:
@@ -15479,10 +15675,20 @@ class ImageAnnotationTool(QMainWindow):
             self.statusBar().showMessage(get_text('status_inference_processing', model_type, model_desc))
             QApplication.processEvents()
 
-            # マルチソースモデルかどうかを判定
+            # モデルタイプを判定して推論ルートを選択
             ms_config = getattr(self, '_multi_source_config', None)
+            vs_config = getattr(self, '_virtual_source_config', None)
 
-            if ms_config and model_path:
+            if vs_config and model_path:
+                # 仮想ソース推論 (crop/scale/temporal)
+                if all_images:
+                    target_indices = list(range(len(self.images)))
+                else:
+                    target_indices = [self.current_index]
+                inference_results = self._run_virtual_source_inference(
+                    target_indices, model_path, force_reload=force_reload
+                )
+            elif ms_config and model_path:
                 # マルチソース推論
                 if all_images:
                     target_indices = list(range(len(self.images)))
@@ -15638,6 +15844,17 @@ class ImageAnnotationTool(QMainWindow):
                     output_values = output[0].cpu().numpy()
                     output_values = np.clip(output_values, -1.0, 1.0)
 
+                    # Attention 重みの取得（attention 融合モデルのみ）
+                    attn_scores = None
+                    raw_weights = getattr(model, 'last_attn_weights', None)
+                    if raw_weights is not None:
+                        # (batch, S, S) → 列方向平均 → (S,) = 各カメラの貢献スコア
+                        col_mean = raw_weights[0].mean(dim=0).cpu().numpy()
+                        total = col_mean.sum()
+                        if total > 0:
+                            col_mean = col_mean / total
+                        attn_scores = {src: float(col_mean[i]) for i, src in enumerate(sources)}
+
                     img_width, img_height = first_img_size
                     num_out = len(output_values)
                     angle = output_values[0]
@@ -15656,8 +15873,10 @@ class ImageAnnotationTool(QMainWindow):
                         "angle": float(angle),
                         "throttle": float(throttle),
                         "x": x,
-                        "y": y
+                        "y": y,
                     }
+                    if attn_scores is not None:
+                        results[idx]["attention_weights"] = attn_scores
 
                     if speed is not None:
                         results[idx]["speed"] = float(speed)
@@ -15696,6 +15915,101 @@ class ImageAnnotationTool(QMainWindow):
 
                 except Exception as e:
                     print(f"マルチソース推論エラー (index={idx}): {e}")
+
+        return results
+
+    def _run_virtual_source_inference(self, target_indices, model_path=None, force_reload=False):
+        """仮想ソースモデル（crop/scale/temporal）で推論を実行する
+
+        Args:
+            target_indices: 推論対象インデックスリスト
+            model_path: モデルファイルのパス（ログ用）
+
+        Returns:
+            dict: {index: {angle, throttle, x, y, [attention_weights]}}
+        """
+        config = getattr(self, '_virtual_source_config', None)
+        if not config:
+            print("仮想ソース推論設定がありません")
+            return {}
+
+        virtual_type = config['virtual_type']
+        num_sources = config['num_sources']
+        source_names = config['source_names']
+
+        model = getattr(self, 'model', None)
+        if model is None:
+            return {}
+
+        device = next(model.parameters()).device
+        transform = model.get_preprocess()
+
+        results = {}
+        with torch.no_grad():
+            for idx in target_indices:
+                try:
+                    if idx < 0 or idx >= len(self.images):
+                        continue
+                    img_path = self.images[idx]
+                    img = Image.open(img_path).convert('RGB')
+                    W, H = img.size
+
+                    # 仮想ソース生成
+                    if virtual_type == 'crop':
+                        n = num_sources
+                        step = W / n
+                        overlap = step * 0.15
+                        source_imgs = []
+                        for i in range(n):
+                            x0 = max(0, int(step * i - overlap))
+                            x1 = min(W, int(step * (i + 1) + overlap))
+                            source_imgs.append(img.crop((x0, 0, x1, H)))
+                    elif virtual_type == 'scale':
+                        source_imgs = [img]
+                        scale = 0.55
+                        for _ in range(num_sources - 1):
+                            cw = max(1, int(W * scale))
+                            ch = max(1, int(H * scale))
+                            x0, y0 = (W - cw) // 2, (H - ch) // 2
+                            cropped = img.crop((x0, y0, x0 + cw, y0 + ch))
+                            source_imgs.append(cropped.resize((W, H), Image.LANCZOS))
+                            scale *= 0.55
+                    elif virtual_type == 'temporal':
+                        source_imgs = []
+                        for k in range(num_sources):
+                            prev_idx = max(0, idx - k)
+                            source_imgs.append(Image.open(self.images[prev_idx]).convert('RGB'))
+                    else:
+                        source_imgs = [img] * num_sources
+
+                    tensors = [transform(s) for s in source_imgs]
+                    stacked = torch.cat(tensors, dim=0).unsqueeze(0).to(device)
+
+                    output = model(stacked)
+                    output_values = output[0].cpu().numpy()
+                    output_values = np.clip(output_values, -1.0, 1.0)
+
+                    # Attention 重みの取得
+                    attn_scores = None
+                    raw_weights = getattr(model, 'last_attn_weights', None)
+                    if raw_weights is not None:
+                        col_mean = raw_weights[0].mean(dim=0).cpu().numpy()
+                        total = col_mean.sum()
+                        if total > 0:
+                            col_mean = col_mean / total
+                        attn_scores = {src: float(col_mean[i]) for i, src in enumerate(source_names)}
+
+                    angle = float(output_values[0])
+                    throttle = float(output_values[1])
+                    x = max(0, min(int((angle + 1) / 2 * W), W - 1))
+                    y = max(0, min(int((1 - throttle) / 2 * H), H - 1))
+
+                    results[idx] = {"angle": angle, "throttle": throttle, "x": x, "y": y}
+                    if attn_scores:
+                        results[idx]["attention_weights"] = attn_scores
+
+                except Exception as e:
+                    print(f"仮想ソース推論エラー (index={idx}): {e}")
 
         return results
 
@@ -16124,6 +16438,25 @@ class ImageAnnotationTool(QMainWindow):
                 inference_text += f"<div style='display: inline-block; background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 5px; border-radius: 5px;'>"
                 inference_text += get_text('label_inference_location', location) + "</div></div>"
 
+            # Attention スコアの表示（マルチソース attention モデルのみ）
+            attn_weights = inference.get("attention_weights")
+            if attn_weights:
+                inference_text += f"<br><b>{get_text('label_attention_weights')}</b><br>"
+                max_score = max(attn_weights.values()) if attn_weights else 1.0
+                for cam_name, score in attn_weights.items():
+                    bar_len = max(1, round(score * 15))
+                    # スコアに応じて青→緑でグラデーション
+                    r = int((1 - score) * 80)
+                    g = int(score * 200 + 55)
+                    b = int((1 - score) * 200 + 55)
+                    color = f"#{r:02x}{g:02x}{b:02x}"
+                    bar = '█' * bar_len
+                    inference_text += (
+                        f"<font face='monospace'>{cam_name}: "
+                        f"<font color='{color}'>{bar}</font>"
+                        f" {score:.0%}</font><br>"
+                    )
+
             # リッチテキストとして設定
             self.inference_info_label.setText(inference_text)
             self.inference_info_label.setTextFormat(Qt.RichText)
@@ -16163,6 +16496,23 @@ class ImageAnnotationTool(QMainWindow):
                 text = f"<b>{get_text('label_driving_model_n_inference', i+2)}</b><br>"
                 text += f"angle = <span style='color: {color};'>{angle:.4f}</span><br>"
                 text += f"throttle = <span style='color: {color};'>{throttle:.4f}</span>"
+
+                # Attention 貢献度バー表示
+                attn = inf.get("attention_weights")
+                if attn:
+                    text += f"<br><b>{get_text('label_attention_weights')}</b><br>"
+                    max_blocks = 12
+                    for src, score in attn.items():
+                        blocks = int(round(score * max_blocks))
+                        pct = int(round(score * 100))
+                        intensity = int(score * 200)
+                        r = min(255, 55 + intensity)
+                        g = max(0, 200 - intensity)
+                        b = 80
+                        bar_color = f"#{r:02x}{g:02x}{b:02x}"
+                        bar = f"<span style='color:{bar_color};'>{'█' * blocks}</span>"
+                        text += f"{src}: {bar} {pct}%<br>"
+
                 slot['info_label'].setText(text)
                 slot['info_label'].setTextFormat(Qt.RichText)
             else:
@@ -17120,7 +17470,35 @@ class ImageAnnotationTool(QMainWindow):
             num_outputs = detect_num_outputs_from_checkpoint(model_path, device)
             input_size = detect_input_size_from_checkpoint(model_path, device)
 
-            if is_multi_source:
+            virtual_type = ms_info.get('virtual_source_type') if ms_info else None
+
+            if virtual_type:
+                # 仮想ソースモデルの読み込み（crop/scale/temporal）
+                from model_catalog import create_multi_source_model, VirtualSourceDataset
+                base_model_name = ms_info['base_model_name'] or actual_model_type
+                self.model = create_multi_source_model(
+                    base_model_name=base_model_name,
+                    num_sources=ms_info['num_sources'],
+                    fusion_method=ms_info['fusion_method'] or 'concat',
+                    pretrained=False,
+                    num_outputs=num_outputs,
+                    input_size=input_size
+                )
+                load_model_weights(self.model, model_path, device)
+                self.model.eval()
+
+                src_names = (ms_info.get('selected_sources') or
+                             VirtualSourceDataset.source_names(virtual_type, ms_info['num_sources']))
+                self._virtual_source_config = {
+                    'virtual_type': virtual_type,
+                    'num_sources': ms_info['num_sources'],
+                    'source_names': src_names,
+                }
+                self._multi_source_config = None
+                inference_results = self._run_virtual_source_inference(
+                    [self.current_index], model_path, force_reload=True
+                )
+            elif is_multi_source:
                 # マルチソースモデルの読み込み
                 from model_catalog import create_multi_source_model
                 base_model_name = ms_info['base_model_name'] or actual_model_type
@@ -17135,15 +17513,13 @@ class ImageAnnotationTool(QMainWindow):
                 load_model_weights(self.model, model_path, device)
                 self.model.eval()
 
-                # マルチソース推論設定を保存
                 self._multi_source_config = {
                     'sources': multi_source_selected,
                     'num_sources': ms_info['num_sources'],
                     'fusion_method': ms_info['fusion_method'] or 'concat',
                     'base_model_name': base_model_name,
                 }
-
-                # マルチソース推論を実行（現在の画像）
+                self._virtual_source_config = None
                 inference_results = self._run_multi_source_inference(
                     [self.current_index], model_path, force_reload=True
                 )
@@ -17153,16 +17529,14 @@ class ImageAnnotationTool(QMainWindow):
                 load_model_weights(self.model, model_path, device)
                 self.model.eval()
 
-                # マルチソース設定をクリア
                 self._multi_source_config = None
-
-                # モデルを強制的に再読み込み（現在表示中の画像だけ推論）
+                self._virtual_source_config = None
                 inference_results = batch_inference(
                     [current_img_path],
                     method="model",
                     model_type=model_type,
                     model_path=model_path,
-                    force_reload=True  # 強制再読み込み
+                    force_reload=True
                 )
             
             progress.setLabelText(get_text('msg_saving_inference'))
@@ -17213,33 +17587,71 @@ class ImageAnnotationTool(QMainWindow):
                         from model_catalog import get_model as get_model_fn, load_model_weights as load_weights_fn
                         from model_catalog import detect_num_outputs_from_checkpoint as detect_outputs_fn
                         from model_catalog import detect_input_size_from_checkpoint as detect_input_fn
+                        from model_catalog import detect_multi_source_from_checkpoint, create_multi_source_model
 
                         extra_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                         extra_num_outputs = detect_outputs_fn(extra_model_path, extra_device)
                         extra_input_size = detect_input_fn(extra_model_path, extra_device)
-                        extra_model = get_model_fn(extra_model_type, pretrained=False, input_size=extra_input_size, num_outputs=extra_num_outputs)
-                        load_weights_fn(extra_model, extra_model_path, extra_device)
-                        extra_model.eval()
-                        slot['model'] = extra_model
 
-                        # 現在の画像に対して推論実行
-                        extra_inference_results = batch_inference(
-                            [current_img_path],
-                            method="model",
-                            model_type=extra_model_type,
-                            model_path=extra_model_path,
-                            force_reload=True
-                        )
+                        # マルチソース検出
+                        extra_ms_info = detect_multi_source_from_checkpoint(extra_model_path, extra_device)
+                        slot['selected_sources'] = extra_ms_info.get('selected_sources') or []
 
-                        # 推論結果をインデックスベースで保存
-                        if clear_inference:
-                            slot['inference_results'] = {}
-                        for img_path_key, result in extra_inference_results.items():
-                            try:
-                                idx = self.images.index(img_path_key)
-                                slot['inference_results'][idx] = result
-                            except ValueError:
-                                pass
+                        if extra_ms_info['num_sources'] > 1:
+                            # 仮想ソース or マルチソースモデルの読み込み
+                            slot['ms_info'] = extra_ms_info
+                            extra_base_model = extra_ms_info['base_model_name'] or extra_model_type
+                            extra_model = create_multi_source_model(
+                                base_model_name=extra_base_model,
+                                num_sources=extra_ms_info['num_sources'],
+                                fusion_method=extra_ms_info['fusion_method'] or 'concat',
+                                pretrained=False,
+                                num_outputs=extra_num_outputs,
+                                input_size=extra_input_size
+                            )
+                            load_weights_fn(extra_model, extra_model_path, extra_device)
+                            extra_model.eval()
+                            slot['model'] = extra_model
+
+                            # 仮想ソース or マルチソース推論を実行（現在のインデックス）
+                            if clear_inference:
+                                slot['inference_results'] = {}
+                            extra_vtype = extra_ms_info.get('virtual_source_type')
+                            if extra_vtype:
+                                ms_results = self._run_extra_virtual_source_inference(
+                                    [self.current_index], extra_model, extra_ms_info, extra_device
+                                )
+                            else:
+                                ms_results = self._run_extra_multi_source_inference(
+                                    [self.current_index], extra_model, extra_ms_info, extra_device
+                                )
+                            slot['inference_results'].update(ms_results)
+                        else:
+                            # シングルソースモデルの読み込み
+                            slot['ms_info'] = None
+                            extra_model = get_model_fn(extra_model_type, pretrained=False, input_size=extra_input_size, num_outputs=extra_num_outputs)
+                            load_weights_fn(extra_model, extra_model_path, extra_device)
+                            extra_model.eval()
+                            slot['model'] = extra_model
+
+                            # 現在の画像に対して推論実行
+                            extra_inference_results = batch_inference(
+                                [current_img_path],
+                                method="model",
+                                model_type=extra_model_type,
+                                model_path=extra_model_path,
+                                force_reload=True
+                            )
+
+                            # 推論結果をインデックスベースで保存
+                            if clear_inference:
+                                slot['inference_results'] = {}
+                            for img_path_key, result in extra_inference_results.items():
+                                try:
+                                    idx = self.images.index(img_path_key)
+                                    slot['inference_results'][idx] = result
+                                except ValueError:
+                                    pass
 
                         # チェックボックスを有効化
                         slot['checkbox'].setEnabled(True)
@@ -17249,6 +17661,8 @@ class ImageAnnotationTool(QMainWindow):
                     except Exception as e:
                         print(f"追加モデル{slot_idx + 2}の読み込みエラー: {e}")
                         slot['model'] = None
+                        slot['ms_info'] = None
+                        slot['selected_sources'] = []
 
             # 推論表示チェックボックスを有効にして自動的にオンにする
             progress.setLabelText(get_text('msg_updating_inference'))
@@ -17841,14 +18255,23 @@ class ImageAnnotationTool(QMainWindow):
         if not pil_images:
             return None
 
-        # 推論対象のソースを判定
+        # 各モデルの推論ソースとカラーを収集: {source: [(rgb, inset_index)]}
+        source_model_colors = {}  # {source_name: [rgb_tuple, ...]}
         ms_config = getattr(self, '_multi_source_config', None)
         if ms_config:
-            inference_sources = set(ms_config.get('sources', []))
+            main_srcs = ms_config.get('sources', [])
         else:
-            # シングルソース: self.imagesのベースバリアント
             base_variant = self.available_variants[0] if self.available_variants else None
-            inference_sources = {base_variant} if base_variant else set()
+            main_srcs = [base_variant] if base_variant else []
+        for src in main_srcs:
+            source_model_colors.setdefault(src, []).append((0, 153, 153))  # #009999
+        for i, slot in enumerate(getattr(self, 'extra_model_slots', [])):
+            if slot.get('model') is None or not slot['checkbox'].isChecked():
+                continue
+            hex_c = self.extra_model_colors[i].lstrip('#')
+            rgb = tuple(int(hex_c[j:j+2], 16) for j in (0, 2, 4))
+            for src in slot.get('selected_sources', []):
+                source_model_colors.setdefault(src, []).append(rgb)
 
         # ダイアログで選択されたグリッドサイズを使用
         grid = getattr(self, '_combined_grid', '2x1')
@@ -17882,18 +18305,19 @@ class ImageAnnotationTool(QMainWindow):
             y = r * cell_h + (cell_h - new_h) // 2
             combined.paste(resized, (x, y))
 
-            # 推論対象ソースの場合、赤枠を描画
-            if i < len(source_names) and source_names[i] in inference_sources:
-                border_w = max(2, min(canvas_w, canvas_h) // 120)
-                cell_x0 = c * cell_w
-                cell_y0 = r * cell_h
-                cell_x1 = cell_x0 + cell_w - 1
-                cell_y1 = cell_y0 + cell_h - 1
-                for b in range(border_w):
-                    draw.rectangle(
-                        [cell_x0 + b, cell_y0 + b, cell_x1 - b, cell_y1 - b],
-                        outline=(255, 0, 0)
-                    )
+            # 各モデルの色でセル枠を描画（外側から順に重ねる）
+            if i < len(source_names):
+                colors_for_src = source_model_colors.get(source_names[i], [])
+                if colors_for_src:
+                    border_w = max(2, min(canvas_w, canvas_h) // 120)
+                    for ci, color_rgb in enumerate(colors_for_src):
+                        inset = ci * border_w
+                        x0 = c * cell_w + inset
+                        y0 = r * cell_h + inset
+                        x1 = c * cell_w + cell_w - 1 - inset
+                        y1 = r * cell_h + cell_h - 1 - inset
+                        for b in range(border_w):
+                            draw.rectangle([x0 + b, y0 + b, x1 - b, y1 - b], outline=color_rgb)
 
         return combined
 
@@ -19991,16 +20415,24 @@ class ImageAnnotationTool(QMainWindow):
 
         def update_training_sources_count():
             checked_sources = [name for name, cb in training_source_checkboxes.items() if cb.isChecked()]
-            # 推定画像数を計算
-            estimated_count = 0
-            for src_name in checked_sources:
-                if src_name in available_sources:
-                    estimated_count += len(available_sources[src_name])
-                else:
-                    estimated_count += len(self.images)
-            training_sources_count_label.setText(
-                get_text('label_training_sources_count', len(checked_sources), estimated_count)
-            )
+            n_sources = len(checked_sources)
+            if n_sources > 1:
+                # マルチソース: サンプル数 = 最初のソースの画像数
+                first_src = checked_sources[0]
+                n_samples = len(available_sources.get(first_src, self.images))
+                training_sources_count_label.setText(
+                    get_text('label_training_sources_count_multi', n_sources, n_samples, n_sources)
+                )
+            else:
+                estimated_count = 0
+                for src_name in checked_sources:
+                    if src_name in available_sources:
+                        estimated_count += len(available_sources[src_name])
+                    else:
+                        estimated_count += len(self.images)
+                training_sources_count_label.setText(
+                    get_text('label_training_sources_count', n_sources, estimated_count)
+                )
             # データ選択のサンプル数も更新
             if 'update_data_selection_ui' in dir():
                 update_data_selection_ui()
@@ -20043,9 +20475,62 @@ class ImageAnnotationTool(QMainWindow):
         def update_fusion_visibility():
             checked_count = sum(1 for cb in training_source_checkboxes.values() if cb.isChecked())
             fusion_group.setVisible(checked_count > 1)
+            virtual_group.setVisible(checked_count == 1)
 
         for cb in training_source_checkboxes.values():
             cb.stateChanged.connect(update_fusion_visibility)
+
+        # 仮想ソース生成設定グループ（単一ソース選択時のみ表示）
+        virtual_group = QGroupBox(get_text('label_virtual_source_settings'))
+        virtual_layout = QVBoxLayout()
+
+        virtual_type_row = QHBoxLayout()
+        virtual_type_row.addWidget(QLabel(get_text('label_virtual_source_type')))
+        virtual_type_combo = QComboBox()
+        virtual_type_combo.addItem(get_text('opt_virtual_none'),     None)
+        virtual_type_combo.addItem(get_text('opt_virtual_crop'),     'crop')
+        virtual_type_combo.addItem(get_text('opt_virtual_scale'),    'scale')
+        virtual_type_combo.addItem(get_text('opt_virtual_temporal'), 'temporal')
+        virtual_type_row.addWidget(virtual_type_combo)
+        virtual_type_row.addStretch()
+        virtual_layout.addLayout(virtual_type_row)
+
+        virtual_nsrc_row_widget = QWidget()
+        virtual_nsrc_row = QHBoxLayout(virtual_nsrc_row_widget)
+        virtual_nsrc_row.setContentsMargins(0, 0, 0, 0)
+        virtual_nsrc_row.addWidget(QLabel(get_text('label_virtual_num_sources')))
+        virtual_nsrc_spin = QSpinBox()
+        virtual_nsrc_spin.setRange(2, 4)
+        virtual_nsrc_spin.setValue(3)
+        virtual_nsrc_row.addWidget(virtual_nsrc_spin)
+        virtual_nsrc_row.addStretch()
+        virtual_nsrc_label = QLabel()  # "left / center / right" などの説明ラベル
+        virtual_nsrc_row.addWidget(virtual_nsrc_label)
+        virtual_layout.addWidget(virtual_nsrc_row_widget)
+
+        virtual_note = QLabel(get_text('label_virtual_source_note'))
+        virtual_note.setStyleSheet("color: #1565C0; font-style: italic;")
+        virtual_note.setWordWrap(True)
+        virtual_layout.addWidget(virtual_note)
+
+        def _update_virtual_nsrc_label():
+            from model_catalog import VirtualSourceDataset
+            vtype = virtual_type_combo.currentData()
+            n = virtual_nsrc_spin.value()
+            if vtype:
+                names = VirtualSourceDataset.source_names(vtype, n)
+                virtual_nsrc_label.setText(' / '.join(names))
+            else:
+                virtual_nsrc_label.setText('')
+            virtual_nsrc_row_widget.setVisible(vtype is not None)
+
+        virtual_type_combo.currentIndexChanged.connect(_update_virtual_nsrc_label)
+        virtual_nsrc_spin.valueChanged.connect(_update_virtual_nsrc_label)
+        _update_virtual_nsrc_label()
+
+        virtual_group.setLayout(virtual_layout)
+        left_column.addWidget(virtual_group)
+        update_fusion_visibility()  # 初期表示時に正しい可視状態を設定
 
         # 学習パラメータグループ
         training_params_group = QGroupBox(get_text('label_training_params'))
@@ -20543,13 +21028,24 @@ class ImageAnnotationTool(QMainWindow):
         model_name_note.setStyleSheet("color: #888; font-style: italic;")
         model_name_layout.addWidget(model_name_note)
 
-        # モデルタイプが変更されたらプレフィックスと注釈を更新
-        def update_model_name_prefix():
+        # モデルタイプ・ソース数・融合方法が変わったらプレフィックスと注釈を更新
+        def get_current_model_prefix():
             selected_type = model_type_combo.currentText()
-            prefix_label.setText(f"{selected_type}_")
-            model_name_note.setText(get_text('label_model_name_note_pth', selected_type))
+            checked = [n for n, cb in training_source_checkboxes.items() if cb.isChecked()]
+            if len(checked) > 1:
+                fusion = fusion_combo.currentData() if fusion_combo.currentData() else 'concat'
+                return f"multi{len(checked)}_{fusion}_{selected_type}_"
+            return f"{selected_type}_"
+
+        def update_model_name_prefix():
+            prefix = get_current_model_prefix()
+            prefix_label.setText(prefix)
+            model_name_note.setText(get_text('label_model_name_note_pth', prefix.rstrip('_')))
 
         model_type_combo.currentIndexChanged.connect(update_model_name_prefix)
+        fusion_combo.currentIndexChanged.connect(update_model_name_prefix)
+        for cb in training_source_checkboxes.values():
+            cb.stateChanged.connect(update_model_name_prefix)
 
         name_comment_layout.addWidget(model_name_group)
 
@@ -20581,7 +21077,13 @@ class ImageAnnotationTool(QMainWindow):
         # 設定値の取得
         # ダイアログで選択されたモデルタイプを使用
         model_type = model_type_combo.currentText()
-        autonomous_prefix = f"{model_type}_"
+        # マルチソース時はソース数と融合方法をプレフィックスに含める
+        _checked_sources = [n for n, cb in training_source_checkboxes.items() if cb.isChecked()]
+        if len(_checked_sources) > 1:
+            _fusion = fusion_combo.currentData() if fusion_combo.currentData() else 'concat'
+            autonomous_prefix = f"multi{len(_checked_sources)}_{_fusion}_{model_type}_"
+        else:
+            autonomous_prefix = f"{model_type}_"
 
         num_epochs = epoch_spin.value()
         use_early_stopping = early_stopping_check.isChecked()
@@ -20663,10 +21165,16 @@ class ImageAnnotationTool(QMainWindow):
             QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_select_at_least_one_source'))
             return
 
+        # 仮想ソースモード判定
+        training_virtual_type = virtual_type_combo.currentData()  # None / 'crop' / 'scale' / 'temporal'
+        training_virtual_nsrc = virtual_nsrc_spin.value() if training_virtual_type else 1
+
         # マルチソースモード判定と融合方法の取得
-        is_multi_source = len(selected_sources) > 1
+        is_virtual_source = training_virtual_type is not None and len(selected_sources) == 1
+        is_multi_source = len(selected_sources) > 1 and not is_virtual_source
         training_fusion_method = fusion_combo.currentData() if is_multi_source else None
-        training_num_sources = len(selected_sources) if is_multi_source else 1
+        training_num_sources = (training_virtual_nsrc if is_virtual_source
+                                else len(selected_sources) if is_multi_source else 1)
 
         try:
             # 学習データの準備（データ選択設定を適用）
@@ -20840,7 +21348,8 @@ class ImageAnnotationTool(QMainWindow):
                 num_outputs=num_outputs,  # 出力数を指定
                 multi_source_paths=multi_source_paths if is_multi_source else None,
                 num_sources=training_num_sources,
-                fusion_method=training_fusion_method or 'concat'
+                fusion_method=training_fusion_method or 'concat',
+                virtual_source_type=training_virtual_type if is_virtual_source else None
             )
 
             # 最初の画像から実際のサイズを取得
@@ -20863,7 +21372,7 @@ class ImageAnnotationTool(QMainWindow):
                 save_dir=models_dir,
                 progress_callback=update_progress,
                 pretrained=use_pretrained,  # 事前学習済みの重みを使用するか
-                model_path=model_path if load_weights and not is_multi_source else None,  # マルチソース時はファインチューニング不可
+                model_path=model_path if load_weights else None,
                 num_epochs=num_epochs,  # 指定されたエポック数
                 learning_rate=learning_rate,  # 指定された学習率
                 weight_decay=weight_decay,  # L2正則化
@@ -20877,7 +21386,12 @@ class ImageAnnotationTool(QMainWindow):
                 input_size=input_size,  # 実際の画像サイズを渡す
                 num_sources=training_num_sources,
                 fusion_method=training_fusion_method or 'concat',
-                selected_sources=selected_sources if is_multi_source else None
+                selected_sources=(
+                    VirtualSourceDataset.source_names(training_virtual_type, training_virtual_nsrc)
+                    if is_virtual_source else
+                    (selected_sources if is_multi_source else selected_sources)
+                ),
+                virtual_source_type=training_virtual_type if is_virtual_source else None
             )
             
             progress.close()
@@ -20918,7 +21432,11 @@ class ImageAnnotationTool(QMainWindow):
                     "augmentation_params": augmentation_params,
                     "data_folder": self.folder_path if hasattr(self, 'folder_path') and self.folder_path else "unknown",
                     "model_name": model_name,
-                    "comment": comment
+                    "comment": comment,
+                    "is_multi_source": is_multi_source,
+                    "num_sources": training_num_sources,
+                    "fusion_method": training_fusion_method if is_multi_source else None,
+                    "selected_sources": selected_sources if is_multi_source else None,
                 },
                 dataset_info={
                     "total_annotations": len(self.annotations),
@@ -20926,7 +21444,8 @@ class ImageAnnotationTool(QMainWindow):
                     "train_samples": len(train_loader.dataset),
                     "val_samples": len(val_loader.dataset),
                     "input_shape": input_size,
-                    "deleted_samples": len(getattr(self, 'deleted_indexes', []))
+                    "deleted_samples": len(getattr(self, 'deleted_indexes', [])),
+                    "num_sources": training_num_sources,
                 },
                 image_paths=image_paths
             )
@@ -20950,7 +21469,11 @@ class ImageAnnotationTool(QMainWindow):
                     "load_weights": load_weights,
                     "use_random_init": use_random_init,
                     "selected_model": selected_finetune_model if load_weights else None,
-                    "data_folder": os.path.basename(self.folder_path) if hasattr(self, 'folder_path') and self.folder_path else "unknown"
+                    "data_folder": os.path.basename(self.folder_path) if hasattr(self, 'folder_path') and self.folder_path else "unknown",
+                    "is_multi_source": is_multi_source,
+                    "num_sources": training_num_sources,
+                    "fusion_method": training_fusion_method if is_multi_source else None,
+                    "selected_sources": selected_sources if is_multi_source else None,
                 },
                 dataset_info={
                     "image_paths_count": len(image_paths),
@@ -21142,6 +21665,32 @@ class ImageAnnotationTool(QMainWindow):
 
         arch_specific_layout.addStretch()
         arch_layout.addLayout(arch_specific_layout)
+
+        # マルチカメラ融合方法（同じ行に配置）
+        fusion_layout = QHBoxLayout()
+        fusion_layout.addWidget(QLabel(get_text('label_fusion_method')))
+        fusion_combo = QComboBox()
+        fusion_combo.addItem(get_text('opt_fusion_concat'), 'concat')
+        fusion_combo.addItem(get_text('opt_fusion_attention'), 'attention')
+        fusion_layout.addWidget(fusion_combo)
+
+        attn_heads_label = QLabel(get_text('label_attn_heads'))
+        fusion_layout.addWidget(attn_heads_label)
+        attn_heads_spin = QSpinBox()
+        attn_heads_spin.setRange(1, 8)
+        attn_heads_spin.setValue(SEQ_DEFAULT_ATTN_HEADS)
+        fusion_layout.addWidget(attn_heads_spin)
+        attn_heads_label.setVisible(False)
+        attn_heads_spin.setVisible(False)
+
+        def on_fusion_changed(idx):
+            is_attn = (fusion_combo.currentData() == 'attention')
+            attn_heads_label.setVisible(is_attn)
+            attn_heads_spin.setVisible(is_attn)
+
+        fusion_combo.currentIndexChanged.connect(on_fusion_changed)
+        fusion_layout.addStretch()
+        arch_layout.addLayout(fusion_layout)
 
         def update_arch_widgets():
             arch = arch_combo.currentData()
@@ -21428,6 +21977,10 @@ class ImageAnnotationTool(QMainWindow):
         elif selected_arch == 'causal_cnn':
             config['kernel_size'] = cnn_kernel_spin.value()
             config['cnn_channels'] = SEQ_CAUSAL_CNN_DEFAULT_CHANNELS
+
+        # マルチカメラ融合パラメータ
+        config['fusion_method'] = fusion_combo.currentData()
+        config['attn_heads'] = attn_heads_spin.value()
 
         try:
             # 進捗ダイアログ
@@ -21779,7 +22332,13 @@ class ImageAnnotationTool(QMainWindow):
         dialog.setMinimumWidth(800)
         dlg_layout = QVBoxLayout(dialog)
 
-        title_label = QLabel(f"{model_type} モデルを学習し保存しました: {os.path.basename(training_results['model_path'])}")
+        if training_params.get('is_multi_source'):
+            num_src = training_params.get('num_sources', 1)
+            fusion = training_params.get('fusion_method', 'concat')
+            title_text = f"[{num_src}ソース/{fusion}] {model_type} モデルを学習し保存しました: {os.path.basename(training_results['model_path'])}"
+        else:
+            title_text = f"{model_type} モデルを学習し保存しました: {os.path.basename(training_results['model_path'])}"
+        title_label = QLabel(title_text)
         title_label.setStyleSheet("font-weight: bold;")
         dlg_layout.addWidget(title_label)
 

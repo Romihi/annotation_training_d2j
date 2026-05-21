@@ -469,7 +469,8 @@ def create_datasets(
     num_outputs: int = 2,
     multi_source_paths: List[List[str]] = None,
     num_sources: int = 1,
-    fusion_method: str = 'concat'
+    fusion_method: str = 'concat',
+    virtual_source_type: Optional[str] = None
 ) -> Tuple[DataLoader, DataLoader, Dict[str, Any]]:
     """トレーニングとバリデーション用のデータローダーを作成する
 
@@ -482,7 +483,8 @@ def create_datasets(
     if image_paths is None or annotations is None or len(image_paths) == 0 or len(annotations) == 0:
         raise ValueError("有効な画像パスとアノテーションが必要です。")
 
-    is_multi_source = num_sources > 1 and multi_source_paths is not None
+    is_virtual_source = virtual_source_type is not None and num_sources > 1
+    is_multi_source = num_sources > 1 and multi_source_paths is not None and not is_virtual_source
 
     # サンプル画像から実際のサイズを取得
     if is_multi_source:
@@ -563,7 +565,19 @@ def create_datasets(
         ])
 
     # データセットの作成
-    if is_multi_source:
+    if is_virtual_source:
+        from model_catalog import VirtualSourceDataset
+        dataset = VirtualSourceDataset(
+            image_paths=image_paths,
+            annotations=annotations,
+            num_virtual_sources=num_sources,
+            virtual_type=virtual_source_type,
+            transform=transform,
+            use_speed=use_speed,
+            use_future=use_future
+        )
+        print(f"VirtualSourceDataset作成: {len(dataset)}サンプル, {num_sources}仮想ソース, タイプ={virtual_source_type}")
+    elif is_multi_source:
         from model_catalog import MultiSourceDataset
         dataset = MultiSourceDataset(
             grouped_image_paths=multi_source_paths,
@@ -649,7 +663,8 @@ def train_model(
     input_size: Optional[Tuple[int, int]] = None,
     num_sources: int = 1,
     fusion_method: str = 'concat',
-    selected_sources: Optional[List[str]] = None
+    selected_sources: Optional[List[str]] = None,
+    virtual_source_type: Optional[str] = None
 ) -> Dict[str, Any]:
     """モデルをトレーニングする
 
@@ -712,29 +727,39 @@ def train_model(
     # 入力サイズをモデルから確認
     model_input_size = model.input_size if hasattr(model, 'input_size') else input_size
     print(f"Model input size: {model_input_size}")
-    
+
     # 特定のモデルファイルから重みをロードする場合
     if model_path and os.path.exists(model_path):
         if progress_callback:
             progress_callback(0, num_epochs, f"保存済みモデル '{os.path.basename(model_path)}' から重みをロード中...")
-        
+
         try:
-            # モデルチェックポイントをロード
             checkpoint = torch.load(model_path, map_location=device)
-            
-            # state_dictがあるかチェック
-            if 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
-                print(f"モデル重みを '{model_path}' からロードしました")
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
+
+            if is_multi_source:
+                # マルチソース同士の互換性チェック
+                ckpt_num_sources = checkpoint.get('num_sources', 1)
+                ckpt_fusion = checkpoint.get('fusion_method', 'concat')
+                arch_match = (ckpt_num_sources == num_sources and ckpt_fusion == fusion_method)
+
+                if arch_match:
+                    model.load_state_dict(state_dict)
+                    print(f"マルチソースモデル重みをロードしました: {os.path.basename(model_path)}")
+                else:
+                    # アーキテクチャ不一致: エンコーダ重みのみ転移
+                    print(f"アーキテクチャ不一致 (ソース数: {ckpt_num_sources}→{num_sources}, "
+                          f"融合: {ckpt_fusion}→{fusion_method})")
+                    print("エンコーダ重みのみ転移します (strict=False)")
+                    model.load_state_dict(state_dict, strict=False)
             else:
-                # 直接state_dictが保存されている場合
-                model.load_state_dict(checkpoint)
+                model.load_state_dict(state_dict)
                 print(f"モデル重みを '{model_path}' からロードしました")
-                
+
         except Exception as e:
             print(f"モデル重みのロードに失敗しました: {e}")
             print("事前学習済みモデルまたはランダム初期化を使用します")
-    
+
     model = model.to(device)
 
     # 損失関数
@@ -987,12 +1012,14 @@ def train_model(
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': best_val_loss,
                 'input_size': model_input_size,
+                'selected_sources': selected_sources,
             }
             if is_multi_source:
                 save_dict['num_sources'] = num_sources
                 save_dict['fusion_method'] = fusion_method
-                save_dict['selected_sources'] = selected_sources
                 save_dict['base_model_name'] = model_name
+                if virtual_source_type:
+                    save_dict['virtual_source_type'] = virtual_source_type
             torch.save(save_dict, best_model_path)
 
             if progress_callback:
@@ -1060,12 +1087,14 @@ def train_model(
         'early_stopped': early_stopped,
         'stopped_epoch': stopped_epoch if early_stopped else completed_epochs,
         'input_size': model_input_size,
+        'selected_sources': selected_sources,
     }
     if is_multi_source:
         final_save_dict['num_sources'] = num_sources
         final_save_dict['fusion_method'] = fusion_method
-        final_save_dict['selected_sources'] = selected_sources
         final_save_dict['base_model_name'] = model_name
+        if virtual_source_type:
+            final_save_dict['virtual_source_type'] = virtual_source_type
     torch.save(final_save_dict, model_path)
 
     # トレーニング結果

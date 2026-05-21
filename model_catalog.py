@@ -107,7 +107,8 @@ def detect_multi_source_from_checkpoint(weights_path, device='cpu'):
     Returns:
         dict: {'num_sources': int, 'fusion_method': str or None, 'selected_sources': list or None, 'base_model_name': str or None}
     """
-    result = {'num_sources': 1, 'fusion_method': None, 'selected_sources': None, 'base_model_name': None}
+    result = {'num_sources': 1, 'fusion_method': None, 'selected_sources': None,
+              'base_model_name': None, 'virtual_source_type': None}
     try:
         checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
         if isinstance(checkpoint, dict):
@@ -119,8 +120,12 @@ def detect_multi_source_from_checkpoint(weights_path, device='cpu'):
                 result['selected_sources'] = checkpoint['selected_sources']
             if 'base_model_name' in checkpoint:
                 result['base_model_name'] = checkpoint['base_model_name']
+            if 'virtual_source_type' in checkpoint:
+                result['virtual_source_type'] = checkpoint['virtual_source_type']
             if result['num_sources'] > 1:
-                print(f"マルチソースモデル検出: {result['num_sources']}ソース, 融合: {result['fusion_method']}, ソース: {result['selected_sources']}")
+                vt = result['virtual_source_type']
+                print(f"マルチソースモデル検出: {result['num_sources']}ソース, 融合: {result['fusion_method']}, "
+                      f"仮想タイプ: {vt or 'なし'}, ソース: {result['selected_sources']}")
     except Exception as e:
         print(f"マルチソース情報の検出に失敗: {e}")
     return result
@@ -1377,14 +1382,36 @@ class EgoStateEncoder(nn.Module):
         return self.relu(self.fc(x))
 
 
+class MultiCameraAttentionFusion(nn.Module):
+    """複数カメラ特徴量をクロスアテンションで融合
+    入力: (B*T, S, feat_dim)  →  出力: (B*T, feat_dim)
+    S=1 の場合は恒等変換に相当するため concat と同等。
+    """
+
+    def __init__(self, feat_dim=128, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(feat_dim, num_heads, dropout=dropout, batch_first=True)
+        self.norm = nn.LayerNorm(feat_dim)
+
+    def forward(self, x):
+        # x: (B*T, S, feat_dim)
+        attn_out, attn_weights = self.attn(x, x, x, need_weights=True, average_attn_weights=True)
+        self.last_attn_weights = attn_weights.detach()  # (B*T, S, S) — 可視化用
+        x = self.norm(x + attn_out)   # residual + LayerNorm
+        return x.mean(dim=1)          # (B*T, feat_dim)
+
+
 class BaseSequenceModel(nn.Module):
     """時系列モデルの共通ベース
 
     サブクラスは _build_temporal() と _forward_temporal() を実装する。
+    fusion_method='attention' かつ num_image_sources>1 の場合、
+    クロスカメラ Attention で複数ソースを融合する。
     """
 
     def __init__(self, num_image_sources, ego_dim=5, img_feat_dim=128,
-                 ego_feat_dim=32, hidden_dim=256, pred_horizon=10, dropout=0.1):
+                 ego_feat_dim=32, hidden_dim=256, pred_horizon=10, dropout=0.1,
+                 fusion_method='concat', attn_heads=4):
         super().__init__()
         self.num_image_sources = num_image_sources
         self.pred_horizon = pred_horizon
@@ -1394,7 +1421,14 @@ class BaseSequenceModel(nn.Module):
         self.image_encoder = ImageEncoder(img_feat_dim)
         self.ego_encoder = EgoStateEncoder(ego_dim, ego_feat_dim)
 
-        fusion_input_dim = img_feat_dim * num_image_sources + ego_feat_dim
+        use_attn = (fusion_method == 'attention' and num_image_sources > 1)
+        if use_attn:
+            self.camera_attention = MultiCameraAttentionFusion(img_feat_dim, attn_heads, dropout)
+            fusion_input_dim = img_feat_dim + ego_feat_dim
+        else:
+            self.camera_attention = None
+            fusion_input_dim = img_feat_dim * num_image_sources + ego_feat_dim
+
         self.fusion = nn.Sequential(
             nn.Linear(fusion_input_dim, hidden_dim),
             nn.ReLU(inplace=True)
@@ -1415,8 +1449,14 @@ class BaseSequenceModel(nn.Module):
         B, T, S, C, H, W = images.shape
 
         images_flat = images.reshape(B * T * S, C, H, W)
-        img_features = self.image_encoder(images_flat)
-        img_features = img_features.reshape(B, T, S * self.img_feat_dim)
+        img_features = self.image_encoder(images_flat)   # (B*T*S, feat_dim)
+
+        if self.camera_attention is not None:
+            img_features = img_features.reshape(B * T, S, self.img_feat_dim)
+            img_features = self.camera_attention(img_features)   # (B*T, feat_dim)
+            img_features = img_features.reshape(B, T, self.img_feat_dim)
+        else:
+            img_features = img_features.reshape(B, T, S * self.img_feat_dim)
 
         ego_flat = ego_states.reshape(B * T, -1)
         ego_features = self.ego_encoder(ego_flat).reshape(B, T, -1)
@@ -1439,11 +1479,12 @@ class GRUSequenceModel(BaseSequenceModel):
 
     def __init__(self, num_image_sources, ego_dim=5, img_feat_dim=128,
                  ego_feat_dim=32, hidden_dim=256, num_layers=1,
-                 pred_horizon=10, dropout=0.1):
+                 pred_horizon=10, dropout=0.1, fusion_method='concat', attn_heads=4):
         self._num_layers = num_layers
         self._dropout = dropout
         super().__init__(num_image_sources, ego_dim, img_feat_dim,
-                         ego_feat_dim, hidden_dim, pred_horizon, dropout)
+                         ego_feat_dim, hidden_dim, pred_horizon, dropout,
+                         fusion_method, attn_heads)
 
     def _build_temporal(self, hidden_dim, dropout):
         self.gru = nn.GRU(
@@ -1501,12 +1542,14 @@ class TCNSequenceModel(BaseSequenceModel):
 
     def __init__(self, num_image_sources, ego_dim=5, img_feat_dim=128,
                  ego_feat_dim=32, hidden_dim=256, tcn_channels=None,
-                 kernel_size=3, pred_horizon=10, dropout=0.1):
+                 kernel_size=3, pred_horizon=10, dropout=0.1,
+                 fusion_method='concat', attn_heads=4):
         self._tcn_channels = tcn_channels or [128, 128, 256]
         self._kernel_size = kernel_size
         self._dropout = dropout
         super().__init__(num_image_sources, ego_dim, img_feat_dim,
-                         ego_feat_dim, hidden_dim, pred_horizon, dropout)
+                         ego_feat_dim, hidden_dim, pred_horizon, dropout,
+                         fusion_method, attn_heads)
 
     def _build_temporal(self, hidden_dim, dropout):
         channels = [hidden_dim] + self._tcn_channels
@@ -1545,12 +1588,14 @@ class CausalCNNSequenceModel(BaseSequenceModel):
 
     def __init__(self, num_image_sources, ego_dim=5, img_feat_dim=128,
                  ego_feat_dim=32, hidden_dim=256, cnn_channels=None,
-                 kernel_size=3, pred_horizon=10, dropout=0.1):
+                 kernel_size=3, pred_horizon=10, dropout=0.1,
+                 fusion_method='concat', attn_heads=4):
         self._cnn_channels = cnn_channels or [64, 128, 256]
         self._kernel_size = kernel_size
         self._dropout = dropout
         super().__init__(num_image_sources, ego_dim, img_feat_dim,
-                         ego_feat_dim, hidden_dim, pred_horizon, dropout)
+                         ego_feat_dim, hidden_dim, pred_horizon, dropout,
+                         fusion_method, attn_heads)
 
     def _build_temporal(self, hidden_dim, dropout):
         channels = [hidden_dim] + self._cnn_channels
@@ -1601,6 +1646,8 @@ def create_sequence_model(model_arch, num_image_sources, config):
         hidden_dim=config.get('hidden_dim', 256),
         pred_horizon=config.get('pred_horizon', 10),
         dropout=config.get('dropout', 0.1),
+        fusion_method=config.get('fusion_method', 'concat'),
+        attn_heads=config.get('attn_heads', 4),
     )
 
     if model_arch == "gru":
@@ -1822,7 +1869,9 @@ class MultiSourceModel(BaseModel):
         elif self.fusion_method == 'attention':
             # [batch, num_sources, feature_dim]
             seq = torch.stack(features_list, dim=1)
-            attn_out, _ = self.attention(seq, seq, seq)
+            attn_out, attn_weights = self.attention(seq, seq, seq,
+                                                    need_weights=True, average_attn_weights=True)
+            self.last_attn_weights = attn_weights.detach()  # (batch, S, S) — 可視化用
             norm_out = self.norm(seq + attn_out)
             fused = norm_out.mean(dim=1)
 
@@ -1937,6 +1986,135 @@ class MultiSourceDataset(torch.utils.data.Dataset):
 
         target = torch.tensor(target_values, dtype=torch.float)
         return stacked, target
+
+
+class VirtualSourceDataset(torch.utils.data.Dataset):
+    """単一カメラ画像から複数の仮想ソースを生成するデータセット
+
+    virtual_type:
+        'crop'     : 水平方向の空間クロップ [左/中/右] (A)
+        'scale'    : 中央スケールピラミッド [全体/2x/4x zoom] (B)
+        'temporal' : 現在＋過去フレームスタック [t, t-1, t-2] (C)
+    """
+
+    _SOURCE_NAMES = {
+        'crop':     {2: ['left', 'right'],
+                     3: ['left', 'center', 'right'],
+                     4: ['left', 'center_l', 'center_r', 'right']},
+        'scale':    {2: ['full', 'zoom2x'],
+                     3: ['full', 'zoom2x', 'zoom4x'],
+                     4: ['full', 'zoom2x', 'zoom4x', 'zoom8x']},
+        'temporal': {2: ['t+0', 't-1'],
+                     3: ['t+0', 't-1', 't-2'],
+                     4: ['t+0', 't-1', 't-2', 't-3']},
+    }
+
+    @staticmethod
+    def source_names(virtual_type: str, num_sources: int) -> list:
+        names = VirtualSourceDataset._SOURCE_NAMES.get(virtual_type, {})
+        return names.get(num_sources, [f'{virtual_type}_{i}' for i in range(num_sources)])
+
+    def __init__(self, image_paths, annotations, num_virtual_sources=3,
+                 virtual_type='crop', transform=None, use_speed=False, use_future=False):
+        self.image_paths = image_paths
+        self.annotations = annotations
+        self.num_virtual_sources = num_virtual_sources
+        self.virtual_type = virtual_type
+        self.transform = transform
+        self.use_speed = use_speed
+        self.use_future = use_future
+        self.future_offsets = [5, 10]
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def _get_annotation_values(self, annotation):
+        angle = annotation.get("angle", 0.0)
+        throttle = annotation.get("throttle", 0.0)
+        speed = annotation.get("speed", annotation.get("user/speed", annotation.get("pilot/speed", 0.0)))
+        return angle, throttle, speed
+
+    def _spatial_crops(self, img):
+        """水平方向に N 分割（隣接スライス間 15% オーバーラップ）"""
+        W, H = img.size
+        n = self.num_virtual_sources
+        step = W / n
+        overlap = step * 0.15
+        crops = []
+        for i in range(n):
+            x0 = max(0, int(step * i - overlap))
+            x1 = min(W, int(step * (i + 1) + overlap))
+            crops.append(img.crop((x0, 0, x1, H)))
+        return crops
+
+    def _scale_pyramid(self, img):
+        """中央クロップを段階的に拡大してリサイズ (55% ずつ縮小)"""
+        W, H = img.size
+        sources = [img]
+        scale = 0.55
+        for _ in range(self.num_virtual_sources - 1):
+            cw = max(1, int(W * scale))
+            ch = max(1, int(H * scale))
+            x0 = (W - cw) // 2
+            y0 = (H - ch) // 2
+            cropped = img.crop((x0, y0, x0 + cw, y0 + ch))
+            sources.append(cropped.resize((W, H), Image.LANCZOS))
+            scale *= 0.55
+        return sources
+
+    def _temporal_stack(self, idx):
+        """現在フレームと過去 N-1 フレームを取得（先頭でクランプ）"""
+        sources = []
+        for k in range(self.num_virtual_sources):
+            prev_idx = max(0, idx - k)
+            sources.append(Image.open(self.image_paths[prev_idx]).convert('RGB'))
+        return sources
+
+    def __getitem__(self, idx):
+        img = Image.open(self.image_paths[idx]).convert('RGB')
+
+        if self.virtual_type == 'crop':
+            source_imgs = self._spatial_crops(img)
+        elif self.virtual_type == 'scale':
+            source_imgs = self._scale_pyramid(img)
+        elif self.virtual_type == 'temporal':
+            source_imgs = self._temporal_stack(idx)
+        else:
+            source_imgs = [img] * self.num_virtual_sources
+
+        tensors = []
+        for s_img in source_imgs:
+            if self.transform:
+                try:
+                    t = self.transform(s_img)
+                except Exception:
+                    import torchvision.transforms as _T
+                    t = self.transform(_T.ToTensor()(s_img))
+            else:
+                import torchvision.transforms as _T
+                t = _T.ToTensor()(s_img)
+            tensors.append(t)
+
+        stacked = torch.cat(tensors, dim=0)
+
+        annotation = self.annotations[idx]
+        angle, throttle, speed = self._get_annotation_values(annotation)
+        target_values = [angle, throttle]
+
+        if self.use_speed:
+            target_values.append(speed)
+
+        if self.use_future:
+            for offset in self.future_offsets:
+                future_idx = min(idx + offset, len(self.annotations) - 1)
+                future_ann = self.annotations[future_idx]
+                f_angle, f_throttle, f_speed = self._get_annotation_values(future_ann)
+                if self.use_speed:
+                    target_values.extend([f_angle, f_throttle, f_speed])
+                else:
+                    target_values.extend([f_angle, f_throttle])
+
+        return stacked, torch.tensor(target_values, dtype=torch.float)
 
 
 def create_multi_source_model(base_model_name, num_sources=2, fusion_method='concat',
