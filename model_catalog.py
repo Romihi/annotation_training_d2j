@@ -108,7 +108,7 @@ def detect_multi_source_from_checkpoint(weights_path, device='cpu'):
         dict: {'num_sources': int, 'fusion_method': str or None, 'selected_sources': list or None, 'base_model_name': str or None}
     """
     result = {'num_sources': 1, 'fusion_method': None, 'selected_sources': None,
-              'base_model_name': None, 'virtual_source_type': None}
+              'base_model_name': None, 'virtual_source_type': None, 'temporal_interval': 10}
     try:
         checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
         if isinstance(checkpoint, dict):
@@ -122,6 +122,8 @@ def detect_multi_source_from_checkpoint(weights_path, device='cpu'):
                 result['base_model_name'] = checkpoint['base_model_name']
             if 'virtual_source_type' in checkpoint:
                 result['virtual_source_type'] = checkpoint['virtual_source_type']
+            if 'temporal_interval' in checkpoint:
+                result['temporal_interval'] = checkpoint['temporal_interval']
             if result['num_sources'] > 1:
                 vt = result['virtual_source_type']
                 print(f"マルチソースモデル検出: {result['num_sources']}ソース, 融合: {result['fusion_method']}, "
@@ -1836,6 +1838,8 @@ class MultiSourceModel(BaseModel):
                 embed_dim=self.feature_dim, num_heads=num_heads, batch_first=True
             )
             self.norm = nn.LayerNorm(self.feature_dim)
+            # 位置埋め込み: ソース順序（現在フレーム=0, 過去フレーム=1,2,...）を保持
+            self.pos_embed = nn.Parameter(torch.randn(1, num_sources, self.feature_dim) * 0.02)
             self.regressor = nn.Sequential(
                 nn.Linear(self.feature_dim, min(256, self.feature_dim)),
                 nn.ReLU(inplace=True),
@@ -1869,11 +1873,12 @@ class MultiSourceModel(BaseModel):
         elif self.fusion_method == 'attention':
             # [batch, num_sources, feature_dim]
             seq = torch.stack(features_list, dim=1)
+            seq = seq + self.pos_embed  # 位置情報を加算してソース順序を保持
             attn_out, attn_weights = self.attention(seq, seq, seq,
                                                     need_weights=True, average_attn_weights=True)
             self.last_attn_weights = attn_weights.detach()  # (batch, S, S) — 可視化用
             norm_out = self.norm(seq + attn_out)
-            fused = norm_out.mean(dim=1)
+            fused = norm_out[:, 0, :]  # インデックス0=現在フレームの出力を使用
 
         return self.regressor(fused)
 
@@ -2010,12 +2015,15 @@ class VirtualSourceDataset(torch.utils.data.Dataset):
     }
 
     @staticmethod
-    def source_names(virtual_type: str, num_sources: int) -> list:
+    def source_names(virtual_type: str, num_sources: int, temporal_interval: int = 10) -> list:
+        if virtual_type == 'temporal':
+            return ['t+0'] + [f't-{i * temporal_interval}' for i in range(1, num_sources)]
         names = VirtualSourceDataset._SOURCE_NAMES.get(virtual_type, {})
         return names.get(num_sources, [f'{virtual_type}_{i}' for i in range(num_sources)])
 
     def __init__(self, image_paths, annotations, num_virtual_sources=3,
-                 virtual_type='crop', transform=None, use_speed=False, use_future=False):
+                 virtual_type='crop', transform=None, use_speed=False, use_future=False,
+                 temporal_interval: int = 10):
         self.image_paths = image_paths
         self.annotations = annotations
         self.num_virtual_sources = num_virtual_sources
@@ -2023,6 +2031,7 @@ class VirtualSourceDataset(torch.utils.data.Dataset):
         self.transform = transform
         self.use_speed = use_speed
         self.use_future = use_future
+        self.temporal_interval = temporal_interval
         self.future_offsets = [5, 10]
 
     def __len__(self):
@@ -2066,7 +2075,7 @@ class VirtualSourceDataset(torch.utils.data.Dataset):
         """現在フレームと過去 N-1 フレームを取得（先頭でクランプ）"""
         sources = []
         for k in range(self.num_virtual_sources):
-            prev_idx = max(0, idx - k)
+            prev_idx = max(0, idx - k * self.temporal_interval)
             sources.append(Image.open(self.image_paths[prev_idx]).convert('RGB'))
         return sources
 

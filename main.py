@@ -104,7 +104,11 @@ class ImageLabel(QLabel):
         self.extra_inference_points = []  # 追加モデルの推論ポイントリスト [(QPoint, QColor, show_flag), ...]
         self.sequence_prediction_points = []  # 時系列予測軌道 [(QPoint, ...)]
         self.show_gru_prediction = False  # 時系列予測表示フラグ
-        self.zoom_factor = DEFAULT_ZOOM_FACTOR  
+        self.zoom_factor = DEFAULT_ZOOM_FACTOR
+        self.resolution_scale = 1.0          # 1.0=フル解像度, 0.1=10%
+        self.crop_overlay_config = None      # 仮想ソース表示用
+        self.virtual_overlay_mode = 'fill'   # 'none', 'border', 'fill'
+        self._temporal_thumb_cache = {}      # {(path, w, h): QPixmap}
         self.is_deleted = False
         self.is_downsampled = False  # ダウンサンプリング対象フラグ
 
@@ -465,6 +469,7 @@ class ImageLabel(QLabel):
         painter = QPainter(self)
 
         self.draw_initial_frame(painter)
+        self.draw_virtual_overlay(painter, self.target_rect)
 
         # CAMオーバーレイを描画（ベース画像の上、他のアノテーションの下）
         self.draw_gradcam_overlay(painter, self.target_rect)
@@ -509,7 +514,138 @@ class ImageLabel(QLabel):
 
         # 画像を拡大して描画
         self.target_rect = QRect(self.x, self.y, self.scaled_width, self.scaled_height)
-        painter.drawPixmap(self.target_rect, self.pixmap())
+        pix = self.pixmap()
+        if self.resolution_scale < 1.0:
+            small_w = max(1, int(self.pix_width * self.resolution_scale))
+            small_h = max(1, int(self.pix_height * self.resolution_scale))
+            pix = pix.scaled(small_w, small_h, Qt.IgnoreAspectRatio, Qt.FastTransformation)
+            pix = pix.scaled(self.scaled_width, self.scaled_height, Qt.IgnoreAspectRatio, Qt.FastTransformation)
+        painter.drawPixmap(self.target_rect, pix)
+
+    def draw_virtual_overlay(self, painter, target_rect):
+        """仮想ソース領域をオーバーレイ表示（crop/scale/temporal 対応）"""
+        cfg = self.crop_overlay_config
+        mode = getattr(self, 'virtual_overlay_mode', 'fill')
+        if not cfg or mode == 'none':
+            return
+        vtype = cfg.get('virtual_type', '')
+        if vtype == 'crop':
+            self._draw_crop_overlay(painter, target_rect, cfg, mode)
+        elif vtype == 'scale':
+            self._draw_scale_overlay(painter, target_rect, cfg, mode)
+        elif vtype == 'temporal':
+            self._draw_temporal_overlay(painter, target_rect, cfg, mode)
+
+    def _draw_crop_overlay(self, painter, target_rect, cfg, mode):
+        """水平クロップ領域を縦ストライプで表示"""
+        n = cfg['num_sources']
+        names = cfg.get('source_names', [str(i) for i in range(n)])
+        W = self.pix_width
+        step = W / n
+        overlap = step * 0.15
+        colors = [(220, 80, 80), (80, 180, 80), (80, 120, 220), (200, 160, 40)]
+        tx, ty = target_rect.x(), target_rect.y()
+        sw, sh = self.scaled_width, self.scaled_height
+
+        for i in range(n):
+            x0 = max(0.0, step * i - overlap)
+            x1 = min(float(W), step * (i + 1) + overlap)
+            dx0 = int(tx + x0 / W * sw)
+            dx1 = int(tx + x1 / W * sw)
+            r, g, b = colors[i % len(colors)]
+
+            if mode == 'fill':
+                painter.fillRect(dx0, ty, dx1 - dx0, sh, QColor(r, g, b, 40))
+            painter.setPen(QPen(QColor(r, g, b, 200), 2))
+            painter.drawRect(dx0, ty, dx1 - dx0, sh)
+            painter.setPen(QPen(QColor(r, g, b), 2))
+            painter.setFont(QFont("Arial", 10, QFont.Bold))
+            painter.drawText(dx0 + 4, ty + 18, names[i] if i < len(names) else str(i))
+
+    def _draw_scale_overlay(self, painter, target_rect, cfg, mode):
+        """スケールピラミッドの中央クロップ領域を同心矩形で表示"""
+        n = cfg['num_sources']
+        names = cfg.get('source_names', [str(i) for i in range(n)])
+        colors = [(220, 80, 80), (80, 180, 80), (80, 120, 220), (200, 160, 40)]
+        tx, ty = target_rect.x(), target_rect.y()
+        sw, sh = self.scaled_width, self.scaled_height
+
+        scale = 1.0
+        for i in range(n):
+            cw = int(sw * scale)
+            ch = int(sh * scale)
+            rx = tx + (sw - cw) // 2
+            ry = ty + (sh - ch) // 2
+            r, g, b = colors[i % len(colors)]
+
+            if mode == 'fill':
+                painter.fillRect(rx, ry, cw, ch, QColor(r, g, b, 35))
+            painter.setPen(QPen(QColor(r, g, b, 200), 2))
+            painter.drawRect(rx, ry, cw, ch)
+            painter.setPen(QPen(QColor(r, g, b), 2))
+            painter.setFont(QFont("Arial", 10, QFont.Bold))
+            label = names[i] if i < len(names) else str(i)
+            painter.drawText(rx + 4, ry + 18, label)
+            scale *= 0.55
+
+    def _draw_temporal_overlay(self, painter, target_rect, cfg, mode):
+        """時系列フレームを実際のサムネイルでキャンバス上部に表示"""
+        n = cfg['num_sources']
+        temporal_interval = cfg.get('temporal_interval', 10)
+        names = cfg.get('source_names', ['t+0'] + [f't-{i * temporal_interval}' for i in range(1, n)])
+        colors = [(220, 80, 80), (80, 180, 80), (80, 120, 220), (200, 160, 40)]
+        tx, ty = target_rect.x(), target_rect.y()
+        sw, sh = self.scaled_width, self.scaled_height
+
+        label_h = 18
+        thumb_h = max(60, sh // 4)
+        thumb_w = sw // n
+
+        # メインウィンドウから画像リストと現在インデックスを取得
+        mw = getattr(self, 'main_window', None)
+        images = getattr(mw, 'images', []) if mw else []
+        current_idx = getattr(mw, 'current_index', 0) if mw else 0
+
+        for i in range(n):
+            bx = tx + i * thumb_w
+            bw = thumb_w if i < n - 1 else sw - i * thumb_w
+            r, g, b = colors[i % len(colors)]
+
+            # 実フレームインデックス（temporal_intervalフレームずつさかのぼる）
+            frame_idx = max(0, current_idx - i * temporal_interval)
+
+            # 黒半透明の背景
+            painter.fillRect(bx, ty, bw, thumb_h + label_h, QColor(0, 0, 0, 180))
+
+            # サムネイル画像（キャッシュ付き）
+            if images and frame_idx < len(images):
+                img_path = images[frame_idx]
+                cache_key = (img_path, bw, thumb_h)
+                if cache_key not in self._temporal_thumb_cache:
+                    pix = QPixmap(img_path)
+                    self._temporal_thumb_cache[cache_key] = (
+                        pix.scaled(bw, thumb_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                        if not pix.isNull() else None
+                    )
+                    # キャッシュ上限（メモリ節約）
+                    if len(self._temporal_thumb_cache) > 120:
+                        oldest = next(iter(self._temporal_thumb_cache))
+                        del self._temporal_thumb_cache[oldest]
+                thumb = self._temporal_thumb_cache.get(cache_key)
+                if thumb:
+                    ox = bx + (bw - thumb.width()) // 2
+                    painter.drawPixmap(ox, ty, thumb)
+
+            # カラー枠線
+            painter.setPen(QPen(QColor(r, g, b, 220), 2))
+            painter.drawRect(bx, ty, bw, thumb_h)
+
+            # ラベル帯（サムネイル下）
+            painter.fillRect(bx, ty + thumb_h, bw, label_h, QColor(r, g, b, 210))
+            painter.setPen(QPen(Qt.white, 1))
+            painter.setFont(QFont("Arial", 9, QFont.Bold))
+            label = names[i] if i < len(names) else str(i)
+            painter.drawText(QRect(bx, ty + thumb_h, bw, label_h), Qt.AlignCenter, label)
 
     def draw_gradcam_overlay(self, painter, target_rect):
         """CAMヒートマップオーバーレイを描画"""
@@ -3765,6 +3901,12 @@ class ImageAnnotationTool(QMainWindow):
             QColor(123, 104, 238),  # Medium Slate Blue
         ]
 
+        # 仮想ソースオーバーレイモード
+        self._virtual_overlay_mode = 'fill'
+        self._virtual_source_config = None
+        self._multi_source_config = None
+        self._temporal_interval = 10  # デフォルト時間差（フレーム数）
+
         # YOLO関連の初期化を追加
         self.yolo_model = None  # YOLOモデルのインスタンス
         self.yolo_confidence_threshold = 0.6  
@@ -3867,6 +4009,19 @@ class ImageAnnotationTool(QMainWindow):
             combined_button.setStyleSheet("padding: 2px 8px;")
             combined_button.clicked.connect(self._show_combined_view_dialog)
             variant_layout.addWidget(combined_button)
+        # 仮想ソースオーバーレイ表示モード選択（常時表示・起動時はグレーアウト）
+        init_overlay_combo = QComboBox()
+        init_overlay_combo.setToolTip(get_text('tip_virtual_overlay'))
+        init_overlay_combo.addItem(get_text('opt_virtual_overlay_none'), 'none')
+        init_overlay_combo.addItem(get_text('opt_virtual_overlay_crop'), 'crop')
+        init_overlay_combo.addItem(get_text('opt_virtual_overlay_scale'), 'scale')
+        init_overlay_combo.addItem(get_text('opt_virtual_overlay_temporal'), 'temporal')
+        init_overlay_combo.setCurrentIndex(0)
+        init_overlay_combo.currentIndexChanged.connect(
+            lambda i, cb=init_overlay_combo: self._on_virtual_source_type_changed(cb.itemData(i))
+        )
+        variant_layout.addWidget(init_overlay_combo)
+        self._virtual_overlay_combo = init_overlay_combo
         toolbar.addWidget(self.variant_box)
 
         # 左側にスペーサーを追加して右寄せ
@@ -4485,10 +4640,54 @@ class ImageAnnotationTool(QMainWindow):
         image_and_slider_layout.setContentsMargins(0, 0, 0, 0)
         image_and_slider_layout.setSpacing(2)
 
+        # 画像列（解像度スライダー＋画像ビュー）
+        image_column = QVBoxLayout()
+        image_column.setContentsMargins(0, 0, 0, 0)
+        image_column.setSpacing(2)
+
+        # 解像度スライダー（画像の真上・画像と同幅）
+        resolution_row = QHBoxLayout()
+        resolution_row.setContentsMargins(0, 1, 0, 1)
+        resolution_row.setSpacing(4)
+
+        self.image_size_label = QLabel("---")
+        self.image_size_label.setFixedWidth(110)
+        self.image_size_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.image_size_label.setStyleSheet("color: #666; font-size: 14px;")
+        resolution_row.addWidget(self.image_size_label)
+
+        resolution_label = QLabel(get_text('label_resolution_scale'))
+        resolution_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        resolution_row.addWidget(resolution_label)
+
+        self.resolution_value_label = QLabel("100%")
+        self.resolution_value_label.setFixedWidth(52)
+        self.resolution_value_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        resolution_row.addWidget(self.resolution_value_label)
+
+        resolution_row.addStretch(1)  # 左パディング
+
+        self.resolution_slider = QSlider(Qt.Horizontal)
+        self.resolution_slider.setMinimum(10)
+        self.resolution_slider.setMaximum(100)
+        self.resolution_slider.setValue(100)
+        self.resolution_slider.setTickPosition(QSlider.TicksBelow)
+        self.resolution_slider.setTickInterval(10)
+        self.resolution_slider.setSingleStep(5)
+        self.resolution_slider.setToolTip(get_text('tooltip_resolution_scale'))
+        self.resolution_slider.valueChanged.connect(self._on_resolution_scale_changed)
+        resolution_row.addWidget(self.resolution_slider, 3)  # スライダー幅を縮小
+
+        resolution_row.addStretch(1)  # 右パディング
+
+        image_column.addLayout(resolution_row)
+
         self.main_image_view = ImageLabel(main_window=self)
         self.main_image_view.setMinimumSize(800, 600)
         self.main_image_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        image_and_slider_layout.addWidget(self.main_image_view, 1)  # ストレッチファクター1で拡張
+        image_column.addWidget(self.main_image_view, 1)
+
+        image_and_slider_layout.addLayout(image_column, 1)
 
         # キャンバスサイズ調整用の縦スライダー（画像の右側）
         zoom_slider_container = QVBoxLayout()
@@ -4499,6 +4698,8 @@ class ImageAnnotationTool(QMainWindow):
         zoom_label.setAlignment(Qt.AlignCenter)
         zoom_slider_container.addWidget(zoom_label)
 
+        zoom_slider_container.addStretch(1)  # 上パディング（スライダーを中央75%に）
+
         self.canvas_zoom_slider = QSlider(Qt.Vertical)
         self.canvas_zoom_slider.setMinimum(10)   # zoom_factor 1.0
         self.canvas_zoom_slider.setMaximum(50)   # zoom_factor 5.0
@@ -4508,7 +4709,9 @@ class ImageAnnotationTool(QMainWindow):
         self.canvas_zoom_slider.setFixedWidth(30)
         self.canvas_zoom_slider.setToolTip(get_text('canvas_zoom_tooltip'))
         self.canvas_zoom_slider.valueChanged.connect(self._on_canvas_zoom_changed)
-        zoom_slider_container.addWidget(self.canvas_zoom_slider)
+        zoom_slider_container.addWidget(self.canvas_zoom_slider, 6)  # 75% 高さ
+
+        zoom_slider_container.addStretch(1)  # 下パディング
 
         image_and_slider_layout.addLayout(zoom_slider_container)
 
@@ -6832,7 +7035,7 @@ class ImageAnnotationTool(QMainWindow):
         self.add_model_button.setEnabled(len(self.extra_model_slots) < 3)
         self.remove_model_button.setEnabled(len(self.extra_model_slots) > 0)
 
-    def _run_extra_model_inference_for_current(self):
+    def _run_extra_model_inference_for_current(self, force_update=False, downscale_factor=1.0):
         """現在の画像に対して追加モデルの推論を実行する（結果がない場合のみ）"""
         if not self.images or not self.extra_model_slots:
             return
@@ -6845,8 +7048,8 @@ class ImageAnnotationTool(QMainWindow):
             # チェックボックスが有効でない（モデル未読込）ならスキップ
             if slot['model'] is None:
                 continue
-            # すでに結果があればスキップ
-            if current_index in slot['inference_results']:
+            # すでに結果があればスキップ（force_updateの場合はスキップしない）
+            if not force_update and current_index in slot['inference_results']:
                 continue
 
             extra_model_type = slot['method_combo'].currentText()
@@ -6865,7 +7068,8 @@ class ImageAnnotationTool(QMainWindow):
                     # 仮想ソース推論
                     device = next(slot['model'].parameters()).device
                     results = self._run_extra_virtual_source_inference(
-                        [current_index], slot['model'], ms_info, device
+                        [current_index], slot['model'], ms_info, device,
+                        downscale_factor=downscale_factor
                     )
                     for idx_key, result in results.items():
                         slot['inference_results'][idx_key] = result
@@ -6874,7 +7078,8 @@ class ImageAnnotationTool(QMainWindow):
                     # マルチソース推論
                     device = next(slot['model'].parameters()).device
                     results = self._run_extra_multi_source_inference(
-                        [current_index], slot['model'], ms_info, device
+                        [current_index], slot['model'], ms_info, device,
+                        downscale_factor=downscale_factor
                     )
                     for idx_key, result in results.items():
                         slot['inference_results'][idx_key] = result
@@ -6886,7 +7091,8 @@ class ImageAnnotationTool(QMainWindow):
                         method="model",
                         model_type=extra_model_type,
                         model_path=extra_model_path,
-                        force_reload=False
+                        force_reload=False,
+                        downscale_factor=downscale_factor
                     )
                     for img_path_key, result in extra_results.items():
                         try:
@@ -6903,7 +7109,7 @@ class ImageAnnotationTool(QMainWindow):
             self._update_extra_inference_points()
             self.main_image_view.update()
 
-    def _run_extra_multi_source_inference(self, target_indices, model, ms_info, device):
+    def _run_extra_multi_source_inference(self, target_indices, model, ms_info, device, downscale_factor=1.0):
         """追加スロット用マルチソース推論
 
         Args:
@@ -6911,6 +7117,7 @@ class ImageAnnotationTool(QMainWindow):
             model: 読み込み済みマルチソースモデル
             ms_info: detect_multi_source_from_checkpoint() の返値
             device: torch.device
+            downscale_factor: ピクセレーション係数
 
         Returns:
             dict: {index: {angle, throttle, x, y, [attention_weights]}}
@@ -6948,6 +7155,11 @@ class ImageAnnotationTool(QMainWindow):
                         img = Image.open(path).convert('RGB')
                         if first_img_size is None:
                             first_img_size = img.size
+                        if downscale_factor < 1.0:
+                            W2, H2 = img.size
+                            pw = max(1, int(W2 * downscale_factor))
+                            ph = max(1, int(H2 * downscale_factor))
+                            img = img.resize((pw, ph), Image.NEAREST).resize((W2, H2), Image.NEAREST)
                         tensors.append(transform(img))
 
                     stacked = torch.cat(tensors, dim=0).unsqueeze(0).to(device)
@@ -6980,12 +7192,13 @@ class ImageAnnotationTool(QMainWindow):
 
         return results
 
-    def _run_extra_virtual_source_inference(self, target_indices, model, ms_info, device):
+    def _run_extra_virtual_source_inference(self, target_indices, model, ms_info, device, downscale_factor=1.0):
         """追加スロット用仮想ソース推論 (crop/scale/temporal)"""
         virtual_type = ms_info.get('virtual_source_type')
         num_sources = ms_info['num_sources']
+        temporal_interval = ms_info.get('temporal_interval', 10)
         source_names = (ms_info.get('selected_sources') or
-                        VirtualSourceDataset.source_names(virtual_type, num_sources))
+                        VirtualSourceDataset.source_names(virtual_type, num_sources, temporal_interval))
 
         transform = model.get_preprocess()
         results = {}
@@ -7020,10 +7233,20 @@ class ImageAnnotationTool(QMainWindow):
                     elif virtual_type == 'temporal':
                         source_imgs = []
                         for k in range(num_sources):
-                            prev_idx = max(0, idx - k)
+                            prev_idx = max(0, idx - k * temporal_interval)
                             source_imgs.append(Image.open(self.images[prev_idx]).convert('RGB'))
                     else:
                         source_imgs = [img] * num_sources
+
+                    # 解像度ダウンスケール（ピクセレーション）を各ソースに適用
+                    if downscale_factor < 1.0:
+                        pixelated = []
+                        for s in source_imgs:
+                            sw2, sh2 = s.size
+                            pw = max(1, int(sw2 * downscale_factor))
+                            ph = max(1, int(sh2 * downscale_factor))
+                            pixelated.append(s.resize((pw, ph), Image.NEAREST).resize((sw2, sh2), Image.NEAREST))
+                        source_imgs = pixelated
 
                     tensors = [transform(s) for s in source_imgs]
                     stacked = torch.cat(tensors, dim=0).unsqueeze(0).to(device)
@@ -7398,6 +7621,98 @@ class ImageAnnotationTool(QMainWindow):
             combined_button.setStyleSheet("padding: 2px 8px;")
             combined_button.clicked.connect(self._show_combined_view_dialog)
             variant_layout.addWidget(combined_button)
+
+        # 仮想ソースオーバーレイ表示モード選択（常時表示・仮想ソース未ロード時はグレーアウト）
+        overlay_combo = QComboBox()
+        overlay_combo.setToolTip(get_text('tip_virtual_overlay'))
+        overlay_combo.addItem(get_text('opt_virtual_overlay_none'), 'none')
+        overlay_combo.addItem(get_text('opt_virtual_overlay_crop'), 'crop')
+        overlay_combo.addItem(get_text('opt_virtual_overlay_scale'), 'scale')
+        overlay_combo.addItem(get_text('opt_virtual_overlay_temporal'), 'temporal')
+        current_type = getattr(self, '_virtual_overlay_type', 'none')
+        for idx in range(overlay_combo.count()):
+            if overlay_combo.itemData(idx) == current_type:
+                overlay_combo.setCurrentIndex(idx)
+                break
+        overlay_combo.currentIndexChanged.connect(
+            lambda i, cb=overlay_combo: self._on_virtual_source_type_changed(cb.itemData(i))
+        )
+        variant_layout.addWidget(overlay_combo)
+        self._virtual_overlay_combo = overlay_combo
+
+        # 時間差インターバルスピナー（temporalのときのみ表示）
+        overlay_interval_spin = QSpinBox()
+        overlay_interval_spin.setRange(1, 300)
+        overlay_interval_spin.setValue(getattr(self, '_temporal_interval', 10))
+        overlay_interval_spin.setSuffix('f')
+        overlay_interval_spin.setFixedWidth(68)
+        overlay_interval_spin.setToolTip(get_text('label_temporal_interval'))
+        overlay_interval_spin.setVisible(current_type == 'temporal')
+        overlay_interval_spin.valueChanged.connect(self._on_temporal_interval_changed)
+        variant_layout.addWidget(overlay_interval_spin)
+        self._overlay_interval_spin = overlay_interval_spin
+
+        def _sync_interval_spin_visibility(idx, cb=overlay_combo):
+            is_temporal = cb.itemData(idx) == 'temporal'
+            overlay_interval_spin.setVisible(is_temporal)
+        overlay_combo.currentIndexChanged.connect(_sync_interval_spin_visibility)
+
+    def _on_temporal_interval_changed(self, value: int):
+        """オーバーレイの時間差インターバルが変更されたときの処理"""
+        self._temporal_interval = value
+        # crop_overlay_config が temporal の場合は再生成して再描画
+        cfg = getattr(self.main_image_view, 'crop_overlay_config', None)
+        if cfg and cfg.get('virtual_type') == 'temporal':
+            from model_catalog import VirtualSourceDataset
+            n = cfg['num_sources']
+            names = VirtualSourceDataset.source_names('temporal', n, value)
+            cfg['temporal_interval'] = value
+            cfg['source_names'] = names
+        self.main_image_view._temporal_thumb_cache.clear()
+        self.main_image_view.update()
+
+    # 仮想ソースタイプごとのツールチップ（学習ダイアログとの対応を説明）
+    _VIRTUAL_TYPE_TIPS = {
+        'none': None,
+        'crop': '画像を水平方向に {n} 分割して複数ソースを生成します。\n学習ダイアログ → 仮想ソース生成 → 空間クロップ を選ぶと\nこのプレビューと同じ入力形式で学習できます。',
+        'scale': '中央部を段階的にズームして {n} 段階のソースを生成します。\n学習ダイアログ → 仮想ソース生成 → スケールピラミッド を選ぶと\nこのプレビューと同じ入力形式で学習できます。',
+        'temporal': '現在フレームと過去 {n} フレームを重ねて入力します。\n学習ダイアログ → 仮想ソース生成 → 時間差スタック を選ぶと\nこのプレビューと同じ入力形式で学習できます。',
+    }
+
+    def _on_virtual_source_type_changed(self, type_str: str):
+        """仮想ソース可視化タイプが変更されたときの処理"""
+        self._virtual_overlay_type = type_str
+
+        if type_str == 'none':
+            self.main_image_view.crop_overlay_config = None
+            tip = get_text('tip_virtual_overlay')
+        else:
+            # ロード済みモデルのconfigと一致する場合はそちらを優先
+            vs_config = getattr(self, '_virtual_source_config', None)
+            if vs_config and vs_config.get('virtual_type') == type_str:
+                config = vs_config
+            else:
+                from model_catalog import VirtualSourceDataset
+                n = 3
+                t_interval = getattr(self, '_temporal_interval', 10)
+                names = VirtualSourceDataset.source_names(type_str, n, t_interval)
+                config = {
+                    'virtual_type': type_str,
+                    'num_sources': n,
+                    'source_names': names,
+                    'temporal_interval': t_interval,
+                }
+            self.main_image_view.crop_overlay_config = config
+            self.main_image_view.virtual_overlay_mode = 'fill'
+            n_actual = config['num_sources']
+            tip_template = self._VIRTUAL_TYPE_TIPS.get(type_str, '')
+            tip = tip_template.format(n=n_actual) if tip_template else get_text('tip_virtual_overlay')
+
+        # ドロップダウンのツールチップを動的更新
+        if hasattr(self, '_virtual_overlay_combo'):
+            self._virtual_overlay_combo.setToolTip(tip)
+
+        self.main_image_view.update()
 
     def _show_combined_view_dialog(self):
         """結合表示の設定ダイアログを表示"""
@@ -15345,6 +15660,49 @@ class ImageAnnotationTool(QMainWindow):
         self.main_image_view.zoom_factor = zoom
         self.main_image_view.update()
 
+    def _on_resolution_scale_changed(self, value):
+        """解像度スライダーの値が変更されたときの処理"""
+        self.main_image_view.resolution_scale = value / 100.0
+        self.resolution_value_label.setText(f"{value}%")
+        self._update_resolution_size_label()
+        self.main_image_view.update()
+
+        # 推論再実行（デバウンス: スライダー操作が止まってから300ms後に実行）
+        if not hasattr(self, '_resolution_inference_timer'):
+            from PyQt5.QtCore import QTimer
+            self._resolution_inference_timer = QTimer(self)
+            self._resolution_inference_timer.setSingleShot(True)
+            self._resolution_inference_timer.timeout.connect(self._run_inference_for_resolution)
+        self._resolution_inference_timer.start(300)
+
+    def _run_inference_for_resolution(self):
+        """解像度変更後の推論再実行（モデルが読み込まれている場合のみ）"""
+        if not self.images or not getattr(self, 'model', None):
+            return
+        if not getattr(self, 'inference_checkbox', None) or not self.inference_checkbox.isChecked():
+            return
+        res_scale = getattr(self.main_image_view, 'resolution_scale', 1.0)
+        self.run_inference_check(all_images=False)
+        # 追加モデルも解像度を反映して強制再推論
+        if self.extra_model_slots:
+            self._run_extra_model_inference_for_current(force_update=True, downscale_factor=res_scale)
+            self.update_inference_display()
+            self.main_image_view.update()
+
+    def _update_resolution_size_label(self):
+        """解像度スライダー左の画像サイズ表示を更新"""
+        if not hasattr(self, 'image_size_label'):
+            return
+        pix = self.main_image_view.pixmap() if hasattr(self, 'main_image_view') else None
+        if pix is None or pix.isNull():
+            self.image_size_label.setText("---")
+            return
+        pw, ph = pix.width(), pix.height()
+        val = self.resolution_slider.value() if hasattr(self, 'resolution_slider') else 100
+        sw = max(1, int(pw * val / 100))
+        sh = max(1, int(ph * val / 100))
+        self.image_size_label.setText(f"{sw}×{sh}px")
+
     def slider_changed(self, value):
         """スライダーの値が変更されたときの処理"""
         if self.images and value != self.current_index:
@@ -15704,7 +16062,8 @@ class ImageAnnotationTool(QMainWindow):
                     method="model",
                     model_type=model_type,
                     model_path=model_path,
-                    force_reload=force_reload
+                    force_reload=force_reload,
+                    downscale_factor=getattr(self.main_image_view, 'resolution_scale', 1.0)
                 )
             else:
                 QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_inference_method_not_supported'))
@@ -15936,6 +16295,7 @@ class ImageAnnotationTool(QMainWindow):
         virtual_type = config['virtual_type']
         num_sources = config['num_sources']
         source_names = config['source_names']
+        temporal_interval = config.get('temporal_interval', 10)
 
         model = getattr(self, 'model', None)
         if model is None:
@@ -15977,10 +16337,21 @@ class ImageAnnotationTool(QMainWindow):
                     elif virtual_type == 'temporal':
                         source_imgs = []
                         for k in range(num_sources):
-                            prev_idx = max(0, idx - k)
+                            prev_idx = max(0, idx - k * temporal_interval)
                             source_imgs.append(Image.open(self.images[prev_idx]).convert('RGB'))
                     else:
                         source_imgs = [img] * num_sources
+
+                    # 解像度ダウンスケール（ピクセレーション）を各ソースに適用
+                    res_scale = getattr(self.main_image_view, 'resolution_scale', 1.0)
+                    if res_scale < 1.0:
+                        pixelated = []
+                        for s in source_imgs:
+                            sw2, sh2 = s.size
+                            pw = max(1, int(sw2 * res_scale))
+                            ph = max(1, int(sh2 * res_scale))
+                            pixelated.append(s.resize((pw, ph), Image.NEAREST).resize((sw2, sh2), Image.NEAREST))
+                        source_imgs = pixelated
 
                     tensors = [transform(s) for s in source_imgs]
                     stacked = torch.cat(tensors, dim=0).unsqueeze(0).to(device)
@@ -17487,13 +17858,26 @@ class ImageAnnotationTool(QMainWindow):
                 load_model_weights(self.model, model_path, device)
                 self.model.eval()
 
+                _t_interval = ms_info.get('temporal_interval', 10)
                 src_names = (ms_info.get('selected_sources') or
-                             VirtualSourceDataset.source_names(virtual_type, ms_info['num_sources']))
+                             VirtualSourceDataset.source_names(virtual_type, ms_info['num_sources'], _t_interval))
                 self._virtual_source_config = {
                     'virtual_type': virtual_type,
                     'num_sources': ms_info['num_sources'],
                     'source_names': src_names,
+                    'temporal_interval': _t_interval,
                 }
+                self.main_image_view.crop_overlay_config = self._virtual_source_config
+                self.main_image_view.virtual_overlay_mode = 'fill'
+                # ドロップダウンをモデルのタイプに自動同期
+                self._virtual_overlay_type = virtual_type
+                if hasattr(self, '_virtual_overlay_combo'):
+                    for _i in range(self._virtual_overlay_combo.count()):
+                        if self._virtual_overlay_combo.itemData(_i) == virtual_type:
+                            self._virtual_overlay_combo.blockSignals(True)
+                            self._virtual_overlay_combo.setCurrentIndex(_i)
+                            self._virtual_overlay_combo.blockSignals(False)
+                            break
                 self._multi_source_config = None
                 inference_results = self._run_virtual_source_inference(
                     [self.current_index], model_path, force_reload=True
@@ -17520,6 +17904,7 @@ class ImageAnnotationTool(QMainWindow):
                     'base_model_name': base_model_name,
                 }
                 self._virtual_source_config = None
+                self.main_image_view.crop_overlay_config = None
                 inference_results = self._run_multi_source_inference(
                     [self.current_index], model_path, force_reload=True
                 )
@@ -17531,6 +17916,7 @@ class ImageAnnotationTool(QMainWindow):
 
                 self._multi_source_config = None
                 self._virtual_source_config = None
+                self.main_image_view.crop_overlay_config = None
                 inference_results = batch_inference(
                     [current_img_path],
                     method="model",
@@ -17687,6 +18073,7 @@ class ImageAnnotationTool(QMainWindow):
             
             # 推論表示を更新
             self.update_inference_display()
+            self.update_variant_buttons()
             self.update_ui()
             
             # ダークモードの状態を再適用（モデル読み込み後のスタイルリセット対策）
@@ -18326,6 +18713,10 @@ class ImageAnnotationTool(QMainWindow):
         if not self.images or self.current_index >= len(self.images):
             return
 
+        # 時系列サムネイルキャッシュをクリア（フレームが変わると前後フレームも変わる）
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view._temporal_thumb_cache.clear()
+
         current_image_path = self.images[self.current_index]
 
         try:
@@ -18348,6 +18739,7 @@ class ImageAnnotationTool(QMainWindow):
             # main_image_viewに画像を設定
             if hasattr(self, 'main_image_view'):
                 self.main_image_view.setPixmap(pixmap)
+                self._update_resolution_size_label()
                 
                 # バウンディングボックスアノテーションがあれば表示用データを設定
                 if hasattr(self, 'bbox_annotations') and self.current_index in self.bbox_annotations:
@@ -20508,6 +20900,19 @@ class ImageAnnotationTool(QMainWindow):
         virtual_nsrc_row.addWidget(virtual_nsrc_label)
         virtual_layout.addWidget(virtual_nsrc_row_widget)
 
+        # 時間差インターバル行（temporalのみ表示）
+        temporal_interval_row_widget = QWidget()
+        temporal_interval_row = QHBoxLayout(temporal_interval_row_widget)
+        temporal_interval_row.setContentsMargins(0, 0, 0, 0)
+        temporal_interval_row.addWidget(QLabel(get_text('label_temporal_interval')))
+        temporal_interval_spin = QSpinBox()
+        temporal_interval_spin.setRange(1, 300)
+        temporal_interval_spin.setValue(getattr(self, '_temporal_interval', 10))
+        temporal_interval_spin.setSuffix(' frames')
+        temporal_interval_row.addWidget(temporal_interval_spin)
+        temporal_interval_row.addStretch()
+        virtual_layout.addWidget(temporal_interval_row_widget)
+
         virtual_note = QLabel(get_text('label_virtual_source_note'))
         virtual_note.setStyleSheet("color: #1565C0; font-style: italic;")
         virtual_note.setWordWrap(True)
@@ -20517,20 +20922,43 @@ class ImageAnnotationTool(QMainWindow):
             from model_catalog import VirtualSourceDataset
             vtype = virtual_type_combo.currentData()
             n = virtual_nsrc_spin.value()
+            interval = temporal_interval_spin.value()
             if vtype:
-                names = VirtualSourceDataset.source_names(vtype, n)
+                names = VirtualSourceDataset.source_names(vtype, n, interval)
                 virtual_nsrc_label.setText(' / '.join(names))
             else:
                 virtual_nsrc_label.setText('')
             virtual_nsrc_row_widget.setVisible(vtype is not None)
+            temporal_interval_row_widget.setVisible(vtype == 'temporal')
 
         virtual_type_combo.currentIndexChanged.connect(_update_virtual_nsrc_label)
         virtual_nsrc_spin.valueChanged.connect(_update_virtual_nsrc_label)
+        temporal_interval_spin.valueChanged.connect(_update_virtual_nsrc_label)
         _update_virtual_nsrc_label()
 
         virtual_group.setLayout(virtual_layout)
         left_column.addWidget(virtual_group)
         update_fusion_visibility()  # 初期表示時に正しい可視状態を設定
+
+        # 解像度モードグループ（メインスライダーが100%未満のときのみ表示）
+        res_val = getattr(self, 'resolution_slider', None)
+        res_val = res_val.value() if res_val else 100
+        resolution_mode_group = QGroupBox(get_text('label_resolution_mode_group'))
+        resolution_mode_layout = QVBoxLayout()
+
+        res_info_label = QLabel(get_text('label_resolution_mode_current', res_val))
+        res_info_label.setStyleSheet("color: #555; font-size: 11px;")
+        resolution_mode_layout.addWidget(res_info_label)
+
+        pixelate_radio = QRadioButton(get_text('opt_resolution_pixelate'))
+        pixelate_radio.setChecked(True)
+        resize_radio = QRadioButton(get_text('opt_resolution_resize'))
+        resolution_mode_layout.addWidget(pixelate_radio)
+        resolution_mode_layout.addWidget(resize_radio)
+
+        resolution_mode_group.setLayout(resolution_mode_layout)
+        resolution_mode_group.setVisible(res_val < 100)
+        left_column.addWidget(resolution_mode_group)
 
         # 学習パラメータグループ
         training_params_group = QGroupBox(get_text('label_training_params'))
@@ -20955,25 +21383,231 @@ class ImageAnnotationTool(QMainWindow):
         
         aug_options_layout.addLayout(erase_details_layout)
         
+        # =====================================================================
+        # ドメインランダマイゼーション グループ (A-D)
+        # =====================================================================
+        dr_group = QGroupBox(get_text('group_domain_randomization'))
+        dr_layout = QVBoxLayout()
+
+        def _dr_row(check_key, checked_default, *param_widgets):
+            row = QHBoxLayout()
+            cb = QCheckBox(get_text(check_key))
+            cb.setChecked(checked_default)
+            row.addWidget(cb)
+            for w in param_widgets:
+                row.addWidget(w)
+            row.addStretch()
+            dr_layout.addLayout(row)
+            return cb
+
+        # A: 色相シフト
+        aug_hue_range_label = QLabel(get_text('label_hue_range'))
+        aug_hue_range = QDoubleSpinBox()
+        aug_hue_range.setRange(0.01, 0.5)
+        aug_hue_range.setSingleStep(0.01)
+        aug_hue_range.setValue(0.1)
+        aug_hue_prob_label = QLabel(get_text('label_hue_prob'))
+        aug_hue_prob = QDoubleSpinBox()
+        aug_hue_prob.setRange(0.05, 1.0)
+        aug_hue_prob.setSingleStep(0.05)
+        aug_hue_prob.setValue(0.5)
+        aug_hue_checkbox = _dr_row('chk_aug_hue', False, aug_hue_range_label, aug_hue_range,
+                                   aug_hue_prob_label, aug_hue_prob)
+
+        # A: グレースケール化
+        aug_grayscale_prob_label = QLabel(get_text('label_grayscale_prob'))
+        aug_grayscale_prob = QDoubleSpinBox()
+        aug_grayscale_prob.setRange(0.01, 1.0)
+        aug_grayscale_prob.setSingleStep(0.05)
+        aug_grayscale_prob.setValue(0.1)
+        aug_grayscale_checkbox = _dr_row('chk_aug_grayscale', False, aug_grayscale_prob_label, aug_grayscale_prob)
+
+        # A: ガウシアンノイズ
+        aug_noise_std_label = QLabel(get_text('label_noise_std'))
+        aug_noise_std = QDoubleSpinBox()
+        aug_noise_std.setRange(0.005, 0.15)
+        aug_noise_std.setSingleStep(0.005)
+        aug_noise_std.setValue(0.03)
+        aug_noise_prob_label = QLabel(get_text('label_noise_prob'))
+        aug_noise_prob = QDoubleSpinBox()
+        aug_noise_prob.setRange(0.05, 1.0)
+        aug_noise_prob.setSingleStep(0.05)
+        aug_noise_prob.setValue(0.5)
+        aug_noise_checkbox = _dr_row('chk_aug_noise', False, aug_noise_std_label, aug_noise_std,
+                                     aug_noise_prob_label, aug_noise_prob)
+
+        # B: ガウシアンブラー
+        aug_blur_kernel_label = QLabel(get_text('label_blur_kernel'))
+        aug_blur_kernel = QSpinBox()
+        aug_blur_kernel.setRange(3, 21)
+        aug_blur_kernel.setSingleStep(2)
+        aug_blur_kernel.setValue(5)
+        aug_blur_prob_label = QLabel(get_text('label_blur_prob'))
+        aug_blur_prob = QDoubleSpinBox()
+        aug_blur_prob.setRange(0.05, 1.0)
+        aug_blur_prob.setSingleStep(0.05)
+        aug_blur_prob.setValue(0.5)
+        aug_blur_checkbox = _dr_row('chk_aug_blur', False, aug_blur_kernel_label, aug_blur_kernel,
+                                    aug_blur_prob_label, aug_blur_prob)
+
+        # B: モーションブラー
+        aug_motion_kernel_label = QLabel(get_text('label_motion_kernel'))
+        aug_motion_kernel = QSpinBox()
+        aug_motion_kernel.setRange(3, 25)
+        aug_motion_kernel.setSingleStep(2)
+        aug_motion_kernel.setValue(9)
+        aug_motion_prob_label = QLabel(get_text('label_motion_prob'))
+        aug_motion_prob = QDoubleSpinBox()
+        aug_motion_prob.setRange(0.05, 1.0)
+        aug_motion_prob.setSingleStep(0.05)
+        aug_motion_prob.setValue(0.5)
+        aug_motion_blur_checkbox = _dr_row('chk_aug_motion_blur', False, aug_motion_kernel_label, aug_motion_kernel,
+                                           aug_motion_prob_label, aug_motion_prob)
+
+        # D: 霧・霞
+        aug_fog_intensity_label = QLabel(get_text('label_fog_intensity'))
+        aug_fog_intensity = QDoubleSpinBox()
+        aug_fog_intensity.setRange(0.05, 0.8)
+        aug_fog_intensity.setSingleStep(0.05)
+        aug_fog_intensity.setValue(0.3)
+        aug_fog_prob_label = QLabel(get_text('label_fog_prob'))
+        aug_fog_prob = QDoubleSpinBox()
+        aug_fog_prob.setRange(0.05, 1.0)
+        aug_fog_prob.setSingleStep(0.05)
+        aug_fog_prob.setValue(0.5)
+        aug_fog_checkbox = _dr_row('chk_aug_fog', False, aug_fog_intensity_label, aug_fog_intensity,
+                                   aug_fog_prob_label, aug_fog_prob)
+
+        dr_group.setLayout(dr_layout)
+        aug_options_layout.addWidget(dr_group)
+
+        # =====================================================================
+        # 強光・路面グレア グループ
+        # =====================================================================
+        sun_group = QGroupBox(get_text('group_sunlight'))
+        sun_layout = QVBoxLayout()
+
+        def _sun_row(check_key, checked_default, *param_widgets):
+            row = QHBoxLayout()
+            cb = QCheckBox(get_text(check_key))
+            cb.setChecked(checked_default)
+            row.addWidget(cb)
+            for w in param_widgets:
+                row.addWidget(w)
+            row.addStretch()
+            sun_layout.addLayout(row)
+            return cb
+
+        # サンスポット
+        aug_sunspot_intensity_label = QLabel(get_text('label_sunspot_intensity'))
+        aug_sunspot_intensity = QDoubleSpinBox()
+        aug_sunspot_intensity.setRange(0.1, 0.95)
+        aug_sunspot_intensity.setSingleStep(0.05)
+        aug_sunspot_intensity.setValue(0.55)
+        aug_sunspot_num_label = QLabel(get_text('label_sunspot_num'))
+        aug_sunspot_num = QSpinBox()
+        aug_sunspot_num.setRange(1, 8)
+        aug_sunspot_num.setValue(1)
+        aug_sunspot_prob_label = QLabel(get_text('label_sunspot_prob'))
+        aug_sunspot_prob = QDoubleSpinBox()
+        aug_sunspot_prob.setRange(0.05, 1.0)
+        aug_sunspot_prob.setSingleStep(0.05)
+        aug_sunspot_prob.setValue(0.5)
+        aug_sunspot_checkbox = _sun_row('chk_aug_sunspot', False,
+                                        aug_sunspot_intensity_label, aug_sunspot_intensity,
+                                        aug_sunspot_num_label, aug_sunspot_num,
+                                        aug_sunspot_prob_label, aug_sunspot_prob)
+
+        # ガンマ変動
+        aug_gamma_min_label = QLabel(get_text('label_gamma_min'))
+        aug_gamma_min = QDoubleSpinBox()
+        aug_gamma_min.setRange(0.3, 1.0)
+        aug_gamma_min.setSingleStep(0.05)
+        aug_gamma_min.setValue(0.5)
+        aug_gamma_max_label = QLabel(get_text('label_gamma_max'))
+        aug_gamma_max = QDoubleSpinBox()
+        aug_gamma_max.setRange(1.0, 3.0)
+        aug_gamma_max.setSingleStep(0.1)
+        aug_gamma_max.setValue(1.8)
+        aug_gamma_prob_label = QLabel(get_text('label_gamma_prob'))
+        aug_gamma_prob = QDoubleSpinBox()
+        aug_gamma_prob.setRange(0.05, 1.0)
+        aug_gamma_prob.setSingleStep(0.05)
+        aug_gamma_prob.setValue(0.5)
+        aug_gamma_checkbox = _sun_row('chk_aug_gamma', False,
+                                      aug_gamma_min_label, aug_gamma_min,
+                                      aug_gamma_max_label, aug_gamma_max,
+                                      aug_gamma_prob_label, aug_gamma_prob)
+
+        # 影コントラスト
+        aug_shadow_darkness_label = QLabel(get_text('label_shadow_darkness'))
+        aug_shadow_darkness = QDoubleSpinBox()
+        aug_shadow_darkness.setRange(0.1, 0.9)
+        aug_shadow_darkness.setSingleStep(0.05)
+        aug_shadow_darkness.setValue(0.5)
+        aug_shadow_prob_label = QLabel(get_text('label_shadow_prob'))
+        aug_shadow_prob = QDoubleSpinBox()
+        aug_shadow_prob.setRange(0.05, 1.0)
+        aug_shadow_prob.setSingleStep(0.05)
+        aug_shadow_prob.setValue(0.5)
+        aug_shadow_checkbox = _sun_row('chk_aug_shadow', False,
+                                       aug_shadow_darkness_label, aug_shadow_darkness,
+                                       aug_shadow_prob_label, aug_shadow_prob)
+
+        sun_group.setLayout(sun_layout)
+        aug_options_layout.addWidget(sun_group)
+
         # プレビューボタン
         preview_layout = QHBoxLayout()
         preview_button = QPushButton(get_text('btn_aug_preview'))
-        preview_button.clicked.connect(lambda: self.show_augmentation_preview_dialog({
-            'enabled': aug_enable_check.isChecked(),
-            'use_flip': aug_flip_checkbox.isChecked(),
-            'flip_prob': aug_flip_proba.value(),
-            'use_color': aug_color_checkbox.isChecked(),
-            'brightness': aug_brightness.value(),
-            'contrast': aug_contrast.value(),
-            'saturation': aug_saturation.value(),
-            'use_geometry': aug_geometry_checkbox.isChecked(),
-            'rotation_degrees': aug_rotation.value(),
-            'translate_ratio': aug_translate.value(),
-            'use_erase': aug_erase_checkbox.isChecked(),
-            'erase_prob': aug_erase_proba.value(),
-            'erase_min_ratio': aug_erase_min_ratio.value(),
-            'erase_max_ratio': aug_erase_max_ratio.value()
-        }))
+        def _build_aug_params():
+            return {
+                'enabled': aug_enable_check.isChecked(),
+                'use_flip': aug_flip_checkbox.isChecked(),
+                'flip_prob': aug_flip_proba.value(),
+                'use_color': aug_color_checkbox.isChecked(),
+                'brightness': aug_brightness.value(),
+                'contrast': aug_contrast.value(),
+                'saturation': aug_saturation.value(),
+                'use_geometry': aug_geometry_checkbox.isChecked(),
+                'rotation_degrees': aug_rotation.value(),
+                'translate_ratio': aug_translate.value(),
+                'use_erase': aug_erase_checkbox.isChecked(),
+                'erase_prob': aug_erase_proba.value(),
+                'erase_min_ratio': aug_erase_min_ratio.value(),
+                'erase_max_ratio': aug_erase_max_ratio.value(),
+                # Domain randomization
+                'use_hue': aug_hue_checkbox.isChecked(),
+                'hue_range': aug_hue_range.value(),
+                'hue_prob': aug_hue_prob.value(),
+                'use_grayscale': aug_grayscale_checkbox.isChecked(),
+                'grayscale_prob': aug_grayscale_prob.value(),
+                'use_noise': aug_noise_checkbox.isChecked(),
+                'noise_std': aug_noise_std.value(),
+                'noise_prob': aug_noise_prob.value(),
+                'use_blur': aug_blur_checkbox.isChecked(),
+                'blur_kernel': aug_blur_kernel.value(),
+                'blur_prob': aug_blur_prob.value(),
+                'use_motion_blur': aug_motion_blur_checkbox.isChecked(),
+                'motion_kernel': aug_motion_kernel.value(),
+                'motion_prob': aug_motion_prob.value(),
+                'use_fog': aug_fog_checkbox.isChecked(),
+                'fog_intensity': aug_fog_intensity.value(),
+                'fog_prob': aug_fog_prob.value(),
+                # Sunlight
+                'use_sunspot': aug_sunspot_checkbox.isChecked(),
+                'sunspot_intensity': aug_sunspot_intensity.value(),
+                'sunspot_num': aug_sunspot_num.value(),
+                'sunspot_prob': aug_sunspot_prob.value(),
+                'use_gamma': aug_gamma_checkbox.isChecked(),
+                'gamma_min': aug_gamma_min.value(),
+                'gamma_max': aug_gamma_max.value(),
+                'gamma_prob': aug_gamma_prob.value(),
+                'use_shadow': aug_shadow_checkbox.isChecked(),
+                'shadow_darkness': aug_shadow_darkness.value(),
+                'shadow_prob': aug_shadow_prob.value(),
+            }
+        preview_button.clicked.connect(lambda: self.show_augmentation_preview_dialog(_build_aug_params()))
         preview_layout.addStretch()
         preview_layout.addWidget(preview_button)
         aug_options_layout.addLayout(preview_layout)
@@ -21142,22 +21776,7 @@ class ImageAnnotationTool(QMainWindow):
         exclude_downsampled = exclude_downsampled_check.isChecked()
 
         # オーグメンテーション設定の取得
-        augmentation_params = {
-            'enabled': aug_enable_check.isChecked(),
-            'use_flip': aug_flip_checkbox.isChecked(),
-            'flip_prob': aug_flip_proba.value(),
-            'use_color': aug_color_checkbox.isChecked(),
-            'brightness': aug_brightness.value(),
-            'contrast': aug_contrast.value(),
-            'saturation': aug_saturation.value(),
-            'use_geometry': aug_geometry_checkbox.isChecked(),
-            'rotation_degrees': aug_rotation.value(),
-            'translate_ratio': aug_translate.value(),
-            'use_erase': aug_erase_checkbox.isChecked(),
-            'erase_prob': aug_erase_proba.value(),
-            'erase_min_ratio': aug_erase_min_ratio.value(),
-            'erase_max_ratio': aug_erase_max_ratio.value()
-        }
+        augmentation_params = _build_aug_params()
 
         # 選択された画像ソースを取得
         selected_sources = [name for name, cb in training_source_checkboxes.items() if cb.isChecked()]
@@ -21168,6 +21787,8 @@ class ImageAnnotationTool(QMainWindow):
         # 仮想ソースモード判定
         training_virtual_type = virtual_type_combo.currentData()  # None / 'crop' / 'scale' / 'temporal'
         training_virtual_nsrc = virtual_nsrc_spin.value() if training_virtual_type else 1
+        training_temporal_interval = temporal_interval_spin.value() if training_virtual_type == 'temporal' else 10
+        training_downscale_mode = 'resize' if resize_radio.isChecked() else 'pixelate'
 
         # マルチソースモード判定と融合方法の取得
         is_virtual_source = training_virtual_type is not None and len(selected_sources) == 1
@@ -21349,7 +21970,10 @@ class ImageAnnotationTool(QMainWindow):
                 multi_source_paths=multi_source_paths if is_multi_source else None,
                 num_sources=training_num_sources,
                 fusion_method=training_fusion_method or 'concat',
-                virtual_source_type=training_virtual_type if is_virtual_source else None
+                virtual_source_type=training_virtual_type if is_virtual_source else None,
+                downscale_factor=getattr(self, 'resolution_slider', None) and self.resolution_slider.value() / 100.0 or 1.0,
+                downscale_mode=training_downscale_mode,
+                temporal_interval=training_temporal_interval
             )
 
             # 最初の画像から実際のサイズを取得
@@ -21387,11 +22011,12 @@ class ImageAnnotationTool(QMainWindow):
                 num_sources=training_num_sources,
                 fusion_method=training_fusion_method or 'concat',
                 selected_sources=(
-                    VirtualSourceDataset.source_names(training_virtual_type, training_virtual_nsrc)
+                    VirtualSourceDataset.source_names(training_virtual_type, training_virtual_nsrc, training_temporal_interval)
                     if is_virtual_source else
                     (selected_sources if is_multi_source else selected_sources)
                 ),
-                virtual_source_type=training_virtual_type if is_virtual_source else None
+                virtual_source_type=training_virtual_type if is_virtual_source else None,
+                temporal_interval=training_temporal_interval
             )
             
             progress.close()
@@ -23274,7 +23899,7 @@ class ImageAnnotationTool(QMainWindow):
             print("サンプル生成開始...")
             samples = generate_augmentation_samples(
                 current_img_path,
-                num_samples=5,  # オリジナル含め5枚表示
+                num_samples=5,
                 use_flip=aug_params['use_flip'],
                 flip_prob=aug_params['flip_prob'],
                 use_color=aug_params['use_color'],
@@ -23287,7 +23912,35 @@ class ImageAnnotationTool(QMainWindow):
                 use_erase=aug_params['use_erase'],
                 erase_prob=aug_params['erase_prob'],
                 erase_min_ratio=aug_params['erase_min_ratio'],
-                erase_max_ratio=aug_params['erase_max_ratio']
+                erase_max_ratio=aug_params['erase_max_ratio'],
+                use_hue=aug_params.get('use_hue', False),
+                hue_range=aug_params.get('hue_range', 0.1),
+                hue_prob=aug_params.get('hue_prob', 0.5),
+                use_grayscale=aug_params.get('use_grayscale', False),
+                grayscale_prob=aug_params.get('grayscale_prob', 0.1),
+                use_noise=aug_params.get('use_noise', False),
+                noise_std=aug_params.get('noise_std', 0.03),
+                noise_prob=aug_params.get('noise_prob', 0.5),
+                use_blur=aug_params.get('use_blur', False),
+                blur_kernel=aug_params.get('blur_kernel', 5),
+                blur_prob=aug_params.get('blur_prob', 0.5),
+                use_motion_blur=aug_params.get('use_motion_blur', False),
+                motion_kernel=aug_params.get('motion_kernel', 9),
+                motion_prob=aug_params.get('motion_prob', 0.5),
+                use_fog=aug_params.get('use_fog', False),
+                fog_intensity=aug_params.get('fog_intensity', 0.3),
+                fog_prob=aug_params.get('fog_prob', 0.5),
+                use_sunspot=aug_params.get('use_sunspot', False),
+                sunspot_intensity=aug_params.get('sunspot_intensity', 0.55),
+                sunspot_num=aug_params.get('sunspot_num', 1),
+                sunspot_prob=aug_params.get('sunspot_prob', 0.5),
+                use_gamma=aug_params.get('use_gamma', False),
+                gamma_min=aug_params.get('gamma_min', 0.5),
+                gamma_max=aug_params.get('gamma_max', 1.8),
+                gamma_prob=aug_params.get('gamma_prob', 0.5),
+                use_shadow=aug_params.get('use_shadow', False),
+                shadow_darkness=aug_params.get('shadow_darkness', 0.5),
+                shadow_prob=aug_params.get('shadow_prob', 0.5),
             )
             print(f"サンプル生成完了: {len(samples)}枚")
             
@@ -23310,15 +23963,29 @@ class ImageAnnotationTool(QMainWindow):
             if aug_params['use_flip']:
                 settings_text += f"・水平反転 (確率: {aug_params['flip_prob']})\n"
             if aug_params['use_color']:
-                settings_text += f"・色調整 (明るさ: ±{aug_params['brightness']}, "
-                settings_text += f"コントラスト: ±{aug_params['contrast']}, "
-                settings_text += f"彩度: ±{aug_params['saturation']})\n"
+                settings_text += f"・色調整 (明るさ: ±{aug_params['brightness']}, コントラスト: ±{aug_params['contrast']}, 彩度: ±{aug_params['saturation']})\n"
+            if aug_params.get('use_hue'):
+                settings_text += f"・色相シフト (±{aug_params.get('hue_range', 0.1)})\n"
+            if aug_params.get('use_grayscale'):
+                settings_text += f"・グレースケール化 (確率: {aug_params.get('grayscale_prob', 0.1)})\n"
             if aug_params['use_geometry']:
-                settings_text += f"・幾何変換 (回転: ±{aug_params['rotation_degrees']}度, "
-                settings_text += f"平行移動: ±{aug_params['translate_ratio']})\n"
+                settings_text += f"・幾何変換 (回転: ±{aug_params['rotation_degrees']}度, 平行移動: ±{aug_params['translate_ratio']})\n"
+            if aug_params.get('use_blur'):
+                settings_text += f"・ガウシアンブラー (kernel={aug_params.get('blur_kernel', 5)})\n"
+            if aug_params.get('use_motion_blur'):
+                settings_text += f"・モーションブラー (kernel={aug_params.get('motion_kernel', 9)})\n"
+            if aug_params.get('use_fog'):
+                settings_text += f"・霧 (強度: {aug_params.get('fog_intensity', 0.3)})\n"
             if aug_params['use_erase']:
-                settings_text += f"・ランダムイレース (確率: {aug_params['erase_prob']}, "
-                settings_text += f"範囲: {aug_params['erase_min_ratio']}～{aug_params['erase_max_ratio']})\n"
+                settings_text += f"・ランダムイレース (確率: {aug_params['erase_prob']}, 範囲: {aug_params['erase_min_ratio']}～{aug_params['erase_max_ratio']})\n"
+            if aug_params.get('use_noise'):
+                settings_text += f"・ガウシアンノイズ (std: {aug_params.get('noise_std', 0.03)})\n"
+            if aug_params.get('use_sunspot'):
+                settings_text += f"・サンスポット (強度: {aug_params.get('sunspot_intensity', 0.55)}, 数: {aug_params.get('sunspot_num', 3)})\n"
+            if aug_params.get('use_gamma'):
+                settings_text += f"・ガンマ変動 (γ {aug_params.get('gamma_min', 0.5)}～{aug_params.get('gamma_max', 1.8)})\n"
+            if aug_params.get('use_shadow'):
+                settings_text += f"・影コントラスト (暗さ: {aug_params.get('shadow_darkness', 0.5)})\n"
                 
             settings_label = QLabel(settings_text)
             settings_label.setStyleSheet("font-size: 12px;")
