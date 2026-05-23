@@ -516,8 +516,9 @@ class ImageLabel(QLabel):
         self.target_rect = QRect(self.x, self.y, self.scaled_width, self.scaled_height)
         pix = self.pixmap()
         if self.resolution_scale < 1.0:
-            small_w = max(1, int(self.pix_width * self.resolution_scale))
-            small_h = max(1, int(self.pix_height * self.resolution_scale))
+            # round()でアスペクト比誤差を最小化し、ブロック形状の歪みを抑える
+            small_h = max(1, round(self.pix_height * self.resolution_scale))
+            small_w = max(1, round(small_h * self.pix_width / self.pix_height))
             pix = pix.scaled(small_w, small_h, Qt.IgnoreAspectRatio, Qt.FastTransformation)
             pix = pix.scaled(self.scaled_width, self.scaled_height, Qt.IgnoreAspectRatio, Qt.FastTransformation)
         painter.drawPixmap(self.target_rect, pix)
@@ -20504,14 +20505,19 @@ class ImageAnnotationTool(QMainWindow):
         # 学習設定ダイアログを表示
         training_settings = QDialog(self)
         training_settings.setWindowTitle(get_text('dlg_training_settings'))
-        training_settings.setMinimumWidth(1000)  # 2カラムレイアウト用に幅を広げる
+        training_settings.setMinimumSize(1150, 500)
+        training_settings.resize(1350, 750)
+        training_settings.setSizeGripEnabled(True)
 
         settings_layout = QVBoxLayout(training_settings)
 
         # タブウィジェットを作成
         tabs = QTabWidget()
 
-        # 基本設定タブ
+        # 基本設定タブ（スクロールエリアでラップして縦に収まるように）
+        basic_scroll = QScrollArea()
+        basic_scroll.setWidgetResizable(True)
+        basic_scroll.setFrameShape(QScrollArea.NoFrame)
         basic_tab = QWidget()
         basic_layout = QHBoxLayout(basic_tab)
         left_column = QVBoxLayout()
@@ -21238,8 +21244,9 @@ class ImageAnnotationTool(QMainWindow):
         basic_layout.addLayout(left_column)
         basic_layout.addLayout(right_column)
 
-        # タブに追加
-        tabs.addTab(basic_tab, get_text('tab_basic_settings'))
+        # スクロールエリアにセットしてタブに追加
+        basic_scroll.setWidget(basic_tab)
+        tabs.addTab(basic_scroll, get_text('tab_basic_settings'))
         
         # データオーグメンテーションタブ
         aug_tab = QWidget()
@@ -21627,8 +21634,25 @@ class ImageAnnotationTool(QMainWindow):
         # タブに追加
         tabs.addTab(aug_tab, get_text('tab_data_augmentation'))
 
-        # タブをレイアウトに追加
-        settings_layout.addWidget(tabs)
+        # タブをレイアウトに追加（残りスペースを全て使う）
+        settings_layout.addWidget(tabs, 1)
+
+        # ===== 固定フッターエリア（モデル名・コメント・ボタン）=====
+        # 区切り線
+        _sep = QFrame()
+        _sep.setFrameShape(QFrame.HLine)
+        _sep.setFrameShadow(QFrame.Sunken)
+        settings_layout.addWidget(_sep)
+
+        # 固定エリアコンテナ（わずかに暗い背景で視覚的に区別）
+        _footer = QFrame()
+        _footer.setStyleSheet(
+            "QFrame { background-color: #e8eaed; border-radius: 0px; }"
+            "QGroupBox { background-color: transparent; }"
+        )
+        _footer_layout = QVBoxLayout(_footer)
+        _footer_layout.setContentsMargins(8, 6, 8, 6)
+        _footer_layout.setSpacing(6)
 
         # モデル名とコメント欄を横並びで追加
         name_comment_layout = QHBoxLayout()
@@ -21695,14 +21719,16 @@ class ImageAnnotationTool(QMainWindow):
 
         name_comment_layout.addWidget(comment_group)
 
-        settings_layout.addLayout(name_comment_layout)
+        _footer_layout.addLayout(name_comment_layout)
 
         # ボタンの配置
         button_box = QDialogButtonBox(QDialogButtonBox.Cancel)
         start_button = button_box.addButton(get_text('btn_start_training'), QDialogButtonBox.AcceptRole)
         button_box.accepted.connect(training_settings.accept)
         button_box.rejected.connect(training_settings.reject)
-        settings_layout.addWidget(button_box)
+        _footer_layout.addWidget(button_box)
+
+        settings_layout.addWidget(_footer)
 
         # ダイアログを表示
         if not training_settings.exec_():
@@ -21976,10 +22002,8 @@ class ImageAnnotationTool(QMainWindow):
                 temporal_interval=training_temporal_interval
             )
 
-            # 最初の画像から実際のサイズを取得
-            sample_img_path = image_paths[0]
-            sample_img = Image.open(sample_img_path)
-            input_size = (sample_img.height, sample_img.width)  # 高さ、幅の順
+            # モデル入力サイズを取得（downscale_mode='resize'時はcreate_datasets内で縮小済み）
+            input_size = dataset_info['actual_image_size']
 
             progress.setLabelText(get_text('msg_preparing_with_input_size', input_size))
             progress.setValue(10)
