@@ -96,13 +96,14 @@ def detect_input_size_from_checkpoint(weights_path, device='cpu'):
     return None
 
 
-def detect_multi_source_from_checkpoint(weights_path, device='cpu'):
+def detect_multi_source_from_checkpoint(weights_path, device='cpu', verbose=False):
     """
     チェックポイントファイルからマルチソース情報を検出する
 
     Args:
         weights_path: 重みファイルのパス
         device: 読み込みに使用するデバイス
+        verbose: True のときのみ検出結果を print する
 
     Returns:
         dict: {'num_sources': int, 'fusion_method': str or None, 'selected_sources': list or None, 'base_model_name': str or None}
@@ -124,7 +125,7 @@ def detect_multi_source_from_checkpoint(weights_path, device='cpu'):
                 result['virtual_source_type'] = checkpoint['virtual_source_type']
             if 'temporal_interval' in checkpoint:
                 result['temporal_interval'] = checkpoint['temporal_interval']
-            if result['num_sources'] > 1:
+            if verbose and result['num_sources'] > 1:
                 vt = result['virtual_source_type']
                 print(f"マルチソースモデル検出: {result['num_sources']}ソース, 融合: {result['fusion_method']}, "
                       f"仮想タイプ: {vt or 'なし'}, ソース: {result['selected_sources']}")

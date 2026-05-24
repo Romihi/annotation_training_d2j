@@ -14,10 +14,65 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QGroupBox, QGridLayout, QTableWidget,
     QTableWidgetItem, QHeaderView, QScrollArea, QCheckBox,
     QListWidget, QListWidgetItem, QAbstractItemView, QSpinBox,
-    QButtonGroup, QRadioButton, QSplitter
+    QButtonGroup, QRadioButton, QSplitter, QSizePolicy
 )
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, pyqtSignal, QPropertyAnimation, QEasingCurve
 from PyQt5.QtGui import QColor
+
+
+class CollapsibleSection(QWidget):
+    """折り畳み・展開できるセクションウィジェット"""
+
+    def __init__(self, title, collapsed=False, parent=None):
+        super().__init__(parent)
+        self._title = title
+        self._collapsed = collapsed
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 4)
+        outer.setSpacing(0)
+
+        # ─── ヘッダーボタン ───
+        self.toggle_btn = QPushButton()
+        self.toggle_btn.setCheckable(False)
+        self.toggle_btn.clicked.connect(self._toggle)
+        self.toggle_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.toggle_btn.setStyleSheet("""
+            QPushButton {
+                text-align: left;
+                padding: 5px 10px;
+                font-weight: bold;
+                font-size: 11px;
+                background-color: #3a3a3a;
+                color: #d0d0d0;
+                border: 1px solid #555;
+                border-radius: 4px;
+            }
+            QPushButton:hover  { background-color: #484848; }
+            QPushButton:pressed { background-color: #282828; }
+        """)
+        outer.addWidget(self.toggle_btn)
+
+        # ─── コンテンツエリア ───
+        self.content_widget = QWidget()
+        self.content_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        outer.addWidget(self.content_widget)
+
+        self._update_label()
+        if collapsed:
+            self.content_widget.setVisible(False)
+
+    def _update_label(self):
+        arrow = '▶' if self._collapsed else '▼'
+        self.toggle_btn.setText(f'  {arrow}  {self._title}')
+
+    def _toggle(self):
+        self._collapsed = not self._collapsed
+        self.content_widget.setVisible(not self._collapsed)
+        self._update_label()
+
+    def set_content_layout(self, layout):
+        self.content_widget.setLayout(layout)
 
 # 日本語フォントの設定
 plt.rcParams['font.family'] = ['MS Gothic', 'Yu Gothic', 'Meiryo', 'sans-serif']
@@ -60,7 +115,7 @@ class DataAnalysisDialog(QDialog):
         self.all_keys = self.base_keys + sorted(list(self.available_sensor_keys))
 
         self.setWindowTitle(get_text('dlg_data_analysis'))
-        self.setMinimumSize(1050, 900)
+        self.setMinimumSize(600, 300)
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
 
         self.init_ui()
@@ -77,8 +132,9 @@ class DataAnalysisDialog(QDialog):
         layout = QVBoxLayout(scroll_widget)
 
         # === 統計・分布セクション（横並び） ===
-        stats_dist_group = QGroupBox(get_text('section_stats_distribution'))
+        self._stats_section = CollapsibleSection(get_text('section_stats_distribution'))
         stats_dist_layout = QHBoxLayout()
+        stats_dist_layout.setContentsMargins(4, 4, 4, 4)
 
         # 左側: 統計量テーブル
         self.stats_table = QTableWidget()
@@ -121,20 +177,24 @@ class DataAnalysisDialog(QDialog):
         # 行の高さを狭める
         self.stats_table.verticalHeader().setDefaultSectionSize(20)
         self.stats_table.horizontalHeader().setFixedHeight(22)
+        self.stats_table.setMinimumHeight(60)
+        self.stats_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         stats_dist_layout.addWidget(self.stats_table, 1)
 
         # 右側: 分布グラフ（AngleとThrottleを1つのグラフに統合）
-        self.dist_figure = Figure(figsize=(4, 3), dpi=100)
+        self.dist_figure = Figure(figsize=(3, 1.8), dpi=80)
         self.dist_canvas = FigureCanvas(self.dist_figure)
-        self.dist_canvas.setMinimumHeight(200)
+        self.dist_canvas.setMinimumHeight(80)
+        self.dist_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         stats_dist_layout.addWidget(self.dist_canvas, 1)
 
-        stats_dist_group.setLayout(stats_dist_layout)
-        layout.addWidget(stats_dist_group)
+        self._stats_section.set_content_layout(stats_dist_layout)
+        layout.addWidget(self._stats_section)
 
         # === 時系列セクション ===
-        timeseries_group = QGroupBox(get_text('section_timeseries'))
+        self._timeseries_section = CollapsibleSection(get_text('section_timeseries'))
         timeseries_layout = QVBoxLayout()
+        timeseries_layout.setContentsMargins(4, 4, 4, 4)
 
         # 上部1行目: 表示形式選択
         mode_layout = QHBoxLayout()
@@ -219,13 +279,14 @@ class DataAnalysisDialog(QDialog):
         graph_layout = QHBoxLayout()
 
         # 時系列グラフ（左側）
-        self.timeseries_figure = Figure(figsize=(8, 4), dpi=100)
+        self.timeseries_figure = Figure(figsize=(5, 2.5), dpi=80)
         self.timeseries_canvas = FigureCanvas(self.timeseries_figure)
         self.timeseries_canvas.mpl_connect('button_press_event', self._on_mouse_press)
         self.timeseries_canvas.mpl_connect('button_release_event', self._on_mouse_release)
         self.timeseries_canvas.mpl_connect('motion_notify_event', self._on_mouse_move)
         self.timeseries_canvas.mpl_connect('scroll_event', self._on_scroll)
-        self.timeseries_canvas.setMinimumHeight(300)
+        self.timeseries_canvas.setMinimumHeight(100)
+        self.timeseries_canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._drag_start = None  # ドラッグ開始位置 (x_data, y_data)
         self._is_dragging = False
         self._zoom_xlim = None  # ズーム後のX範囲（Noneで自動）
@@ -239,6 +300,7 @@ class DataAnalysisDialog(QDialog):
         self.key_list.setSelectionMode(QAbstractItemView.MultiSelection)
         self.key_list.setMaximumWidth(180)
         self.key_list.setMinimumWidth(140)
+        self.key_list.setMinimumHeight(80)
 
         # 基本キーを追加
         for key in self.all_keys:
@@ -261,16 +323,14 @@ class DataAnalysisDialog(QDialog):
         info_bar.addWidget(info_label)
         info_bar.addStretch()
         self.zoom_reset_btn = QPushButton(get_text('btn_zoom_reset'))
-        self.zoom_reset_btn.setFixedWidth(100)
+        self.zoom_reset_btn.setMinimumWidth(120)
         self.zoom_reset_btn.setEnabled(False)
         self.zoom_reset_btn.clicked.connect(self._reset_zoom)
         info_bar.addWidget(self.zoom_reset_btn)
         timeseries_layout.addLayout(info_bar)
 
-        timeseries_group.setLayout(timeseries_layout)
-        layout.addWidget(timeseries_group)
-
-        layout.addStretch()
+        self._timeseries_section.set_content_layout(timeseries_layout)
+        layout.addWidget(self._timeseries_section)
 
         scroll_area.setWidget(scroll_widget)
         main_layout.addWidget(scroll_area)
