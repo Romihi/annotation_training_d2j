@@ -1251,24 +1251,27 @@ class ImageLabel(QLabel):
 
     def _get_annotation_draw_params(self, target_rect):
         """結合表示時、推論対象ソースのセルに対応した (eff_rect, eff_pix_w, eff_pix_h) を返す。
+        3x1グリッドの場合は中央セル(index=1)を強制使用。
         非結合表示または推論対象未指定の場合は (target_rect, pix_width, pix_height) をそのまま返す。"""
         mw = self.main_window
-        if (mw is None or
-                getattr(mw, 'current_variant', None) != '__combined__' or
-                not getattr(mw, '_combined_inference_source', None)):
+        if mw is None or getattr(mw, 'current_variant', None) != '__combined__':
             return target_rect, self.pix_width, self.pix_height
-
-        infer_src = mw._combined_inference_source
-        combined_sources = getattr(mw, '_combined_sources',
-                                   list(getattr(mw, 'available_variants', [])))
-        if infer_src not in combined_sources:
-            return target_rect, self.pix_width, self.pix_height
-
-        slot_idx = combined_sources.index(infer_src)
 
         grid = getattr(mw, '_combined_grid', '2x1')
         grid_map = {'2x1': (2, 1), '1x2': (1, 2), '3x1': (3, 1), '2x2': (2, 2), '3x3': (3, 3)}
         cols, rows = grid_map.get(grid, (2, 1))
+
+        combined_sources = getattr(mw, '_combined_sources',
+                                   list(getattr(mw, 'available_variants', [])))
+
+        # 3x1グリッド（3カメラ）は中央セル(index=1)を固定使用
+        if grid == '3x1' and len(combined_sources) >= 3:
+            slot_idx = 1
+        else:
+            infer_src = getattr(mw, '_combined_inference_source', None)
+            if not infer_src or infer_src not in combined_sources:
+                return target_rect, self.pix_width, self.pix_height
+            slot_idx = combined_sources.index(infer_src)
 
         # _create_combined_image と同じグリッド縮小計算
         n_slots = len(combined_sources)
