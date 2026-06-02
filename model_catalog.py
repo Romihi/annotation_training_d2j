@@ -11,6 +11,7 @@ from PIL import Image
 from typing import Dict, Any, Optional, Tuple, List
 
 
+from config import MAX_SPEED as _MAX_SPEED
 import model_info
 from model_info import (
     MODEL_ACCURACY_INFO,
@@ -1752,7 +1753,8 @@ class AnnotationDataset(torch.utils.data.Dataset):
         """アノテーションからangle, throttle, speedを取得"""
         angle = annotation.get("angle", 0.0)
         throttle = annotation.get("throttle", 0.0)
-        speed = annotation.get("speed", annotation.get("user/speed", annotation.get("pilot/speed", 0.0)))
+        _raw_speed = annotation.get("speed", annotation.get("user/speed", annotation.get("pilot/speed", 0.0)))
+        speed = max(0.0, min(1.0, _raw_speed / _MAX_SPEED)) if _MAX_SPEED > 0 else 0.0
         return angle, throttle, speed
 
     def __getitem__(self, idx):
@@ -1995,7 +1997,8 @@ class MultiSourceDataset(torch.utils.data.Dataset):
         """アノテーションからangle, throttle, speedを取得"""
         angle = annotation.get("angle", 0.0)
         throttle = annotation.get("throttle", 0.0)
-        speed = annotation.get("speed", annotation.get("user/speed", annotation.get("pilot/speed", 0.0)))
+        _raw_speed = annotation.get("speed", annotation.get("user/speed", annotation.get("pilot/speed", 0.0)))
+        speed = max(0.0, min(1.0, _raw_speed / _MAX_SPEED)) if _MAX_SPEED > 0 else 0.0
         return angle, throttle, speed
 
     def __getitem__(self, idx):
@@ -2087,7 +2090,8 @@ class VirtualSourceDataset(torch.utils.data.Dataset):
     def _get_annotation_values(self, annotation):
         angle = annotation.get("angle", 0.0)
         throttle = annotation.get("throttle", 0.0)
-        speed = annotation.get("speed", annotation.get("user/speed", annotation.get("pilot/speed", 0.0)))
+        _raw_speed = annotation.get("speed", annotation.get("user/speed", annotation.get("pilot/speed", 0.0)))
+        speed = max(0.0, min(1.0, _raw_speed / _MAX_SPEED)) if _MAX_SPEED > 0 else 0.0
         return angle, throttle, speed
 
     def _spatial_crops(self, img):

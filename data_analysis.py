@@ -196,60 +196,57 @@ class DataAnalysisDialog(QDialog):
         timeseries_layout = QVBoxLayout()
         timeseries_layout.setContentsMargins(4, 4, 4, 4)
 
-        # 上部1行目: 表示形式選択
-        mode_layout = QHBoxLayout()
+        # ── 処理パイプライン（チェックボックス、上から順番に適用）──
+        pipeline_label = QLabel("処理ステップ（上から順に適用）:")
+        pipeline_label.setStyleSheet("font-size: 10px; color: #aaa;")
+        timeseries_layout.addWidget(pipeline_label)
 
-        mode_layout.addWidget(QLabel(get_text('label_display')))
-
-        self.display_mode_group = QButtonGroup(self)
-        self.raw_data_radio = QRadioButton(get_text('label_raw_data'))
-        self.raw_data_radio.setChecked(True)
-        self.display_mode_group.addButton(self.raw_data_radio, 0)
-        self.raw_data_radio.toggled.connect(self.update_timeseries_graph)
-        mode_layout.addWidget(self.raw_data_radio)
-
-        self.moving_avg_radio = QRadioButton(get_text('label_moving_avg'))
-        self.display_mode_group.addButton(self.moving_avg_radio, 1)
-        self.moving_avg_radio.toggled.connect(self.update_timeseries_graph)
-        mode_layout.addWidget(self.moving_avg_radio)
-
-        self.mean_hist_radio = QRadioButton(get_text('label_bin_avg'))
-        self.display_mode_group.addButton(self.mean_hist_radio, 2)
-        self.mean_hist_radio.toggled.connect(self.update_timeseries_graph)
-        mode_layout.addWidget(self.mean_hist_radio)
-
-        self.normalized_radio = QRadioButton(get_text('label_normalized'))
-        self.display_mode_group.addButton(self.normalized_radio, 3)
-        self.normalized_radio.toggled.connect(self.update_timeseries_graph)
-        mode_layout.addWidget(self.normalized_radio)
-
-        mode_layout.addStretch()
-        timeseries_layout.addLayout(mode_layout)
-
-        # 上部2行目: パラメータ設定
-        params_layout = QHBoxLayout()
-
-        # 移動平均の窓サイズ
-        params_layout.addWidget(QLabel(get_text('label_window')))
+        # Step 1: 移動平均
+        ma_row = QHBoxLayout()
+        ma_row.setSpacing(4)
+        self.ma_check = QCheckBox(get_text('label_moving_avg'))
+        self.ma_check.setChecked(False)
+        self.ma_check.toggled.connect(self._on_pipeline_changed)
+        ma_row.addWidget(self.ma_check)
+        ma_row.addWidget(QLabel(get_text('label_window')))
         self.moving_avg_spin = QSpinBox()
         self.moving_avg_spin.setRange(2, 300)
         self.moving_avg_spin.setValue(50)
         self.moving_avg_spin.setSingleStep(1)
+        self.moving_avg_spin.setEnabled(False)
         self.moving_avg_spin.valueChanged.connect(self.update_timeseries_graph)
-        params_layout.addWidget(self.moving_avg_spin)
+        ma_row.addWidget(self.moving_avg_spin)
+        ma_row.addStretch()
+        timeseries_layout.addLayout(ma_row)
 
-        # 区間平均の区間サイズ
-        params_layout.addWidget(QLabel(get_text('label_bin')))
+        # Step 2: 正規化
+        norm_row = QHBoxLayout()
+        norm_row.setSpacing(4)
+        self.norm_check = QCheckBox(get_text('label_normalized'))
+        self.norm_check.setChecked(False)
+        self.norm_check.toggled.connect(self._on_pipeline_changed)
+        norm_row.addWidget(self.norm_check)
+        norm_row.addStretch()
+        timeseries_layout.addLayout(norm_row)
+
+        # Step 3: 区間平均（バー表示）
+        bin_row = QHBoxLayout()
+        bin_row.setSpacing(4)
+        self.bin_check = QCheckBox(get_text('label_bin_avg'))
+        self.bin_check.setChecked(False)
+        self.bin_check.toggled.connect(self._on_pipeline_changed)
+        bin_row.addWidget(self.bin_check)
+        bin_row.addWidget(QLabel(get_text('label_bin')))
         self.bin_size_spin = QSpinBox()
         self.bin_size_spin.setRange(10, 1000)
         self.bin_size_spin.setValue(200)
         self.bin_size_spin.setSingleStep(10)
         self.bin_size_spin.setSuffix(" idx")
+        self.bin_size_spin.setEnabled(False)
         self.bin_size_spin.valueChanged.connect(self.update_timeseries_graph)
-        params_layout.addWidget(self.bin_size_spin)
-
-        params_layout.addStretch()
-        timeseries_layout.addLayout(params_layout)
+        bin_row.addWidget(self.bin_size_spin)
+        bin_row.addStretch()
+        timeseries_layout.addLayout(bin_row)
 
         # 2行目: 表示範囲設定
         range_layout = QHBoxLayout()
@@ -538,120 +535,126 @@ class DataAnalysisDialog(QDialog):
 
         ax = self.timeseries_figure.add_subplot(111)
 
-        if self.mean_hist_radio.isChecked():
-            # 平均値ヒストグラム表示
+        use_ma   = self.ma_check.isChecked()
+        use_norm = self.norm_check.isChecked()
+        use_bin  = self.bin_check.isChecked()
+
+        # 処理パイプラインを適用してグラフ描画
+        if use_bin:
+            # ── 区間平均（バー表示）──
+            # Step1: 移動平均 → Step2: 正規化 → Step3: 区間平均
             min_idx = min(indices)
             max_idx = max(indices)
             bin_starts = list(range(min_idx, max_idx + 1, bin_size))
             num_keys = len(selected_keys)
             bar_width = bin_size * 0.8 / num_keys
 
-            for key_idx, key in enumerate(selected_keys):
-                means = []
-                bin_centers = []
+            title_steps = []
+            if use_ma:   title_steps.append(f"MA{window_size}")
+            if use_norm: title_steps.append("正規化")
+            title_steps.append(f"区間平均(bin={bin_size})")
 
+            for key_idx, key in enumerate(selected_keys):
+                key_indices = sorted(data_by_key[key].keys())
+                key_values  = np.array([data_by_key[key][i] for i in key_indices], dtype=float)
+
+                if len(key_values) == 0:
+                    continue
+
+                # Step1: 移動平均
+                if use_ma and len(key_values) >= window_size:
+                    kernel = np.ones(window_size) / window_size
+                    ma = np.convolve(key_values, kernel, mode='valid')
+                    offset = window_size // 2
+                    key_indices = key_indices[offset: offset + len(ma)]
+                    key_values  = ma
+
+                # Step2: 正規化
+                if use_norm:
+                    abs_max = np.max(np.abs(key_values))
+                    if abs_max > 0:
+                        key_values = key_values / abs_max
+
+                # Step3: 区間平均（バー）
+                ki_arr = np.array(key_indices)
+                means, bin_centers = [], []
                 for bin_start in bin_starts:
-                    bin_end = bin_start + bin_size
+                    bin_end    = bin_start + bin_size
                     bin_center = bin_start + bin_size / 2
                     bin_centers.append(bin_center)
+                    mask = (ki_arr >= bin_start) & (ki_arr < bin_end)
+                    vals = key_values[mask]
+                    means.append(float(np.mean(vals)) if len(vals) > 0 else np.nan)
 
-                    # このビン内のデータを収集
-                    bin_values = []
-                    for idx in indices:
-                        if bin_start <= idx < bin_end and idx in data_by_key[key]:
-                            bin_values.append(data_by_key[key][idx])
-
-                    # 平均値を計算
-                    if bin_values:
-                        means.append(np.mean(bin_values))
-                    else:
-                        means.append(np.nan)
-
-                # バーをオフセットして描画
-                offset = (key_idx - num_keys / 2 + 0.5) * bar_width
+                bar_offset = (key_idx - num_keys / 2 + 0.5) * bar_width
                 color = COLORS[key_idx % len(COLORS)]
-                ax.bar([c + offset for c in bin_centers], means,
+                ax.bar([c + bar_offset for c in bin_centers], means,
                        width=bar_width, color=color, alpha=0.7,
                        label=key, edgecolor='white')
 
-            ax.set_title(get_text('label_bin_avg_title', bin_size))
-
-            # 現在位置マーカー
-            ax.axvline(x=self.current_index, color='purple', linestyle='--', alpha=0.8, linewidth=2)
-
-        elif self.moving_avg_radio.isChecked():
-            # 移動平均表示
-            for key_idx, key in enumerate(selected_keys):
-                key_indices = sorted(data_by_key[key].keys())
-                key_values = [data_by_key[key][i] for i in key_indices]
-
-                if key_values:
-                    color = COLORS[key_idx % len(COLORS)]
-
-                    if len(key_values) >= window_size:
-                        # 移動平均を計算
-                        values_arr = np.array(key_values)
-                        moving_avg = np.convolve(values_arr, np.ones(window_size)/window_size, mode='valid')
-                        # 移動平均のインデックスを調整（中央揃え）
-                        offset = window_size // 2
-                        avg_indices = key_indices[offset:offset + len(moving_avg)]
-                        ax.plot(avg_indices, moving_avg, '-', color=color, alpha=0.9, label=f'{key}(MA{window_size})', linewidth=1.2)
-                        # 元データを薄く表示
-                        ax.plot(key_indices, key_values, '-', color=color, alpha=0.2, linewidth=0.5)
-                    else:
-                        # データが少ない場合は生データのみ
-                        ax.plot(key_indices, key_values, '-', color=color, alpha=0.7, label=key, linewidth=0.8)
-
-            ax.set_title(get_text('label_data_trend_ma', window_size))
-
-            # 現在位置マーカー
-            ax.axvline(x=self.current_index, color='purple', linestyle='--', alpha=0.8, linewidth=2)
-            if self.current_index in indices:
-                if selected_keys and self.current_index in data_by_key[selected_keys[0]]:
-                    y_val = data_by_key[selected_keys[0]][self.current_index]
-                    ax.scatter([self.current_index], [y_val], color='purple', s=100, zorder=5, marker='o')
-
-        elif self.normalized_radio.isChecked():
-            # 正規化表示（各センサーの絶対最大値で正規化）
-            for key_idx, key in enumerate(selected_keys):
-                key_indices = sorted(data_by_key[key].keys())
-                key_values = [data_by_key[key][i] for i in key_indices]
-
-                if key_values:
-                    color = COLORS[key_idx % len(COLORS)]
-                    abs_max = max(abs(v) for v in key_values)
-                    if abs_max > 0:
-                        norm_values = [v / abs_max for v in key_values]
-                        ax.plot(key_indices, norm_values, '-', color=color, alpha=0.7,
-                                label=f'{key} (max={abs_max:.3f})', linewidth=0.8)
-                    else:
-                        ax.plot(key_indices, key_values, '-', color=color, alpha=0.7,
-                                label=f'{key} (max=0)', linewidth=0.8)
-
-            ax.set_title(get_text('label_normalized_title'))
-
-            # 現在位置マーカー
+            ax.set_title(" → ".join(title_steps))
             ax.axvline(x=self.current_index, color='purple', linestyle='--', alpha=0.8, linewidth=2)
 
         else:
-            # 生データ表示（線グラフ）
+            # ── 折れ線表示（Step1: MA → Step2: 正規化）──
+            title_steps = []
+            if use_ma:   title_steps.append(f"MA{window_size}")
+            if use_norm: title_steps.append("正規化")
+            if not title_steps: title_steps.append(get_text('label_raw_data'))
+
             for key_idx, key in enumerate(selected_keys):
                 key_indices = sorted(data_by_key[key].keys())
-                key_values = [data_by_key[key][i] for i in key_indices]
+                key_values  = np.array([data_by_key[key][i] for i in key_indices], dtype=float)
 
-                if key_values:
-                    color = COLORS[key_idx % len(COLORS)]
-                    ax.plot(key_indices, key_values, '-', color=color, alpha=0.7, label=key, linewidth=0.8)
+                if len(key_values) == 0:
+                    continue
 
-            ax.set_title(get_text('label_data_trend'))
+                color = COLORS[key_idx % len(COLORS)]
+                raw_indices = key_indices[:]
+                raw_values  = key_values.copy()  # MA前の元データ（背景表示用）
+                applied_ma  = False
 
-            # 現在位置マーカー
+                # Step1: 移動平均
+                if use_ma and len(key_values) >= window_size:
+                    kernel = np.ones(window_size) / window_size
+                    ma = np.convolve(key_values, kernel, mode='valid')
+                    offset = window_size // 2
+                    key_indices = key_indices[offset: offset + len(ma)]
+                    key_values  = ma
+                    applied_ma  = True
+
+                # Step2: 正規化 — abs_max は MA 後の値から算出
+                abs_max_label = ""
+                norm_factor   = None
+                if use_norm:
+                    abs_max = np.max(np.abs(key_values))
+                    if abs_max > 0:
+                        norm_factor    = abs_max
+                        key_values     = key_values / abs_max
+                        abs_max_label  = f" (÷{abs_max:.3f})"
+
+                # 元データの背景線: MA 有効時のみ、正規化も同係数で揃える
+                if applied_ma:
+                    bg = raw_values.copy()
+                    if norm_factor is not None:
+                        bg = bg / norm_factor  # 正規化と同じスケールに合わせる
+                    ax.plot(raw_indices, bg, '-', color=color, alpha=0.15, linewidth=0.5)
+
+                label = key + (f"(MA{window_size})" if applied_ma else "") + abs_max_label
+                ax.plot(key_indices, key_values, '-', color=color, alpha=0.85,
+                        label=label, linewidth=1.0)
+
+            ax.set_title(" → ".join(title_steps))
             ax.axvline(x=self.current_index, color='purple', linestyle='--', alpha=0.8, linewidth=2)
-            if self.current_index in indices:
-                # 最初の選択キーの値をマーカーで表示
-                if selected_keys and self.current_index in data_by_key[selected_keys[0]]:
-                    y_val = data_by_key[selected_keys[0]][self.current_index]
-                    ax.scatter([self.current_index], [y_val], color='purple', s=100, zorder=5, marker='o')
+            if self.current_index in indices and selected_keys:
+                if self.current_index in data_by_key[selected_keys[0]]:
+                    raw_y = data_by_key[selected_keys[0]][self.current_index]
+                    # 正規化有効時は現在位置マーカーも正規化スケールで表示
+                    if use_norm:
+                        key0_vals = list(data_by_key[selected_keys[0]].values())
+                        amax = max(abs(v) for v in key0_vals) if key0_vals else 1.0
+                        raw_y = raw_y / amax if amax > 0 else raw_y
+                    ax.scatter([self.current_index], [raw_y], color='purple', s=80, zorder=5, marker='o')
 
         ax.set_xlabel(get_text('label_index'))
         ax.set_ylabel(get_text('label_value'))
@@ -660,28 +663,38 @@ class DataAnalysisDialog(QDialog):
 
         # X軸の範囲を設定
         if self._zoom_xlim is not None:
-            # ズーム状態を維持
             ax.set_xlim(self._zoom_xlim)
         elif indices:
             idx_min_setting = self.idx_min_spin.value()
             idx_max_setting = self.idx_max_spin.value()
-
-            # 自動範囲（max=0の場合）またはカスタム範囲
             if idx_max_setting == 0:
                 x_min = min(indices) - 10
                 x_max = max(indices) + 10
             else:
                 x_min = idx_min_setting
                 x_max = idx_max_setting
-
             ax.set_xlim(x_min, x_max)
 
-        # Y軸のズーム状態を維持
+        # Y軸の範囲を設定（優先順位: ズーム > 正規化固定 > 自動）
         if self._zoom_ylim is not None:
             ax.set_ylim(self._zoom_ylim)
+        elif use_norm and not use_bin:
+            # 正規化時は [-1, 1] 基準に固定（自動スケールを上書き）
+            ax.set_ylim(-1.1, 1.1)
+            ax.autoscale(False, axis='y')
 
         self.timeseries_figure.tight_layout()
         self.timeseries_canvas.draw()
+
+    def _on_pipeline_changed(self):
+        """チェックボックスの状態に合わせてスピナー有効/無効を切り替え、ズームをリセットしてグラフ更新"""
+        self.moving_avg_spin.setEnabled(self.ma_check.isChecked())
+        self.bin_size_spin.setEnabled(self.bin_check.isChecked())
+        # パイプライン変更時はズーム状態をリセット（前のスケールが残らないよう）
+        self._zoom_xlim = None
+        self._zoom_ylim = None
+        self.zoom_reset_btn.setEnabled(False)
+        self.update_timeseries_graph()
 
     def _on_mouse_press(self, event):
         """マウスボタン押下"""

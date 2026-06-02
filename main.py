@@ -41,8 +41,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                             QGroupBox, QRadioButton, QTabWidget, QSizePolicy,QButtonGroup,
                             QListView, QTreeView, QAbstractItemView,QStyleOptionSlider,QStyle, QTextEdit, QPlainTextEdit,
                             QGraphicsOpacityEffect, QListWidget, QListWidgetItem)
-from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont, QPolygon, QCursor
-from PyQt5.QtCore import Qt, QRect, QPoint, QTimer, QEvent, QThread, pyqtSignal
+from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont, QPolygon, QCursor, QIcon, QPainterPath
+from PyQt5.QtCore import Qt, QRect, QPoint, QSize, QTimer, QEvent, QThread, pyqtSignal
 
 from PIL import Image, ImageDraw
 
@@ -196,6 +196,152 @@ def _morphological_close(mask, kernel_size):
             for y in range(h)
         ], dtype=bool)
 
+def _mask_to_contour_points(mask):
+    """bool マスクから最大輪郭の (x, y) ピクセル点リストを返す。cv2 使用。"""
+    import numpy as _np
+    try:
+        import cv2 as _cv2
+        mask_u8 = mask.astype(_np.uint8) * 255
+        contours, _ = _cv2.findContours(mask_u8, _cv2.RETR_EXTERNAL, _cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return []
+        largest = max(contours, key=_cv2.contourArea)
+        return [(int(pt[0][0]), int(pt[0][1])) for pt in largest]
+    except ImportError:
+        # cv2 がない場合: バウンディングボックスで近似
+        rows = _np.any(mask, axis=1)
+        cols = _np.any(mask, axis=0)
+        if not rows.any():
+            return []
+        rmin, rmax = int(_np.where(rows)[0][0]), int(_np.where(rows)[0][-1])
+        cmin, cmax = int(_np.where(cols)[0][0]), int(_np.where(cols)[0][-1])
+        return [(cmin, rmin), (cmax, rmin), (cmax, rmax), (cmin, rmax)]
+
+def _seg_to_polygon_points(seg, img_width, img_height):
+    """polygon / fill / brush アノテーションを (x, y) 輪郭点リストに変換する。
+    変換できない場合は空リストを返す。"""
+    import numpy as _np
+    ann_type = seg.get('type', 'polygon') if isinstance(seg, dict) else 'polygon'
+
+    if ann_type == 'fill':
+        rle = seg.get('rle', [])
+        if not rle:
+            return []
+        iw, ih = seg.get('img_size', (img_width, img_height))
+        mask = _rle_to_mask(rle, ih, iw)
+        if seg.get('offset', [0, 0]) != [0, 0]:
+            _apply_fill_offset(seg)
+            mask = _rle_to_mask(seg['rle'], ih, iw)
+        return _mask_to_contour_points(mask)
+
+    elif ann_type == 'brush':
+        strokes = seg.get('strokes', [])
+        if not strokes:
+            return []
+        mask = _np.zeros((img_height, img_width), dtype=bool)
+        ys, xs = _np.ogrid[:img_height, :img_width]
+        for cx, cy, r in strokes:
+            mask |= ((xs - cx) ** 2 + (ys - cy) ** 2) <= r ** 2
+        return _mask_to_contour_points(mask)
+
+    else:  # polygon
+        pts = seg.get('points', []) if isinstance(seg, dict) else getattr(seg, 'points', [])
+        return pts if pts else []
+
+def _apply_fill_to_bottom(mask):
+    """マスクを左右下端まで拡張する（ペイントの下端塗りつぶし用）。
+    各列の最下True行（一番下に塗られたピクセル）から画像下端まで塗りつぶす。
+    内側に凹んだ形状のセグメンテーションにも正しく対応する。"""
+    import numpy as _np
+    h, w = mask.shape
+    present = mask.any(axis=0)
+    if not present.any():
+        return mask.copy()
+    result = mask.copy()
+    # mask を上下反転して argmax → 各列の最下True行インデックスを取得
+    flipped = mask[::-1, :]
+    max_y = _np.where(present, h - 1 - _np.argmax(flipped, axis=0), h)
+    rows = _np.arange(h)[:, None]   # (h, 1)
+    result = result | (present[None, :] & (rows >= max_y[None, :]))
+    # 左端・右端まで同プロファイルで拡張
+    left_x = int(_np.argmax(present))
+    right_x = int(w - 1 - _np.argmax(present[::-1]))
+    result[int(max_y[left_x]):, :left_x] = True
+    result[int(max_y[right_x]):, right_x + 1:] = True
+    return result
+
+def _seg_annotation_to_mask(seg, img_h, img_w):
+    """任意のセグメンテーションアノテーションを bool マスク (h, w) に変換する。
+    変換できない場合は None を返す。fill タイプの offset は焼き込む（seg を変更する）。"""
+    import numpy as _np
+    ann_type = seg.get('type', 'polygon')
+    if ann_type == 'fill':
+        if seg.get('offset', [0, 0]) != [0, 0]:
+            _apply_fill_offset(seg)
+        ew, eh = seg.get('img_size', (img_w, img_h))
+        if ew != img_w or eh != img_h:
+            return None
+        return _rle_to_mask(seg['rle'], img_h, img_w)
+    elif ann_type == 'brush':
+        mask = _np.zeros((img_h, img_w), dtype=bool)
+        ys, xs = _np.ogrid[:img_h, :img_w]
+        for cx, cy, r in seg.get('strokes', []):
+            mask |= ((xs - cx) ** 2 + (ys - cy) ** 2) <= r ** 2
+        return mask
+    else:  # polygon
+        try:
+            from PIL import Image as _PILImg, ImageDraw as _IDraw
+        except ImportError:
+            return None
+        pts = seg.get('points', [])
+        if len(pts) < 3:
+            return None
+        img_p = _PILImg.new('1', (img_w, img_h), 0)
+        _IDraw.Draw(img_p).polygon(pts, fill=1)
+        return _np.array(img_p, dtype=bool)
+
+# 位置インデックス → (角度deg, ラベル) のマッピング（コーナー表示モード用）
+_CORNER_INFO = [
+    (0,   "ストレート"),
+    (30,  "30°コーナー"),
+    (60,  "60°コーナー"),
+    (90,  "90°コーナー"),
+    (120, "120°コーナー"),
+    (150, "150°コーナー"),
+    (180, "180°コーナー"),
+]
+
+def _make_corner_icon(angle_deg, size=26):
+    """道路コーナーの形状アイコンを QIcon で返す。
+    angle_deg: 0=ストレート, 30〜180=右コーナー角度。
+    入口は下中央↑、出口は angle_deg だけ右に曲がった方向。"""
+    import math
+    pix = QPixmap(size, size)
+    pix.fill(Qt.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.Antialiasing)
+    pen = QPen(QColor(55, 55, 55), 2.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+    p.setPen(pen)
+    cx, cy = size / 2.0, size / 2.0
+    half = size / 2.0 - 3
+    ex, ey = cx, size - 2.0          # 入口（下中央）
+    rad = math.radians(angle_deg)
+    tx = cx + half * math.sin(rad)   # 出口
+    ty = cy - half * math.cos(rad)
+    path = QPainterPath()
+    path.moveTo(ex, ey)
+    path.quadTo(cx, cy, tx, ty)      # 二次ベジェで曲線
+    p.drawPath(path)
+    # 矢印ヘッド（出口方向に合わせる）
+    tdx, tdy = tx - cx, ty - cy
+    length = (tdx ** 2 + tdy ** 2) ** 0.5 or 1.0
+    ndx, ndy = tdx / length, tdy / length
+    ax, ay = tx - ndx * 5, ty - ndy * 5
+    p.drawLine(int(tx), int(ty), int(ax - ndy * 3), int(ay + ndx * 3))
+    p.drawLine(int(tx), int(ty), int(ax + ndy * 3), int(ay - ndx * 3))
+    p.end()
+    return QIcon(pix)
+
 def _compute_flood_fill(img_array, seed_x, seed_y, tolerance):
     """BFS フラッドフィル。bool マスク (h, w) を返す。"""
     import numpy as _np
@@ -277,10 +423,11 @@ class ImageLabel(QLabel):
         # ペイントツール関連
         self.seg_tool_mode = 'polygon'      # 'polygon', 'paint', 'fill', 'eraser'
         self.polygon_fill_to_bottom = False  # 左右下端まで塗りつぶし
-        self.brush_size = 20                # ペンサイズ（画像ピクセル半径）
+        self.brush_size = 10                # ペンサイズ（画像ピクセル半径）
         self.fill_tolerance = 30            # フラッドフィル許容差（0-255）
         self.fill_close_enabled = False     # モルフォロジークロージング有効
         self.fill_close_kernel = 11         # クロージングカーネルサイズ（px）
+        self.seg_merge_enabled = False      # 同クラス領域結合モード
         self.is_painting = False
         self.current_paint_strokes = []     # [(cx, cy, r), ...] 画像座標
         # カーソルオーバーレイ・塗りつぶしプレビュー関連
@@ -320,11 +467,7 @@ class ImageLabel(QLabel):
         self.current_mouse_pos = None  # 現在のマウス位置
         self.normalized_coords = None  # 正規化座標 (x, y) -1～1の範囲
 
-        # Speedバー関連
-        self.is_adjusting_speed = False  # speedバー調整中フラグ
-        self.hovering_speed_bar = False  # speedバーにホバー中フラグ
-        self.speed_bar_hover_y = None  # speedバー上のホバーY座標
-        self.max_speed = MAX_SPEED  # speed正規化用の最大速度
+        self.max_speed = MAX_SPEED  # speed正規化用の最大速度（SpeedGaugeWidget から参照）
 
         # 将来アノテーション表示
         self.show_future_annotations = True  # デフォルトON
@@ -371,6 +514,44 @@ class ImageLabel(QLabel):
         if hasattr(self.main_window, 'statusBar'):
             self.main_window.statusBar().showMessage(get_text('status_polygon_point_added', insert_index), 3000)
     
+    def _show_seg_context_menu(self, global_pos, seg_index, orig_x, orig_y, seg_data):
+        """セグメンテーション右クリックコンテキストメニューを表示"""
+        from PyQt5.QtWidgets import QMenu, QAction
+        menu = QMenu(self)
+
+        # クラスを変更
+        change_class_action = QAction("クラスを変更...", self)
+        menu.addAction(change_class_action)
+
+        # ポリゴン型のみ: 点を追加
+        is_polygon = seg_data.get('type', 'polygon') not in ('fill', 'brush')
+        if is_polygon and len(seg_data.get('points', [])) >= 3:
+            menu.addSeparator()
+            add_point_action = QAction("点を追加", self)
+            menu.addAction(add_point_action)
+        else:
+            add_point_action = None
+
+        chosen = menu.exec_(global_pos)
+
+        if chosen is None:
+            return
+
+        if chosen == change_class_action:
+            # クラス選択ダイアログを表示
+            new_class = self.main_window.select_object_class()
+            if new_class:
+                old_class = seg_data.get('class', '')
+                seg_data['class'] = new_class
+                self.update()
+                self.main_window.update_gallery()
+                if hasattr(self.main_window, 'statusBar'):
+                    self.main_window.statusBar().showMessage(
+                        f"クラスを変更: {old_class} → {new_class}", 3000
+                    )
+        elif add_point_action and chosen == add_point_action:
+            self.add_point_to_polygon(seg_index, orig_x, orig_y)
+
     def find_best_insertion_point(self, points, x, y):
         """新しい点を挿入する最適な位置を見つける"""
         if len(points) < 2:
@@ -647,8 +828,9 @@ class ImageLabel(QLabel):
         # 自動運転アノテーション走行軌跡を描画
         self.draw_auto_driving_direction(_ann_pw, _ann_ph, painter, _ann_rect)
 
-        # Speedバーを描画（画像の右側）
-        self.draw_speed_bar(_ann_pw, _ann_ph, painter, _ann_rect)
+        # SpeedGaugeWidget（画像外の独立ウィジェット）を更新
+        if self.main_window and hasattr(self.main_window, 'speed_gauge'):
+            self.main_window.speed_gauge.update()
 
         # マウス座標表示（自動運転モードのみ、最後に描画して常に最前面に）
         if self.main_window and self.main_window.current_mode == 0:
@@ -2640,12 +2822,6 @@ class ImageLabel(QLabel):
             pos = event.pos()
             self.last_click_time = current_time  # クリック時間を更新
 
-            # speedバーのクリック判定（画像外でもspeedバー領域内なら処理）
-            if hasattr(self, 'target_rect') and self.is_point_in_speed_bar(pos, self.target_rect):
-                if event.button() == Qt.LeftButton:
-                    self.handle_speed_bar_click(pos)
-                    return
-
             # クリック位置が画像内かチェック
             if not self.target_rect.contains(pos):
                 return
@@ -2779,6 +2955,27 @@ class ImageLabel(QLabel):
 
                 # ペイントモード
                 if self.seg_tool_mode == 'paint':
+                    if event.button() == Qt.RightButton:
+                        # 右クリック: 既存ブラシアノテーション上ならコンテキストメニュー
+                        if (hasattr(self.main_window, 'segmentation_annotations') and
+                                current_index in self.main_window.segmentation_annotations):
+                            for i, seg_data in enumerate(
+                                    self.main_window.segmentation_annotations[current_index]):
+                                if seg_data is None:
+                                    continue
+                                ann_type = seg_data.get('type')
+                                hit = False
+                                if ann_type == 'brush':
+                                    hit = any(
+                                        (orig_x - cx) ** 2 + (orig_y - cy) ** 2 <= r ** 2
+                                        for cx, cy, r in seg_data.get('strokes', [])
+                                    )
+                                elif ann_type == 'fill':
+                                    hit = _fill_hit_test(seg_data, orig_x, orig_y)
+                                if hit:
+                                    self._show_seg_context_menu(event.globalPos(), i, orig_x, orig_y, seg_data)
+                                    return
+                        return
                     if event.button() == Qt.LeftButton:
                         # 既存のブラシアノテーションにヒットする場合は移動を優先
                         hit_move = False
@@ -2808,6 +3005,27 @@ class ImageLabel(QLabel):
 
                 # 塗りつぶしモード
                 if self.seg_tool_mode == 'fill':
+                    if event.button() == Qt.RightButton:
+                        # 右クリック: 既存 fill/brush アノテーション上ならコンテキストメニュー
+                        if (hasattr(self.main_window, 'segmentation_annotations') and
+                                current_index in self.main_window.segmentation_annotations):
+                            for i, seg_data in enumerate(
+                                    self.main_window.segmentation_annotations[current_index]):
+                                if seg_data is None:
+                                    continue
+                                ann_type = seg_data.get('type')
+                                hit = False
+                                if ann_type == 'fill':
+                                    hit = _fill_hit_test(seg_data, orig_x, orig_y)
+                                elif ann_type == 'brush':
+                                    hit = any(
+                                        (orig_x - cx) ** 2 + (orig_y - cy) ** 2 <= r ** 2
+                                        for cx, cy, r in seg_data.get('strokes', [])
+                                    )
+                                if hit:
+                                    self._show_seg_context_menu(event.globalPos(), i, orig_x, orig_y, seg_data)
+                                    return
+                        return
                     if event.button() == Qt.LeftButton:
                         # 既存の fill/brush アノテーションに当たっていれば移動優先
                         hit_move = False
@@ -2887,9 +3105,9 @@ class ImageLabel(QLabel):
 
                             self.update()
                             return
-                        elif event.button() == Qt.RightButton and self.selected_segmentation_index == i:
-                            # 右クリックでポリゴンに新しい点を追加
-                            self.add_point_to_polygon(i, orig_x, orig_y)
+                        elif event.button() == Qt.RightButton:
+                            # 右クリック: コンテキストメニューを表示
+                            self._show_seg_context_menu(event.globalPos(), i, orig_x, orig_y, seg_data)
                             return
                 
                 # 新しいポリゴンの描画処理
@@ -3041,13 +3259,6 @@ class ImageLabel(QLabel):
                     self.main_window.skip_images(1)  # デフォルトは1枚
 
     def mouseReleaseEvent(self, event):
-        # speedバー調整完了処理
-        if self.is_adjusting_speed:
-            self.is_adjusting_speed = False
-            self.setCursor(Qt.ArrowCursor)
-            self.update()
-            return
-
         # 一筆書きウェイポイント描画完了処理
         if self.is_drawing_waypoints:
             self.is_drawing_waypoints = False
@@ -3190,31 +3401,6 @@ class ImageLabel(QLabel):
                 self._fill_preview_mask = None
                 self._fill_preview_timer.start(300)
             self.update()
-
-        # speedバーの調整中の処理
-        if self.is_adjusting_speed:
-            self.handle_speed_bar_click(pos)  # 同じロジックを使用
-            return
-
-        # speedバーのホバー検出
-        if hasattr(self, 'target_rect'):
-            is_hovering = self.is_point_in_speed_bar(pos, self.target_rect)
-            if is_hovering:
-                # ホバー位置のY座標を保存
-                self.speed_bar_hover_y = pos.y()
-            else:
-                self.speed_bar_hover_y = None
-
-            if is_hovering != self.hovering_speed_bar:
-                self.hovering_speed_bar = is_hovering
-                if is_hovering:
-                    self.setCursor(Qt.PointingHandCursor)
-                else:
-                    self.setCursor(Qt.ArrowCursor)
-
-            # ホバー中は常に再描画（プレビューバー更新のため）
-            if is_hovering:
-                self.update()
 
         # ウェイポイントドラッグ中のカーソル設定
         if self.is_moving_waypoint:
@@ -4061,6 +4247,256 @@ class ImageLabel(QLabel):
         
         return None
 
+
+class SpeedGaugeWidget(QWidget):
+    """画像の外側に表示するスピードゲージウィジェット。
+    ズームスライダーと同じ比率（上下 1/8 ずつ余白、トラック 6/8）でレイアウトし、
+    スライダーハンドルスタイルで現在値を表示する。
+    """
+
+    # トラック領域の x オフセットと幅
+    TRACK_X = 8
+    TRACK_W = 20
+    HANDLE_H = 8   # ハンドルの縦幅（px）
+    LABEL_H = 0    # ラベルはトラック直上に相対配置するため予約不要
+
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.setFixedWidth(72)
+        self.setMinimumHeight(100)
+        self.setMouseTracking(True)
+
+        self._is_hovering = False
+        self._is_dragging = False
+        self._hover_y = None
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+    def _track_rect(self):
+        """ズームスライダーと同じ 1/8 上下余白、6/8 トラック高さで計算"""
+        rem = max(24, self.height() - self.LABEL_H)
+        top_pad = rem // 8
+        th = rem * 6 // 8
+        ty = self.LABEL_H + top_pad
+        return QRect(self.TRACK_X, ty, self.TRACK_W, th)
+
+    def _max_speed(self):
+        if self.main_window and hasattr(self.main_window, 'main_image_view'):
+            return self.main_window.main_image_view.max_speed
+        from config import MAX_SPEED
+        return MAX_SPEED
+
+    def _current_annotation(self):
+        mw = self.main_window
+        if not mw:
+            return None
+        ann = mw.annotations.get(mw.current_index)
+        if ann is None or 'speed' not in ann:
+            return None
+        return ann
+
+    def _speed_from_y(self, y):
+        tr = self._track_rect()
+        rel = (y - tr.y()) / tr.height()
+        rel = max(0.0, min(1.0, rel))
+        return (1.0 - rel) * self._max_speed()  # 上が高速
+
+    def _y_from_norm(self, norm, tr):
+        """正規化値 (0-1) からY座標（ハンドル中心）を計算"""
+        return tr.y() + tr.height() - int(tr.height() * norm)
+
+    # ------------------------------------------------------------------
+    # painting
+    # ------------------------------------------------------------------
+    def paintEvent(self, event):
+        ann = self._current_annotation()
+        if ann is None:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        speed = ann['speed']
+        ms = self._max_speed()
+        normalized = max(0.0, min(1.0, speed / ms)) if ms > 0 else 0.0
+
+        tr = self._track_rect()
+        tx, ty, tw, th = tr.x(), tr.y(), tr.width(), tr.height()
+        track_cx = tx + tw // 2  # トラック中心 x
+
+        is_dark = getattr(self.main_window, 'is_dark_mode', False) if self.main_window else False
+        text_color = QColor(200, 200, 200) if is_dark else QColor(50, 50, 50)
+
+        # ── トラック背景（薄グレー） ──
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(210, 210, 210)))
+        painter.drawRect(tx, ty, tw, th)
+
+        # ── 現在値の充填バー（下から上へ） ──
+        fill_h = int(th * normalized)
+        fill_y = ty + th - fill_h
+        if normalized < 0.5:
+            fill_r = int(normalized * 2 * 200)
+            fill_g = 190
+        else:
+            fill_r = 190
+            fill_g = int((1.0 - (normalized - 0.5) * 2) * 190)
+        painter.setBrush(QBrush(QColor(fill_r, fill_g, 50, 220)))
+        painter.drawRect(tx, fill_y, tw, fill_h)
+
+        # ── トラック外枠 ──
+        painter.setPen(QPen(QColor(110, 110, 110), 1))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(tx, ty, tw, th)
+
+        # ── 将来フレームのマーカー（横線）──
+        mw = self.main_window
+        if mw and getattr(mw.main_image_view, 'show_future_annotations', False):
+            idx = mw.current_index
+            future_cfg = [(10, 2, QColor(200, 180, 0)), (5, 3, QColor(255, 165, 0))]
+            for offset, lw, fc in future_cfg:
+                fann = mw.annotations.get(idx + offset)
+                if fann and 'speed' in fann:
+                    fn = max(0.0, min(1.0, fann['speed'] / ms)) if ms > 0 else 0.0
+                    fy = self._y_from_norm(fn, tr)
+                    painter.setPen(QPen(fc, lw))
+                    painter.drawLine(tx, fy, tx + tw, fy)
+
+        # ── 推論結果の横線 ──
+        if (mw and hasattr(mw, 'inference_checkbox') and
+                mw.inference_checkbox.isChecked() and
+                hasattr(mw, 'inference_results')):
+            idx = mw.current_index
+            inf = mw.inference_results.get(idx)
+            if inf:
+                if getattr(mw.main_image_view, 'show_future_annotations', False):
+                    for offset, lw, lc in [(10, 2, QColor(0, 150, 150)), (5, 3, QColor(0, 200, 200))]:
+                        fd = inf.get(f"future_{offset}", {})
+                        if 'speed' in fd:
+                            fn = max(0.0, min(1.0, fd['speed']))
+                            fy = self._y_from_norm(fn, tr)
+                            painter.setPen(QPen(lc, lw))
+                            painter.drawLine(tx, fy, tx + tw, fy)
+                if 'speed' in inf:
+                    ni = max(0.0, min(1.0, inf['speed']))
+                    iy = self._y_from_norm(ni, tr)
+                    painter.setPen(QPen(QColor(0, 255, 255), 3))
+                    painter.drawLine(tx - 2, iy, tx + tw + 2, iy)
+                    # 推論値テキスト
+                    painter.setPen(QPen(QColor(0, 200, 200), 1))
+                    painter.setFont(QFont("Arial", 7, QFont.Bold))
+                    painter.drawText(tx + tw + 4, iy + 4, f"({inf['speed'] * ms:.2f})")
+
+        # ── 目盛り ──
+        num_ticks = 11
+        painter.setFont(QFont("Arial", 7))
+        for i in range(num_ticks):
+            tick_y = ty + th - int(th * i / (num_ticks - 1))
+            painter.setPen(QPen(text_color, 1))
+            painter.drawLine(tx + tw, tick_y, tx + tw + 3, tick_y)
+            if i % 2 == 0:
+                tv = ms * i / (num_ticks - 1)
+                tl = f"{tv:.1f}" if tv != int(tv) else f"{int(tv)}"
+                painter.setFont(QFont("Arial", 7))
+                painter.drawText(tx + tw + 5, tick_y + 4, tl)
+
+        # ── "SPEED X.XX" を1行でトラック直上に描画（ズームラベルと高さを合わせる）──
+        painter.setFont(QFont("Arial", 7))
+        fm = painter.fontMetrics()
+        gap = 8  # トラック上端からのクリアランス
+        label_baseline = max(fm.ascent() + 2, ty - fm.descent() - gap)
+        painter.setPen(QPen(text_color, 1))
+        painter.drawText(2, label_baseline, f"SPEED {speed:.2f}")
+
+        # ── 現在値ハンドル（赤・太め） ──
+        handle_y = self._y_from_norm(normalized, tr)
+        hh = self.HANDLE_H + 4
+        painter.setBrush(QBrush(QColor(210, 30, 30)))
+        painter.setPen(QPen(QColor(255, 255, 255), 1))
+        painter.drawRect(tx - 3, handle_y - hh // 2, tw + 6, hh)
+
+        # ── ホバー時の予定値をトラック左側に表示 ──
+        if (self._is_hovering or self._is_dragging) and self._hover_y is not None:
+            hover_speed = self._speed_from_y(self._hover_y)
+            text = f"{hover_speed:.2f}"
+            font = QFont("Arial", 9, QFont.Bold)
+            painter.setFont(font)
+            fm = painter.fontMetrics()
+            tw_txt = fm.horizontalAdvance(text)
+            th_txt = fm.height()
+            pad = 4
+            # トラック左側に配置（ウィジェット左端を超えないようクランプ）
+            tooltip_x = max(pad, tx - tw_txt - pad)
+            tooltip_y = max(ty + th_txt + pad,
+                            min(self._hover_y, ty + th - pad))
+            bg_rect = QRect(tooltip_x - pad,
+                            tooltip_y - th_txt - pad,
+                            tw_txt + pad * 2,
+                            th_txt + pad * 2)
+            painter.fillRect(bg_rect, QColor(0, 0, 0, 190))
+            painter.setPen(QPen(QColor(100, 200, 255), 1))
+            painter.drawRect(bg_rect)
+            painter.setPen(Qt.white)
+            painter.drawText(tooltip_x, tooltip_y, text)
+
+        painter.end()
+
+    # ------------------------------------------------------------------
+    # mouse interaction
+    # ------------------------------------------------------------------
+    def _apply_speed_at_y(self, y):
+        ann = self._current_annotation()
+        if ann is None:
+            return
+        new_speed = self._speed_from_y(y)
+        ann['speed'] = new_speed
+        self._hover_y = y
+        self.update()
+        mw = self.main_window
+        if mw and hasattr(mw, 'statusBar'):
+            mw.statusBar().showMessage(get_text('status_speed_updated', new_speed), 2000)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._is_dragging = True
+            self._is_hovering = False
+            self._apply_speed_at_y(event.pos().y())
+
+    def mouseMoveEvent(self, event):
+        y = event.pos().y()
+        tr = self._track_rect()
+        in_bar = tr.adjusted(-8, -8, 8, 8).contains(event.pos())
+
+        if self._is_dragging:
+            self._apply_speed_at_y(y)
+            return
+
+        if in_bar != self._is_hovering:
+            self._is_hovering = in_bar
+            self.setCursor(Qt.SizeVerCursor if in_bar else Qt.ArrowCursor)
+
+        if in_bar:
+            self._hover_y = y
+            self.update()
+        elif self._hover_y is not None:
+            self._hover_y = None
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._is_dragging:
+            self._is_dragging = False
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+
+    def leaveEvent(self, event):
+        if self._is_hovering or self._hover_y is not None:
+            self._is_hovering = False
+            self._hover_y = None
+            self.update()
+
+
 # 下部ギャラリー系（物体検知・セグメンテーション対応強化版）
 class ThumbnailWidget(QWidget):
     def __init__(self, parent=None, img_path="", index=0, is_selected=False,
@@ -4469,6 +4905,8 @@ class ImageAnnotationTool(QMainWindow):
         self.last_bbox = None  # 前回作成したバウンディングボックスの情報
         self.last_bboxes = []  # 前回の画像の全てのバウンディングボックスを保存するリスト（新規追加）
         self.auto_apply_last_bbox = False  # 前回のバウンディングボックスを自動適用するかどうか
+        self._bbox_fixed_class_advance = False   # 物体検知: クラス固定で次へ
+        self._seg_fixed_class_advance = False    # セグメンテーション: クラス固定で次へ
 
         # セグメンテーション関連の初期化
         self.segmentation_annotations = {}  # セグメンテーションアノテーション用
@@ -4510,6 +4948,7 @@ class ImageAnnotationTool(QMainWindow):
         self.location_buttons = []  # 位置情報ボタンのリスト
         self.current_location = None  # 現在選択されている位置情報
         self.location_annotations = {}  # 画像ごとの位置情報アノテーション
+        self._location_display_mode = 'position'  # 'position' or 'corner'
         
         # アノテーションのタイムスタンプを保存する辞書
         self.annotation_timestamps = {}
@@ -5418,16 +5857,20 @@ class ImageAnnotationTool(QMainWindow):
 
         image_and_slider_layout.addLayout(image_column, 1)
 
+        # スピードゲージ（zoom スライダーの左）
+        self.speed_gauge = SpeedGaugeWidget(self)
+        image_and_slider_layout.addWidget(self.speed_gauge)
+
         # キャンバスサイズ調整用の縦スライダー（画像の右側）
         zoom_slider_container = QVBoxLayout()
         zoom_slider_container.setContentsMargins(0, 0, 0, 0)
-        zoom_slider_container.setSpacing(2)
+        zoom_slider_container.setSpacing(1)
+
+        zoom_slider_container.addStretch(1)  # 上パディング（スライダーと同比率）
 
         zoom_label = QLabel(get_text('canvas_zoom_label'))
         zoom_label.setAlignment(Qt.AlignCenter)
-        zoom_slider_container.addWidget(zoom_label)
-
-        zoom_slider_container.addStretch(1)  # 上パディング（スライダーを中央75%に）
+        zoom_slider_container.addWidget(zoom_label)  # ラベルをスライダー直上に配置
 
         self.canvas_zoom_slider = QSlider(Qt.Vertical)
         self.canvas_zoom_slider.setMinimum(10)   # zoom_factor 1.0
@@ -5718,9 +6161,17 @@ class ImageAnnotationTool(QMainWindow):
         location_layout = QVBoxLayout(location_panel)
         location_layout.setSpacing(5)
         
+        # アノテーションモード ラベル（右にヒントを横並び）
+        mode_header_row = QHBoxLayout()
+        mode_header_row.setSpacing(6)
         mode_layout_label = QLabel(get_text('label_annotation_mode'))
         mode_layout_label.setStyleSheet("font-weight: bold;")
-        location_layout.addWidget(mode_layout_label)
+        mode_header_row.addWidget(mode_layout_label)
+        self.mode_hint_label = QLabel(get_text('label_mode_hint'))
+        self.mode_hint_label.setStyleSheet("color: #888; font-style: italic; font-size: 10px;")
+        mode_header_row.addWidget(self.mode_hint_label)
+        mode_header_row.addStretch()
+        location_layout.addLayout(mode_header_row)
 
         # アノテーションモード切替ボタン
         mode_layout = QHBoxLayout()
@@ -5754,6 +6205,19 @@ class ImageAnnotationTool(QMainWindow):
         mode_layout.addWidget(self.waypoint_mode_button)  # 追加
 
         location_layout.addLayout(mode_layout)
+
+        # クリック時の自動スキップ枚数（全モード共通、モードボタン直下）
+        skip_layout = QHBoxLayout()
+        self.skip_images_on_click = QCheckBox(get_text('chk_auto_skip_on_click'))
+        self.skip_images_on_click.setChecked(True)
+        skip_layout.addWidget(self.skip_images_on_click)
+        self.skip_count_spin = QSpinBox()
+        self.skip_count_spin.setRange(1, 1000)
+        self.skip_count_spin.setValue(10)
+        self.skip_count_spin.valueChanged.connect(self.update_skip_button_labels)
+        skip_layout.addWidget(self.skip_count_spin)
+        skip_layout.addStretch()
+        location_layout.addLayout(skip_layout)
 
         # 自動運転走行軌跡制御パネル
         self.auto_driving_control_widget = QWidget()
@@ -5934,16 +6398,23 @@ class ImageAnnotationTool(QMainWindow):
 
         segmentation_control_layout.addLayout(tool_row)
 
-        # 左右下端まで塗りつぶし（ポリゴンモード時のみ有効）
+        # 左右下端まで塗りつぶし ＋ 領域を結合（同一行）
         poly_bottom_row = QHBoxLayout()
-        poly_bottom_row.setSpacing(4)
-        self._poly_fill_bottom_check = QCheckBox("左右下端まで塗りつぶし")
+        poly_bottom_row.setSpacing(6)
+        self._poly_fill_bottom_check = QCheckBox("下端まで塗りつぶし")
         self._poly_fill_bottom_check.setToolTip(
             "ポリゴン完了時に最初・最後の点から画像の左右端・下端まで自動的に範囲を拡張します\n"
             "（道路・壁の上端ラインを引くだけで全領域を塗りつぶすのに便利）"
         )
         self._poly_fill_bottom_check.setChecked(False)
         poly_bottom_row.addWidget(self._poly_fill_bottom_check)
+        self._seg_merge_checkbox = QCheckBox("領域を結合")
+        self._seg_merge_checkbox.setToolTip(
+            "同じクラスのアノテーションが既にある場合、新しい領域を既存領域に統合する\n"
+            "（ポリゴン・ペイント・塗りつぶし 共通）"
+        )
+        self._seg_merge_checkbox.setChecked(False)
+        poly_bottom_row.addWidget(self._seg_merge_checkbox)
         poly_bottom_row.addStretch()
         segmentation_control_layout.addLayout(poly_bottom_row)
 
@@ -5955,11 +6426,11 @@ class ImageAnnotationTool(QMainWindow):
         self._brush_size_slider = QSlider(Qt.Horizontal)
         self._brush_size_slider.setMinimum(2)
         self._brush_size_slider.setMaximum(100)
-        self._brush_size_slider.setValue(20)
+        self._brush_size_slider.setValue(10)
         self._brush_size_slider.setTickInterval(10)
         self._brush_size_slider.setToolTip("ブラシの半径（画像ピクセル単位）")
         brush_row.addWidget(self._brush_size_slider, 1)
-        self._brush_size_value_label = QLabel("20px")
+        self._brush_size_value_label = QLabel("10px")
         self._brush_size_value_label.setFixedWidth(36)
         brush_row.addWidget(self._brush_size_value_label)
         segmentation_control_layout.addLayout(brush_row)
@@ -6006,7 +6477,7 @@ class ImageAnnotationTool(QMainWindow):
             is_paint = (mode == 'paint')
             is_fill = (mode == 'fill')
             is_eraser = (mode == 'eraser')
-            self._poly_fill_bottom_check.setEnabled(is_polygon)
+            self._poly_fill_bottom_check.setEnabled(is_polygon or is_paint)
             self._brush_size_label.setEnabled(is_paint or is_eraser)
             self._brush_size_slider.setEnabled(is_paint or is_eraser)
             self._brush_size_value_label.setEnabled(is_paint or is_eraser)
@@ -6015,6 +6486,7 @@ class ImageAnnotationTool(QMainWindow):
             self._fill_tolerance_value_label.setEnabled(is_fill)
             self._fill_close_checkbox.setEnabled(is_fill)
             self._fill_close_kernel_spin.setEnabled(is_fill and self._fill_close_checkbox.isChecked())
+            self._seg_merge_checkbox.setEnabled(not is_eraser)
             cursor = Qt.CrossCursor if (is_paint or is_fill or is_eraser) else Qt.ArrowCursor
             self.main_image_view.setCursor(cursor)
 
@@ -6045,6 +6517,9 @@ class ImageAnnotationTool(QMainWindow):
         self._poly_fill_bottom_check.toggled.connect(
             lambda checked: setattr(self.main_image_view, 'polygon_fill_to_bottom', checked)
         )
+        self._seg_merge_checkbox.toggled.connect(
+            lambda checked: setattr(self.main_image_view, 'seg_merge_enabled', checked)
+        )
 
         # 初期状態でペンサイズ・許容差・クロージング行を無効化（ポリゴンモード）
         self._brush_size_label.setEnabled(False)
@@ -6055,6 +6530,8 @@ class ImageAnnotationTool(QMainWindow):
         self._fill_tolerance_value_label.setEnabled(False)
         self._fill_close_checkbox.setEnabled(False)
         self._fill_close_kernel_spin.setEnabled(False)
+        # 結合チェックは初期（ポリゴンモード）から有効
+        self._seg_merge_checkbox.setEnabled(True)
 
         # セグメンテーション制御ラベル
         segmentation_label = QLabel(get_text('label_steering_direction'))
@@ -6068,41 +6545,41 @@ class ImageAnnotationTool(QMainWindow):
         self.show_seg_driving_direction_checkbox.stateChanged.connect(self.toggle_seg_driving_direction)
         segmentation_control_layout.addWidget(self.show_seg_driving_direction_checkbox)
 
-        # クラスIDとY座標の設定（横並び）
+        # ID / Y座標 / 最大舵角（横並び）
         seg_params_layout = QHBoxLayout()
+        seg_params_layout.setSpacing(4)
 
-        seg_params_layout.addWidget(QLabel(get_text('label_class_id')))
+        seg_params_layout.addWidget(QLabel("ID"))
         self.seg_class_id_spin = QSpinBox()
         self.seg_class_id_spin.setRange(0, 99)
-        self.seg_class_id_spin.setValue(0)  # デフォルト0
+        self.seg_class_id_spin.setValue(0)
+        self.seg_class_id_spin.setFixedWidth(44)
         self.seg_class_id_spin.setToolTip(get_text('tip_seg_class_id'))
         self.seg_class_id_spin.valueChanged.connect(self.update_seg_driving_direction_class)
         seg_params_layout.addWidget(self.seg_class_id_spin)
 
-        seg_params_layout.addSpacing(20)
         seg_params_layout.addWidget(QLabel(get_text('label_y_coordinate')))
         self.seg_direction_y_spin = QSpinBox()
         self.seg_direction_y_spin.setRange(0, 1000)
-        self.seg_direction_y_spin.setValue(100)  # デフォルト100
+        self.seg_direction_y_spin.setValue(100)
+        self.seg_direction_y_spin.setFixedWidth(52)
         self.seg_direction_y_spin.setToolTip(get_text('tip_seg_y_coordinate'))
         self.seg_direction_y_spin.valueChanged.connect(self.update_seg_driving_direction_y)
         seg_params_layout.addWidget(self.seg_direction_y_spin)
 
-        segmentation_control_layout.addLayout(seg_params_layout)
-
-        # 最大舵角の設定
-        steering_layout = QHBoxLayout()
-        steering_layout.addWidget(QLabel(get_text('label_max_steering')))
+        seg_params_layout.addWidget(QLabel(get_text('label_max_steering')))
         self.seg_max_steering_spin = QDoubleSpinBox()
         self.seg_max_steering_spin.setRange(0.1, 90.0)
-        self.seg_max_steering_spin.setValue(30.0)  # デフォルト30度
+        self.seg_max_steering_spin.setValue(30.0)
         self.seg_max_steering_spin.setSuffix("°")
         self.seg_max_steering_spin.setDecimals(1)
+        self.seg_max_steering_spin.setFixedWidth(62)
         self.seg_max_steering_spin.setToolTip(get_text('tip_seg_max_steering'))
         self.seg_max_steering_spin.valueChanged.connect(self.update_seg_max_steering_angle)
-        steering_layout.addWidget(self.seg_max_steering_spin)
-        steering_layout.addStretch()
-        segmentation_control_layout.addLayout(steering_layout)
+        seg_params_layout.addWidget(self.seg_max_steering_spin)
+        seg_params_layout.addStretch()
+
+        segmentation_control_layout.addLayout(seg_params_layout)
 
         # 表示モード選択
         display_mode_layout = QHBoxLayout()
@@ -6130,45 +6607,87 @@ class ImageAnnotationTool(QMainWindow):
         # ラジオボタンの変更を監視
         self.seg_display_mode_button_group.buttonClicked.connect(self.on_seg_display_mode_changed)
 
+        # クラス固定で次に進む（セグメンテーション）
+        self._seg_fixed_advance_checkbox = QCheckBox("クラス固定で次に進む")
+        self._seg_fixed_advance_checkbox.setToolTip(
+            "前回のクラスを固定し、アノテーション完了後にスキップ枚数分だけ自動で次の画像へ進む"
+        )
+        self._seg_fixed_advance_checkbox.setChecked(False)
+        self._seg_fixed_advance_checkbox.toggled.connect(
+            lambda checked: setattr(self, '_seg_fixed_class_advance', checked)
+        )
+        segmentation_control_layout.addWidget(self._seg_fixed_advance_checkbox)
+
         # 初期状態では非表示
         self.segmentation_control_widget.setVisible(False)
         location_layout.addWidget(self.segmentation_control_widget)
 
         # 現在のモードを表すヒントラベル
-        self.mode_hint_label = QLabel(get_text('label_mode_hint'))
-        self.mode_hint_label.setStyleSheet("color: #666; font-style: italic;")
-        location_layout.addWidget(self.mode_hint_label)
 
-        # 前回のバウンディングボックスを自動適用するチェックボックス
+        # 前回のバウンディングボックスを自動適用するチェックボックス（物体検知モードのみ表示）
         self.apply_last_bbox_checkbox = QCheckBox(get_text('chk_apply_last_bbox'))
         self.apply_last_bbox_checkbox.setChecked(False)
         self.apply_last_bbox_checkbox.setToolTip(get_text('tip_apply_last_bbox'))
         self.apply_last_bbox_checkbox.stateChanged.connect(self.toggle_auto_apply_bbox)
+        self.apply_last_bbox_checkbox.setVisible(False)  # 初期は非表示（物体検知モード時のみ表示）
         location_layout.addWidget(self.apply_last_bbox_checkbox)
 
-        # セグメンテーション用の前回適用チェックボックス
+        # クラス固定で次に進む（物体検知モードのみ表示）
+        self._bbox_fixed_advance_checkbox = QCheckBox("クラス固定で次に進む")
+        self._bbox_fixed_advance_checkbox.setToolTip(
+            "前回のクラスを固定し、アノテーション完了後にスキップ枚数分だけ自動で次の画像へ進む"
+        )
+        self._bbox_fixed_advance_checkbox.setChecked(False)
+        self._bbox_fixed_advance_checkbox.setVisible(False)  # 初期は非表示
+        self._bbox_fixed_advance_checkbox.toggled.connect(
+            lambda checked: setattr(self, '_bbox_fixed_class_advance', checked)
+        )
+        location_layout.addWidget(self._bbox_fixed_advance_checkbox)
+
+        # セグメンテーション用の前回適用チェックボックス（セグメンテーションモードのみ表示）
         self.apply_last_segmentation_checkbox = QCheckBox(get_text('chk_apply_last_segmentation'))
         self.apply_last_segmentation_checkbox.setChecked(False)
         self.apply_last_segmentation_checkbox.setToolTip(get_text('tip_apply_last_segmentation'))
         self.apply_last_segmentation_checkbox.stateChanged.connect(self.toggle_auto_apply_segmentation)
+        self.apply_last_segmentation_checkbox.setVisible(False)  # 初期は非表示（セグメンテーションモード時のみ表示）
         location_layout.addWidget(self.apply_last_segmentation_checkbox)
-
-        # スキップ枚数設定
-        skip_layout = QHBoxLayout()
-        self.skip_images_on_click = QCheckBox(get_text('chk_auto_skip_on_click'))
-        self.skip_images_on_click.setChecked(True)  # デフォルトでオン
-        skip_layout.addWidget(self.skip_images_on_click)
-        self.skip_count_spin = QSpinBox()
-        self.skip_count_spin.setRange(1, 1000)
-        self.skip_count_spin.setValue(10)  # デフォルト値は10
-        self.skip_count_spin.valueChanged.connect(self.update_skip_button_labels)
-        skip_layout.addWidget(self.skip_count_spin)
-
-        location_layout.addLayout(skip_layout)
 
         location_label = QLabel(get_text('label_location_info'))
         location_label.setStyleSheet("font-weight: bold;")
         location_layout.addWidget(location_label)
+
+        # 位置 / コーナー 切り替えボタン
+        loc_mode_row = QHBoxLayout()
+        loc_mode_row.setSpacing(2)
+        self._loc_mode_btn_group = QButtonGroup(self)
+        self._loc_mode_btn_group.setExclusive(True)
+        self._loc_pos_btn = QPushButton("位置")
+        self._loc_pos_btn.setCheckable(True)
+        self._loc_pos_btn.setChecked(True)
+        self._loc_pos_btn.setFixedHeight(24)
+        self._loc_pos_btn.setStyleSheet(
+            "QPushButton{border:1px solid #aaa;border-radius:3px;padding:2px 8px;background:#f0f0f0;}"
+            "QPushButton:checked{background:#4a90d9;color:white;border-color:#2a70b9;}"
+        )
+        self._loc_corner_btn = QPushButton("コーナー")
+        self._loc_corner_btn.setCheckable(True)
+        self._loc_corner_btn.setFixedHeight(24)
+        self._loc_corner_btn.setStyleSheet(
+            "QPushButton{border:1px solid #aaa;border-radius:3px;padding:2px 8px;background:#f0f0f0;}"
+            "QPushButton:checked{background:#4a90d9;color:white;border-color:#2a70b9;}"
+        )
+        self._loc_mode_btn_group.addButton(self._loc_pos_btn, 0)
+        self._loc_mode_btn_group.addButton(self._loc_corner_btn, 1)
+        loc_mode_row.addWidget(self._loc_pos_btn)
+        loc_mode_row.addWidget(self._loc_corner_btn)
+        loc_mode_row.addStretch()
+        location_layout.addLayout(loc_mode_row)
+
+        def _on_loc_mode_changed(btn_id):
+            self._location_display_mode = 'corner' if btn_id == 1 else 'position'
+            self._update_location_button_display()
+
+        self._loc_mode_btn_group.idClicked.connect(_on_loc_mode_changed)
 
         # 位置情報の自動適用チェックボックス
         self.apply_location_checkbox = QCheckBox(get_text('chk_apply_location'))
@@ -6319,6 +6838,7 @@ class ImageAnnotationTool(QMainWindow):
                 "last_model_sources": (self._multi_source_config.get('sources') if hasattr(self, '_multi_source_config') and self._multi_source_config else None),
                 "extra_models": extra_models_info,
                 "max_speed": self.main_image_view.max_speed if hasattr(self, 'main_image_view') else MAX_SPEED,
+                "detection_classes": self.classes_input.text() if hasattr(self, 'classes_input') else "",
                 "timestamp": int(time.time())
             }
             
@@ -6690,6 +7210,11 @@ class ImageAnnotationTool(QMainWindow):
                     # セグメンテーション全体が選択されている場合はセグメンテーションを削除
                     elif self.main_image_view.selected_segmentation_index is not None:
                         self.delete_selected_segmentation()
+                    # ペイント/塗りつぶしモードでホバー中のアノテーションを削除
+                    elif (getattr(self.main_image_view, 'seg_tool_mode', '') in ('paint', 'fill') and
+                          self.main_image_view.hovering_polygon_index is not None):
+                        self.delete_selected_segmentation(self.main_image_view.hovering_polygon_index)
+                        self.main_image_view.hovering_polygon_index = None
                 elif self.current_mode == 3:  # waypointモードの場合
                     # 現在の画像のwaypointアノテーションを全削除
                     self.delete_current_waypoint_annotations()
@@ -7740,9 +8265,7 @@ class ImageAnnotationTool(QMainWindow):
         for button in self.location_buttons:
             loc_value = button.property("location_value")
             count = location_counts.get(loc_value, 0)
-            
-            # ボタンのテキストを更新（数を追加）
-            button.setText(get_text('btn_location_with_count', count, loc_value))
+            button.setProperty("location_count", count)
             
             # カウントに応じてスタイルを調整
             color = get_location_color(loc_value)
@@ -7779,6 +8302,9 @@ class ImageAnnotationTool(QMainWindow):
                     }}
                 """)
 
+        # テキスト・アイコンを現在のモードで更新
+        self._update_location_button_display()
+
     def add_location_button(self):
         """位置情報選択ボタンを追加する"""
         location_value = self.new_location_input.value()
@@ -7792,6 +8318,7 @@ class ImageAnnotationTool(QMainWindow):
         # 新しいボタンを作成
         button = QPushButton(get_text('label_location_button', location_value))
         button.setProperty("location_value", location_value)
+        button.setProperty("location_count", 0)
         button.setCheckable(True)  # チェック可能に設定
         button.clicked.connect(lambda checked, value=location_value: self.set_location(value))
         
@@ -7813,10 +8340,13 @@ class ImageAnnotationTool(QMainWindow):
         # レイアウトに追加
         self.location_buttons_layout.addWidget(button)
         self.location_buttons.append(button)
-        
+
+        # 現在の表示モードに合わせてテキスト/アイコンを更新
+        self._update_location_button_display()
+
         # 次の値にインクリメント
         self.new_location_input.setValue(location_value + 1)
-        
+
         # 初期ボタンを生成するだけの場合はメッセージを表示しない
         if len(self.location_buttons) > 1:
             QMessageBox.information(self, get_text('dlg_add_complete'), get_text('msg_location_added', location_value))
@@ -9202,6 +9732,9 @@ class ImageAnnotationTool(QMainWindow):
             self.auto_driving_control_widget.setVisible(True)
             self.waypoint_control_widget.setVisible(False)
             self.segmentation_control_widget.setVisible(False)
+            self.apply_last_bbox_checkbox.setVisible(False)
+            self.apply_last_segmentation_checkbox.setVisible(False)
+            self._bbox_fixed_advance_checkbox.setVisible(False)
             self.statusBar().showMessage(get_text('status_switched_to_auto_driving'), 3000)
         elif sender == self.detection_mode_button:
             self.current_mode = 1
@@ -9212,6 +9745,9 @@ class ImageAnnotationTool(QMainWindow):
             self.auto_driving_control_widget.setVisible(False)
             self.waypoint_control_widget.setVisible(False)
             self.segmentation_control_widget.setVisible(False)
+            self.apply_last_bbox_checkbox.setVisible(True)
+            self.apply_last_segmentation_checkbox.setVisible(False)
+            self._bbox_fixed_advance_checkbox.setVisible(True)
             self.statusBar().showMessage(get_text('status_switched_to_detection'), 3000)
         elif sender == self.segmentation_mode_button:
             self.current_mode = 2
@@ -9222,6 +9758,9 @@ class ImageAnnotationTool(QMainWindow):
             self.auto_driving_control_widget.setVisible(False)
             self.waypoint_control_widget.setVisible(False)
             self.segmentation_control_widget.setVisible(True)
+            self.apply_last_bbox_checkbox.setVisible(False)
+            self.apply_last_segmentation_checkbox.setVisible(True)
+            self._bbox_fixed_advance_checkbox.setVisible(False)
             # ツールをポリゴンにリセット
             self._seg_polygon_btn.setChecked(True)
             self.main_image_view.seg_tool_mode = 'polygon'
@@ -9238,6 +9777,9 @@ class ImageAnnotationTool(QMainWindow):
             self.auto_driving_control_widget.setVisible(False)
             self.waypoint_control_widget.setVisible(True)
             self.segmentation_control_widget.setVisible(False)
+            self.apply_last_bbox_checkbox.setVisible(False)
+            self.apply_last_segmentation_checkbox.setVisible(False)
+            self._bbox_fixed_advance_checkbox.setVisible(False)
             self.statusBar().showMessage(get_text('status_switched_to_waypoint'), 3000)
         else:
             # Bキーでの切り替え（4つのモードをサイクル）
@@ -9250,6 +9792,9 @@ class ImageAnnotationTool(QMainWindow):
                 self.auto_driving_control_widget.setVisible(True)
                 self.waypoint_control_widget.setVisible(False)
                 self.segmentation_control_widget.setVisible(False)
+                self.apply_last_bbox_checkbox.setVisible(False)
+                self.apply_last_segmentation_checkbox.setVisible(False)
+                self._bbox_fixed_advance_checkbox.setVisible(False)
                 self.statusBar().showMessage(get_text('status_switched_to_auto_driving'), 3000)
             elif self.current_mode == 1:
                 self.auto_mode_button.setChecked(False)
@@ -9259,6 +9804,9 @@ class ImageAnnotationTool(QMainWindow):
                 self.auto_driving_control_widget.setVisible(False)
                 self.waypoint_control_widget.setVisible(False)
                 self.segmentation_control_widget.setVisible(False)
+                self.apply_last_bbox_checkbox.setVisible(True)
+                self.apply_last_segmentation_checkbox.setVisible(False)
+                self._bbox_fixed_advance_checkbox.setVisible(True)
                 self.statusBar().showMessage(get_text('status_switched_to_detection'), 3000)
             elif self.current_mode == 2:
                 self.auto_mode_button.setChecked(False)
@@ -9268,6 +9816,9 @@ class ImageAnnotationTool(QMainWindow):
                 self.auto_driving_control_widget.setVisible(False)
                 self.waypoint_control_widget.setVisible(False)
                 self.segmentation_control_widget.setVisible(True)
+                self.apply_last_bbox_checkbox.setVisible(False)
+                self.apply_last_segmentation_checkbox.setVisible(True)
+                self._bbox_fixed_advance_checkbox.setVisible(False)
                 self.statusBar().showMessage(get_text('status_switched_to_segmentation'), 3000)
             else:  # current_mode == 3
                 self.auto_mode_button.setChecked(False)
@@ -9277,6 +9828,9 @@ class ImageAnnotationTool(QMainWindow):
                 self.auto_driving_control_widget.setVisible(False)
                 self.waypoint_control_widget.setVisible(True)
                 self.segmentation_control_widget.setVisible(False)
+                self.apply_last_bbox_checkbox.setVisible(False)
+                self.apply_last_segmentation_checkbox.setVisible(False)
+                self._bbox_fixed_advance_checkbox.setVisible(False)
                 self.statusBar().showMessage(get_text('status_switched_to_waypoint'), 3000)
         
         self.main_image_view.update()
@@ -9405,29 +9959,64 @@ class ImageAnnotationTool(QMainWindow):
         if not self.images or not polygon_data:
             return
 
-        # インデックスベースに変更
         current_index = self.current_index
 
         if current_index not in self.segmentation_annotations:
             self.segmentation_annotations[current_index] = []
 
-        # polygon_dataをディープコピーしてから追加（参照の共有を防ぐ）
+        # 領域結合モード: 同じクラスの既存アノテーションにマスクをOR合成
+        if getattr(self.main_image_view, 'seg_merge_enabled', False):
+            class_name = polygon_data.get('class')
+            existing_anns = self.segmentation_annotations.get(current_index, [])
+            target_seg = next(
+                (s for s in existing_anns if s is not None and s.get('class') == class_name),
+                None
+            )
+            if target_seg is not None:
+                try:
+                    from PIL import Image as _PILImage
+                    import numpy as _np
+                    img = _PILImage.open(self.images[current_index]).convert('RGB')
+                    img_arr = _np.array(img)
+                    img_h, img_w = img_arr.shape[:2]
+                    ex_mask = _seg_annotation_to_mask(target_seg, img_h, img_w)
+                    new_mask = _seg_annotation_to_mask(polygon_data, img_h, img_w)
+                    if ex_mask is not None and new_mask is not None:
+                        merged_mask = ex_mask | new_mask
+                        target_seg.clear()
+                        target_seg.update({
+                            'type': 'fill',
+                            'class': class_name,
+                            'rle': _mask_to_rle(merged_mask),
+                            'img_size': (img_w, img_h),
+                            'offset': [0, 0],
+                            'source': 'manual',
+                        })
+                        self.last_segmentation = deepcopy(target_seg)
+                        self.last_segmentations = [deepcopy(s) for s in existing_anns if s is not None]
+                        self.main_image_view.update()
+                        self.update_gallery()
+                        if getattr(self, '_seg_fixed_class_advance', False):
+                            skip = self.skip_count_spin.value()
+                            QTimer.singleShot(80, lambda: self.skip_images(skip))
+                        return
+                except Exception:
+                    pass  # 失敗時は通常追加にフォールスルー
+
+        # 通常追加
         self.segmentation_annotations[current_index].append(deepcopy(polygon_data))
-
-        # 前回のセグメンテーションとして保存（ディープコピーで完全に独立させる）
         self.last_segmentation = deepcopy(polygon_data)
-
-        # データクリーンアップ: Noneエントリを削除
         self.segmentation_annotations[current_index] = [
             seg for seg in self.segmentation_annotations[current_index] if seg is not None
         ]
-
-        # 現在のすべてのセグメンテーションを保存（ディープコピーで完全に独立させる）
         self.last_segmentations = [deepcopy(seg) for seg in self.segmentation_annotations[current_index]]
-
-        # UI更新
         self.main_image_view.update()
         self.update_gallery()
+
+        # クラス固定で次に進む
+        if getattr(self, '_seg_fixed_class_advance', False):
+            skip = self.skip_count_spin.value()
+            QTimer.singleShot(80, lambda: self.skip_images(skip))
             
     def clear_segmentation_annotations(self):
         """現在の画像のセグメンテーションアノテーションをすべて削除"""
@@ -9457,6 +10046,31 @@ class ImageAnnotationTool(QMainWindow):
         class_name = self.select_object_class()
         if not class_name:
             return
+        # 左右下端まで塗りつぶし: ストロークをマスク化して下端まで拡張し fill 型で保存
+        if getattr(self.main_image_view, 'polygon_fill_to_bottom', False) and self.images:
+            try:
+                from PIL import Image as _PILImage
+                import numpy as _np
+                img = _PILImage.open(self.images[self.current_index]).convert('RGB')
+                img_arr = _np.array(img)
+                img_h, img_w = img_arr.shape[:2]
+                mask = _np.zeros((img_h, img_w), dtype=bool)
+                ys, xs = _np.ogrid[:img_h, :img_w]
+                for cx, cy, r in strokes:
+                    mask |= ((xs - cx) ** 2 + (ys - cy) ** 2) <= r ** 2
+                mask = _apply_fill_to_bottom(mask)
+                fill_data = {
+                    'type': 'fill',
+                    'class': class_name,
+                    'rle': _mask_to_rle(mask),
+                    'img_size': (img_w, img_h),
+                    'offset': [0, 0],
+                    'source': 'manual',
+                }
+                self.add_segmentation_annotation(fill_data)
+                return
+            except Exception:
+                pass  # 失敗時は通常の brush 型にフォールスルー
         brush_data = {
             'type': 'brush',
             'class': class_name,
@@ -9490,12 +10104,12 @@ class ImageAnnotationTool(QMainWindow):
         class_name = self.select_object_class()
         if not class_name:
             return
-        rle = _mask_to_rle(mask)
+        img_h, img_w = img_array.shape[:2]
         fill_data = {
             'type': 'fill',
             'class': class_name,
-            'rle': rle,
-            'img_size': (img_array.shape[1], img_array.shape[0]),  # (w, h)
+            'rle': _mask_to_rle(mask),
+            'img_size': (img_w, img_h),
             'offset': [0, 0],
             'source': 'manual',
         }
@@ -9993,20 +10607,15 @@ class ImageAnnotationTool(QMainWindow):
         # セグメンテーションアノテーションがあるインデックスのみを取得
         valid_indices = []
         for idx, segments in self.segmentation_annotations.items():
-            if segments and len(segments) > 0:
-                # 各セグメンテーションに有効な座標があるかチェック
-                has_valid_segments = False
-                for seg in segments:
-                    points = None
-                    if isinstance(seg, dict):
-                        points = seg.get('points', [])
-                    else:
-                        points = getattr(seg, 'points', [])
-                    
-                    if points and len(points) >= 3:  # 最低3点必要
-                        has_valid_segments = True
-                        break
-                
+            if segments:
+                has_valid_segments = any(
+                    seg is not None and
+                    len(_seg_to_polygon_points(
+                        seg if isinstance(seg, dict) else {'points': getattr(seg, 'points', [])},
+                        1, 1  # img_size は validity チェックのみなので任意の値でよい
+                    )) >= 3
+                    for seg in segments
+                )
                 if has_valid_segments:
                     valid_indices.append(idx)
         
@@ -10211,44 +10820,40 @@ class ImageAnnotationTool(QMainWindow):
                     with open(label_path, 'w') as f:
                         for seg in self.segmentation_annotations[idx]:
                             # クラス名を取得
-                            class_name = None
                             if isinstance(seg, dict):
                                 class_name = seg.get('class') or seg.get('class_name')
-                                points = seg.get('points', [])
+                                seg_d = seg
                             else:
                                 class_name = getattr(seg, 'class', None) or getattr(seg, 'class_name', None)
-                                points = getattr(seg, 'points', [])
-                            
-                            if class_name and class_name in class_to_index and points and len(points) >= 3:
-                                class_id = class_to_index[class_name]
-                                
-                                # ポイントを正規化座標に変換
-                                normalized_points = []
-                                for point in points:
-                                    # アプリではピクセル座標で保存されているため正規化が必要
-                                    if isinstance(point, (list, tuple)) and len(point) >= 2:
-                                        # タプル/リスト形式: (x, y)
-                                        x = point[0] / img_width
-                                        y = point[1] / img_height
-                                    elif isinstance(point, dict):
-                                        # 辞書形式: {'x': x, 'y': y}
-                                        x = point.get('x', 0) / img_width
-                                        y = point.get('y', 0) / img_height
-                                    else:
-                                        # オブジェクト形式: point.x, point.y
-                                        x = getattr(point, 'x', 0) / img_width
-                                        y = getattr(point, 'y', 0) / img_height
-                                    
-                                    # 座標を0-1の範囲にクランプ
-                                    x = max(0.0, min(1.0, x))
-                                    y = max(0.0, min(1.0, y))
-                                    
-                                    normalized_points.extend([x, y])
-                                
-                                # YOLO セグメンテーション形式で書き込み
-                                if len(normalized_points) >= 6:  # 最低3点 (6座標)
-                                    points_str = ' '.join([f"{coord:.6f}" for coord in normalized_points])
-                                    f.write(f"{class_id} {points_str}\n")
+                                seg_d = {'points': getattr(seg, 'points', [])}
+
+                            if not class_name or class_name not in class_to_index:
+                                continue
+
+                            # polygon / fill / brush すべて対応した輪郭点取得
+                            points = _seg_to_polygon_points(seg_d, img_width, img_height)
+                            if len(points) < 3:
+                                continue
+
+                            class_id = class_to_index[class_name]
+
+                            # ポイントを正規化座標に変換
+                            normalized_points = []
+                            for point in points:
+                                if isinstance(point, (list, tuple)) and len(point) >= 2:
+                                    x, y = point[0] / img_width, point[1] / img_height
+                                elif isinstance(point, dict):
+                                    x, y = point.get('x', 0) / img_width, point.get('y', 0) / img_height
+                                else:
+                                    x, y = getattr(point, 'x', 0) / img_width, getattr(point, 'y', 0) / img_height
+                                normalized_points.extend([
+                                    max(0.0, min(1.0, x)),
+                                    max(0.0, min(1.0, y))
+                                ])
+
+                            if len(normalized_points) >= 6:  # 最低3点 (6座標)
+                                points_str = ' '.join([f"{coord:.6f}" for coord in normalized_points])
+                                f.write(f"{class_id} {points_str}\n")
                     
                     success_count += 1
                     
@@ -10296,26 +10901,22 @@ class ImageAnnotationTool(QMainWindow):
                 if segments and len(segments) > 0:
                     total_segments += len(segments)
                     for seg in segments:
-                        points = None
-                        if isinstance(seg, dict):
-                            points = seg.get('points', [])
-                        else:
-                            points = getattr(seg, 'points', [])
-                        
-                        if points and len(points) >= 3:  # 最低3点必要
+                        seg_d = seg if isinstance(seg, dict) else {'points': getattr(seg, 'points', [])}
+                        pts = _seg_to_polygon_points(seg_d, 1, 1)
+                        if len(pts) >= 3:
                             valid_segments += 1
                             image_has_valid_segments = True
-                
+
                 if image_has_valid_segments:
                     valid_images += 1
-            
+
             print(f"\n=== セグメンテーションアノテーション確認 ===")
             print(f"アノテーション辞書数: {len(annotations)}")
             print(f"総セグメンテーション数: {total_segments}")
             print(f"有効なセグメンテーション数: {valid_segments}")
             print(f"有効なセグメンテーションがある画像数: {valid_images}")
             print("=" * 50)
-            
+
             if valid_segments == 0:
                 QMessageBox.critical(
                     self,
@@ -12024,19 +12625,18 @@ class ImageAnnotationTool(QMainWindow):
                         class_name = seg.get('class', 'unknown')
                         if class_name in classes:
                             class_id = classes.index(class_name)
-                            
-                            # ポリゴンポイントを正規化
+
+                            # polygon / fill / brush すべて対応
+                            points = _seg_to_polygon_points(seg, img_width, img_height)
+
                             normalized_points = []
-                            points = seg.get('points', [])
-                            
                             for point in points:
                                 if isinstance(point, (list, tuple)) and len(point) >= 2:
-                                    norm_x = point[0] / img_width
-                                    norm_y = point[1] / img_height
+                                    norm_x = max(0.0, min(1.0, point[0] / img_width))
+                                    norm_y = max(0.0, min(1.0, point[1] / img_height))
                                     normalized_points.extend([norm_x, norm_y])
-                            
-                            if normalized_points:
-                                # YOLO形式でポリゴンを出力
+
+                            if len(normalized_points) >= 6:
                                 points_str = ' '.join(f"{p:.6f}" for p in normalized_points)
                                 f.write(f"{class_id} {points_str}\n")
         
@@ -12181,21 +12781,22 @@ class ImageAnnotationTool(QMainWindow):
                 if hasattr(self, 'segmentation_annotations') and img_path in self.segmentation_annotations:
                     for seg in self.segmentation_annotations[img_path]:
                         class_name = seg.get('class', 'unknown')
-                        points = seg.get('points', [])
-                        
+
+                        # polygon / fill / brush すべて対応
+                        points = _seg_to_polygon_points(seg, img_width, img_height)
+
                         if class_name in classes and len(points) >= 3:
                             class_id = classes.index(class_name)
-                            
-                            # ポリゴンの座標を正規化
+
                             normalized_points = []
                             for x, y in points:
-                                norm_x = x / img_width
-                                norm_y = y / img_height
+                                norm_x = max(0.0, min(1.0, x / img_width))
+                                norm_y = max(0.0, min(1.0, y / img_height))
                                 normalized_points.extend([norm_x, norm_y])
-                            
-                            # YOLO セグメンテーション形式
-                            line = f"{class_id} " + " ".join(f"{coord:.6f}" for coord in normalized_points)
-                            f.write(line + '\n')
+
+                            if len(normalized_points) >= 6:
+                                line = f"{class_id} " + " ".join(f"{coord:.6f}" for coord in normalized_points)
+                                f.write(line + '\n')
         
         # classes.txtを作成
         classes_path = os.path.join(output_folder, 'classes.txt')
@@ -13498,8 +14099,9 @@ class ImageAnnotationTool(QMainWindow):
             result_data = {
                 'segments': segments,
                 'bboxes': bboxes,
-                'masks': masks,  # マスク配列を追加
-                'classes': class_ids  # クラスIDを追加
+                'masks': masks,
+                'classes': class_ids,
+                'success': True  # 推論成功フラグ（例外結果と区別するため）
             }
             self.segmentation_inference_results[current_img_path] = result_data
             # インデックスでもアクセスできるように保存
@@ -13536,7 +14138,9 @@ class ImageAnnotationTool(QMainWindow):
             print(f"YOLOセグメンテーション推論エラー: {e}")
             import traceback
             traceback.print_exc()
-            self.segmentation_inference_results[current_img_path] = {'segments': [], 'bboxes': []}
+            # 例外時はキャッシュしない → 次回ナビゲーション時に再試行できる
+            if current_img_path in self.segmentation_inference_results:
+                del self.segmentation_inference_results[current_img_path]
             return False
 
     def test_model_comparison(self):
@@ -14029,12 +14633,21 @@ class ImageAnnotationTool(QMainWindow):
 
     def select_object_class(self):
             """物体クラスを選択するダイアログを表示 - 動的クラス対応"""
+            # クラス固定モード: 前回のクラスをダイアログなしで返す
+            mode = getattr(self, 'current_mode', 0)
+            if mode == 1 and getattr(self, '_bbox_fixed_class_advance', False):
+                if self.last_selected_bbox_class:
+                    return self.last_selected_bbox_class
+            if mode == 2 and getattr(self, '_seg_fixed_class_advance', False):
+                if self.last_selected_bbox_class:
+                    return self.last_selected_bbox_class
+
             classes = self.get_current_classes()
-            
+
             if not classes:
                 QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_no_classes'))
                 return None
-            
+
             # 前回選択したクラスのインデックスを取得
             default_index = 0
             if self.last_selected_bbox_class and self.last_selected_bbox_class in classes:
@@ -16161,6 +16774,11 @@ class ImageAnnotationTool(QMainWindow):
         self.main_image_view.update()
         self.update_gallery()
 
+        # クラス固定で次に進む
+        if getattr(self, '_bbox_fixed_class_advance', False):
+            skip = self.skip_count_spin.value()
+            QTimer.singleShot(80, lambda: self.skip_images(skip))
+
     def add_session_check_to_init_ui(self):
         """init_uiメソッドの最後に追加する初期セッション確認コード"""
         # メインウィンドウを最前面にアクティブ化
@@ -16175,6 +16793,11 @@ class ImageAnnotationTool(QMainWindow):
         # max_speedの復元
         if session_info and "max_speed" in session_info:
             self.main_image_view.max_speed = session_info["max_speed"]
+
+        # 検知クラスの復元
+        if session_info and "detection_classes" in session_info and session_info["detection_classes"]:
+            if hasattr(self, 'classes_input'):
+                self.classes_input.setText(session_info["detection_classes"])
 
         # 複数フォルダを優先的に使用
         has_folders = False
@@ -16963,12 +17586,12 @@ class ImageAnnotationTool(QMainWindow):
         # セグメンテーション推論表示の更新
         if hasattr(self, 'segmentation_inference_checkbox') and self.segmentation_inference_checkbox.isChecked():
             current_img_path = self.images[self.current_index]
-            # 推論結果がまだない場合のみ推論を実行
-            if current_img_path not in self.segmentation_inference_results:
-                self.run_single_yolo_segmentation_inference()
-            else:
-                # 既にある結果の表示を更新
+            cached = self.segmentation_inference_results.get(current_img_path)
+            # success=True の成功済みキャッシュがある場合のみスキップ
+            if cached and cached.get('success'):
                 self.update_segmentation_inference_display()
+            else:
+                self.run_single_yolo_segmentation_inference()
 
     def toggle_future_annotation_display(self, state):
         """将来アノテーション表示の切り替え"""
@@ -19599,7 +20222,15 @@ class ImageAnnotationTool(QMainWindow):
                             location = entry.get('user/loc', entry.get('pilot/loc', None))
 
                             # Speed情報を取得
-                            speed = entry.get('speed', entry.get('user/speed', entry.get('pilot/speed', None)))
+                            # user/speed → その他の */speed（pilot/speed除く）→ speed → pilot/speed の優先順で取得
+                            speed = entry.get('user/speed')
+                            if speed is None:
+                                for _k, _v in entry.items():
+                                    if _k.endswith('/speed') and _k != 'pilot/speed' and _k != 'user/speed':
+                                        speed = _v
+                                        break
+                            if speed is None:
+                                speed = entry.get('speed', entry.get('pilot/speed', None))
 
                             # 座標に変換
                             x = int((angle + 1) / 2 * img_width)
@@ -19637,6 +20268,8 @@ class ImageAnnotationTool(QMainWindow):
                                     continue
                                 if key in ['user/angle', 'pilot/angle', 'user/throttle', 'pilot/throttle',
                                            'user/loc', 'pilot/loc', 'speed', 'user/speed', 'pilot/speed']:
+                                    continue
+                                if key.endswith('/speed'):  # */speed は上で処理済み
                                     continue
                                 # 数値データのみ保存
                                 if isinstance(value, (int, float)):
@@ -20653,12 +21286,11 @@ class ImageAnnotationTool(QMainWindow):
 
         # セグメンテーション推論表示の更新
         if hasattr(self, 'segmentation_inference_checkbox') and self.segmentation_inference_checkbox.isChecked():
-            # 推論結果がまだない場合のみ推論を実行
-            if new_img_path not in self.segmentation_inference_results:
-                self.run_single_yolo_segmentation_inference()
-            else:
-                # 既にある結果の表示を更新
+            cached = self.segmentation_inference_results.get(new_img_path)
+            if cached and cached.get('success'):
                 self.update_segmentation_inference_display()
+            else:
+                self.run_single_yolo_segmentation_inference()
 
         # 画面を更新 - ギャラリーは遅延更新でパフォーマンス改善
         # 再生中はデバウンスをスキップして直接更新（タイマーリセット問題を回避）
@@ -21157,22 +21789,24 @@ class ImageAnnotationTool(QMainWindow):
             with open(label_path, 'w') as f:
                 for seg_idx, seg_data in enumerate(segmentations):
                     class_name = seg_data.get('class', 'unknown')
-                    points = seg_data.get('points', [])
-                    
+
+                    # polygon / fill / brush すべてに対応した輪郭点取得
+                    points = _seg_to_polygon_points(seg_data, img_width, img_height)
+
                     # クラスインデックスを取得
                     if class_name not in class_to_index:
                         print(f"警告: 未知のクラス '{class_name}' をスキップします")
                         continue
-                    
+
                     class_idx = class_to_index[class_name]
-                    
+
                     # ポイント数の確認
                     if len(points) < 3:
                         print(f"警告: ポイント数が不足しています ({len(points)}点) - セグメンテーション {seg_idx}")
                         continue
-                    
+
                     print(f"  セグメンテーション {seg_idx}: クラス={class_name}({class_idx}), ポイント数={len(points)}")
-                    
+
                     # YOLO セグメンテーション形式のコーディネートに変換
                     normalized_coords = []
                     for point_idx, (px, py) in enumerate(points):
@@ -25528,9 +26162,30 @@ class ImageAnnotationTool(QMainWindow):
                 }}
             """)
             
+            # カウントをプロパティとして保持（表示更新用）
+            button.setProperty("location_count", 0)
             # レイアウトに追加
             self.location_buttons_layout.addWidget(button)
             self.location_buttons.append(button)
+
+        # 初期表示を適用
+        self._update_location_button_display()
+
+    def _update_location_button_display(self):
+        """位置/コーナーモードに応じてボタンのテキスト・アイコンを更新する"""
+        mode = getattr(self, '_location_display_mode', 'position')
+        for btn in self.location_buttons:
+            loc_val = btn.property("location_value")
+            count = btn.property("location_count") or 0
+            if mode == 'corner' and loc_val is not None and loc_val < len(_CORNER_INFO):
+                _, label = _CORNER_INFO[loc_val]
+                angle, _ = _CORNER_INFO[loc_val]
+                btn.setText(f"{count} | {label}")
+                btn.setIcon(_make_corner_icon(angle))
+                btn.setIconSize(QSize(24, 24))
+            else:
+                btn.setText(get_text('btn_location_with_count', count, loc_val))
+                btn.setIcon(QIcon())
 
     def add_location_model_section(self):
         """位置推論モデルのセクションを追加する"""
@@ -27826,27 +28481,20 @@ class ImageAnnotationTool(QMainWindow):
                     for seg_idx, seg in enumerate(self.segmentation_annotations[idx]):
                         # クラス名を取得 - 複数のキーを試す
                         class_name = None
-                        points = []
-                        
                         if isinstance(seg, dict):
-                            # 複数のキー名で試行
                             class_name = seg.get('class_name') or seg.get('class') or seg.get('label')
-                            points = seg.get('points', [])
-                            
-                            print(f"  セグメント {seg_idx}: 辞書キー={list(seg.keys())}")
-                            print(f"    class_name={seg.get('class_name')}, class={seg.get('class')}")
-                            
+                            seg_d = seg
                         else:
-                            # オブジェクト形式の場合
-                            class_name = (getattr(seg, 'class_name', None) or 
-                                        getattr(seg, 'class', None) or 
-                                        getattr(seg, 'label', None))
-                            points = getattr(seg, 'points', [])
-                        
-                        print(f"  セグメント {seg_idx}: 最終クラス名={class_name}, ポイント数={len(points)}")
-                        
+                            class_name = (getattr(seg, 'class_name', None) or
+                                          getattr(seg, 'class', None) or
+                                          getattr(seg, 'label', None))
+                            seg_d = {'points': getattr(seg, 'points', [])}
+
+                        # polygon / fill / brush すべてに対応した輪郭点取得
+                        points = _seg_to_polygon_points(seg_d, img_width, img_height)
+
                         # クラス名が有効で、期待されるクラスリストに含まれているかチェック
-                        if class_name and class_name in class_to_index and points and len(points) >= 3:
+                        if class_name and class_name in class_to_index and len(points) >= 3:
                             class_id = class_to_index[class_name]
                             
                             # ポイントを正規化座標に変換
@@ -28035,14 +28683,10 @@ class ImageAnnotationTool(QMainWindow):
                         if class_name:
                             class_names_found.add(class_name)
                         
-                        # ポイント数チェック
-                        points = None
-                        if isinstance(seg, dict):
-                            points = seg.get('points', [])
-                        else:
-                            points = getattr(seg, 'points', [])
-                        
-                        if class_name and points and len(points) >= 3:
+                        # ポイント数チェック（polygon / fill / brush すべて対応）
+                        seg_d = seg if isinstance(seg, dict) else {'points': getattr(seg, 'points', [])}
+                        pts = _seg_to_polygon_points(seg_d, 1, 1)
+                        if class_name and len(pts) >= 3:
                             valid_segments += 1
                             image_has_valid_segments = True
                 
