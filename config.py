@@ -122,6 +122,9 @@ SEGMENTATION_VERTEX_RADIUS = 8
 SEGMENTATION_VERTEX_HANDLE_RADIUS = 8
 SEGMENTATION_HOVER_VERTEX_RADIUS = 5
 
+# Speed
+MAX_SPEED = 5  # speed正規化の最大値 (m/s)
+
 # ===========================================
 # 色設定（QColorは使用側で生成）
 # ===========================================
@@ -207,6 +210,10 @@ SEQ_DEFAULT_BATCH_SIZE = 16
 
 # GRU固有パラメータ
 SEQ_GRU_DEFAULT_NUM_LAYERS = 1
+
+# マルチカメラ融合パラメータ
+SEQ_DEFAULT_FUSION_METHOD = 'concat'   # 'concat' or 'attention'
+SEQ_DEFAULT_ATTN_HEADS = 4             # Attention ヘッド数
 
 # TCN固有パラメータ
 SEQ_TCN_DEFAULT_CHANNELS = [128, 128, 256]

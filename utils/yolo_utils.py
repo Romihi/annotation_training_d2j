@@ -420,6 +420,11 @@ class TrainingOutputDialog(QDialog):
 
     def append_log(self, text):
         """ログテキストを追加"""
+        # ANSI エスケープシーケンスを除去（端末制御文字・カラーコード）
+        import re as _re
+        text = _re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', text)   # CSI シーケンス
+        text = _re.sub(r'\x1b[()][0-9A-Za-z]', '', text)      # その他エスケープ
+        text = text.replace('\r', '')                          # キャリッジリターン
         # すべてのテキストをログに追加（フィルタリングを緩める）
         if text.strip():
             # 改行がない場合は現在の行に追加

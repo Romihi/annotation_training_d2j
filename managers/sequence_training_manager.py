@@ -351,6 +351,10 @@ class SequenceTrainingManager:
             save_dict["config"]["cnn_channels"] = config.get('cnn_channels', [64, 128, 256])
             save_dict["config"]["kernel_size"] = config.get('kernel_size', 3)
 
+        # マルチカメラ融合パラメータを保存
+        save_dict["config"]["fusion_method"] = config.get('fusion_method', 'concat')
+        save_dict["config"]["attn_heads"] = config.get('attn_heads', 4)
+
         torch.save(save_dict, model_path)
         print(f"Sequence model ({model_arch}) saved to: {model_path}")
         return model_path
@@ -381,6 +385,10 @@ class SequenceTrainingManager:
             cfg = checkpoint['config']
         else:
             raise ValueError(f"未対応のモデルタイプ: {model_type}")
+
+        # 後方互換: 旧モデルに fusion_method / attn_heads が無い場合のデフォルト補完
+        cfg.setdefault('fusion_method', 'concat')
+        cfg.setdefault('attn_heads', 4)
 
         model = create_sequence_model(model_arch, cfg['num_image_sources'], cfg).to(device)
         model.load_state_dict(checkpoint['model_state_dict'])

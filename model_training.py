@@ -22,7 +22,7 @@ from model_catalog import get_model, AnnotationDataset
 from managers.sequence_training_manager import SequenceTrainingManager
 
 import random
-from PIL import Image, ImageOps, ImageEnhance
+from PIL import Image, ImageOps, ImageEnhance, ImageFilter, ImageDraw
 
 
 class EarlyStopping:
@@ -256,101 +256,252 @@ def calculate_individual_losses(outputs, targets, criterion):
 
     return steering_loss, throttle_loss, speed_loss, future_5_losses, future_10_losses
 
+# =====================================================================
+# ドメインランダマイゼーション カスタム変換（PIL ベース）
+# =====================================================================
+
+def _dr_motion_blur(img: Image.Image, kernel_size: int = 9) -> Image.Image:
+    """ランダム方向のモーションブラー"""
+    k = max(3, int(kernel_size) | 1)
+    angle = random.uniform(0, 180)
+    rotated = img.rotate(angle, expand=False, resample=Image.BILINEAR)
+    blurred = rotated.filter(ImageFilter.BoxBlur(k // 2))
+    return blurred.rotate(-angle, expand=False, resample=Image.BILINEAR)
+
+
+def _dr_fog(img: Image.Image, intensity: float = 0.4) -> Image.Image:
+    """霧・霞: 白オーバーレイのアルファブレンド"""
+    fog = Image.new('RGBA', img.size, (220, 220, 220, int(intensity * 255)))
+    base = img.convert('RGBA')
+    base.alpha_composite(fog)
+    return base.convert('RGB')
+
+
+def _dr_sunspot(img: Image.Image, num_spots: int = 3, intensity: float = 0.6) -> Image.Image:
+    """路面サンスポット: 放射状グラデーション楕円 + 光のストリーク"""
+    W, H = img.size
+    road_top = H // 3
+    base_arr = np.array(img.convert('RGB'), dtype=np.float32)
+    # アキュムレータ: RGB寄与量とアルファ重み
+    acc_rgb = np.zeros((H, W, 3), dtype=np.float32)
+    acc_alpha = np.zeros((H, W), dtype=np.float32)
+
+    ys, xs = np.mgrid[0:H, 0:W]
+
+    def _add_gradient_ellipse(cx, cy, rx, ry, color_rgb, peak_alpha, sigma=2.5):
+        """Gaussianフォールオフ楕円をアキュムレータに加算"""
+        dx = (xs - cx) / max(rx, 1)
+        dy = (ys - cy) / max(ry, 1)
+        falloff = np.exp(-sigma * (dx * dx + dy * dy))
+        a = falloff * peak_alpha
+        for c, col in enumerate(color_rgb):
+            acc_rgb[:, :, c] += a * col
+        acc_alpha[:] += a
+
+    for _ in range(num_spots):
+        cx = random.randint(W // 8, 7 * W // 8)
+        cy = random.randint(road_top, H - H // 10)
+        rx = random.randint(W // 10, W // 4)
+        ry = random.randint(H // 16, H // 7)
+        # メイン楕円: 中心が明るい白→薄い黄色
+        _add_gradient_ellipse(cx, cy, rx, ry, (255, 252, 220), intensity)
+
+        # 光のストリーク: 細長い楕円を2〜4本
+        for _ in range(random.randint(2, 4)):
+            scx = cx + random.randint(-rx, rx)
+            scy = cy + random.randint(-ry // 2, ry // 2)
+            srx = random.randint(int(rx * 0.6), int(rx * 1.5))
+            sry = random.randint(max(2, ry // 8), ry // 4)
+            # 回転: 座標を事前に変換してから楕円距離を計算
+            angle_rad = random.uniform(-0.5, 0.5)
+            cos_a, sin_a = float(np.cos(angle_rad)), float(np.sin(angle_rad))
+            dxr = (xs - scx) * cos_a + (ys - scy) * sin_a
+            dyr = -(xs - scx) * sin_a + (ys - scy) * cos_a
+            dist_s = (dxr / max(srx, 1)) ** 2 + (dyr / max(sry, 1)) ** 2
+            falloff_s = np.exp(-3.0 * dist_s)
+            streak_alpha = intensity * random.uniform(0.35, 0.7)
+            a_s = falloff_s * streak_alpha
+            for c, col in enumerate((255, 255, 245)):
+                acc_rgb[:, :, c] += a_s * col
+            acc_alpha[:] += a_s
+
+    # アルファを[0,1]にクランプしてブレンド
+    alpha_ch = np.clip(acc_alpha, 0, 1)[:, :, np.newaxis]
+    overlay_rgb = np.clip(acc_rgb / np.where(acc_alpha[:, :, np.newaxis] > 0, acc_alpha[:, :, np.newaxis], 1), 0, 255)
+    out_arr = np.clip(base_arr * (1 - alpha_ch) + overlay_rgb * alpha_ch, 0, 255).astype(np.uint8)
+    return Image.fromarray(out_arr, 'RGB')
+
+
+def _dr_gamma(img: Image.Image, gamma_min: float = 0.5, gamma_max: float = 1.8) -> Image.Image:
+    """ガンマ補正: 露出シミュレーション"""
+    gamma = random.uniform(gamma_min, gamma_max)
+    arr = np.array(img, dtype=np.float32) / 255.0
+    arr = np.power(arr, gamma)
+    return Image.fromarray((arr * 255).clip(0, 255).astype(np.uint8))
+
+
+def _dr_shadow(img: Image.Image, darkness: float = 0.5) -> Image.Image:
+    """影コントラスト: 左右どちらかの帯をグラデーションで暗くする"""
+    W, H = img.size
+    arr = np.array(img, dtype=np.float32)
+    shadow_w = int(random.uniform(0.25, 0.65) * W)
+    factor_dark = 1.0 - darkness
+    if random.random() < 0.5:
+        fade = np.linspace(factor_dark, 1.0, shadow_w)
+        arr[:, :shadow_w, :] *= fade[np.newaxis, :, np.newaxis]
+    else:
+        fade = np.linspace(1.0, factor_dark, shadow_w)
+        arr[:, W - shadow_w:, :] *= fade[np.newaxis, :, np.newaxis]
+    return Image.fromarray(arr.clip(0, 255).astype(np.uint8))
+
+
+def _dr_gaussian_noise_tensor(tensor, std: float = 0.03):
+    """ガウシアンノイズ: テンソルへのランダムノイズ付加"""
+    import torch
+    return (tensor + torch.randn_like(tensor) * std).clamp(0.0, 1.0)
+
+
 def create_augmentation_transform(
-    use_flip=True,
-    flip_prob=0.5,
-    use_color=True,
-    brightness=0.2,
-    contrast=0.2,
-    saturation=0.2,
-    use_geometry=True,
-    rotation_degrees=5,
-    translate_ratio=0.1,
-    use_erase=True,
-    erase_prob=0.5,
-    erase_min_ratio=0.02,
-    erase_max_ratio=0.2,
+    use_flip=True, flip_prob=0.5,
+    use_color=True, brightness=0.2, contrast=0.2, saturation=0.2,
+    use_geometry=True, rotation_degrees=5, translate_ratio=0.1,
+    use_erase=True, erase_prob=0.5, erase_min_ratio=0.02, erase_max_ratio=0.2,
+    # --- ドメインランダマイゼーション (A-D) ---
+    use_hue=False, hue_range=0.1, hue_prob=0.5,
+    use_grayscale=False, grayscale_prob=0.1,
+    use_blur=False, blur_kernel=5, blur_prob=0.5,
+    use_motion_blur=False, motion_kernel=9, motion_prob=0.5,
+    use_fog=False, fog_intensity=0.3, fog_prob=0.5,
+    use_noise=False, noise_std=0.03, noise_prob=0.5,
+    # --- 強光・路面グレア ---
+    use_sunspot=False, sunspot_intensity=0.5, sunspot_num=1, sunspot_prob=0.5,
+    use_gamma=False, gamma_min=0.5, gamma_max=1.8, gamma_prob=0.5,
+    use_shadow=False, shadow_darkness=0.5, shadow_prob=0.5,
     base_transform=None
 ) -> transforms.Compose:
-    """詳細設定可能なデータオーグメンテーション変換を作成する
+    """詳細設定可能なデータオーグメンテーション変換を作成する"""
+    pil_list = []   # ToTensor 前の PIL 変換
+    tensor_list = [transforms.ToTensor()]  # ToTensor + その後のテンソル変換
 
-    Args:
-        use_flip: 水平反転を使用するかどうか
-        flip_prob: 水平反転の確率
-        use_color: 色調整を使用するかどうか
-        brightness: 明るさの調整範囲
-        contrast: コントラストの調整範囲
-        saturation: 彩度の調整範囲
-        use_geometry: 幾何変換を使用するかどうか
-        rotation_degrees: 回転角度の範囲
-        translate_ratio: 平行移動の比率
-        use_erase: ランダムイレースを使用するかどうか
-        erase_prob: イレースの確率
-        erase_min_ratio: イレースの最小比率
-        erase_max_ratio: イレースの最大比率
-        base_transform: ベース変換（モデルの前処理）
+    # --- PIL 変換群 ---
+    # 色調整 (明るさ/コントラスト/彩度)
+    if use_color:
+        pil_list.append(transforms.ColorJitter(
+            brightness=brightness,
+            contrast=contrast,
+            saturation=saturation,
+        ))
 
-    Returns:
-        変換のCompose
-    """
-    transform_list = []
-    
+    # 色相シフト (C) — 独立した確率で適用
+    if use_hue:
+        _hr = hue_range
+        pil_list.append(transforms.RandomApply(
+            [transforms.ColorJitter(hue=_hr)],
+            p=hue_prob
+        ))
+
+    # グレースケール化 (C)
+    if use_grayscale:
+        pil_list.append(transforms.RandomGrayscale(p=grayscale_prob))
+
     # 水平反転
     if use_flip:
-        transform_list.append(transforms.RandomHorizontalFlip(p=flip_prob))
-    
-    # 色調整
-    if use_color:
-        transform_list.append(
-            transforms.ColorJitter(
-                brightness=brightness,
-                contrast=contrast,
-                saturation=saturation
-            )
-        )
-    
+        pil_list.append(transforms.RandomHorizontalFlip(p=flip_prob))
+
     # 幾何変換
     if use_geometry:
-        transform_list.append(
-            transforms.RandomAffine(
-                degrees=rotation_degrees,
-                translate=(translate_ratio, translate_ratio)
-            )
-        )
-    
+        pil_list.append(transforms.RandomAffine(
+            degrees=rotation_degrees,
+            translate=(translate_ratio, translate_ratio)
+        ))
+
+    # ガウシアンブラー (B)
+    if use_blur:
+        k = max(3, int(blur_kernel) | 1)
+        pil_list.append(transforms.RandomApply(
+            [transforms.GaussianBlur(kernel_size=k, sigma=(0.5, 2.0))],
+            p=blur_prob
+        ))
+
+    # モーションブラー (B)
+    if use_motion_blur:
+        _mk = motion_kernel
+        pil_list.append(transforms.RandomApply(
+            [transforms.Lambda(lambda img: _dr_motion_blur(img, _mk))],
+            p=motion_prob
+        ))
+
+    # 霧 (D)
+    if use_fog:
+        _fi = fog_intensity
+        pil_list.append(transforms.RandomApply(
+            [transforms.Lambda(lambda img: _dr_fog(img, _fi))],
+            p=fog_prob
+        ))
+
+    # サンスポット (強光)
+    if use_sunspot:
+        _si, _sn = sunspot_intensity, sunspot_num
+        pil_list.append(transforms.RandomApply(
+            [transforms.Lambda(lambda img: _dr_sunspot(img, _sn, _si))],
+            p=sunspot_prob
+        ))
+
+    # ガンマ補正 (強光)
+    if use_gamma:
+        _gmin, _gmax = gamma_min, gamma_max
+        pil_list.append(transforms.RandomApply(
+            [transforms.Lambda(lambda img: _dr_gamma(img, _gmin, _gmax))],
+            p=gamma_prob
+        ))
+
+    # 影コントラスト (強光)
+    if use_shadow:
+        _sd = shadow_darkness
+        pil_list.append(transforms.RandomApply(
+            [transforms.Lambda(lambda img: _dr_shadow(img, _sd))],
+            p=shadow_prob
+        ))
+
+    # --- テンソル変換群（ToTensor 後）---
+    # ガウシアンノイズ (A)
+    if use_noise:
+        _ns = noise_std
+        tensor_list.append(transforms.RandomApply(
+            [transforms.Lambda(lambda t: _dr_gaussian_noise_tensor(t, _ns))],
+            p=noise_prob
+        ))
+
     # ランダムイレース
     if use_erase:
-        transform_list.append(
-            transforms.RandomErasing(
-                p=erase_prob,
-                scale=(erase_min_ratio, erase_max_ratio),
-                ratio=(0.3, 3.3),
-                value=0
-            )
-        )
-    
-    # ベース変換（モデルの前処理）を追加
+        tensor_list.append(transforms.RandomErasing(
+            p=erase_prob,
+            scale=(erase_min_ratio, erase_max_ratio),
+            ratio=(0.3, 3.3),
+            value=0
+        ))
+
     if base_transform is not None:
-        transform_list.append(base_transform)
-        
-    return transforms.Compose(transform_list)
+        tensor_list.append(base_transform)
+
+    return transforms.Compose(pil_list + tensor_list)
 
 def generate_augmentation_samples(
     image_path,
     num_samples=4,
-    use_flip=True,
-    flip_prob=0.5,
-    use_color=True,
-    brightness=0.2,
-    contrast=0.2,
-    saturation=0.2,
-    use_geometry=True,
-    rotation_degrees=5,
-    translate_ratio=0.1,
-    use_erase=True,
-    erase_prob=0.5,
-    erase_min_ratio=0.02,
-    erase_max_ratio=0.2
+    use_flip=True, flip_prob=0.5,
+    use_color=True, brightness=0.2, contrast=0.2, saturation=0.2,
+    use_geometry=True, rotation_degrees=5, translate_ratio=0.1,
+    use_erase=True, erase_prob=0.5, erase_min_ratio=0.02, erase_max_ratio=0.2,
+    use_hue=False, hue_range=0.1, hue_prob=0.5,
+    use_grayscale=False, grayscale_prob=0.1,
+    use_blur=False, blur_kernel=5, blur_prob=0.5,
+    use_motion_blur=False, motion_kernel=9, motion_prob=0.5,
+    use_fog=False, fog_intensity=0.3, fog_prob=0.5,
+    use_noise=False, noise_std=0.03, noise_prob=0.5,
+    use_sunspot=False, sunspot_intensity=0.5, sunspot_num=1, sunspot_prob=0.5,
+    use_gamma=False, gamma_min=0.5, gamma_max=1.8, gamma_prob=0.5,
+    use_shadow=False, shadow_darkness=0.5, shadow_prob=0.5,
 ) -> list:
     """指定された画像に対してオーグメンテーションのサンプルを生成する
     
@@ -437,7 +588,57 @@ def generate_augmentation_samples(
         transform_components.append(
             (erase_img, "ランダムイレース", erase_prob)
         )
-    
+
+    # --- ドメインランダマイゼーション ---
+    if use_hue:
+        _hr = hue_range
+        transform_components.append(
+            (lambda img: transforms.functional.adjust_hue(img, random.uniform(-_hr, _hr)),
+             "色相シフト", hue_prob)
+        )
+    if use_grayscale:
+        transform_components.append(
+            (lambda img: img.convert('L').convert('RGB'), "グレースケール", grayscale_prob)
+        )
+    if use_blur:
+        _bk = blur_kernel
+        transform_components.append(
+            (lambda img: img.filter(ImageFilter.GaussianBlur(radius=max(1, _bk // 2))),
+             "ガウシアンブラー", blur_prob)
+        )
+    if use_motion_blur:
+        _mk = motion_kernel
+        transform_components.append(
+            (lambda img: _dr_motion_blur(img, _mk), "モーションブラー", motion_prob)
+        )
+    if use_fog:
+        _fi = fog_intensity
+        transform_components.append(
+            (lambda img: _dr_fog(img, _fi), "霧", fog_prob)
+        )
+    if use_noise:
+        _ns = noise_std
+        def _noise_pil(img):
+            arr = np.array(img, dtype=np.float32)
+            arr += np.random.randn(*arr.shape) * (_ns * 255)
+            return Image.fromarray(arr.clip(0, 255).astype(np.uint8))
+        transform_components.append((_noise_pil, "ガウシアンノイズ", noise_prob))
+    if use_sunspot:
+        _si, _sn = sunspot_intensity, sunspot_num
+        transform_components.append(
+            (lambda img: _dr_sunspot(img, _sn, _si), "サンスポット", sunspot_prob)
+        )
+    if use_gamma:
+        _gmin, _gmax = gamma_min, gamma_max
+        transform_components.append(
+            (lambda img: _dr_gamma(img, _gmin, _gmax), "ガンマ補正", gamma_prob)
+        )
+    if use_shadow:
+        _sd = shadow_darkness
+        transform_components.append(
+            (lambda img: _dr_shadow(img, _sd), "影コントラスト", shadow_prob)
+        )
+
     # サンプル生成
     for _ in range(num_samples - 1):  # オリジナルを除いて指定数を生成
         img = original_img.copy()
@@ -466,73 +667,112 @@ def create_datasets(
     use_augmentation: bool = False,
     use_speed: bool = False,
     use_future: bool = False,
-    num_outputs: int = 2
+    num_outputs: int = 2,
+    multi_source_paths: List[List[str]] = None,
+    num_sources: int = 1,
+    fusion_method: str = 'concat',
+    virtual_source_type: Optional[str] = None,
+    downscale_factor: float = 1.0,
+    downscale_mode: str = 'pixelate',
+    temporal_interval: int = 10
 ) -> Tuple[DataLoader, DataLoader, Dict[str, Any]]:
-    """トレーニングとバリデーション用のデータローダーを作成する"""
+    """トレーニングとバリデーション用のデータローダーを作成する
+
+    マルチソースモードの場合:
+        multi_source_paths: [[source1, source2, ...], ...] 形式のグループ化パス
+        num_sources: 画像ソース数 (>1 でマルチソースモード)
+        fusion_method: 融合方法 ('concat' or 'attention')
+    """
     # 引数チェック
     if image_paths is None or annotations is None or len(image_paths) == 0 or len(annotations) == 0:
         raise ValueError("有効な画像パスとアノテーションが必要です。")
 
+    is_virtual_source = virtual_source_type is not None and num_sources > 1
+    is_multi_source = num_sources > 1 and multi_source_paths is not None and not is_virtual_source
+
     # サンプル画像から実際のサイズを取得
-    sample_img = Image.open(image_paths[0]).convert('RGB')
+    if is_multi_source:
+        sample_path = multi_source_paths[0][0]
+    else:
+        sample_path = image_paths[0]
+    sample_img = Image.open(sample_path).convert('RGB')
     actual_size = (sample_img.height, sample_img.width)
     print(f"実際の画像サイズ: {actual_size}")
+    if is_multi_source:
+        print(f"マルチソースモード: {num_sources}ソース, 融合方法: {fusion_method}")
+
+    # サイズ縮小モード: actual_size自体をダウンスケールしてモデルを構築
+    if downscale_factor < 1.0 and downscale_mode == 'resize':
+        actual_size = (max(1, int(actual_size[0] * downscale_factor)),
+                       max(1, int(actual_size[1] * downscale_factor)))
+        print(f"入力サイズ縮小: {actual_size} (係数: {downscale_factor:.2f})")
 
     # モデルの前処理を取得（実際のサイズとnum_outputsを指定）
     model = get_model(model_name, pretrained=False, input_size=actual_size, num_outputs=num_outputs)
     base_transform = model.get_preprocess()
-    
+
+    # ピクセレーションモード: 元サイズのまま内容を劣化させる
+    if downscale_factor < 1.0 and downscale_mode == 'pixelate':
+        _factor = downscale_factor
+        def _pixelate(img):
+            W, H = img.size
+            sw = max(1, int(W * _factor))
+            sh = max(1, int(H * _factor))
+            return img.resize((sw, sh), Image.NEAREST).resize((W, H), Image.NEAREST)
+        base_transform = transforms.Compose([transforms.Lambda(_pixelate), base_transform])
+
     # データオーグメンテーションの設定
     if use_augmentation:
         if isinstance(use_augmentation, dict):
-            # 詳細設定が提供されている場合
-            aug_params = use_augmentation
-            # まず明示的にToTensorを入れる
-            transform_list = [transforms.ToTensor()]
-            
-            # 水平反転
-            if aug_params.get('use_flip', True):
-                transform_list.append(transforms.RandomHorizontalFlip(p=aug_params.get('flip_prob', 0.5)))
-            
-            # 色調整
-            if aug_params.get('use_color', True):
-                transform_list.append(
-                    transforms.ColorJitter(
-                        brightness=aug_params.get('brightness', 0.2),
-                        contrast=aug_params.get('contrast', 0.2),
-                        saturation=aug_params.get('saturation', 0.2)
-                    )
-                )
-            
-            # 幾何変換
-            if aug_params.get('use_geometry', True):
-                transform_list.append(
-                    transforms.RandomAffine(
-                        degrees=aug_params.get('rotation_degrees', 5),
-                        translate=(aug_params.get('translate_ratio', 0.1), 
-                                aug_params.get('translate_ratio', 0.1))
-                    )
-                )
-            
-            # ランダムイレース（テンソル変換後に適用）
-            if aug_params.get('use_erase', True):
-                transform_list.append(
-                    transforms.RandomErasing(
-                        p=aug_params.get('erase_prob', 0.5),
-                        scale=(aug_params.get('erase_min_ratio', 0.02), 
-                            aug_params.get('erase_max_ratio', 0.2)),
-                        ratio=(0.3, 3.3),
-                        value=0
-                    )
-                )
-            
-            
-            transform = transforms.Compose(transform_list)
+            p = use_augmentation
+            transform = create_augmentation_transform(
+                use_flip=p.get('use_flip', True),
+                flip_prob=p.get('flip_prob', 0.5),
+                use_color=p.get('use_color', True),
+                brightness=p.get('brightness', 0.2),
+                contrast=p.get('contrast', 0.2),
+                saturation=p.get('saturation', 0.2),
+                use_geometry=p.get('use_geometry', True),
+                rotation_degrees=p.get('rotation_degrees', 5),
+                translate_ratio=p.get('translate_ratio', 0.1),
+                use_erase=p.get('use_erase', True),
+                erase_prob=p.get('erase_prob', 0.5),
+                erase_min_ratio=p.get('erase_min_ratio', 0.02),
+                erase_max_ratio=p.get('erase_max_ratio', 0.2),
+                use_hue=p.get('use_hue', False),
+                hue_range=p.get('hue_range', 0.1),
+                hue_prob=p.get('hue_prob', 0.5),
+                use_grayscale=p.get('use_grayscale', False),
+                grayscale_prob=p.get('grayscale_prob', 0.1),
+                use_blur=p.get('use_blur', False),
+                blur_kernel=p.get('blur_kernel', 5),
+                blur_prob=p.get('blur_prob', 0.5),
+                use_motion_blur=p.get('use_motion_blur', False),
+                motion_kernel=p.get('motion_kernel', 9),
+                motion_prob=p.get('motion_prob', 0.5),
+                use_fog=p.get('use_fog', False),
+                fog_intensity=p.get('fog_intensity', 0.3),
+                fog_prob=p.get('fog_prob', 0.5),
+                use_noise=p.get('use_noise', False),
+                noise_std=p.get('noise_std', 0.03),
+                noise_prob=p.get('noise_prob', 0.5),
+                use_sunspot=p.get('use_sunspot', False),
+                sunspot_intensity=p.get('sunspot_intensity', 0.5),
+                sunspot_num=p.get('sunspot_num', 1),
+                sunspot_prob=p.get('sunspot_prob', 0.5),
+                use_gamma=p.get('use_gamma', False),
+                gamma_min=p.get('gamma_min', 0.5),
+                gamma_max=p.get('gamma_max', 1.8),
+                gamma_prob=p.get('gamma_prob', 0.5),
+                use_shadow=p.get('use_shadow', False),
+                shadow_darkness=p.get('shadow_darkness', 0.5),
+                shadow_prob=p.get('shadow_prob', 0.5),
+            )
         else:
             # 従来の単純な有効化の場合
             transform = transforms.Compose([
-                transforms.Resize(actual_size),  # 実際のサイズにリサイズ
-                transforms.ToTensor(),  # 明示的にToTensorを最初に
+                transforms.Resize(actual_size),
+                transforms.ToTensor(),
                 transforms.RandomHorizontalFlip(),
                 transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
                 transforms.RandomAffine(degrees=5, translate=(0.1, 0.1)),
@@ -545,8 +785,33 @@ def create_datasets(
             transforms.ToTensor()
         ])
 
-    # データセットの作成（use_speed, use_futureパラメータを追加）
-    dataset = AnnotationDataset(image_paths, annotations, transform=transform, use_speed=use_speed, use_future=use_future)
+    # データセットの作成
+    if is_virtual_source:
+        from model_catalog import VirtualSourceDataset
+        dataset = VirtualSourceDataset(
+            image_paths=image_paths,
+            annotations=annotations,
+            num_virtual_sources=num_sources,
+            virtual_type=virtual_source_type,
+            transform=transform,
+            use_speed=use_speed,
+            use_future=use_future,
+            temporal_interval=temporal_interval
+        )
+        print(f"VirtualSourceDataset作成: {len(dataset)}サンプル, {num_sources}仮想ソース, タイプ={virtual_source_type}, 時間差={temporal_interval}")
+    elif is_multi_source:
+        from model_catalog import MultiSourceDataset
+        dataset = MultiSourceDataset(
+            grouped_image_paths=multi_source_paths,
+            annotations=annotations,
+            num_sources=num_sources,
+            transform=transform,
+            use_speed=use_speed,
+            use_future=use_future
+        )
+        print(f"MultiSourceDataset作成: {len(dataset)}サンプル, {num_sources}ソース")
+    else:
+        dataset = AnnotationDataset(image_paths, annotations, transform=transform, use_speed=use_speed, use_future=use_future)
 
     # バッチサイズが小さすぎる場合の対策
     if batch_size < 2:
@@ -591,7 +856,9 @@ def create_datasets(
         'use_augmentation': use_augmentation,
         'use_speed': use_speed,
         'use_future': use_future,
-        'actual_image_size': actual_size
+        'actual_image_size': actual_size,
+        'num_sources': num_sources,
+        'fusion_method': fusion_method if is_multi_source else None
     }
 
     return train_loader, val_loader, dataset_info
@@ -615,7 +882,12 @@ def train_model(
     scheduler_name: str = 'ReduceLROnPlateau',
     custom_model_name: Optional[str] = None,
     num_outputs: int = 2,
-    input_size: Optional[Tuple[int, int]] = None
+    input_size: Optional[Tuple[int, int]] = None,
+    num_sources: int = 1,
+    fusion_method: str = 'concat',
+    selected_sources: Optional[List[str]] = None,
+    virtual_source_type: Optional[str] = None,
+    temporal_interval: int = 10
 ) -> Dict[str, Any]:
     """モデルをトレーニングする
 
@@ -652,39 +924,65 @@ def train_model(
         input_size = (sample_batch[0].shape[2], sample_batch[0].shape[3])  # (H, W)
         print(f"データローダーから入力サイズを推定: {input_size}")
 
+    # マルチソース判定
+    is_multi_source = num_sources > 1
+
     # モデルのロード
     if progress_callback:
         progress_callback(0, num_epochs, "モデルをロード中...")
 
-    # まず事前学習済みの重みでモデルを初期化（またはランダム初期化）
-    model = get_model(model_name, pretrained=pretrained, input_size=input_size, num_outputs=num_outputs)
+    if is_multi_source:
+        # マルチソースモデルを作成
+        from model_catalog import create_multi_source_model
+        model = create_multi_source_model(
+            base_model_name=model_name,
+            num_sources=num_sources,
+            fusion_method=fusion_method,
+            pretrained=pretrained,
+            num_outputs=num_outputs,
+            input_size=input_size
+        )
+        print(f"マルチソースモデル作成: {model.name} ({num_sources}ソース, {fusion_method}融合)")
+    else:
+        # まず事前学習済みの重みでモデルを初期化（またはランダム初期化）
+        model = get_model(model_name, pretrained=pretrained, input_size=input_size, num_outputs=num_outputs)
 
     # 入力サイズをモデルから確認
     model_input_size = model.input_size if hasattr(model, 'input_size') else input_size
     print(f"Model input size: {model_input_size}")
-    
+
     # 特定のモデルファイルから重みをロードする場合
     if model_path and os.path.exists(model_path):
         if progress_callback:
             progress_callback(0, num_epochs, f"保存済みモデル '{os.path.basename(model_path)}' から重みをロード中...")
-        
+
         try:
-            # モデルチェックポイントをロード
             checkpoint = torch.load(model_path, map_location=device)
-            
-            # state_dictがあるかチェック
-            if 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
-                print(f"モデル重みを '{model_path}' からロードしました")
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
+
+            if is_multi_source:
+                # マルチソース同士の互換性チェック
+                ckpt_num_sources = checkpoint.get('num_sources', 1)
+                ckpt_fusion = checkpoint.get('fusion_method', 'concat')
+                arch_match = (ckpt_num_sources == num_sources and ckpt_fusion == fusion_method)
+
+                if arch_match:
+                    model.load_state_dict(state_dict)
+                    print(f"マルチソースモデル重みをロードしました: {os.path.basename(model_path)}")
+                else:
+                    # アーキテクチャ不一致: エンコーダ重みのみ転移
+                    print(f"アーキテクチャ不一致 (ソース数: {ckpt_num_sources}→{num_sources}, "
+                          f"融合: {ckpt_fusion}→{fusion_method})")
+                    print("エンコーダ重みのみ転移します (strict=False)")
+                    model.load_state_dict(state_dict, strict=False)
             else:
-                # 直接state_dictが保存されている場合
-                model.load_state_dict(checkpoint)
+                model.load_state_dict(state_dict)
                 print(f"モデル重みを '{model_path}' からロードしました")
-                
+
         except Exception as e:
             print(f"モデル重みのロードに失敗しました: {e}")
             print("事前学習済みモデルまたはランダム初期化を使用します")
-    
+
     model = model.to(device)
 
     # 損失関数
@@ -931,13 +1229,22 @@ def train_model(
         if improved:
             early_stopping_counter = 0  # カウンタをリセット
 
-            torch.save({
+            save_dict = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': best_val_loss,
                 'input_size': model_input_size,
-            }, best_model_path)
+                'selected_sources': selected_sources,
+            }
+            if is_multi_source:
+                save_dict['num_sources'] = num_sources
+                save_dict['fusion_method'] = fusion_method
+                save_dict['base_model_name'] = model_name
+                if virtual_source_type:
+                    save_dict['virtual_source_type'] = virtual_source_type
+                    save_dict['temporal_interval'] = temporal_interval
+            torch.save(save_dict, best_model_path)
 
             if progress_callback:
                 progress_callback(epoch + 1, num_epochs,
@@ -994,7 +1301,7 @@ def train_model(
         return training_results
 
     # 最終モデルの保存
-    torch.save({
+    final_save_dict = {
         'epoch': completed_epochs,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
@@ -1004,7 +1311,16 @@ def train_model(
         'early_stopped': early_stopped,
         'stopped_epoch': stopped_epoch if early_stopped else completed_epochs,
         'input_size': model_input_size,
-    }, model_path)
+        'selected_sources': selected_sources,
+    }
+    if is_multi_source:
+        final_save_dict['num_sources'] = num_sources
+        final_save_dict['fusion_method'] = fusion_method
+        final_save_dict['base_model_name'] = model_name
+        if virtual_source_type:
+            final_save_dict['virtual_source_type'] = virtual_source_type
+            final_save_dict['temporal_interval'] = temporal_interval
+    torch.save(final_save_dict, model_path)
 
     # トレーニング結果
     training_results = {

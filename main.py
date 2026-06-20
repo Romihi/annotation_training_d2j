@@ -41,8 +41,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                             QGroupBox, QRadioButton, QTabWidget, QSizePolicy,QButtonGroup,
                             QListView, QTreeView, QAbstractItemView,QStyleOptionSlider,QStyle, QTextEdit, QPlainTextEdit,
                             QGraphicsOpacityEffect, QListWidget, QListWidgetItem)
-from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont, QPolygon, QCursor
-from PyQt5.QtCore import Qt, QRect, QPoint, QTimer, QEvent, QThread, pyqtSignal
+from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont, QPolygon, QCursor, QIcon, QPainterPath
+from PyQt5.QtCore import Qt, QRect, QPoint, QSize, QTimer, QEvent, QThread, pyqtSignal
 
 from PIL import Image, ImageDraw
 
@@ -63,7 +63,7 @@ from utils.image_utils import (
 )
 
 # カスタムモジュールのインポート
-from model_catalog import get_model, list_available_models
+from model_catalog import get_model, list_available_models, VirtualSourceDataset
 from utils.inference_utils import batch_inference
 from utils.export_utils import export_to_donkey, export_to_jetracer, export_to_video, export_to_video_multi_source
 from model_training import train_model, create_datasets
@@ -89,6 +89,288 @@ sys.excepthook = exception_hook
 from config import *
 from translations import get_text, set_language, get_current_language, t
 
+# ─── フラッドフィル ヘルパー関数 ─────────────────────────────────────────────
+
+def _mask_to_rle(mask):
+    """numpy bool マスクを [(value, count), ...] RLE に変換"""
+    flat = mask.flatten()
+    rle = []
+    if flat.size == 0:
+        return rle
+    cur = bool(flat[0])
+    count = 1
+    for v in flat[1:]:
+        bv = bool(v)
+        if bv == cur:
+            count += 1
+        else:
+            rle.append((cur, count))
+            cur = bv
+            count = 1
+    rle.append((cur, count))
+    return rle
+
+def _rle_to_mask(rle, h, w):
+    """RLE を numpy bool マスク (h, w) に戻す"""
+    import numpy as _np
+    flat = []
+    for val, count in rle:
+        flat.extend([val] * count)
+    arr = _np.array(flat, dtype=bool)
+    if arr.size < h * w:
+        arr = _np.pad(arr, (0, h * w - arr.size))
+    return arr[:h * w].reshape(h, w)
+
+def _rle_pixel(rle, w, x, y):
+    """RLE 全展開なしで 1 ピクセルの値を返す"""
+    target = y * w + x
+    idx = 0
+    for val, count in rle:
+        if idx + count > target:
+            return val
+        idx += count
+    return False
+
+def _fill_hit_test(seg_data, orig_x, orig_y):
+    """fill アノテーションのヒット判定（オフセット考慮）"""
+    img_w, img_h = seg_data.get('img_size', (0, 0))
+    if img_w == 0 or img_h == 0:
+        return False
+    off = seg_data.get('offset', [0, 0])
+    ax = orig_x - int(off[0])
+    ay = orig_y - int(off[1])
+    if not (0 <= ax < img_w and 0 <= ay < img_h):
+        return False
+    return bool(_rle_pixel(seg_data.get('rle', []), img_w, ax, ay))
+
+def _apply_fill_offset(seg_data):
+    """fill アノテーションのオフセットをマスクに焼き込んで offset をリセット"""
+    import numpy as _np
+    off = seg_data.get('offset', [0, 0])
+    if off == [0, 0]:
+        return
+    img_w, img_h = seg_data.get('img_size', (1, 1))
+    mask = _rle_to_mask(seg_data.get('rle', []), img_h, img_w)
+    dx, dy = int(off[0]), int(off[1])
+    shifted = _np.roll(mask, (dy, dx), axis=(0, 1))
+    if dy > 0:
+        shifted[:dy, :] = False
+    elif dy < 0:
+        shifted[dy:, :] = False
+    if dx > 0:
+        shifted[:, :dx] = False
+    elif dx < 0:
+        shifted[:, dx:] = False
+    seg_data['rle'] = _mask_to_rle(shifted)
+    seg_data['offset'] = [0, 0]
+
+def _morphological_close(mask, kernel_size):
+    """bool マスクにモルフォロジークロージング（膨張→収縮）を適用して細い隙間を埋める。
+    収縮ステップは border_value=True で画像端を保護する。"""
+    import numpy as _np
+    k = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
+    struct = _np.ones((k, k), dtype=bool)
+    try:
+        from scipy.ndimage import binary_dilation as _bd, binary_erosion as _be
+        dilated = _bd(mask, structure=struct)
+        # border_value=True: 端のピクセルはカーネル外を True とみなすので収縮されない
+        return _be(dilated, structure=struct, border_value=True)
+    except ImportError:
+        pass
+    # scipy がない場合: numpy sliding_window_view で代替
+    h, w = mask.shape
+    pad = k // 2
+    # 膨張 (dilation): 境界外は False
+    padded = _np.pad(mask, pad, constant_values=False)
+    try:
+        from numpy.lib.stride_tricks import sliding_window_view
+        wins = sliding_window_view(padded, (k, k))
+        dilated = wins.any(axis=(-2, -1))
+        # 収縮 (erosion): 境界外は True として扱うため True でパディング
+        padded2 = _np.pad(dilated, pad, constant_values=True)
+        wins2 = sliding_window_view(padded2, (k, k))
+        return wins2.all(axis=(-2, -1))
+    except ImportError:
+        return _np.array([
+            [padded[y:y+k, x:x+k].any() for x in range(w)]
+            for y in range(h)
+        ], dtype=bool)
+
+def _mask_to_contour_points(mask):
+    """bool マスクから最大輪郭の (x, y) ピクセル点リストを返す。cv2 使用。"""
+    import numpy as _np
+    try:
+        import cv2 as _cv2
+        mask_u8 = mask.astype(_np.uint8) * 255
+        contours, _ = _cv2.findContours(mask_u8, _cv2.RETR_EXTERNAL, _cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return []
+        largest = max(contours, key=_cv2.contourArea)
+        return [(int(pt[0][0]), int(pt[0][1])) for pt in largest]
+    except ImportError:
+        # cv2 がない場合: バウンディングボックスで近似
+        rows = _np.any(mask, axis=1)
+        cols = _np.any(mask, axis=0)
+        if not rows.any():
+            return []
+        rmin, rmax = int(_np.where(rows)[0][0]), int(_np.where(rows)[0][-1])
+        cmin, cmax = int(_np.where(cols)[0][0]), int(_np.where(cols)[0][-1])
+        return [(cmin, rmin), (cmax, rmin), (cmax, rmax), (cmin, rmax)]
+
+def _seg_to_polygon_points(seg, img_width, img_height):
+    """polygon / fill / brush アノテーションを (x, y) 輪郭点リストに変換する。
+    変換できない場合は空リストを返す。"""
+    import numpy as _np
+    ann_type = seg.get('type', 'polygon') if isinstance(seg, dict) else 'polygon'
+
+    if ann_type == 'fill':
+        rle = seg.get('rle', [])
+        if not rle:
+            return []
+        iw, ih = seg.get('img_size', (img_width, img_height))
+        mask = _rle_to_mask(rle, ih, iw)
+        if seg.get('offset', [0, 0]) != [0, 0]:
+            _apply_fill_offset(seg)
+            mask = _rle_to_mask(seg['rle'], ih, iw)
+        return _mask_to_contour_points(mask)
+
+    elif ann_type == 'brush':
+        strokes = seg.get('strokes', [])
+        if not strokes:
+            return []
+        mask = _np.zeros((img_height, img_width), dtype=bool)
+        ys, xs = _np.ogrid[:img_height, :img_width]
+        for cx, cy, r in strokes:
+            mask |= ((xs - cx) ** 2 + (ys - cy) ** 2) <= r ** 2
+        return _mask_to_contour_points(mask)
+
+    else:  # polygon
+        pts = seg.get('points', []) if isinstance(seg, dict) else getattr(seg, 'points', [])
+        return pts if pts else []
+
+def _apply_fill_to_bottom(mask):
+    """マスクを左右下端まで拡張する（ペイントの下端塗りつぶし用）。
+    各列の最下True行（一番下に塗られたピクセル）から画像下端まで塗りつぶす。
+    内側に凹んだ形状のセグメンテーションにも正しく対応する。"""
+    import numpy as _np
+    h, w = mask.shape
+    present = mask.any(axis=0)
+    if not present.any():
+        return mask.copy()
+    result = mask.copy()
+    # mask を上下反転して argmax → 各列の最下True行インデックスを取得
+    flipped = mask[::-1, :]
+    max_y = _np.where(present, h - 1 - _np.argmax(flipped, axis=0), h)
+    rows = _np.arange(h)[:, None]   # (h, 1)
+    result = result | (present[None, :] & (rows >= max_y[None, :]))
+    # 左端・右端まで同プロファイルで拡張
+    left_x = int(_np.argmax(present))
+    right_x = int(w - 1 - _np.argmax(present[::-1]))
+    result[int(max_y[left_x]):, :left_x] = True
+    result[int(max_y[right_x]):, right_x + 1:] = True
+    return result
+
+def _seg_annotation_to_mask(seg, img_h, img_w):
+    """任意のセグメンテーションアノテーションを bool マスク (h, w) に変換する。
+    変換できない場合は None を返す。fill タイプの offset は焼き込む（seg を変更する）。"""
+    import numpy as _np
+    ann_type = seg.get('type', 'polygon')
+    if ann_type == 'fill':
+        if seg.get('offset', [0, 0]) != [0, 0]:
+            _apply_fill_offset(seg)
+        ew, eh = seg.get('img_size', (img_w, img_h))
+        if ew != img_w or eh != img_h:
+            return None
+        return _rle_to_mask(seg['rle'], img_h, img_w)
+    elif ann_type == 'brush':
+        mask = _np.zeros((img_h, img_w), dtype=bool)
+        ys, xs = _np.ogrid[:img_h, :img_w]
+        for cx, cy, r in seg.get('strokes', []):
+            mask |= ((xs - cx) ** 2 + (ys - cy) ** 2) <= r ** 2
+        return mask
+    else:  # polygon
+        try:
+            from PIL import Image as _PILImg, ImageDraw as _IDraw
+        except ImportError:
+            return None
+        pts = seg.get('points', [])
+        if len(pts) < 3:
+            return None
+        img_p = _PILImg.new('1', (img_w, img_h), 0)
+        _IDraw.Draw(img_p).polygon(pts, fill=1)
+        return _np.array(img_p, dtype=bool)
+
+# 位置インデックス → (角度deg, ラベル) のマッピング（コーナー表示モード用）
+_CORNER_INFO = [
+    (0,   "ストレート"),
+    (30,  "30°コーナー"),
+    (60,  "60°コーナー"),
+    (90,  "90°コーナー"),
+    (120, "120°コーナー"),
+    (150, "150°コーナー"),
+    (180, "180°コーナー"),
+]
+
+def _make_corner_icon(angle_deg, size=26):
+    """道路コーナーの形状アイコンを QIcon で返す。
+    angle_deg: 0=ストレート, 30〜180=右コーナー角度。
+    入口は下中央↑、出口は angle_deg だけ右に曲がった方向。"""
+    import math
+    pix = QPixmap(size, size)
+    pix.fill(Qt.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.Antialiasing)
+    pen = QPen(QColor(55, 55, 55), 2.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+    p.setPen(pen)
+    cx, cy = size / 2.0, size / 2.0
+    half = size / 2.0 - 3
+    ex, ey = cx, size - 2.0          # 入口（下中央）
+    rad = math.radians(angle_deg)
+    tx = cx + half * math.sin(rad)   # 出口
+    ty = cy - half * math.cos(rad)
+    path = QPainterPath()
+    path.moveTo(ex, ey)
+    path.quadTo(cx, cy, tx, ty)      # 二次ベジェで曲線
+    p.drawPath(path)
+    # 矢印ヘッド（出口方向に合わせる）
+    tdx, tdy = tx - cx, ty - cy
+    length = (tdx ** 2 + tdy ** 2) ** 0.5 or 1.0
+    ndx, ndy = tdx / length, tdy / length
+    ax, ay = tx - ndx * 5, ty - ndy * 5
+    p.drawLine(int(tx), int(ty), int(ax - ndy * 3), int(ay + ndx * 3))
+    p.drawLine(int(tx), int(ty), int(ax + ndy * 3), int(ay - ndx * 3))
+    p.end()
+    return QIcon(pix)
+
+def _compute_flood_fill(img_array, seed_x, seed_y, tolerance):
+    """BFS フラッドフィル。bool マスク (h, w) を返す。"""
+    import numpy as _np
+    from collections import deque
+    h, w = img_array.shape[:2]
+    if not (0 <= seed_x < w and 0 <= seed_y < h):
+        return None
+    seed_color = img_array[seed_y, seed_x].astype(_np.int32)
+    if img_array.ndim == 3:
+        diff = _np.max(_np.abs(img_array.astype(_np.int32) - seed_color), axis=2)
+    else:
+        diff = _np.abs(img_array.astype(_np.int32) - seed_color)
+    similar = diff <= tolerance
+    mask = _np.zeros((h, w), dtype=bool)
+    if not similar[seed_y, seed_x]:
+        return mask
+    queue = deque([(seed_x, seed_y)])
+    mask[seed_y, seed_x] = True
+    while queue:
+        x, y = queue.popleft()
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < w and 0 <= ny < h and not mask[ny, nx] and similar[ny, nx]:
+                mask[ny, nx] = True
+                queue.append((nx, ny))
+    return mask
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 # マウス操作画面表示系
 class ImageLabel(QLabel):
     def __init__(self, parent=None, main_window=None):
@@ -104,7 +386,11 @@ class ImageLabel(QLabel):
         self.extra_inference_points = []  # 追加モデルの推論ポイントリスト [(QPoint, QColor, show_flag), ...]
         self.sequence_prediction_points = []  # 時系列予測軌道 [(QPoint, ...)]
         self.show_gru_prediction = False  # 時系列予測表示フラグ
-        self.zoom_factor = DEFAULT_ZOOM_FACTOR  
+        self.zoom_factor = DEFAULT_ZOOM_FACTOR
+        self.resolution_scale = 1.0          # 1.0=フル解像度, 0.1=10%
+        self.crop_overlay_config = None      # 仮想ソース表示用
+        self.virtual_overlay_mode = 'fill'   # 'none', 'border', 'fill'
+        self._temporal_thumb_cache = {}      # {(path, w, h): QPixmap}
         self.is_deleted = False
         self.is_downsampled = False  # ダウンサンプリング対象フラグ
 
@@ -131,9 +417,26 @@ class ImageLabel(QLabel):
         self.resize_start_pos = None     
 
         # セグメンテーション関連の新規追加
-        self.segmentation_polygons = []  
-        self.current_segmentation_polygon = []  
+        self.segmentation_polygons = []
+        self.current_segmentation_polygon = []
         self.is_drawing_segmentation = False
+        # ペイントツール関連
+        self.seg_tool_mode = 'polygon'      # 'polygon', 'paint', 'fill', 'eraser'
+        self.polygon_fill_to_bottom = False  # 左右下端まで塗りつぶし
+        self.brush_size = 10                # ペンサイズ（画像ピクセル半径）
+        self.fill_tolerance = 30            # フラッドフィル許容差（0-255）
+        self.fill_close_enabled = False     # モルフォロジークロージング有効
+        self.fill_close_kernel = 11         # クロージングカーネルサイズ（px）
+        self.seg_merge_enabled = False      # 同クラス領域結合モード
+        self.is_painting = False
+        self.current_paint_strokes = []     # [(cx, cy, r), ...] 画像座標
+        # カーソルオーバーレイ・塗りつぶしプレビュー関連
+        self._cursor_pos = None             # 現在のウィジェット座標
+        self._fill_preview_mask = None      # フラッドフィルプレビューマスク (numpy bool)
+        self._fill_preview_img_size = (0, 0)
+        self._fill_preview_timer = QTimer(self)
+        self._fill_preview_timer.setSingleShot(True)
+        self._fill_preview_timer.timeout.connect(self._recompute_fill_preview)
         self.segmentation_inference_masks = []          
         self.selected_segmentation_index = None  
         self.is_moving_segmentation = False      
@@ -164,10 +467,7 @@ class ImageLabel(QLabel):
         self.current_mouse_pos = None  # 現在のマウス位置
         self.normalized_coords = None  # 正規化座標 (x, y) -1～1の範囲
 
-        # Speedバー関連
-        self.is_adjusting_speed = False  # speedバー調整中フラグ
-        self.hovering_speed_bar = False  # speedバーにホバー中フラグ
-        self.speed_bar_hover_y = None  # speedバー上のホバーY座標
+        self.max_speed = MAX_SPEED  # speed正規化用の最大速度（SpeedGaugeWidget から参照）
 
         # 将来アノテーション表示
         self.show_future_annotations = True  # デフォルトON
@@ -194,8 +494,10 @@ class ImageLabel(QLabel):
             return
             
         seg_data = segmentations[polygon_index]
-        points = seg_data['points']
-        
+        if seg_data.get('type') == 'brush':
+            return
+        points = seg_data.get('points', [])
+
         if len(points) < 3:
             return
             
@@ -212,6 +514,44 @@ class ImageLabel(QLabel):
         if hasattr(self.main_window, 'statusBar'):
             self.main_window.statusBar().showMessage(get_text('status_polygon_point_added', insert_index), 3000)
     
+    def _show_seg_context_menu(self, global_pos, seg_index, orig_x, orig_y, seg_data):
+        """セグメンテーション右クリックコンテキストメニューを表示"""
+        from PyQt5.QtWidgets import QMenu, QAction
+        menu = QMenu(self)
+
+        # クラスを変更
+        change_class_action = QAction("クラスを変更...", self)
+        menu.addAction(change_class_action)
+
+        # ポリゴン型のみ: 点を追加
+        is_polygon = seg_data.get('type', 'polygon') not in ('fill', 'brush')
+        if is_polygon and len(seg_data.get('points', [])) >= 3:
+            menu.addSeparator()
+            add_point_action = QAction("点を追加", self)
+            menu.addAction(add_point_action)
+        else:
+            add_point_action = None
+
+        chosen = menu.exec_(global_pos)
+
+        if chosen is None:
+            return
+
+        if chosen == change_class_action:
+            # クラス選択ダイアログを表示
+            new_class = self.main_window.select_object_class()
+            if new_class:
+                old_class = seg_data.get('class', '')
+                seg_data['class'] = new_class
+                self.update()
+                self.main_window.update_gallery()
+                if hasattr(self.main_window, 'statusBar'):
+                    self.main_window.statusBar().showMessage(
+                        f"クラスを変更: {old_class} → {new_class}", 3000
+                    )
+        elif add_point_action and chosen == add_point_action:
+            self.add_point_to_polygon(seg_index, orig_x, orig_y)
+
     def find_best_insertion_point(self, points, x, y):
         """新しい点を挿入する最適な位置を見つける"""
         if len(points) < 2:
@@ -464,6 +804,7 @@ class ImageLabel(QLabel):
         painter = QPainter(self)
 
         self.draw_initial_frame(painter)
+        self.draw_virtual_overlay(painter, self.target_rect)
 
         # CAMオーバーレイを描画（ベース画像の上、他のアノテーションの下）
         self.draw_gradcam_overlay(painter, self.target_rect)
@@ -475,18 +816,29 @@ class ImageLabel(QLabel):
         self.draw_bbox(self.pix_width, self.pix_height, painter, self.target_rect)
         self.draw_segmentation(self.pix_width, self.pix_height, painter, self.target_rect)
         self.draw_waypoints(self.pix_width, self.pix_height, painter, self.target_rect)
+        # 結合表示時は推論対象セルのサブ矩形・ピクセル寸法を使う
+        _ann_rect, _ann_pw, _ann_ph = self._get_annotation_draw_params(self.target_rect)
+
         # アノテーション点、推論点、差分ベクトルを最後に描画（上に表示）
-        self.draw_control_points(painter, self.target_rect)
+        self.draw_control_points(painter, _ann_rect, _ann_pw, _ann_ph)
 
         # セグメンテーション走行方向矢印を描画
         self.draw_seg_driving_direction(self.pix_width, self.pix_height, painter, self.target_rect)
 
-        # Speedバーを描画（画像の右側）
-        self.draw_speed_bar(self.pix_width, self.pix_height, painter, self.target_rect)
+        # 自動運転アノテーション走行軌跡を描画
+        self.draw_auto_driving_direction(_ann_pw, _ann_ph, painter, _ann_rect)
+
+        # SpeedGaugeWidget（画像外の独立ウィジェット）を更新
+        if self.main_window and hasattr(self.main_window, 'speed_gauge'):
+            self.main_window.speed_gauge.update()
 
         # マウス座標表示（自動運転モードのみ、最後に描画して常に最前面に）
         if self.main_window and self.main_window.current_mode == 0:
             self.draw_mouse_coordinates(painter)
+
+        # ペン/塗りつぶしカーソルオーバーレイ（セグメンテーションモード）
+        if self.main_window and getattr(self.main_window, 'current_mode', -1) == 2:
+            self.draw_cursor_overlay(painter)
 
         painter.end()
 
@@ -505,7 +857,139 @@ class ImageLabel(QLabel):
 
         # 画像を拡大して描画
         self.target_rect = QRect(self.x, self.y, self.scaled_width, self.scaled_height)
-        painter.drawPixmap(self.target_rect, self.pixmap())
+        pix = self.pixmap()
+        if self.resolution_scale < 1.0:
+            # round()でアスペクト比誤差を最小化し、ブロック形状の歪みを抑える
+            small_h = max(1, round(self.pix_height * self.resolution_scale))
+            small_w = max(1, round(small_h * self.pix_width / self.pix_height))
+            pix = pix.scaled(small_w, small_h, Qt.IgnoreAspectRatio, Qt.FastTransformation)
+            pix = pix.scaled(self.scaled_width, self.scaled_height, Qt.IgnoreAspectRatio, Qt.FastTransformation)
+        painter.drawPixmap(self.target_rect, pix)
+
+    def draw_virtual_overlay(self, painter, target_rect):
+        """仮想ソース領域をオーバーレイ表示（crop/scale/temporal 対応）"""
+        cfg = self.crop_overlay_config
+        mode = getattr(self, 'virtual_overlay_mode', 'fill')
+        if not cfg or mode == 'none':
+            return
+        vtype = cfg.get('virtual_type', '')
+        if vtype == 'crop':
+            self._draw_crop_overlay(painter, target_rect, cfg, mode)
+        elif vtype == 'scale':
+            self._draw_scale_overlay(painter, target_rect, cfg, mode)
+        elif vtype == 'temporal':
+            self._draw_temporal_overlay(painter, target_rect, cfg, mode)
+
+    def _draw_crop_overlay(self, painter, target_rect, cfg, mode):
+        """水平クロップ領域を縦ストライプで表示"""
+        n = cfg['num_sources']
+        names = cfg.get('source_names', [str(i) for i in range(n)])
+        W = self.pix_width
+        step = W / n
+        overlap = step * 0.15
+        colors = [(220, 80, 80), (80, 180, 80), (80, 120, 220), (200, 160, 40)]
+        tx, ty = target_rect.x(), target_rect.y()
+        sw, sh = self.scaled_width, self.scaled_height
+
+        for i in range(n):
+            x0 = max(0.0, step * i - overlap)
+            x1 = min(float(W), step * (i + 1) + overlap)
+            dx0 = int(tx + x0 / W * sw)
+            dx1 = int(tx + x1 / W * sw)
+            r, g, b = colors[i % len(colors)]
+
+            if mode == 'fill':
+                painter.fillRect(dx0, ty, dx1 - dx0, sh, QColor(r, g, b, 40))
+            painter.setPen(QPen(QColor(r, g, b, 200), 2))
+            painter.drawRect(dx0, ty, dx1 - dx0, sh)
+            painter.setPen(QPen(QColor(r, g, b), 2))
+            painter.setFont(QFont("Arial", 10, QFont.Bold))
+            painter.drawText(dx0 + 4, ty + 18, names[i] if i < len(names) else str(i))
+
+    def _draw_scale_overlay(self, painter, target_rect, cfg, mode):
+        """スケールピラミッドの中央クロップ領域を同心矩形で表示"""
+        n = cfg['num_sources']
+        names = cfg.get('source_names', [str(i) for i in range(n)])
+        colors = [(220, 80, 80), (80, 180, 80), (80, 120, 220), (200, 160, 40)]
+        tx, ty = target_rect.x(), target_rect.y()
+        sw, sh = self.scaled_width, self.scaled_height
+
+        scale = 1.0
+        for i in range(n):
+            cw = int(sw * scale)
+            ch = int(sh * scale)
+            rx = tx + (sw - cw) // 2
+            ry = ty + (sh - ch) // 2
+            r, g, b = colors[i % len(colors)]
+
+            if mode == 'fill':
+                painter.fillRect(rx, ry, cw, ch, QColor(r, g, b, 35))
+            painter.setPen(QPen(QColor(r, g, b, 200), 2))
+            painter.drawRect(rx, ry, cw, ch)
+            painter.setPen(QPen(QColor(r, g, b), 2))
+            painter.setFont(QFont("Arial", 10, QFont.Bold))
+            label = names[i] if i < len(names) else str(i)
+            painter.drawText(rx + 4, ry + 18, label)
+            scale *= 0.55
+
+    def _draw_temporal_overlay(self, painter, target_rect, cfg, mode):
+        """時系列フレームを実際のサムネイルでキャンバス上部に表示"""
+        n = cfg['num_sources']
+        temporal_interval = cfg.get('temporal_interval', 10)
+        names = cfg.get('source_names', ['t+0'] + [f't-{i * temporal_interval}' for i in range(1, n)])
+        colors = [(220, 80, 80), (80, 180, 80), (80, 120, 220), (200, 160, 40)]
+        tx, ty = target_rect.x(), target_rect.y()
+        sw, sh = self.scaled_width, self.scaled_height
+
+        label_h = 18
+        thumb_h = max(60, sh // 4)
+        thumb_w = sw // n
+
+        # メインウィンドウから画像リストと現在インデックスを取得
+        mw = getattr(self, 'main_window', None)
+        images = getattr(mw, 'images', []) if mw else []
+        current_idx = getattr(mw, 'current_index', 0) if mw else 0
+
+        for i in range(n):
+            bx = tx + i * thumb_w
+            bw = thumb_w if i < n - 1 else sw - i * thumb_w
+            r, g, b = colors[i % len(colors)]
+
+            # 実フレームインデックス（temporal_intervalフレームずつさかのぼる）
+            frame_idx = max(0, current_idx - i * temporal_interval)
+
+            # 黒半透明の背景
+            painter.fillRect(bx, ty, bw, thumb_h + label_h, QColor(0, 0, 0, 180))
+
+            # サムネイル画像（キャッシュ付き）
+            if images and frame_idx < len(images):
+                img_path = images[frame_idx]
+                cache_key = (img_path, bw, thumb_h)
+                if cache_key not in self._temporal_thumb_cache:
+                    pix = QPixmap(img_path)
+                    self._temporal_thumb_cache[cache_key] = (
+                        pix.scaled(bw, thumb_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                        if not pix.isNull() else None
+                    )
+                    # キャッシュ上限（メモリ節約）
+                    if len(self._temporal_thumb_cache) > 120:
+                        oldest = next(iter(self._temporal_thumb_cache))
+                        del self._temporal_thumb_cache[oldest]
+                thumb = self._temporal_thumb_cache.get(cache_key)
+                if thumb:
+                    ox = bx + (bw - thumb.width()) // 2
+                    painter.drawPixmap(ox, ty, thumb)
+
+            # カラー枠線
+            painter.setPen(QPen(QColor(r, g, b, 220), 2))
+            painter.drawRect(bx, ty, bw, thumb_h)
+
+            # ラベル帯（サムネイル下）
+            painter.fillRect(bx, ty + thumb_h, bw, label_h, QColor(r, g, b, 210))
+            painter.setPen(QPen(Qt.white, 1))
+            painter.setFont(QFont("Arial", 9, QFont.Bold))
+            label = names[i] if i < len(names) else str(i)
+            painter.drawText(QRect(bx, ty + thumb_h, bw, label_h), Qt.AlignCenter, label)
 
     def draw_gradcam_overlay(self, painter, target_rect):
         """CAMヒートマップオーバーレイを描画"""
@@ -947,13 +1431,63 @@ class ImageLabel(QLabel):
             elif i % 2 == 0:
                 painter.drawText(target_rect.x() - 50, int(y_pos) + 5, f"{value:.1f}")
 
-    def draw_control_points(self, painter: QPainter, target_rect: QRect):
+    def _get_annotation_draw_params(self, target_rect):
+        """結合表示時、推論対象ソースのセルに対応した (eff_rect, eff_pix_w, eff_pix_h) を返す。
+        3x1グリッドの場合は中央セル(index=1)を強制使用。
+        非結合表示または推論対象未指定の場合は (target_rect, pix_width, pix_height) をそのまま返す。"""
+        mw = self.main_window
+        if mw is None or getattr(mw, 'current_variant', None) != '__combined__':
+            return target_rect, self.pix_width, self.pix_height
+
+        grid = getattr(mw, '_combined_grid', '2x1')
+        grid_map = {'2x1': (2, 1), '1x2': (1, 2), '3x1': (3, 1), '2x2': (2, 2), '3x3': (3, 3)}
+        cols, rows = grid_map.get(grid, (2, 1))
+
+        combined_sources = getattr(mw, '_combined_sources',
+                                   list(getattr(mw, 'available_variants', [])))
+
+        # 3x1グリッド（3カメラ）は中央セル(index=1)を固定使用
+        if grid == '3x1' and len(combined_sources) >= 3:
+            slot_idx = 1
+        else:
+            infer_src = getattr(mw, '_combined_inference_source', None)
+            if not infer_src or infer_src not in combined_sources:
+                return target_rect, self.pix_width, self.pix_height
+            slot_idx = combined_sources.index(infer_src)
+
+        # _create_combined_image と同じグリッド縮小計算
+        n_slots = len(combined_sources)
+        if n_slots < cols * rows:
+            cols = min(cols, n_slots)
+            rows = max(1, (n_slots + cols - 1) // cols)
+
+        if slot_idx >= cols * rows:
+            return target_rect, self.pix_width, self.pix_height
+
+        col = slot_idx % cols
+        row = slot_idx // cols
+
+        cell_w = target_rect.width() / cols
+        cell_h = target_rect.height() / rows
+        cell_x = target_rect.x() + col * cell_w
+        cell_y = target_rect.y() + row * cell_h
+        eff_rect = QRect(int(cell_x), int(cell_y), int(cell_w), int(cell_h))
+
+        src_w = getattr(mw, 'original_image_width', max(1, self.pix_width // cols))
+        src_h = getattr(mw, 'original_image_height', max(1, self.pix_height // rows))
+
+        return eff_rect, src_w, src_h
+
+    def draw_control_points(self, painter: QPainter, target_rect: QRect,
+                            pix_width=None, pix_height=None):
         """アノテーション点、推論点、ベクトル矢印を描画"""
         if not self.pixmap():
             return
 
-        pix_width = self.pixmap().width()
-        pix_height = self.pixmap().height()
+        if pix_width is None:
+            pix_width = self.pixmap().width()
+        if pix_height is None:
+            pix_height = self.pixmap().height()
 
         # 赤：アノテーション点（教師データ）- 現在のフレーム（最初に描画）
         if self.annotation_point is not None:
@@ -1413,6 +1947,139 @@ class ImageLabel(QLabel):
                 info_text = f"({norm_x:.2f}, {norm_y:.2f}) 直進"
             painter.drawText(int(screen_target_x + 12), int(screen_target_y - 5), info_text)
 
+    def draw_auto_driving_direction(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
+        """自動運転アノテーションのangle値から走行軌跡を描画（等距離射影魚眼モデル）
+
+        等距離射影 r = f_fish * θ を使用し、160°魚眼レンズでの地面投影を正確に行う。
+        arc は車両直下 (gx=0,gy=0) からサンプリングし、clipping で画像下端以外を除外するため
+        直進・旋回問わず arc が画像下端中央付近からスタートする。
+        """
+        if not getattr(self.main_window, 'show_auto_driving_direction', False):
+            return
+
+        current_index = self.main_window.current_index
+        if current_index is None:
+            return
+        if not hasattr(self.main_window, 'annotations'):
+            return
+        if current_index not in self.main_window.annotations:
+            return
+
+        annotation = self.main_window.annotations[current_index]
+        if 'angle' not in annotation:
+            return
+        if self.annotation_point is None:
+            return
+
+        angle_val = annotation['angle']
+
+        # パラメータ取得
+        max_steering  = self.main_window.auto_max_steering_angle
+        cam_pitch_rad = math.radians(getattr(self.main_window, 'auto_cam_pitch_deg', 20.0))
+        fov_deg       = getattr(self.main_window, 'auto_fov_deg', 160.0)
+
+        cx = pix_width  / 2.0
+        cy = pix_height / 2.0
+
+        # 等距離射影の焦点距離: r_image = f_fish * θ
+        # 対角FOVから算出: f_fish = 半対角ピクセル / 半FOV(rad)
+        half_diag_px  = math.sqrt((pix_width / 2.0) ** 2 + (pix_height / 2.0) ** 2)
+        fov_half_rad  = math.radians(fov_deg / 2.0)
+        f_fish        = half_diag_px / fov_half_rad  # pixels / radian
+
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        painter.setOpacity(1.0)
+        traj_color = QColor(255, 120, 0, 220)
+
+        # ── 地面座標 → スクリーン座標（等距離射影魚眼）──────────────────
+        # 地面座標系: gx = 横方向(右正), gy = 前方距離。車両=原点、高さ正規化(h=1)
+        # カメラモデル (俯角 α = cam_pitch_rad):
+        #   X_c = gx
+        #   Y_c = -gy*sin(α) + cos(α)  [Y_c>0 = 画像下方]
+        #   Z_c = gy*cos(α) + sin(α)   [Z_c>0 = カメラ前方]
+        def ground_to_screen(gx, gy):
+            X_c = gx
+            Z_c = gy * math.cos(cam_pitch_rad) + math.sin(cam_pitch_rad)
+            Y_c = -gy * math.sin(cam_pitch_rad) + math.cos(cam_pitch_rad)
+            if Z_c < 1e-6:
+                return None
+            r3d = math.sqrt(X_c * X_c + Y_c * Y_c)
+            theta = math.atan2(r3d, Z_c)  # 光軸からの角度
+            if theta >= fov_half_rad:      # FOV外
+                return None
+            r_img = f_fish * theta         # 等距離射影: 画像中心からのピクセル距離
+            if r3d > 1e-9:
+                ix = cx + r_img * X_c / r3d
+                iy = cy + r_img * Y_c / r3d
+            else:
+                ix, iy = cx, cy
+            sx = target_rect.x() + (ix / pix_width)  * target_rect.width()
+            sy = target_rect.y() + (iy / pix_height) * target_rect.height()
+            return sx, sy
+
+        # ── ステア角から地面円弧の終点を算出 ────────────────────────────
+        steer_rad = math.radians(angle_val * max_steering)
+        # 正規化座標(h=1)で前方 4 単位が軌跡の到達点
+        gy_end   = 4.0
+        gx_end   = gy_end * math.tan(steer_rad)
+        gy_start = gy_end * 0.005  # 車両直近から開始(clippingで画像外を除去)
+
+        # ── 地面上の円弧サンプリング (gy_start → gy_end) ────────────────
+        N_PTS = 50
+        ground_pts = []
+        if abs(gx_end) > 1e-3:
+            R_g = (gx_end * gx_end + gy_end * gy_end) / (2.0 * gx_end)
+            # 正負どちらの旋回でも正しい終端角を求める
+            # gx(t)=R_g*(1-cos t), gy(t)=|R_g|*sin t より:
+            #   cos(θ) = (R_g - gx_end) / R_g,  sin(θ) = gy_end / |R_g|
+            cos_t_end = (R_g - gx_end) / R_g
+            sin_t_end = gy_end / abs(R_g)
+            theta_total = math.atan2(sin_t_end, cos_t_end)
+            if abs(R_g) > 1e-3 and theta_total > 0:
+                sin_arg = max(-1.0, min(1.0, gy_start / abs(R_g)))
+                t_start = math.asin(sin_arg)
+                for i in range(N_PTS + 1):
+                    t = t_start + (theta_total - t_start) * i / N_PTS
+                    ground_pts.append((R_g * (1.0 - math.cos(t)),
+                                       abs(R_g) * math.sin(t)))
+            else:
+                for i in range(N_PTS + 1):
+                    gy_i = gy_start + (gy_end - gy_start) * i / N_PTS
+                    ground_pts.append((0.0, gy_i))
+        else:
+            for i in range(N_PTS + 1):
+                gy_i = gy_start + (gy_end - gy_start) * i / N_PTS
+                ground_pts.append((0.0, gy_i))
+
+        screen_pts = [pt for gx, gy in ground_pts
+                      if (pt := ground_to_screen(gx, gy)) is not None]
+
+        # ── 画像領域にクリッピングして折れ線描画 ─────────────────────────
+        painter.setClipRect(target_rect)
+        painter.setPen(QPen(traj_color, 3))
+        painter.setBrush(Qt.NoBrush)
+        for i in range(len(screen_pts) - 1):
+            x1, y1 = screen_pts[i]
+            x2, y2 = screen_pts[i + 1]
+            painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+        painter.setClipping(False)
+
+        # ── 舵角テキスト (arc終点付近・黒縁白文字) ──────────────────────
+        actual_deg = angle_val * max_steering
+        info_text  = f"{angle_val:.2f} → {actual_deg:.1f}°"
+        if screen_pts:
+            tx_f, ty_f = screen_pts[-1]
+            tx, ty = int(tx_f + 6), int(ty_f - 8)
+        else:
+            tx = int(target_rect.x() + target_rect.width() * 0.5)
+            ty = int(target_rect.y() + 20)
+        painter.setFont(QFont("Arial", 9, QFont.Bold))
+        for odx, ody in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
+            painter.setPen(QPen(QColor(0, 0, 0)))
+            painter.drawText(tx + odx, ty + ody, info_text)
+        painter.setPen(QPen(QColor(255, 255, 255)))
+        painter.drawText(tx, ty, info_text)
+
     def draw_segmentation_inference_results(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
         """セグメンテーション推論結果の描画"""
         if not (hasattr(self.main_window, 'segmentation_inference_results') and 
@@ -1510,10 +2177,103 @@ class ImageLabel(QLabel):
 
             if current_index in self.main_window.segmentation_annotations:
                 polygons = self.main_window.segmentation_annotations[current_index]
-                
+
                 for i, polygon_data in enumerate(polygons):
-                    if polygon_data is None:  # Noneの場合はスキップ
+                    if polygon_data is None:
                         continue
+
+                    # フラッドフィルアノテーションの描画
+                    if polygon_data.get('type') == 'fill':
+                        class_name = polygon_data.get('class', 'unknown')
+                        base_color = QColor(*SEGMENTATION_CLASS_COLORS.get(class_name, (255, 0, 0, 120)))
+                        is_selected = i == self.selected_segmentation_index
+                        is_hovered = i == self.hovering_segmentation_index
+                        overall_alpha = 200 if is_selected else (160 if is_hovered else 120)
+                        rle = polygon_data.get('rle', [])
+                        img_w, img_h = polygon_data.get('img_size', (pix_width, pix_height))
+                        offset = polygon_data.get('offset', [0, 0])
+                        if rle:
+                            import numpy as _np
+                            mask = _rle_to_mask(rle, img_h, img_w)
+                            rgba = _np.zeros((img_h, img_w, 4), dtype=_np.uint8)
+                            rgba[mask, 0] = base_color.red()
+                            rgba[mask, 1] = base_color.green()
+                            rgba[mask, 2] = base_color.blue()
+                            rgba[mask, 3] = 255
+                            qimg = QImage(rgba.tobytes(), img_w, img_h, img_w * 4, QImage.Format_RGBA8888)
+                            scaled = qimg.scaled(target_rect.width(), target_rect.height(),
+                                                 Qt.IgnoreAspectRatio, Qt.FastTransformation)
+                            ox = int(offset[0] / pix_width * target_rect.width())
+                            oy = int(offset[1] / pix_height * target_rect.height())
+                            painter.setOpacity(overall_alpha / 255.0)
+                            painter.drawImage(target_rect.topLeft() + QPoint(ox, oy), scaled)
+                            painter.setOpacity(1.0)
+                            if is_selected or is_hovered:
+                                pen_w = 3 if is_selected else 2
+                                painter.setPen(QPen(base_color.darker(150), pen_w, Qt.DashLine))
+                                painter.setBrush(Qt.NoBrush)
+                                painter.drawRect(target_rect.x() + ox, target_rect.y() + oy,
+                                                 target_rect.width(), target_rect.height())
+                            # ラベル（左上）
+                            lx = target_rect.x() + ox + 4
+                            ly = target_rect.y() + oy + 14
+                            tw = painter.fontMetrics().horizontalAdvance(class_name)
+                            painter.setFont(QFont("Arial", 10, QFont.Bold))
+                            painter.fillRect(lx - 2, ly - 12, tw + 4, 16, base_color.darker())
+                            painter.setPen(QPen(Qt.white, 1))
+                            painter.drawText(lx, ly, class_name)
+                        continue
+
+                    # ブラシアノテーションの描画（単色・オフスクリーン合成）
+                    if polygon_data.get('type') == 'brush':
+                        class_name = polygon_data.get('class', 'unknown')
+                        class_colors = SEGMENTATION_CLASS_COLORS
+                        base_color = QColor(*class_colors.get(class_name, (255, 0, 0, 120)))
+                        is_selected = i == self.selected_segmentation_index
+                        is_hovered = i == self.hovering_segmentation_index
+                        overall_alpha = 200 if is_selected else (160 if is_hovered else 120)
+                        strokes = polygon_data.get('strokes', [])
+                        if strokes:
+                            # オフスクリーン QImage に完全不透明で描画し、後で全体透明度を適用
+                            tmp = QImage(target_rect.width(), target_rect.height(), QImage.Format_ARGB32)
+                            tmp.fill(Qt.transparent)
+                            tp = QPainter(tmp)
+                            tp.setRenderHint(QPainter.Antialiasing)
+                            tp.setBrush(QBrush(QColor(base_color.red(), base_color.green(), base_color.blue(), 255)))
+                            tp.setPen(Qt.NoPen)
+                            for cx, cy, r in strokes:
+                                sx = int(cx / pix_width * target_rect.width())
+                                sy = int(cy / pix_height * target_rect.height())
+                                sr = max(1, int(r / pix_width * target_rect.width()))
+                                tp.drawEllipse(sx - sr, sy - sr, sr * 2, sr * 2)
+                            tp.end()
+                            painter.setOpacity(overall_alpha / 255.0)
+                            painter.drawImage(target_rect.topLeft(), tmp)
+                            painter.setOpacity(1.0)
+                            # 選択時の枠線
+                            if is_selected or is_hovered:
+                                # バウンディングボックスを計算して枠を描画
+                                all_sx = [int(target_rect.x() + cx / pix_width * target_rect.width()) for cx, cy, r in strokes]
+                                all_sy = [int(target_rect.y() + cy / pix_height * target_rect.height()) for cx, cy, r in strokes]
+                                all_sr = [max(1, int(r / pix_width * target_rect.width())) for cx, cy, r in strokes]
+                                bx1 = min(sx - sr for sx, sr in zip(all_sx, all_sr))
+                                by1 = min(sy - sr for sy, sr in zip(all_sy, all_sr))
+                                bx2 = max(sx + sr for sx, sr in zip(all_sx, all_sr))
+                                by2 = max(sy + sr for sy, sr in zip(all_sy, all_sr))
+                                pen_w = 3 if is_selected else 2
+                                painter.setPen(QPen(base_color.darker(150), pen_w, Qt.DashLine))
+                                painter.setBrush(Qt.NoBrush)
+                                painter.drawRect(bx1, by1, bx2 - bx1, by2 - by1)
+                            # ラベル（最初のストロークの位置）
+                            lx = int(target_rect.x() + strokes[0][0] / pix_width * target_rect.width())
+                            ly = int(target_rect.y() + strokes[0][1] / pix_height * target_rect.height())
+                            painter.setPen(QPen(Qt.white, 1))
+                            painter.setFont(QFont("Arial", 10, QFont.Bold))
+                            tw = painter.fontMetrics().horizontalAdvance(class_name)
+                            painter.fillRect(lx - tw//2 - 2, ly - 10, tw + 4, 16, base_color.darker())
+                            painter.drawText(lx - tw//2, ly + 2, class_name)
+                        continue
+
                     class_name = polygon_data.get('class', 'unknown')
                     points = polygon_data.get('points', [])
                     
@@ -1584,6 +2344,24 @@ class ImageLabel(QLabel):
                             painter.fillRect(center_x - text_width//2 - 2, center_y - 10, text_width + 4, 16, base_color.darker())
                             
                             painter.drawText(center_x - text_width//2, center_y + 2, class_name)
+
+        # ペイント中のリアルタイムプレビュー（単色・オフスクリーン合成）
+        if self.is_painting and self.current_paint_strokes:
+            tmp = QImage(target_rect.width(), target_rect.height(), QImage.Format_ARGB32)
+            tmp.fill(Qt.transparent)
+            tp = QPainter(tmp)
+            tp.setRenderHint(QPainter.Antialiasing)
+            tp.setBrush(QBrush(QColor(255, 140, 0, 255)))
+            tp.setPen(Qt.NoPen)
+            for cx, cy, r in self.current_paint_strokes:
+                sx = int(cx / pix_width * target_rect.width())
+                sy = int(cy / pix_height * target_rect.height())
+                sr = max(1, int(r / pix_width * target_rect.width()))
+                tp.drawEllipse(sx - sr, sy - sr, sr * 2, sr * 2)
+            tp.end()
+            painter.setOpacity(0.55)
+            painter.drawImage(target_rect.topLeft(), tmp)
+            painter.setOpacity(1.0)
 
         # 現在描画中のポリゴンの表示（修正）
         if self.is_drawing_segmentation and len(self.current_segmentation_polygon) > 0:
@@ -1886,8 +2664,9 @@ class ImageLabel(QLabel):
             painter.setBrush(QBrush(QColor(40, 40, 40, 200)))  # 半透明の暗い背景
         painter.drawRect(bar_x, bar_y, bar_width, bar_height)
 
-        # speed値を0-1の範囲に正規化（0～10の範囲を想定）
-        normalized_speed = speed / 10.0  # 0～10 -> 0～1
+        # speed値を0-1の範囲に正規化（max_speedで除算）
+        _max_speed = self.max_speed
+        normalized_speed = speed / _max_speed if _max_speed > 0 else 0.0
         normalized_speed = max(0, min(1, normalized_speed))  # 0-1にクランプ
 
         # speedバーの色を自動運転アノテーション（赤丸）と同じ色に
@@ -1925,7 +2704,7 @@ class ImageLabel(QLabel):
                     future_ann = self.main_window.annotations[future_index]
                     if 'speed' in future_ann:
                         future_speed = future_ann['speed']
-                        future_normalized = future_speed / 10.0
+                        future_normalized = future_speed / _max_speed if _max_speed > 0 else 0.0
                         future_normalized = max(0, min(1, future_normalized))
 
                         # サイズと色を取得
@@ -1945,21 +2724,23 @@ class ImageLabel(QLabel):
         is_dark = self.main_window.is_dark_mode if self.main_window else False
         text_color = QColor(200, 200, 200) if is_dark else QColor(50, 50, 50)
 
-        # 目盛りを描画（0～10の範囲、11段階）- 右側に配置
+        # 目盛りを描画（0～max_speed m/sの範囲）- 右側に配置
+        num_ticks = 11
         painter.setFont(QFont("Arial", 8))
-        for i in range(11):  # 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
-            tick_y = bar_y + bar_height - int(bar_height * i / 10)
+        for i in range(num_ticks):
+            tick_y = bar_y + bar_height - int(bar_height * i / (num_ticks - 1))
             # 目盛り線（バーの右側に描画）
             painter.setPen(QPen(text_color, 1))
             painter.drawLine(bar_x + bar_width, tick_y, bar_x + bar_width + 3, tick_y)
-            # 目盛り値（0～10の範囲で表示、バーの右側、2刻みで表示）
-            tick_value = i
-            if i % 2 == 0:  # 0, 2, 4, 6, 8, 10のみ表示
-                painter.drawText(bar_x + bar_width + 6, tick_y + 4, f"{tick_value}")
+            # 目盛り値（m/s実値で表示、偶数インデックスのみ）
+            if i % 2 == 0:
+                tick_value = _max_speed * i / (num_ticks - 1)
+                tick_label = f"{tick_value:.1f}" if tick_value != int(tick_value) else f"{int(tick_value)}"
+                painter.drawText(bar_x + bar_width + 6, tick_y + 4, tick_label)
 
         # 現在のspeed値をテキストで表示（バーの上部）
-        painter.setPen(QPen(text_color, 2))
-        painter.setFont(QFont("Arial", 10, QFont.Bold))
+        painter.setPen(QPen(text_color, 1))
+        painter.setFont(QFont("Arial", 7))
         speed_text = f"{speed:.2f}"
         text_rect = painter.fontMetrics().boundingRect(speed_text)
         painter.drawText(
@@ -1968,9 +2749,14 @@ class ImageLabel(QLabel):
             speed_text
         )
 
-        # ラベル "SPEED" を下部に表示
-        painter.setFont(QFont("Arial", 9, QFont.Bold))
-        painter.drawText(bar_x, bar_y + bar_height + 20, "SPEED")  # 少し下に移動
+        # ラベル "SPEED(m/s)" を下部に表示
+        label_text = "SPEED(m/s)"
+        label_rect = painter.fontMetrics().boundingRect(label_text)
+        painter.drawText(
+            bar_x + bar_width // 2 - label_rect.width() // 2 + 28,
+            bar_y + bar_height + 22,
+            label_text
+        )
 
         # 推論結果のspeedがある場合は太い横線で表示
         if (hasattr(self.main_window, 'inference_checkbox') and
@@ -1992,9 +2778,7 @@ class ImageLabel(QLabel):
                         future_data = inference[future_key]
                         if 'speed' in future_data:
                             future_infer_speed = future_data['speed']
-                            future_infer_speed_display = future_infer_speed * 10.0
-                            future_normalized = future_infer_speed_display / 10.0
-                            future_normalized = max(0, min(1, future_normalized))
+                            future_normalized = max(0, min(1, future_infer_speed))
 
                             future_y = bar_y + bar_height - int(bar_height * future_normalized)
                             future_color = future_colors.get(offset, QColor(0, 200, 200))
@@ -2005,20 +2789,19 @@ class ImageLabel(QLabel):
 
             if 'speed' in inference:
                 infer_speed = inference['speed']
-                # 推論speed値を正規化（0～10 -> 0～1、学習時に10で正規化されているため10倍して戻す）
-                infer_speed_display = infer_speed * 10.0  # 正規化を元に戻す
-                normalized_infer_speed = infer_speed_display / 10.0
-                normalized_infer_speed = max(0, min(1, normalized_infer_speed))
+                # 推論speed値は正規化済み（0〜1）なのでそのまま使用
+                normalized_infer_speed = max(0, min(1, infer_speed))
 
                 # 推論結果の位置にシアン色の太い横線を描画（推論点と同色）
                 infer_y = bar_y + bar_height - int(bar_height * normalized_infer_speed)
                 painter.setPen(QPen(QColor(0, 255, 255), 4))  # 明るい水色（推論点と同色）
                 painter.drawLine(bar_x - 2, infer_y, bar_x + bar_width + 2, infer_y)
 
-                # 推論speed値を横線の右側に表示（少し暗めの色）
-                painter.setPen(QPen(QColor(0, 200, 200), 1))  # 少し暗めのシアン
+                # 推論speed値を横線の右側に表示（m/s実値に逆変換）
+                infer_speed_ms = infer_speed * _max_speed
+                painter.setPen(QPen(QColor(0, 200, 200), 1))
                 painter.setFont(QFont("Arial", 8, QFont.Bold))
-                painter.drawText(bar_x + bar_width + 25, infer_y + 4, f"({infer_speed_display:.2f})")
+                painter.drawText(bar_x + bar_width + 25, infer_y + 4, f"({infer_speed_ms:.2f})")
 
     def mousePressEvent(self, event):
         if self.pixmap() and self.main_window:
@@ -2038,12 +2821,6 @@ class ImageLabel(QLabel):
             # クリック位置を取得
             pos = event.pos()
             self.last_click_time = current_time  # クリック時間を更新
-
-            # speedバーのクリック判定（画像外でもspeedバー領域内なら処理）
-            if hasattr(self, 'target_rect') and self.is_point_in_speed_bar(pos, self.target_rect):
-                if event.button() == Qt.LeftButton:
-                    self.handle_speed_bar_click(pos)
-                    return
 
             # クリック位置が画像内かチェック
             if not self.target_rect.contains(pos):
@@ -2168,9 +2945,109 @@ class ImageLabel(QLabel):
             elif hasattr(self.main_window, 'current_mode') and self.main_window.current_mode == 2:
                 # セグメンテーションモード
                 current_index = self.main_window.current_index  # インデックスベースに変更
-                
+
+                # 消しゴムモード
+                if self.seg_tool_mode == 'eraser':
+                    if event.button() == Qt.LeftButton:
+                        self.is_painting = True
+                        self._erase_at(orig_x, orig_y)
+                    return
+
+                # ペイントモード
+                if self.seg_tool_mode == 'paint':
+                    if event.button() == Qt.RightButton:
+                        # 右クリック: 既存ブラシアノテーション上ならコンテキストメニュー
+                        if (hasattr(self.main_window, 'segmentation_annotations') and
+                                current_index in self.main_window.segmentation_annotations):
+                            for i, seg_data in enumerate(
+                                    self.main_window.segmentation_annotations[current_index]):
+                                if seg_data is None:
+                                    continue
+                                ann_type = seg_data.get('type')
+                                hit = False
+                                if ann_type == 'brush':
+                                    hit = any(
+                                        (orig_x - cx) ** 2 + (orig_y - cy) ** 2 <= r ** 2
+                                        for cx, cy, r in seg_data.get('strokes', [])
+                                    )
+                                elif ann_type == 'fill':
+                                    hit = _fill_hit_test(seg_data, orig_x, orig_y)
+                                if hit:
+                                    self._show_seg_context_menu(event.globalPos(), i, orig_x, orig_y, seg_data)
+                                    return
+                        return
+                    if event.button() == Qt.LeftButton:
+                        # 既存のブラシアノテーションにヒットする場合は移動を優先
+                        hit_move = False
+                        if (hasattr(self.main_window, 'segmentation_annotations') and
+                                current_index in self.main_window.segmentation_annotations):
+                            for i, seg_data in enumerate(
+                                    self.main_window.segmentation_annotations[current_index]):
+                                if seg_data.get('type') != 'brush':
+                                    continue
+                                if any(
+                                    (orig_x - cx) ** 2 + (orig_y - cy) ** 2 <= r ** 2
+                                    for cx, cy, r in seg_data.get('strokes', [])
+                                ):
+                                    self.selected_segmentation_index = i
+                                    self.is_moving_segmentation = True
+                                    self.seg_move_start_pos = QPoint(orig_x, orig_y)
+                                    self.update()
+                                    hit_move = True
+                                    break
+                        if not hit_move:
+                            # ヒットなし: 新規ペイント開始
+                            self.is_painting = True
+                            r = max(1, self.brush_size)
+                            self.current_paint_strokes.append((orig_x, orig_y, r))
+                            self.update()
+                    return
+
+                # 塗りつぶしモード
+                if self.seg_tool_mode == 'fill':
+                    if event.button() == Qt.RightButton:
+                        # 右クリック: 既存 fill/brush アノテーション上ならコンテキストメニュー
+                        if (hasattr(self.main_window, 'segmentation_annotations') and
+                                current_index in self.main_window.segmentation_annotations):
+                            for i, seg_data in enumerate(
+                                    self.main_window.segmentation_annotations[current_index]):
+                                if seg_data is None:
+                                    continue
+                                ann_type = seg_data.get('type')
+                                hit = False
+                                if ann_type == 'fill':
+                                    hit = _fill_hit_test(seg_data, orig_x, orig_y)
+                                elif ann_type == 'brush':
+                                    hit = any(
+                                        (orig_x - cx) ** 2 + (orig_y - cy) ** 2 <= r ** 2
+                                        for cx, cy, r in seg_data.get('strokes', [])
+                                    )
+                                if hit:
+                                    self._show_seg_context_menu(event.globalPos(), i, orig_x, orig_y, seg_data)
+                                    return
+                        return
+                    if event.button() == Qt.LeftButton:
+                        # 既存の fill/brush アノテーションに当たっていれば移動優先
+                        hit_move = False
+                        if (hasattr(self.main_window, 'segmentation_annotations') and
+                                current_index in self.main_window.segmentation_annotations):
+                            for i, seg_data in enumerate(
+                                    self.main_window.segmentation_annotations[current_index]):
+                                ann_type = seg_data.get('type')
+                                if ann_type == 'fill':
+                                    if _fill_hit_test(seg_data, orig_x, orig_y):
+                                        self.selected_segmentation_index = i
+                                        self.is_moving_segmentation = True
+                                        self.seg_move_start_pos = QPoint(orig_x, orig_y)
+                                        self.update()
+                                        hit_move = True
+                                        break
+                        if not hit_move:
+                            self.main_window.complete_fill_annotation(orig_x, orig_y, self.fill_tolerance)
+                    return
+
                 # ホバー中の頂点がある場合はそれを優先
-                if (self.hovering_polygon_index is not None and 
+                if (self.hovering_polygon_index is not None and
                     self.hovering_vertex_index is not None):
                     # 頂点がクリックされた場合
                     self.selected_polygon_index = self.hovering_polygon_index
@@ -2194,29 +3071,44 @@ class ImageLabel(QLabel):
                     
                     # 各セグメンテーションについて、クリック位置が内部にあるかチェック
                     for i, seg_data in enumerate(segmentations):
-                        if is_point_in_polygon(orig_x, orig_y, seg_data['points']):
-                            if event.button() == Qt.LeftButton:
-                                # 選択済みのセグメンテーションをクリックした場合
-                                if self.selected_segmentation_index == i:
-                                    # 選択解除が必要かどうかを判断
-                                    if event.modifiers() & Qt.ShiftModifier:
-                                        self.selected_segmentation_index = None
-                                        self.update()
-                                        if hasattr(self.main_window, 'statusBar'):
-                                            self.main_window.statusBar().showMessage(get_text('status_seg_deselected'), 3000)
-                                        return
-                                
-                                # 新規選択の場合
-                                self.selected_segmentation_index = i
-                                self.is_moving_segmentation = True
-                                self.seg_move_start_pos = QPoint(orig_x, orig_y)
-                                                                
-                                self.update()
-                                return
-                            elif event.button() == Qt.RightButton and self.selected_segmentation_index == i:
-                                # 右クリックでポリゴンに新しい点を追加
-                                self.add_point_to_polygon(i, orig_x, orig_y)
-                                return
+                        if seg_data.get('type') == 'fill':
+                            if not _fill_hit_test(seg_data, orig_x, orig_y):
+                                continue
+                        elif seg_data.get('type') == 'brush':
+                            # ブラシ: いずれかのストローク円内にあるか
+                            hit = any(
+                                (orig_x - cx) ** 2 + (orig_y - cy) ** 2 <= r ** 2
+                                for cx, cy, r in seg_data.get('strokes', [])
+                            )
+                            if not hit:
+                                continue
+                        else:
+                            if not is_point_in_polygon(orig_x, orig_y, seg_data.get('points', [])):
+                                continue
+
+                        # ヒット: このセグメンテーションが選択対象
+                        if event.button() == Qt.LeftButton:
+                            # 選択済みのセグメンテーションをクリックした場合
+                            if self.selected_segmentation_index == i:
+                                # 選択解除が必要かどうかを判断
+                                if event.modifiers() & Qt.ShiftModifier:
+                                    self.selected_segmentation_index = None
+                                    self.update()
+                                    if hasattr(self.main_window, 'statusBar'):
+                                        self.main_window.statusBar().showMessage(get_text('status_seg_deselected'), 3000)
+                                    return
+
+                            # 新規選択の場合
+                            self.selected_segmentation_index = i
+                            self.is_moving_segmentation = True
+                            self.seg_move_start_pos = QPoint(orig_x, orig_y)
+
+                            self.update()
+                            return
+                        elif event.button() == Qt.RightButton:
+                            # 右クリック: コンテキストメニューを表示
+                            self._show_seg_context_menu(event.globalPos(), i, orig_x, orig_y, seg_data)
+                            return
                 
                 # 新しいポリゴンの描画処理
                 if event.button() == Qt.LeftButton:
@@ -2367,13 +3259,6 @@ class ImageLabel(QLabel):
                     self.main_window.skip_images(1)  # デフォルトは1枚
 
     def mouseReleaseEvent(self, event):
-        # speedバー調整完了処理
-        if self.is_adjusting_speed:
-            self.is_adjusting_speed = False
-            self.setCursor(Qt.ArrowCursor)
-            self.update()
-            return
-
         # 一筆書きウェイポイント描画完了処理
         if self.is_drawing_waypoints:
             self.is_drawing_waypoints = False
@@ -2438,11 +3323,27 @@ class ImageLabel(QLabel):
             return
 
         # 既存のコードに追加
+        # ペイント完了処理
+        if self.is_painting:
+            self.is_painting = False
+            if self.seg_tool_mode == 'paint' and self.current_paint_strokes:
+                self.main_window.complete_paint_annotation(list(self.current_paint_strokes))
+            self.current_paint_strokes = []
+            self.update()
+            return
+
         if self.is_moving_segmentation:
             # セグメンテーション移動が完了
             self.is_moving_segmentation = False
             self.seg_move_start_pos = None
-                        
+            # fill タイプならオフセットをマスクに焼き込む
+            if self.selected_segmentation_index is not None and hasattr(self.main_window, 'segmentation_annotations'):
+                ci = self.main_window.current_index
+                segs = self.main_window.segmentation_annotations.get(ci, [])
+                if 0 <= self.selected_segmentation_index < len(segs):
+                    sd = segs[self.selected_segmentation_index]
+                    if sd.get('type') == 'fill' and sd.get('offset', [0, 0]) != [0, 0]:
+                        _apply_fill_offset(sd)
             self.setCursor(Qt.ArrowCursor)
             self.update()
             return
@@ -2491,30 +3392,15 @@ class ImageLabel(QLabel):
         """マウス移動時の処理 - ハンドルによるサイズ変更機能を追加"""
         pos = event.pos()
 
-        # speedバーの調整中の処理
-        if self.is_adjusting_speed:
-            self.handle_speed_bar_click(pos)  # 同じロジックを使用
-            return
-
-        # speedバーのホバー検出
-        if hasattr(self, 'target_rect'):
-            is_hovering = self.is_point_in_speed_bar(pos, self.target_rect)
-            if is_hovering:
-                # ホバー位置のY座標を保存
-                self.speed_bar_hover_y = pos.y()
-            else:
-                self.speed_bar_hover_y = None
-
-            if is_hovering != self.hovering_speed_bar:
-                self.hovering_speed_bar = is_hovering
-                if is_hovering:
-                    self.setCursor(Qt.PointingHandCursor)
-                else:
-                    self.setCursor(Qt.ArrowCursor)
-
-            # ホバー中は常に再描画（プレビューバー更新のため）
-            if is_hovering:
-                self.update()
+        # カーソルオーバーレイ更新（セグメンテーションモード）
+        mode = getattr(self, 'seg_tool_mode', 'polygon')
+        if mode in ('paint', 'fill', 'eraser'):
+            self._cursor_pos = pos
+            if mode == 'fill':
+                # 移動中はプレビューをクリアし、停止後にデバウンスで再計算
+                self._fill_preview_mask = None
+                self._fill_preview_timer.start(300)
+            self.update()
 
         # ウェイポイントドラッグ中のカーソル設定
         if self.is_moving_waypoint:
@@ -2746,8 +3632,42 @@ class ImageLabel(QLabel):
             return
 
         ###
+        # ペイントモードのドラッグ処理
+        if self.is_painting and self.seg_tool_mode == 'paint':
+            if not self.pixmap():
+                return
+            pos = event.pos()
+            pix_w = self.pixmap().width()
+            pix_h = self.pixmap().height()
+            tr = self.target_rect
+            if tr.width() > 0 and tr.height() > 0:
+                px = int((pos.x() - tr.x()) / tr.width() * pix_w)
+                py = int((pos.y() - tr.y()) / tr.height() * pix_h)
+                px = max(0, min(px, pix_w - 1))
+                py = max(0, min(py, pix_h - 1))
+                r = max(1, self.brush_size)
+                self.current_paint_strokes.append((px, py, r))
+                self.update()
+            return
+
+        # 消しゴムモードのドラッグ処理
+        if self.is_painting and self.seg_tool_mode == 'eraser':
+            if not self.pixmap():
+                return
+            pos = event.pos()
+            tr = self.target_rect
+            if tr.width() > 0 and tr.height() > 0:
+                pix_w = self.pixmap().width()
+                pix_h = self.pixmap().height()
+                px = int((pos.x() - tr.x()) / tr.width() * pix_w)
+                py = int((pos.y() - tr.y()) / tr.height() * pix_h)
+                px = max(0, min(px, pix_w - 1))
+                py = max(0, min(py, pix_h - 1))
+                self._erase_at(px, py)
+            return
+
         # セグメンテーションホバー検出（移動中でない場合のみ）- 既存のコードを修正
-        elif (not self.is_moving_segmentation and not self.is_moving_vertex and 
+        elif (not self.is_moving_segmentation and not self.is_moving_vertex and
             hasattr(self.main_window, 'current_mode') and self.main_window.current_mode == 2):
             
             # 座標変換
@@ -2838,13 +3758,28 @@ class ImageLabel(QLabel):
                     
                     # ポリゴンの全ての点を移動
                     seg_data = segmentations[self.selected_segmentation_index]
-                    new_points = []
-                    for px, py in seg_data['points']:
-                        new_x = max(0, min(px + delta_x, pix_width))
-                        new_y = max(0, min(py + delta_y, pix_height))
-                        new_points.append((new_x, new_y))
-                    
-                    segmentations[self.selected_segmentation_index]['points'] = new_points
+                    if seg_data.get('type') == 'fill':
+                        # フラッドフィル: オフセットを蓄積（確定はマウスリリース時）
+                        off = seg_data.setdefault('offset', [0, 0])
+                        off[0] += delta_x
+                        off[1] += delta_y
+                    elif seg_data.get('type') == 'brush':
+                        # ブラシ: ストロークを移動
+                        new_strokes = []
+                        for cx, cy, r in seg_data.get('strokes', []):
+                            new_strokes.append((
+                                max(0, min(cx + delta_x, pix_width)),
+                                max(0, min(cy + delta_y, pix_height)),
+                                r
+                            ))
+                        segmentations[self.selected_segmentation_index]['strokes'] = new_strokes
+                    else:
+                        new_points = []
+                        for px, py in seg_data.get('points', []):
+                            new_x = max(0, min(px + delta_x, pix_width))
+                            new_y = max(0, min(py + delta_y, pix_height))
+                            new_points.append((new_x, new_y))
+                        segmentations[self.selected_segmentation_index]['points'] = new_points
                     self.seg_move_start_pos = QPoint(orig_x, orig_y)
                     
                     # ステータスバーに情報表示
@@ -2872,6 +3807,161 @@ class ImageLabel(QLabel):
         # マウス座標表示の更新（mouseMoveEventの最後で全モード共通）
         self._update_mouse_coordinates(event.pos())
 
+    def _recompute_fill_preview(self):
+        """塗りつぶしプレビューをデバウンス後に再計算"""
+        if self._cursor_pos is None or not hasattr(self, 'target_rect'):
+            return
+        if getattr(self, 'seg_tool_mode', '') != 'fill':
+            return
+        if not self.pixmap() or not self.target_rect.contains(self._cursor_pos):
+            return
+        tr = self.target_rect
+        rel_x = (self._cursor_pos.x() - tr.x()) / tr.width()
+        rel_y = (self._cursor_pos.y() - tr.y()) / tr.height()
+        orig_x = int(rel_x * self.pix_width)
+        orig_y = int(rel_y * self.pix_height)
+        if not (hasattr(self.main_window, 'images') and self.main_window.images):
+            return
+        current_path = self.main_window.images[self.main_window.current_index]
+        try:
+            from PIL import Image as _PIL
+            import numpy as _np
+            img = _PIL.open(current_path).convert('RGB')
+            img_array = _np.array(img)
+        except Exception:
+            return
+        mask = _compute_flood_fill(img_array, orig_x, orig_y, self.fill_tolerance)
+        if mask is not None and mask.any():
+            if self.fill_close_enabled:
+                mask = _morphological_close(mask, self.fill_close_kernel)
+            self._fill_preview_mask = mask
+            self._fill_preview_img_size = (img_array.shape[1], img_array.shape[0])
+        else:
+            self._fill_preview_mask = None
+        self.update()
+
+    def draw_cursor_overlay(self, painter):
+        """ペンモード: ブラシ円、塗りつぶしモード: バケツアイコン＋半透明プレビュー"""
+        pos = self._cursor_pos
+        if pos is None or not hasattr(self, 'target_rect'):
+            return
+        tr = self.target_rect
+        mode = getattr(self, 'seg_tool_mode', 'polygon')
+
+        if mode == 'paint':
+            if not tr.contains(pos):
+                return
+            r_px = max(2, int(self.brush_size / max(1, self.pix_width) * tr.width()))
+            cx, cy = pos.x(), pos.y()
+            # 白縁 + 黒破線の二重リング
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(255, 255, 255, 200), 2))
+            painter.drawEllipse(cx - r_px, cy - r_px, r_px * 2, r_px * 2)
+            painter.setPen(QPen(QColor(0, 0, 0, 180), 1, Qt.DashLine))
+            painter.drawEllipse(cx - r_px, cy - r_px, r_px * 2, r_px * 2)
+
+        elif mode == 'eraser':
+            if not tr.contains(pos):
+                return
+            r_px = max(2, int(self.brush_size / max(1, self.pix_width) * tr.width()))
+            cx, cy = pos.x(), pos.y()
+            # 半透明赤塗り + 赤実線 + 白縁
+            painter.setBrush(QBrush(QColor(220, 60, 60, 40)))
+            painter.setPen(QPen(QColor(255, 255, 255, 180), 2))
+            painter.drawEllipse(cx - r_px, cy - r_px, r_px * 2, r_px * 2)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(220, 60, 60, 200), 1, Qt.DashLine))
+            painter.drawEllipse(cx - r_px, cy - r_px, r_px * 2, r_px * 2)
+
+        elif mode == 'fill':
+            # ① 塗りつぶしプレビューマスク（半透明シアン）
+            mask = self._fill_preview_mask
+            if mask is not None:
+                import numpy as _np
+                iw, ih = self._fill_preview_img_size
+                if iw > 0 and ih > 0:
+                    rgba = _np.zeros((ih, iw, 4), dtype=_np.uint8)
+                    rgba[mask, 0] = 0
+                    rgba[mask, 1] = 200
+                    rgba[mask, 2] = 255
+                    rgba[mask, 3] = 255
+                    qimg = QImage(rgba.tobytes(), iw, ih, iw * 4, QImage.Format_RGBA8888)
+                    scaled = qimg.scaled(tr.width(), tr.height(),
+                                         Qt.IgnoreAspectRatio, Qt.FastTransformation)
+                    painter.setOpacity(0.35)
+                    painter.drawImage(tr.topLeft(), scaled)
+                    painter.setOpacity(1.0)
+
+            # ② バケツアイコン（カーソルの右下）
+            if pos is not None:
+                bx = pos.x() + 10
+                by = pos.y() + 6
+                # バケツ本体（台形）
+                body = QPolygon([
+                    QPoint(bx,      by),
+                    QPoint(bx + 16, by),
+                    QPoint(bx + 13, by + 14),
+                    QPoint(bx + 3,  by + 14),
+                ])
+                painter.setPen(QPen(QColor(30, 30, 30, 220), 1))
+                painter.setBrush(QBrush(QColor(30, 120, 220, 220)))
+                painter.drawPolygon(body)
+                # ハンドル（弧）
+                painter.setPen(QPen(QColor(30, 30, 30, 220), 2))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawArc(bx + 2, by - 7, 12, 10, 0, 180 * 16)
+                # ペンキたれ
+                painter.setPen(QPen(QColor(30, 120, 220, 200), 2))
+                painter.drawLine(bx + 8, by + 14, bx + 8, by + 19)
+                # カーソル十字
+                painter.setPen(QPen(QColor(255, 255, 255, 180), 1))
+                painter.drawLine(pos.x() - 5, pos.y(), pos.x() + 5, pos.y())
+                painter.drawLine(pos.x(), pos.y() - 5, pos.x(), pos.y() + 5)
+
+    def _erase_at(self, img_x, img_y):
+        """消しゴム: 画像座標(img_x, img_y)のブラシサイズ円内をすべてのアノテーションから消去"""
+        if not self.main_window:
+            return
+        import numpy as _np
+        idx = self.main_window.current_index
+        segmentations = self.main_window.segmentation_annotations.get(idx, [])
+        er = max(1, self.brush_size)
+        changed = False
+        for seg_data in segmentations:
+            ann_type = seg_data.get('type')
+            if ann_type == 'brush':
+                before = len(seg_data.get('strokes', []))
+                seg_data['strokes'] = [
+                    (cx, cy, r) for cx, cy, r in seg_data.get('strokes', [])
+                    if (cx - img_x) ** 2 + (cy - img_y) ** 2 > (er + r) ** 2
+                ]
+                if len(seg_data['strokes']) != before:
+                    changed = True
+            elif ann_type == 'fill':
+                rle = seg_data.get('rle', [])
+                img_w, img_h = seg_data.get('img_size', (1, 1))
+                mask = _rle_to_mask(rle, img_h, img_w)
+                Y, X = _np.ogrid[:img_h, :img_w]
+                circle = (X - img_x) ** 2 + (Y - img_y) ** 2 <= er ** 2
+                if mask[circle].any():
+                    mask[circle] = False
+                    seg_data['rle'] = _mask_to_rle(mask)
+                    changed = True
+        # 空になったアノテーションを除去
+        new_segs = []
+        for s in segmentations:
+            t = s.get('type')
+            if t == 'brush' and not s.get('strokes'):
+                changed = True
+                continue
+            if t == 'fill' and not s.get('rle'):
+                changed = True
+                continue
+            new_segs.append(s)
+        self.main_window.segmentation_annotations[idx] = new_segs
+        if changed:
+            self.update()
+
     def leaveEvent(self, event):
         """マウスがウィジェットから離れた時の処理"""
         self.setCursor(Qt.ArrowCursor)
@@ -2885,6 +3975,11 @@ class ImageLabel(QLabel):
         # マウス座標表示もクリア
         self.current_mouse_pos = None
         self.normalized_coords = None
+
+        # カーソルオーバーレイ・プレビューをクリア
+        self._cursor_pos = None
+        self._fill_preview_mask = None
+        self._fill_preview_timer.stop()
 
         self.update()  # 画面を更新してホバー効果を消す
         super().leaveEvent(event)
@@ -3064,19 +4159,18 @@ class ImageLabel(QLabel):
             self.update()
             return
 
-        # 画像内の相対位置を計算
-        rel_x = (pos.x() - self.target_rect.x()) / self.target_rect.width()
-        rel_y = (pos.y() - self.target_rect.y()) / self.target_rect.height()
+        # 結合表示時は推論対象セルのサブ矩形を基準に正規化
+        if hasattr(self, 'pix_width'):
+            coord_rect, _, _ = self._get_annotation_draw_params(self.target_rect)
+        else:
+            coord_rect = self.target_rect
 
-        # 元の画像の座標に変換
-        orig_x = int(rel_x * self.pix_width)
-        orig_y = int(rel_y * self.pix_height)
+        # 座標矩形内の相対位置を計算（結合表示では推論対象セル基準）
+        rel_x = (pos.x() - coord_rect.x()) / coord_rect.width()
+        rel_y = (pos.y() - coord_rect.y()) / coord_rect.height()
 
         # 正規化座標を計算 (x: -1～1, y: -1～1)
-        # X座標を-1（左）から1（右）に変換
         x_norm = (rel_x * 2) - 1
-
-        # Y座標を1（上）から-1（下）に変換
         y_norm = -((rel_y * 2) - 1)
 
         # 座標を保存
@@ -3088,14 +4182,30 @@ class ImageLabel(QLabel):
 
     def complete_segmentation_polygon(self):
         """ポリゴンを完了してクラス選択を行う"""
-        if len(self.current_segmentation_polygon) >= 3:
+        pts = self.current_segmentation_polygon
+        # 左右下端塗りつぶし: 最初と最後の点から画像端へ伸ばす（最低2点あればOK）
+        if getattr(self, 'polygon_fill_to_bottom', False) and len(pts) >= 2:
+            W = max(0, self.pix_width - 1)
+            H = max(0, self.pix_height - 1)
+            x_first, y_first = pts[0].x(), pts[0].y()
+            x_last, y_last = pts[-1].x(), pts[-1].y()
+            extra = [
+                QPoint(W, y_last),   # 最後の点から右端
+                QPoint(W, H),         # 右下角
+                QPoint(0, H),         # 左下角
+                QPoint(0, y_first),   # 左端（最初の点のY）
+            ]
+            all_pts = list(pts) + extra
+        else:
+            all_pts = list(pts)
+
+        if len(all_pts) >= 3:
             # クラス選択ダイアログ
             class_name = self.main_window.select_object_class()
             if class_name:
-                # ポリゴンを保存
                 polygon_data = {
                     'class': class_name,
-                    'points': [(p.x(), p.y()) for p in self.current_segmentation_polygon]
+                    'points': [(p.x(), p.y()) for p in all_pts]
                 }
                 return polygon_data
         return None  # キャンセルまたは無効な場合はNoneを返す
@@ -3122,10 +4232,270 @@ class ImageLabel(QLabel):
             segmentations = self.main_window.segmentation_annotations[current_index]
             
             for i, seg_data in enumerate(segmentations):
-                if is_point_in_polygon(orig_x, orig_y, seg_data['points']):
+                if seg_data.get('type') == 'fill':
+                    if _fill_hit_test(seg_data, orig_x, orig_y):
+                        return i
+                elif seg_data.get('type') == 'brush':
+                    hit = any(
+                        (orig_x - cx) ** 2 + (orig_y - cy) ** 2 <= r ** 2
+                        for cx, cy, r in seg_data.get('strokes', [])
+                    )
+                    if hit:
+                        return i
+                elif is_point_in_polygon(orig_x, orig_y, seg_data.get('points', [])):
                     return i
         
         return None
+
+
+class SpeedGaugeWidget(QWidget):
+    """画像の外側に表示するスピードゲージウィジェット。
+    ズームスライダーと同じ比率（上下 1/8 ずつ余白、トラック 6/8）でレイアウトし、
+    スライダーハンドルスタイルで現在値を表示する。
+    """
+
+    # トラック領域の x オフセットと幅
+    TRACK_X = 8
+    TRACK_W = 20
+    HANDLE_H = 8   # ハンドルの縦幅（px）
+    LABEL_H = 0    # ラベルはトラック直上に相対配置するため予約不要
+
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.setFixedWidth(72)
+        self.setMinimumHeight(100)
+        self.setMouseTracking(True)
+
+        self._is_hovering = False
+        self._is_dragging = False
+        self._hover_y = None
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+    def _track_rect(self):
+        """ズームスライダーと同じ 1/8 上下余白、6/8 トラック高さで計算"""
+        rem = max(24, self.height() - self.LABEL_H)
+        top_pad = rem // 8
+        th = rem * 6 // 8
+        ty = self.LABEL_H + top_pad
+        return QRect(self.TRACK_X, ty, self.TRACK_W, th)
+
+    def _max_speed(self):
+        if self.main_window and hasattr(self.main_window, 'main_image_view'):
+            return self.main_window.main_image_view.max_speed
+        from config import MAX_SPEED
+        return MAX_SPEED
+
+    def _current_annotation(self):
+        mw = self.main_window
+        if not mw:
+            return None
+        ann = mw.annotations.get(mw.current_index)
+        if ann is None or 'speed' not in ann:
+            return None
+        return ann
+
+    def _speed_from_y(self, y):
+        tr = self._track_rect()
+        rel = (y - tr.y()) / tr.height()
+        rel = max(0.0, min(1.0, rel))
+        return (1.0 - rel) * self._max_speed()  # 上が高速
+
+    def _y_from_norm(self, norm, tr):
+        """正規化値 (0-1) からY座標（ハンドル中心）を計算"""
+        return tr.y() + tr.height() - int(tr.height() * norm)
+
+    # ------------------------------------------------------------------
+    # painting
+    # ------------------------------------------------------------------
+    def paintEvent(self, event):
+        ann = self._current_annotation()
+        if ann is None:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        speed = ann['speed']
+        ms = self._max_speed()
+        normalized = max(0.0, min(1.0, speed / ms)) if ms > 0 else 0.0
+
+        tr = self._track_rect()
+        tx, ty, tw, th = tr.x(), tr.y(), tr.width(), tr.height()
+        track_cx = tx + tw // 2  # トラック中心 x
+
+        is_dark = getattr(self.main_window, 'is_dark_mode', False) if self.main_window else False
+        text_color = QColor(200, 200, 200) if is_dark else QColor(50, 50, 50)
+
+        # ── トラック背景（薄グレー） ──
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(210, 210, 210)))
+        painter.drawRect(tx, ty, tw, th)
+
+        # ── 現在値の充填バー（下から上へ） ──
+        fill_h = int(th * normalized)
+        fill_y = ty + th - fill_h
+        if normalized < 0.5:
+            fill_r = int(normalized * 2 * 200)
+            fill_g = 190
+        else:
+            fill_r = 190
+            fill_g = int((1.0 - (normalized - 0.5) * 2) * 190)
+        painter.setBrush(QBrush(QColor(fill_r, fill_g, 50, 220)))
+        painter.drawRect(tx, fill_y, tw, fill_h)
+
+        # ── トラック外枠 ──
+        painter.setPen(QPen(QColor(110, 110, 110), 1))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(tx, ty, tw, th)
+
+        # ── 将来フレームのマーカー（横線）──
+        mw = self.main_window
+        if mw and getattr(mw.main_image_view, 'show_future_annotations', False):
+            idx = mw.current_index
+            future_cfg = [(10, 2, QColor(200, 180, 0)), (5, 3, QColor(255, 165, 0))]
+            for offset, lw, fc in future_cfg:
+                fann = mw.annotations.get(idx + offset)
+                if fann and 'speed' in fann:
+                    fn = max(0.0, min(1.0, fann['speed'] / ms)) if ms > 0 else 0.0
+                    fy = self._y_from_norm(fn, tr)
+                    painter.setPen(QPen(fc, lw))
+                    painter.drawLine(tx, fy, tx + tw, fy)
+
+        # ── 推論結果の横線 ──
+        if (mw and hasattr(mw, 'inference_checkbox') and
+                mw.inference_checkbox.isChecked() and
+                hasattr(mw, 'inference_results')):
+            idx = mw.current_index
+            inf = mw.inference_results.get(idx)
+            if inf:
+                if getattr(mw.main_image_view, 'show_future_annotations', False):
+                    for offset, lw, lc in [(10, 2, QColor(0, 150, 150)), (5, 3, QColor(0, 200, 200))]:
+                        fd = inf.get(f"future_{offset}", {})
+                        if 'speed' in fd:
+                            fn = max(0.0, min(1.0, fd['speed']))
+                            fy = self._y_from_norm(fn, tr)
+                            painter.setPen(QPen(lc, lw))
+                            painter.drawLine(tx, fy, tx + tw, fy)
+                if 'speed' in inf:
+                    ni = max(0.0, min(1.0, inf['speed']))
+                    iy = self._y_from_norm(ni, tr)
+                    painter.setPen(QPen(QColor(0, 255, 255), 3))
+                    painter.drawLine(tx - 2, iy, tx + tw + 2, iy)
+                    # 推論値テキスト
+                    painter.setPen(QPen(QColor(0, 200, 200), 1))
+                    painter.setFont(QFont("Arial", 7, QFont.Bold))
+                    painter.drawText(tx + tw + 4, iy + 4, f"({inf['speed'] * ms:.2f})")
+
+        # ── 目盛り ──
+        num_ticks = 11
+        painter.setFont(QFont("Arial", 7))
+        for i in range(num_ticks):
+            tick_y = ty + th - int(th * i / (num_ticks - 1))
+            painter.setPen(QPen(text_color, 1))
+            painter.drawLine(tx + tw, tick_y, tx + tw + 3, tick_y)
+            if i % 2 == 0:
+                tv = ms * i / (num_ticks - 1)
+                tl = f"{tv:.1f}" if tv != int(tv) else f"{int(tv)}"
+                painter.setFont(QFont("Arial", 7))
+                painter.drawText(tx + tw + 5, tick_y + 4, tl)
+
+        # ── "SPEED X.XX" を1行でトラック直上に描画（ズームラベルと高さを合わせる）──
+        painter.setFont(QFont("Arial", 7))
+        fm = painter.fontMetrics()
+        gap = 8  # トラック上端からのクリアランス
+        label_baseline = max(fm.ascent() + 2, ty - fm.descent() - gap)
+        painter.setPen(QPen(text_color, 1))
+        painter.drawText(2, label_baseline, f"SPEED {speed:.2f}")
+
+        # ── 現在値ハンドル（赤・太め） ──
+        handle_y = self._y_from_norm(normalized, tr)
+        hh = self.HANDLE_H + 4
+        painter.setBrush(QBrush(QColor(210, 30, 30)))
+        painter.setPen(QPen(QColor(255, 255, 255), 1))
+        painter.drawRect(tx - 3, handle_y - hh // 2, tw + 6, hh)
+
+        # ── ホバー時の予定値をトラック左側に表示 ──
+        if (self._is_hovering or self._is_dragging) and self._hover_y is not None:
+            hover_speed = self._speed_from_y(self._hover_y)
+            text = f"{hover_speed:.2f}"
+            font = QFont("Arial", 9, QFont.Bold)
+            painter.setFont(font)
+            fm = painter.fontMetrics()
+            tw_txt = fm.horizontalAdvance(text)
+            th_txt = fm.height()
+            pad = 4
+            # トラック左側に配置（ウィジェット左端を超えないようクランプ）
+            tooltip_x = max(pad, tx - tw_txt - pad)
+            tooltip_y = max(ty + th_txt + pad,
+                            min(self._hover_y, ty + th - pad))
+            bg_rect = QRect(tooltip_x - pad,
+                            tooltip_y - th_txt - pad,
+                            tw_txt + pad * 2,
+                            th_txt + pad * 2)
+            painter.fillRect(bg_rect, QColor(0, 0, 0, 190))
+            painter.setPen(QPen(QColor(100, 200, 255), 1))
+            painter.drawRect(bg_rect)
+            painter.setPen(Qt.white)
+            painter.drawText(tooltip_x, tooltip_y, text)
+
+        painter.end()
+
+    # ------------------------------------------------------------------
+    # mouse interaction
+    # ------------------------------------------------------------------
+    def _apply_speed_at_y(self, y):
+        ann = self._current_annotation()
+        if ann is None:
+            return
+        new_speed = self._speed_from_y(y)
+        ann['speed'] = new_speed
+        self._hover_y = y
+        self.update()
+        mw = self.main_window
+        if mw and hasattr(mw, 'statusBar'):
+            mw.statusBar().showMessage(get_text('status_speed_updated', new_speed), 2000)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._is_dragging = True
+            self._is_hovering = False
+            self._apply_speed_at_y(event.pos().y())
+
+    def mouseMoveEvent(self, event):
+        y = event.pos().y()
+        tr = self._track_rect()
+        in_bar = tr.adjusted(-8, -8, 8, 8).contains(event.pos())
+
+        if self._is_dragging:
+            self._apply_speed_at_y(y)
+            return
+
+        if in_bar != self._is_hovering:
+            self._is_hovering = in_bar
+            self.setCursor(Qt.SizeVerCursor if in_bar else Qt.ArrowCursor)
+
+        if in_bar:
+            self._hover_y = y
+            self.update()
+        elif self._hover_y is not None:
+            self._hover_y = None
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._is_dragging:
+            self._is_dragging = False
+            self.setCursor(Qt.ArrowCursor)
+            self.update()
+
+    def leaveEvent(self, event):
+        if self._is_hovering or self._hover_y is not None:
+            self._is_hovering = False
+            self._hover_y = None
+            self.update()
+
 
 # 下部ギャラリー系（物体検知・セグメンテーション対応強化版）
 class ThumbnailWidget(QWidget):
@@ -3535,6 +4905,8 @@ class ImageAnnotationTool(QMainWindow):
         self.last_bbox = None  # 前回作成したバウンディングボックスの情報
         self.last_bboxes = []  # 前回の画像の全てのバウンディングボックスを保存するリスト（新規追加）
         self.auto_apply_last_bbox = False  # 前回のバウンディングボックスを自動適用するかどうか
+        self._bbox_fixed_class_advance = False   # 物体検知: クラス固定で次へ
+        self._seg_fixed_class_advance = False    # セグメンテーション: クラス固定で次へ
 
         # セグメンテーション関連の初期化
         self.segmentation_annotations = {}  # セグメンテーションアノテーション用
@@ -3547,6 +4919,10 @@ class ImageAnnotationTool(QMainWindow):
         self.show_seg_driving_direction = False  # 走行方向矢印の表示フラグ
         self.seg_max_steering_angle = 30.0  # 最大舵角（度）
         self.seg_display_mode = 'trajectory'  # 表示モード: 'trajectory' or 'waypoint'
+        self.show_auto_driving_direction = False  # 自動運転アノテーション走行軌跡表示フラグ
+        self.auto_max_steering_angle = 25.0  # 自動運転走行軌跡の最大舵角（度）
+        self.auto_cam_pitch_deg = 20.0        # カメラ俯角（度）※spinbox初期値と一致させること
+        self.auto_fov_deg = 160.0             # カメラ対角FOV（度）※spinbox初期値と一致させること
 
         # waypoint関連の初期化
         self.waypoint_annotations = {}  # waypointアノテーション用 {image_index: [(x, y), ...]}
@@ -3562,6 +4938,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # manifest.jsonのパスを保存する変数
         self.last_manifest_path = None
+        # manifest読み込み時の 画像インデックス → カタログエントリインデックス マップ
+        self._manifest_image_to_entry = {}
 
         self.info_panel_width = 280  # 基本の幅
         self.info_panel_margin = 20  # パネル周りの余白（左右合計）
@@ -3570,6 +4948,7 @@ class ImageAnnotationTool(QMainWindow):
         self.location_buttons = []  # 位置情報ボタンのリスト
         self.current_location = None  # 現在選択されている位置情報
         self.location_annotations = {}  # 画像ごとの位置情報アノテーション
+        self._location_display_mode = 'position'  # 'position' or 'corner'
         
         # アノテーションのタイムスタンプを保存する辞書
         self.annotation_timestamps = {}
@@ -3596,7 +4975,8 @@ class ImageAnnotationTool(QMainWindow):
         self.inference_timer = QTimer()
         self.inference_timer.setSingleShot(True)
         self.inference_timer.timeout.connect(self._execute_deferred_inference)
-        self.inference_delay = 50  # 50ms後に推論実行
+        self.inference_delay = 50          # キャッシュ済み結果がある場合のディレイ (ms)
+        self.inference_delay_no_cache = 200  # 推論結果がない場合のディレイ (ms)
 
         # 画像サイズキャッシュ（パフォーマンス改善）
         self.image_size_cache = {}  # {image_path: (width, height)}
@@ -3618,6 +4998,12 @@ class ImageAnnotationTool(QMainWindow):
             QColor(30, 144, 255),   # Dodger Blue
             QColor(123, 104, 238),  # Medium Slate Blue
         ]
+
+        # 仮想ソースオーバーレイモード
+        self._virtual_overlay_mode = 'fill'
+        self._virtual_source_config = None
+        self._multi_source_config = None
+        self._temporal_interval = 10  # デフォルト時間差（フレーム数）
 
         # YOLO関連の初期化を追加
         self.yolo_model = None  # YOLOモデルのインスタンス
@@ -3721,6 +5107,19 @@ class ImageAnnotationTool(QMainWindow):
             combined_button.setStyleSheet("padding: 2px 8px;")
             combined_button.clicked.connect(self._show_combined_view_dialog)
             variant_layout.addWidget(combined_button)
+        # 仮想ソースオーバーレイ表示モード選択（常時表示・起動時はグレーアウト）
+        init_overlay_combo = QComboBox()
+        init_overlay_combo.setToolTip(get_text('tip_virtual_overlay'))
+        init_overlay_combo.addItem(get_text('opt_virtual_overlay_none'), 'none')
+        init_overlay_combo.addItem(get_text('opt_virtual_overlay_crop'), 'crop')
+        init_overlay_combo.addItem(get_text('opt_virtual_overlay_scale'), 'scale')
+        init_overlay_combo.addItem(get_text('opt_virtual_overlay_temporal'), 'temporal')
+        init_overlay_combo.setCurrentIndex(0)
+        init_overlay_combo.currentIndexChanged.connect(
+            lambda i, cb=init_overlay_combo: self._on_virtual_source_type_changed(cb.itemData(i))
+        )
+        variant_layout.addWidget(init_overlay_combo)
+        self._virtual_overlay_combo = init_overlay_combo
         toolbar.addWidget(self.variant_box)
 
         # 左側にスペーサーを追加して右寄せ
@@ -3853,6 +5252,16 @@ class ImageAnnotationTool(QMainWindow):
         from PyQt5.QtWidgets import QMenu
         menu = QMenu(self)
 
+        # --- manifest 上書き保存 ---
+        has_manifest = bool(getattr(self, 'last_manifest_path', None))
+        overwrite_action = menu.addAction("💾 manifest 上書き保存（削除フラグ）")
+        overwrite_action.setEnabled(has_manifest)
+        overwrite_action.triggered.connect(self.overwrite_manifest_deleted_indexes)
+        if not has_manifest:
+            overwrite_action.setToolTip("manifest.json が読み込まれていません")
+
+        menu.addSeparator()
+
         # --- 自動運転アノテーション ---
         menu.addSection(get_text('menu_driving_annotation'))
 
@@ -3881,6 +5290,63 @@ class ImageAnnotationTool(QMainWindow):
         # ボタンの下にメニューを表示
         button = self.toolbar_save_button
         menu.exec_(button.mapToGlobal(button.rect().bottomLeft()))
+
+    def overwrite_manifest_deleted_indexes(self):
+        """現在の削除フラグを読み込んだ manifest.json に上書き保存する"""
+        manifest_path = getattr(self, 'last_manifest_path', None)
+        if not manifest_path or not os.path.exists(manifest_path):
+            QMessageBox.warning(self, "上書き保存", "manifest.json が読み込まれていません。")
+            return
+
+        # 確認ダイアログ
+        reply = QMessageBox.question(
+            self, "manifest 上書き保存",
+            f"削除フラグを以下の manifest.json に上書き保存します。\n\n{manifest_path}\n\n"
+            f"削除済み画像数: {len(self.deleted_indexes)} 件\n\n"
+            "この操作は元に戻せません。続けますか?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            # manifest.json を全行読み込む
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+
+            if len(lines) < 5:
+                QMessageBox.warning(self, "上書き保存", "manifest.json の形式が不正です（5行未満）。")
+                return
+
+            # 5行目 (index 4) のカタログ情報を取得
+            catalog_info = json.loads(lines[4])
+
+            # 現在の self.deleted_indexes（画像インデックス）を
+            # カタログエントリインデックスに変換
+            image_to_entry = getattr(self, '_manifest_image_to_entry', {})
+            new_deleted_entry_indexes = sorted(
+                image_to_entry[img_idx]
+                for img_idx in self.deleted_indexes
+                if img_idx in image_to_entry
+            )
+
+            catalog_info['deleted_indexes'] = new_deleted_entry_indexes
+
+            # 5行目を更新して書き戻す
+            lines[4] = json.dumps(catalog_info, ensure_ascii=False) + '\n'
+            with open(manifest_path, 'w', encoding='utf-8') as f:
+                f.writelines(lines)
+
+            QMessageBox.information(
+                self, "上書き保存完了",
+                f"manifest.json を更新しました。\n"
+                f"削除エントリ数: {len(new_deleted_entry_indexes)} 件\n\n{manifest_path}"
+            )
+            print(f"manifest 上書き保存完了: {manifest_path}, 削除エントリ={new_deleted_entry_indexes}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "上書き保存エラー", f"保存中にエラーが発生しました:\n{e}")
+            print(f"manifest 上書き保存エラー: {e}")
 
     def init_ui(self):
         self.setWindowTitle(get_text('window_title'))
@@ -4101,7 +5567,7 @@ class ImageAnnotationTool(QMainWindow):
         class_label.setMinimumWidth(70)
         classes_layout.addWidget(class_label)
 
-        self.classes_input = QLineEdit("car,red_sign,green_sign,dog")
+        self.classes_input = QLineEdit("car,red_sign,green_sign,dog,wall,road")
         self.classes_input.setPlaceholderText(get_text('classes_placeholder'))
         self.classes_input.setToolTip(get_text('classes_example'))
         self.classes_input.setMinimumWidth(200)
@@ -4253,8 +5719,7 @@ class ImageAnnotationTool(QMainWindow):
 
         self.annotation_info_label = QLabel("")
         self.annotation_info_label.setWordWrap(True)
-        self.annotation_info_label.setMinimumHeight(45)
-        self.annotation_info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.annotation_info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         info_layout.addWidget(self.annotation_info_label)
 
         self.inference_info_label = QLabel("")
@@ -4339,19 +5804,73 @@ class ImageAnnotationTool(QMainWindow):
         image_and_slider_layout.setContentsMargins(0, 0, 0, 0)
         image_and_slider_layout.setSpacing(2)
 
+        # 画像列（解像度スライダー＋画像ビュー）
+        image_column = QVBoxLayout()
+        image_column.setContentsMargins(0, 0, 0, 0)
+        image_column.setSpacing(2)
+
+        # 解像度スライダー（画像の真上・画像と同幅）
+        resolution_row = QHBoxLayout()
+        resolution_row.setContentsMargins(0, 1, 0, 1)
+        resolution_row.setSpacing(4)
+
+        self.image_size_label = QLabel("---")
+        self.image_size_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.image_size_label.setStyleSheet("color: #666;")
+        resolution_row.addWidget(self.image_size_label)
+
+        self.model_input_size_label = QLabel("")
+        self.model_input_size_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.model_input_size_label.setStyleSheet("color: #4a9;")
+        resolution_row.addWidget(self.model_input_size_label)
+
+        resolution_label = QLabel(get_text('label_resolution_scale'))
+        resolution_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        resolution_row.addWidget(resolution_label)
+
+        self.resolution_value_label = QLabel("100%")
+        self.resolution_value_label.setFixedWidth(52)
+        self.resolution_value_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        resolution_row.addWidget(self.resolution_value_label)
+
+        resolution_row.addStretch(1)  # 左パディング
+
+        self.resolution_slider = QSlider(Qt.Horizontal)
+        self.resolution_slider.setMinimum(10)
+        self.resolution_slider.setMaximum(100)
+        self.resolution_slider.setValue(100)
+        self.resolution_slider.setTickPosition(QSlider.TicksBelow)
+        self.resolution_slider.setTickInterval(10)
+        self.resolution_slider.setSingleStep(5)
+        self.resolution_slider.setToolTip(get_text('tooltip_resolution_scale'))
+        self.resolution_slider.valueChanged.connect(self._on_resolution_scale_changed)
+        resolution_row.addWidget(self.resolution_slider, 3)  # スライダー幅を縮小
+
+        resolution_row.addStretch(1)  # 右パディング
+
+        image_column.addLayout(resolution_row)
+
         self.main_image_view = ImageLabel(main_window=self)
         self.main_image_view.setMinimumSize(800, 600)
         self.main_image_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        image_and_slider_layout.addWidget(self.main_image_view, 1)  # ストレッチファクター1で拡張
+        image_column.addWidget(self.main_image_view, 1)
+
+        image_and_slider_layout.addLayout(image_column, 1)
+
+        # スピードゲージ（zoom スライダーの左）
+        self.speed_gauge = SpeedGaugeWidget(self)
+        image_and_slider_layout.addWidget(self.speed_gauge)
 
         # キャンバスサイズ調整用の縦スライダー（画像の右側）
         zoom_slider_container = QVBoxLayout()
         zoom_slider_container.setContentsMargins(0, 0, 0, 0)
-        zoom_slider_container.setSpacing(2)
+        zoom_slider_container.setSpacing(1)
+
+        zoom_slider_container.addStretch(1)  # 上パディング（スライダーと同比率）
 
         zoom_label = QLabel(get_text('canvas_zoom_label'))
         zoom_label.setAlignment(Qt.AlignCenter)
-        zoom_slider_container.addWidget(zoom_label)
+        zoom_slider_container.addWidget(zoom_label)  # ラベルをスライダー直上に配置
 
         self.canvas_zoom_slider = QSlider(Qt.Vertical)
         self.canvas_zoom_slider.setMinimum(10)   # zoom_factor 1.0
@@ -4362,7 +5881,9 @@ class ImageAnnotationTool(QMainWindow):
         self.canvas_zoom_slider.setFixedWidth(30)
         self.canvas_zoom_slider.setToolTip(get_text('canvas_zoom_tooltip'))
         self.canvas_zoom_slider.valueChanged.connect(self._on_canvas_zoom_changed)
-        zoom_slider_container.addWidget(self.canvas_zoom_slider)
+        zoom_slider_container.addWidget(self.canvas_zoom_slider, 6)  # 75% 高さ
+
+        zoom_slider_container.addStretch(1)  # 下パディング
 
         image_and_slider_layout.addLayout(zoom_slider_container)
 
@@ -4640,9 +6161,17 @@ class ImageAnnotationTool(QMainWindow):
         location_layout = QVBoxLayout(location_panel)
         location_layout.setSpacing(5)
         
+        # アノテーションモード ラベル（右にヒントを横並び）
+        mode_header_row = QHBoxLayout()
+        mode_header_row.setSpacing(6)
         mode_layout_label = QLabel(get_text('label_annotation_mode'))
         mode_layout_label.setStyleSheet("font-weight: bold;")
-        location_layout.addWidget(mode_layout_label)
+        mode_header_row.addWidget(mode_layout_label)
+        self.mode_hint_label = QLabel(get_text('label_mode_hint'))
+        self.mode_hint_label.setStyleSheet("color: #888; font-style: italic; font-size: 10px;")
+        mode_header_row.addWidget(self.mode_hint_label)
+        mode_header_row.addStretch()
+        location_layout.addLayout(mode_header_row)
 
         # アノテーションモード切替ボタン
         mode_layout = QHBoxLayout()
@@ -4676,6 +6205,79 @@ class ImageAnnotationTool(QMainWindow):
         mode_layout.addWidget(self.waypoint_mode_button)  # 追加
 
         location_layout.addLayout(mode_layout)
+
+        # クリック時の自動スキップ枚数（全モード共通、モードボタン直下）
+        skip_layout = QHBoxLayout()
+        self.skip_images_on_click = QCheckBox(get_text('chk_auto_skip_on_click'))
+        self.skip_images_on_click.setChecked(True)
+        skip_layout.addWidget(self.skip_images_on_click)
+        self.skip_count_spin = QSpinBox()
+        self.skip_count_spin.setRange(1, 1000)
+        self.skip_count_spin.setValue(10)
+        self.skip_count_spin.valueChanged.connect(self.update_skip_button_labels)
+        skip_layout.addWidget(self.skip_count_spin)
+        skip_layout.addStretch()
+        location_layout.addLayout(skip_layout)
+
+        # 自動運転走行軌跡制御パネル
+        self.auto_driving_control_widget = QWidget()
+        auto_driving_control_layout = QVBoxLayout(self.auto_driving_control_widget)
+        auto_driving_control_layout.setContentsMargins(0, 2, 0, 2)
+        auto_driving_control_layout.setSpacing(3)
+
+        # 行1: [✓ 走行軌跡を表示]  最大舵角: [25.0°]
+        traj_row = QHBoxLayout()
+        traj_row.setSpacing(4)
+        self.show_auto_driving_direction_checkbox = QCheckBox(get_text('chk_show_auto_driving_direction'))
+        self.show_auto_driving_direction_checkbox.setChecked(False)
+        self.show_auto_driving_direction_checkbox.setToolTip(get_text('tip_auto_driving_direction'))
+        self.show_auto_driving_direction_checkbox.stateChanged.connect(self.toggle_auto_driving_direction)
+        self.show_auto_driving_direction_checkbox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.show_auto_driving_direction_checkbox.setMinimumWidth(145)
+        traj_row.addWidget(self.show_auto_driving_direction_checkbox)
+        traj_row.addSpacing(6)
+        traj_row.addWidget(QLabel(get_text('label_auto_max_steering')))
+        self.auto_max_steering_spin = QDoubleSpinBox()
+        self.auto_max_steering_spin.setRange(0.1, 90.0)
+        self.auto_max_steering_spin.setSuffix("°")
+        self.auto_max_steering_spin.setDecimals(1)
+        self.auto_max_steering_spin.setFixedWidth(76)
+        self.auto_max_steering_spin.setToolTip(get_text('tip_auto_max_steering'))
+        self.auto_max_steering_spin.valueChanged.connect(self.update_auto_max_steering_angle)
+        self.auto_max_steering_spin.setValue(25.0)
+        traj_row.addWidget(self.auto_max_steering_spin)
+        traj_row.addStretch()
+        auto_driving_control_layout.addLayout(traj_row)
+
+        # 行2: 俯角:[°]  FOV:[°]  ←stretch
+        cam_row = QHBoxLayout()
+        cam_row.setSpacing(3)
+        cam_row.addWidget(QLabel(get_text('label_auto_cam_pitch')))
+        self.auto_cam_pitch_spin = QDoubleSpinBox()
+        self.auto_cam_pitch_spin.setRange(0.0, 89.0)
+        self.auto_cam_pitch_spin.setSuffix("°")
+        self.auto_cam_pitch_spin.setDecimals(1)
+        self.auto_cam_pitch_spin.setFixedWidth(76)
+        self.auto_cam_pitch_spin.setToolTip(get_text('tip_auto_cam_pitch'))
+        self.auto_cam_pitch_spin.valueChanged.connect(self.update_auto_cam_pitch)
+        self.auto_cam_pitch_spin.setValue(20.0)
+        cam_row.addWidget(self.auto_cam_pitch_spin)
+        cam_row.addSpacing(6)
+        cam_row.addWidget(QLabel(get_text('label_auto_fov')))
+        self.auto_fov_spin = QDoubleSpinBox()
+        self.auto_fov_spin.setRange(60.0, 220.0)
+        self.auto_fov_spin.setSuffix("°")
+        self.auto_fov_spin.setDecimals(0)
+        self.auto_fov_spin.setFixedWidth(76)
+        self.auto_fov_spin.setToolTip(get_text('tip_auto_fov'))
+        self.auto_fov_spin.valueChanged.connect(self.update_auto_fov_deg)
+        self.auto_fov_spin.setValue(160.0)
+        cam_row.addWidget(self.auto_fov_spin)
+        cam_row.addStretch()
+        auto_driving_control_layout.addLayout(cam_row)
+
+        self.auto_driving_control_widget.setVisible(True)  # 初期は自動運転モードで表示
+        location_layout.addWidget(self.auto_driving_control_widget)
 
         # waypoint制御パネル
         self.waypoint_control_widget = QWidget()
@@ -4756,6 +6358,181 @@ class ImageAnnotationTool(QMainWindow):
         segmentation_control_layout = QVBoxLayout(self.segmentation_control_widget)
         segmentation_control_layout.setContentsMargins(5, 5, 5, 5)
 
+        # ツール切り替えボタン（ポリゴン / ペイント）
+        tool_row = QHBoxLayout()
+        tool_row.setSpacing(4)
+        self._seg_tool_btn_group = QButtonGroup(self)
+        self._seg_tool_btn_group.setExclusive(True)
+
+        self._seg_polygon_btn = QPushButton("ポリゴン")
+        self._seg_polygon_btn.setCheckable(True)
+        self._seg_polygon_btn.setChecked(True)
+        self._seg_polygon_btn.setToolTip("クリックで多角形を描画してアノテーション")
+        self._seg_tool_btn_group.addButton(self._seg_polygon_btn, 0)
+        tool_row.addWidget(self._seg_polygon_btn)
+
+        self._seg_paint_btn = QPushButton("ペイント")
+        self._seg_paint_btn.setCheckable(True)
+        self._seg_paint_btn.setToolTip("ドラッグでブラシ塗りアノテーション")
+        self._seg_tool_btn_group.addButton(self._seg_paint_btn, 1)
+        tool_row.addWidget(self._seg_paint_btn)
+
+        self._seg_fill_btn = QPushButton("塗りつぶし")
+        self._seg_fill_btn.setCheckable(True)
+        self._seg_fill_btn.setToolTip("クリック1回で同じ色の連続領域を自動塗りつぶし")
+        self._seg_tool_btn_group.addButton(self._seg_fill_btn, 2)
+        tool_row.addWidget(self._seg_fill_btn)
+
+        self._seg_eraser_btn = QPushButton("消しゴム")
+        self._seg_eraser_btn.setCheckable(True)
+        self._seg_eraser_btn.setToolTip("ドラッグでブラシ・塗りつぶしアノテーションを消去")
+        self._seg_tool_btn_group.addButton(self._seg_eraser_btn, 3)
+        tool_row.addWidget(self._seg_eraser_btn)
+        tool_row.addStretch()
+
+        seg_clear_btn = QPushButton("クリア")
+        seg_clear_btn.setToolTip("現在の画像のセグメンテーションアノテーションをすべて削除")
+        apply_style(seg_clear_btn, "destructive")
+        seg_clear_btn.clicked.connect(self.clear_segmentation_annotations)
+        tool_row.addWidget(seg_clear_btn)
+
+        segmentation_control_layout.addLayout(tool_row)
+
+        # 左右下端まで塗りつぶし ＋ 領域を結合（同一行）
+        poly_bottom_row = QHBoxLayout()
+        poly_bottom_row.setSpacing(6)
+        self._poly_fill_bottom_check = QCheckBox("下端まで塗りつぶし")
+        self._poly_fill_bottom_check.setToolTip(
+            "ポリゴン完了時に最初・最後の点から画像の左右端・下端まで自動的に範囲を拡張します\n"
+            "（道路・壁の上端ラインを引くだけで全領域を塗りつぶすのに便利）"
+        )
+        self._poly_fill_bottom_check.setChecked(False)
+        poly_bottom_row.addWidget(self._poly_fill_bottom_check)
+        self._seg_merge_checkbox = QCheckBox("領域を結合")
+        self._seg_merge_checkbox.setToolTip(
+            "同じクラスのアノテーションが既にある場合、新しい領域を既存領域に統合する\n"
+            "（ポリゴン・ペイント・塗りつぶし 共通）"
+        )
+        self._seg_merge_checkbox.setChecked(False)
+        poly_bottom_row.addWidget(self._seg_merge_checkbox)
+        poly_bottom_row.addStretch()
+        segmentation_control_layout.addLayout(poly_bottom_row)
+
+        # ペンサイズ（ペイントモード時のみ有効）
+        brush_row = QHBoxLayout()
+        brush_row.setSpacing(4)
+        self._brush_size_label = QLabel("ペンサイズ:")
+        brush_row.addWidget(self._brush_size_label)
+        self._brush_size_slider = QSlider(Qt.Horizontal)
+        self._brush_size_slider.setMinimum(2)
+        self._brush_size_slider.setMaximum(100)
+        self._brush_size_slider.setValue(10)
+        self._brush_size_slider.setTickInterval(10)
+        self._brush_size_slider.setToolTip("ブラシの半径（画像ピクセル単位）")
+        brush_row.addWidget(self._brush_size_slider, 1)
+        self._brush_size_value_label = QLabel("10px")
+        self._brush_size_value_label.setFixedWidth(36)
+        brush_row.addWidget(self._brush_size_value_label)
+        segmentation_control_layout.addLayout(brush_row)
+
+        # 許容差スライダー（塗りつぶしモード時のみ有効）
+        fill_row = QHBoxLayout()
+        fill_row.setSpacing(4)
+        self._fill_tolerance_label = QLabel("許容差:")
+        fill_row.addWidget(self._fill_tolerance_label)
+        self._fill_tolerance_slider = QSlider(Qt.Horizontal)
+        self._fill_tolerance_slider.setMinimum(0)
+        self._fill_tolerance_slider.setMaximum(100)
+        self._fill_tolerance_slider.setValue(30)
+        self._fill_tolerance_slider.setTickInterval(10)
+        self._fill_tolerance_slider.setToolTip("色の許容差（大きいほど広く塗りつぶす）")
+        fill_row.addWidget(self._fill_tolerance_slider, 1)
+        self._fill_tolerance_value_label = QLabel("30")
+        self._fill_tolerance_value_label.setFixedWidth(28)
+        fill_row.addWidget(self._fill_tolerance_value_label)
+        segmentation_control_layout.addLayout(fill_row)
+
+        # 隙間を埋める（モルフォロジークロージング）
+        close_row = QHBoxLayout()
+        close_row.setSpacing(4)
+        self._fill_close_checkbox = QCheckBox("隙間を埋める")
+        self._fill_close_checkbox.setToolTip("塗りつぶし後に膨張→収縮処理で床の線などを跨いで塗る")
+        close_row.addWidget(self._fill_close_checkbox)
+        self._fill_close_kernel_spin = QSpinBox()
+        self._fill_close_kernel_spin.setMinimum(3)
+        self._fill_close_kernel_spin.setMaximum(51)
+        self._fill_close_kernel_spin.setSingleStep(2)
+        self._fill_close_kernel_spin.setValue(11)
+        self._fill_close_kernel_spin.setSuffix("px")
+        self._fill_close_kernel_spin.setFixedWidth(58)
+        self._fill_close_kernel_spin.setToolTip("線の太さより大きい値にすると線を跨いで塗れる")
+        close_row.addWidget(self._fill_close_kernel_spin)
+        close_row.addStretch()
+        segmentation_control_layout.addLayout(close_row)
+
+        def _on_seg_tool_changed(btn_id):
+            mode = {0: 'polygon', 1: 'paint', 2: 'fill', 3: 'eraser'}.get(btn_id, 'polygon')
+            self.main_image_view.seg_tool_mode = mode
+            is_polygon = (mode == 'polygon')
+            is_paint = (mode == 'paint')
+            is_fill = (mode == 'fill')
+            is_eraser = (mode == 'eraser')
+            self._poly_fill_bottom_check.setEnabled(is_polygon or is_paint)
+            self._brush_size_label.setEnabled(is_paint or is_eraser)
+            self._brush_size_slider.setEnabled(is_paint or is_eraser)
+            self._brush_size_value_label.setEnabled(is_paint or is_eraser)
+            self._fill_tolerance_label.setEnabled(is_fill)
+            self._fill_tolerance_slider.setEnabled(is_fill)
+            self._fill_tolerance_value_label.setEnabled(is_fill)
+            self._fill_close_checkbox.setEnabled(is_fill)
+            self._fill_close_kernel_spin.setEnabled(is_fill and self._fill_close_checkbox.isChecked())
+            self._seg_merge_checkbox.setEnabled(not is_eraser)
+            cursor = Qt.CrossCursor if (is_paint or is_fill or is_eraser) else Qt.ArrowCursor
+            self.main_image_view.setCursor(cursor)
+
+        def _on_brush_size_changed(val):
+            self._brush_size_value_label.setText(f"{val}px")
+            self.main_image_view.brush_size = val
+
+        def _on_fill_tolerance_changed(val):
+            self._fill_tolerance_value_label.setText(str(val))
+            self.main_image_view.fill_tolerance = val
+
+        def _on_fill_close_toggled(checked):
+            self.main_image_view.fill_close_enabled = checked
+            self._fill_close_kernel_spin.setEnabled(checked)
+
+        def _on_fill_close_kernel_changed(val):
+            # 奇数に強制
+            if val % 2 == 0:
+                self._fill_close_kernel_spin.setValue(val + 1)
+                return
+            self.main_image_view.fill_close_kernel = val
+
+        self._seg_tool_btn_group.idClicked.connect(_on_seg_tool_changed)
+        self._brush_size_slider.valueChanged.connect(_on_brush_size_changed)
+        self._fill_tolerance_slider.valueChanged.connect(_on_fill_tolerance_changed)
+        self._fill_close_checkbox.toggled.connect(_on_fill_close_toggled)
+        self._fill_close_kernel_spin.valueChanged.connect(_on_fill_close_kernel_changed)
+        self._poly_fill_bottom_check.toggled.connect(
+            lambda checked: setattr(self.main_image_view, 'polygon_fill_to_bottom', checked)
+        )
+        self._seg_merge_checkbox.toggled.connect(
+            lambda checked: setattr(self.main_image_view, 'seg_merge_enabled', checked)
+        )
+
+        # 初期状態でペンサイズ・許容差・クロージング行を無効化（ポリゴンモード）
+        self._brush_size_label.setEnabled(False)
+        self._brush_size_slider.setEnabled(False)
+        self._brush_size_value_label.setEnabled(False)
+        self._fill_tolerance_label.setEnabled(False)
+        self._fill_tolerance_slider.setEnabled(False)
+        self._fill_tolerance_value_label.setEnabled(False)
+        self._fill_close_checkbox.setEnabled(False)
+        self._fill_close_kernel_spin.setEnabled(False)
+        # 結合チェックは初期（ポリゴンモード）から有効
+        self._seg_merge_checkbox.setEnabled(True)
+
         # セグメンテーション制御ラベル
         segmentation_label = QLabel(get_text('label_steering_direction'))
         segmentation_label.setStyleSheet("font-weight: bold; color: #333;")
@@ -4768,41 +6545,41 @@ class ImageAnnotationTool(QMainWindow):
         self.show_seg_driving_direction_checkbox.stateChanged.connect(self.toggle_seg_driving_direction)
         segmentation_control_layout.addWidget(self.show_seg_driving_direction_checkbox)
 
-        # クラスIDとY座標の設定（横並び）
+        # ID / Y座標 / 最大舵角（横並び）
         seg_params_layout = QHBoxLayout()
+        seg_params_layout.setSpacing(4)
 
-        seg_params_layout.addWidget(QLabel(get_text('label_class_id')))
+        seg_params_layout.addWidget(QLabel("ID"))
         self.seg_class_id_spin = QSpinBox()
         self.seg_class_id_spin.setRange(0, 99)
-        self.seg_class_id_spin.setValue(0)  # デフォルト0
+        self.seg_class_id_spin.setValue(0)
+        self.seg_class_id_spin.setFixedWidth(44)
         self.seg_class_id_spin.setToolTip(get_text('tip_seg_class_id'))
         self.seg_class_id_spin.valueChanged.connect(self.update_seg_driving_direction_class)
         seg_params_layout.addWidget(self.seg_class_id_spin)
 
-        seg_params_layout.addSpacing(20)
         seg_params_layout.addWidget(QLabel(get_text('label_y_coordinate')))
         self.seg_direction_y_spin = QSpinBox()
         self.seg_direction_y_spin.setRange(0, 1000)
-        self.seg_direction_y_spin.setValue(100)  # デフォルト100
+        self.seg_direction_y_spin.setValue(100)
+        self.seg_direction_y_spin.setFixedWidth(52)
         self.seg_direction_y_spin.setToolTip(get_text('tip_seg_y_coordinate'))
         self.seg_direction_y_spin.valueChanged.connect(self.update_seg_driving_direction_y)
         seg_params_layout.addWidget(self.seg_direction_y_spin)
 
-        segmentation_control_layout.addLayout(seg_params_layout)
-
-        # 最大舵角の設定
-        steering_layout = QHBoxLayout()
-        steering_layout.addWidget(QLabel(get_text('label_max_steering')))
+        seg_params_layout.addWidget(QLabel(get_text('label_max_steering')))
         self.seg_max_steering_spin = QDoubleSpinBox()
         self.seg_max_steering_spin.setRange(0.1, 90.0)
-        self.seg_max_steering_spin.setValue(30.0)  # デフォルト30度
+        self.seg_max_steering_spin.setValue(30.0)
         self.seg_max_steering_spin.setSuffix("°")
         self.seg_max_steering_spin.setDecimals(1)
+        self.seg_max_steering_spin.setFixedWidth(62)
         self.seg_max_steering_spin.setToolTip(get_text('tip_seg_max_steering'))
         self.seg_max_steering_spin.valueChanged.connect(self.update_seg_max_steering_angle)
-        steering_layout.addWidget(self.seg_max_steering_spin)
-        steering_layout.addStretch()
-        segmentation_control_layout.addLayout(steering_layout)
+        seg_params_layout.addWidget(self.seg_max_steering_spin)
+        seg_params_layout.addStretch()
+
+        segmentation_control_layout.addLayout(seg_params_layout)
 
         # 表示モード選択
         display_mode_layout = QHBoxLayout()
@@ -4830,45 +6607,87 @@ class ImageAnnotationTool(QMainWindow):
         # ラジオボタンの変更を監視
         self.seg_display_mode_button_group.buttonClicked.connect(self.on_seg_display_mode_changed)
 
+        # クラス固定で次に進む（セグメンテーション）
+        self._seg_fixed_advance_checkbox = QCheckBox("クラス固定で次に進む")
+        self._seg_fixed_advance_checkbox.setToolTip(
+            "前回のクラスを固定し、アノテーション完了後にスキップ枚数分だけ自動で次の画像へ進む"
+        )
+        self._seg_fixed_advance_checkbox.setChecked(False)
+        self._seg_fixed_advance_checkbox.toggled.connect(
+            lambda checked: setattr(self, '_seg_fixed_class_advance', checked)
+        )
+        segmentation_control_layout.addWidget(self._seg_fixed_advance_checkbox)
+
         # 初期状態では非表示
         self.segmentation_control_widget.setVisible(False)
         location_layout.addWidget(self.segmentation_control_widget)
 
         # 現在のモードを表すヒントラベル
-        self.mode_hint_label = QLabel(get_text('label_mode_hint'))
-        self.mode_hint_label.setStyleSheet("color: #666; font-style: italic;")
-        location_layout.addWidget(self.mode_hint_label)
 
-        # 前回のバウンディングボックスを自動適用するチェックボックス
+        # 前回のバウンディングボックスを自動適用するチェックボックス（物体検知モードのみ表示）
         self.apply_last_bbox_checkbox = QCheckBox(get_text('chk_apply_last_bbox'))
         self.apply_last_bbox_checkbox.setChecked(False)
         self.apply_last_bbox_checkbox.setToolTip(get_text('tip_apply_last_bbox'))
         self.apply_last_bbox_checkbox.stateChanged.connect(self.toggle_auto_apply_bbox)
+        self.apply_last_bbox_checkbox.setVisible(False)  # 初期は非表示（物体検知モード時のみ表示）
         location_layout.addWidget(self.apply_last_bbox_checkbox)
 
-        # セグメンテーション用の前回適用チェックボックス
+        # クラス固定で次に進む（物体検知モードのみ表示）
+        self._bbox_fixed_advance_checkbox = QCheckBox("クラス固定で次に進む")
+        self._bbox_fixed_advance_checkbox.setToolTip(
+            "前回のクラスを固定し、アノテーション完了後にスキップ枚数分だけ自動で次の画像へ進む"
+        )
+        self._bbox_fixed_advance_checkbox.setChecked(False)
+        self._bbox_fixed_advance_checkbox.setVisible(False)  # 初期は非表示
+        self._bbox_fixed_advance_checkbox.toggled.connect(
+            lambda checked: setattr(self, '_bbox_fixed_class_advance', checked)
+        )
+        location_layout.addWidget(self._bbox_fixed_advance_checkbox)
+
+        # セグメンテーション用の前回適用チェックボックス（セグメンテーションモードのみ表示）
         self.apply_last_segmentation_checkbox = QCheckBox(get_text('chk_apply_last_segmentation'))
         self.apply_last_segmentation_checkbox.setChecked(False)
         self.apply_last_segmentation_checkbox.setToolTip(get_text('tip_apply_last_segmentation'))
         self.apply_last_segmentation_checkbox.stateChanged.connect(self.toggle_auto_apply_segmentation)
+        self.apply_last_segmentation_checkbox.setVisible(False)  # 初期は非表示（セグメンテーションモード時のみ表示）
         location_layout.addWidget(self.apply_last_segmentation_checkbox)
-
-        # スキップ枚数設定
-        skip_layout = QHBoxLayout()
-        self.skip_images_on_click = QCheckBox(get_text('chk_auto_skip_on_click'))
-        self.skip_images_on_click.setChecked(True)  # デフォルトでオン
-        skip_layout.addWidget(self.skip_images_on_click)
-        self.skip_count_spin = QSpinBox()
-        self.skip_count_spin.setRange(1, 1000)
-        self.skip_count_spin.setValue(10)  # デフォルト値は10
-        self.skip_count_spin.valueChanged.connect(self.update_skip_button_labels)
-        skip_layout.addWidget(self.skip_count_spin)
-
-        location_layout.addLayout(skip_layout)
 
         location_label = QLabel(get_text('label_location_info'))
         location_label.setStyleSheet("font-weight: bold;")
         location_layout.addWidget(location_label)
+
+        # 位置 / コーナー 切り替えボタン
+        loc_mode_row = QHBoxLayout()
+        loc_mode_row.setSpacing(2)
+        self._loc_mode_btn_group = QButtonGroup(self)
+        self._loc_mode_btn_group.setExclusive(True)
+        self._loc_pos_btn = QPushButton("位置")
+        self._loc_pos_btn.setCheckable(True)
+        self._loc_pos_btn.setChecked(True)
+        self._loc_pos_btn.setFixedHeight(24)
+        self._loc_pos_btn.setStyleSheet(
+            "QPushButton{border:1px solid #aaa;border-radius:3px;padding:2px 8px;background:#f0f0f0;}"
+            "QPushButton:checked{background:#4a90d9;color:white;border-color:#2a70b9;}"
+        )
+        self._loc_corner_btn = QPushButton("コーナー")
+        self._loc_corner_btn.setCheckable(True)
+        self._loc_corner_btn.setFixedHeight(24)
+        self._loc_corner_btn.setStyleSheet(
+            "QPushButton{border:1px solid #aaa;border-radius:3px;padding:2px 8px;background:#f0f0f0;}"
+            "QPushButton:checked{background:#4a90d9;color:white;border-color:#2a70b9;}"
+        )
+        self._loc_mode_btn_group.addButton(self._loc_pos_btn, 0)
+        self._loc_mode_btn_group.addButton(self._loc_corner_btn, 1)
+        loc_mode_row.addWidget(self._loc_pos_btn)
+        loc_mode_row.addWidget(self._loc_corner_btn)
+        loc_mode_row.addStretch()
+        location_layout.addLayout(loc_mode_row)
+
+        def _on_loc_mode_changed(btn_id):
+            self._location_display_mode = 'corner' if btn_id == 1 else 'position'
+            self._update_location_button_display()
+
+        self._loc_mode_btn_group.idClicked.connect(_on_loc_mode_changed)
 
         # 位置情報の自動適用チェックボックス
         self.apply_location_checkbox = QCheckBox(get_text('chk_apply_location'))
@@ -4996,13 +6815,30 @@ class ImageAnnotationTool(QMainWindow):
     # 初期化/ファイル読込
     def save_session_info(self):
         """現在の作業セッション情報を保存する"""
-        try:            
+        try:
+            # 追加モデルスロット情報を収集（モデルが読み込まれているもののみ）
+            extra_models_info = []
+            for slot in getattr(self, 'extra_model_slots', []):
+                if slot.get('model') is None:
+                    continue
+                extra_models_info.append({
+                    "arch": slot['method_combo'].currentText(),
+                    "file": slot['model_combo'].currentText(),
+                    "sources": slot.get('selected_sources') or [],
+                    "checked": slot['checkbox'].isChecked(),
+                })
+
             # 保存する情報
             session_info = {
                 "last_folder_path": self.folder_path if hasattr(self, 'folder_path') else "",
                 "last_folder_paths": self.folder_paths if hasattr(self, 'folder_paths') else [],
                 "last_model_arch": self.auto_method_combo.currentText() if hasattr(self, 'auto_method_combo') else "",
                 "last_model_name": self.model_combo.currentText() if hasattr(self, 'model_combo') else "",
+                "last_model_file": self.get_selected_model_filename() if hasattr(self, 'model_combo') and self.model_combo.count() > 0 else "",
+                "last_model_sources": (self._multi_source_config.get('sources') if hasattr(self, '_multi_source_config') and self._multi_source_config else None),
+                "extra_models": extra_models_info,
+                "max_speed": self.main_image_view.max_speed if hasattr(self, 'main_image_view') else MAX_SPEED,
+                "detection_classes": self.classes_input.text() if hasattr(self, 'classes_input') else "",
                 "timestamp": int(time.time())
             }
             
@@ -5044,6 +6880,77 @@ class ImageAnnotationTool(QMainWindow):
         except Exception as e:
             print(f"セッション情報の読み込みに失敗: {e}")
             return {}
+
+    def _try_restore_session_models(self):
+        """セッションに保存されたモデルをアプリ起動時に復元する"""
+        session = getattr(self, '_pending_session_info', None)
+        if not session:
+            return
+        self._pending_session_info = None  # 一度だけ実行
+
+        model_file = session.get('last_model_file', '')
+        if not model_file:
+            return
+        model_path = os.path.join(models_dir, model_file)
+        if not os.path.exists(model_path):
+            return
+
+        extra_models = session.get('extra_models', [])
+        extra_info = f"\n追加モデル {len(extra_models)} 件を含む" if extra_models else ""
+        msg = QMessageBox(self)
+        msg.setWindowTitle('モデル復元')
+        msg.setText(f"前回読み込んだモデルを復元しますか？\n{model_file}{extra_info}")
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg.setDefaultButton(QMessageBox.Yes)
+        msg.setWindowFlags(msg.windowFlags() | Qt.WindowStaysOnTopHint)
+        if msg.exec_() != QMessageBox.Yes:
+            return
+
+        # アーキ選択
+        arch = session.get('last_model_arch', '')
+        if arch and hasattr(self, 'auto_method_combo'):
+            idx = self.auto_method_combo.findText(arch)
+            if idx >= 0:
+                self.auto_method_combo.blockSignals(True)
+                self.auto_method_combo.setCurrentIndex(idx)
+                self.auto_method_combo.blockSignals(False)
+
+        # モデルリスト更新 + コンボでファイル選択
+        self.refresh_model_list()
+        for i in range(self.model_combo.count()):
+            item_file = self.model_combo.itemData(i) or self.model_combo.itemText(i)
+            if item_file == model_file or self.model_combo.itemText(i).startswith(model_file):
+                self.model_combo.setCurrentIndex(i)
+                break
+
+        # マルチソースのソース選択をダイアログなしで設定
+        sources = session.get('last_model_sources')
+        self._session_restore_sources = sources  # load_selected_model内で参照
+
+        # 追加モデルスロットを事前構成（load_selected_model内で一括ロード）
+        for extra in extra_models:
+            extra_file = extra.get('file', '')
+            if not extra_file or not os.path.exists(os.path.join(models_dir, extra_file)):
+                continue
+            if len(self.extra_model_slots) >= 3:
+                break
+            self._add_extra_model_slot()
+            slot = self.extra_model_slots[-1]
+            extra_arch = extra.get('arch', '')
+            if extra_arch:
+                idx = slot['method_combo'].findText(extra_arch)
+                if idx >= 0:
+                    slot['method_combo'].blockSignals(True)
+                    slot['method_combo'].setCurrentIndex(idx)
+                    slot['method_combo'].blockSignals(False)
+            self._refresh_extra_model_list(slot['model_combo'], slot['method_combo'])
+            for i in range(slot['model_combo'].count()):
+                if slot['model_combo'].itemText(i) == extra_file:
+                    slot['model_combo'].setCurrentIndex(i)
+                    break
+
+        # メインモデルをロード（追加スロットも内部でまとめてロード）
+        self.load_selected_model()
 
     def update_distribution_graph(self):
         """アノテーションの角度とスロットル値の分布を縦並びのヒストグラムで表示
@@ -5186,10 +7093,22 @@ class ImageAnnotationTool(QMainWindow):
 
     def _schedule_inference(self):
         """推論実行をスケジュール（デバウンス処理）"""
-        # 既存のタイマーをリセットして新たにスケジュール
-        if hasattr(self, 'inference_timer'):
-            self.inference_timer.stop()
-            self.inference_timer.start(self.inference_delay)
+        if not hasattr(self, 'inference_timer'):
+            return
+
+        has_cache = bool(self.images and self.current_index in self.inference_results)
+        is_playing = hasattr(self, 'auto_play_timer') and self.auto_play_timer.isActive()
+
+        self.inference_timer.stop()
+
+        if is_playing and not has_cache:
+            # 再生中かつキャッシュなし:
+            # 再生インターバル(100ms) < デバウンス遅延(200ms) のため
+            # タイマーが毎回リセットされて発火しない。デバウンスをスキップして即時実行する。
+            self._execute_deferred_inference()
+        else:
+            delay = self.inference_delay if has_cache else self.inference_delay_no_cache
+            self.inference_timer.start(delay)
 
     def _execute_deferred_inference(self):
         """推論を実際に実行（タイマーから呼ばれる）"""
@@ -5291,6 +7210,11 @@ class ImageAnnotationTool(QMainWindow):
                     # セグメンテーション全体が選択されている場合はセグメンテーションを削除
                     elif self.main_image_view.selected_segmentation_index is not None:
                         self.delete_selected_segmentation()
+                    # ペイント/塗りつぶしモードでホバー中のアノテーションを削除
+                    elif (getattr(self.main_image_view, 'seg_tool_mode', '') in ('paint', 'fill') and
+                          self.main_image_view.hovering_polygon_index is not None):
+                        self.delete_selected_segmentation(self.main_image_view.hovering_polygon_index)
+                        self.main_image_view.hovering_polygon_index = None
                 elif self.current_mode == 3:  # waypointモードの場合
                     # 現在の画像のwaypointアノテーションを全削除
                     self.delete_current_waypoint_annotations()
@@ -5727,6 +7651,30 @@ class ImageAnnotationTool(QMainWindow):
             self.auto_advance_waypoint = True
             if hasattr(self, 'statusBar'):
                 self.statusBar().showMessage(get_text('status_auto_advance_mode'), 2000)
+
+    def toggle_auto_driving_direction(self, state):
+        """自動運転モード走行軌跡の表示/非表示を切り替え"""
+        self.show_auto_driving_direction = (state == Qt.Checked)
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def update_auto_max_steering_angle(self, value):
+        """自動運転走行軌跡の最大舵角を更新"""
+        self.auto_max_steering_angle = value
+        if hasattr(self, 'main_image_view') and self.show_auto_driving_direction:
+            self.main_image_view.update()
+
+    def update_auto_cam_pitch(self, value):
+        """カメラ俯角補正を更新"""
+        self.auto_cam_pitch_deg = value
+        if hasattr(self, 'main_image_view') and self.show_auto_driving_direction:
+            self.main_image_view.update()
+
+    def update_auto_fov_deg(self, value):
+        """カメラ対角FOVを更新"""
+        self.auto_fov_deg = value
+        if hasattr(self, 'main_image_view') and self.show_auto_driving_direction:
+            self.main_image_view.update()
 
     def toggle_seg_driving_direction(self, state):
         """走行方向矢印の表示/非表示を切り替え"""
@@ -6317,9 +8265,7 @@ class ImageAnnotationTool(QMainWindow):
         for button in self.location_buttons:
             loc_value = button.property("location_value")
             count = location_counts.get(loc_value, 0)
-            
-            # ボタンのテキストを更新（数を追加）
-            button.setText(get_text('btn_location_with_count', count, loc_value))
+            button.setProperty("location_count", count)
             
             # カウントに応じてスタイルを調整
             color = get_location_color(loc_value)
@@ -6356,6 +8302,9 @@ class ImageAnnotationTool(QMainWindow):
                     }}
                 """)
 
+        # テキスト・アイコンを現在のモードで更新
+        self._update_location_button_display()
+
     def add_location_button(self):
         """位置情報選択ボタンを追加する"""
         location_value = self.new_location_input.value()
@@ -6369,6 +8318,7 @@ class ImageAnnotationTool(QMainWindow):
         # 新しいボタンを作成
         button = QPushButton(get_text('label_location_button', location_value))
         button.setProperty("location_value", location_value)
+        button.setProperty("location_count", 0)
         button.setCheckable(True)  # チェック可能に設定
         button.clicked.connect(lambda checked, value=location_value: self.set_location(value))
         
@@ -6390,10 +8340,13 @@ class ImageAnnotationTool(QMainWindow):
         # レイアウトに追加
         self.location_buttons_layout.addWidget(button)
         self.location_buttons.append(button)
-        
+
+        # 現在の表示モードに合わせてテキスト/アイコンを更新
+        self._update_location_button_display()
+
         # 次の値にインクリメント
         self.new_location_input.setValue(location_value + 1)
-        
+
         # 初期ボタンを生成するだけの場合はメッセージを表示しない
         if len(self.location_buttons) > 1:
             QMessageBox.information(self, get_text('dlg_add_complete'), get_text('msg_location_added', location_value))
@@ -6564,6 +8517,8 @@ class ImageAnnotationTool(QMainWindow):
             'checkbox': checkbox,
             'info_label': info_label,
             'model': None,
+            'ms_info': None,          # マルチソースメタ情報 (num_sources, selected_sources, fusion_method)
+            'selected_sources': [],   # 学習に使ったソース名リスト（単一・複数問わず常に保持）
         }
         self.extra_model_slots.append(slot)
 
@@ -6599,7 +8554,7 @@ class ImageAnnotationTool(QMainWindow):
         self.add_model_button.setEnabled(len(self.extra_model_slots) < 3)
         self.remove_model_button.setEnabled(len(self.extra_model_slots) > 0)
 
-    def _run_extra_model_inference_for_current(self):
+    def _run_extra_model_inference_for_current(self, force_update=False, downscale_factor=1.0):
         """現在の画像に対して追加モデルの推論を実行する（結果がない場合のみ）"""
         if not self.images or not self.extra_model_slots:
             return
@@ -6612,8 +8567,8 @@ class ImageAnnotationTool(QMainWindow):
             # チェックボックスが有効でない（モデル未読込）ならスキップ
             if slot['model'] is None:
                 continue
-            # すでに結果があればスキップ
-            if current_index in slot['inference_results']:
+            # すでに結果があればスキップ（force_updateの場合はスキップしない）
+            if not force_update and current_index in slot['inference_results']:
                 continue
 
             extra_model_type = slot['method_combo'].currentText()
@@ -6624,21 +8579,47 @@ class ImageAnnotationTool(QMainWindow):
             if not os.path.exists(extra_model_path):
                 continue
 
+            ms_info = slot.get('ms_info')
+            virtual_type = ms_info.get('virtual_source_type') if ms_info else None
+
             try:
-                extra_results = batch_inference(
-                    [current_img_path],
-                    method="model",
-                    model_type=extra_model_type,
-                    model_path=extra_model_path,
-                    force_reload=False
-                )
-                for img_path_key, result in extra_results.items():
-                    try:
-                        idx = self.images.index(img_path_key)
-                        slot['inference_results'][idx] = result
+                if ms_info is not None and virtual_type:
+                    # 仮想ソース推論
+                    device = next(slot['model'].parameters()).device
+                    results = self._run_extra_virtual_source_inference(
+                        [current_index], slot['model'], ms_info, device,
+                        downscale_factor=downscale_factor
+                    )
+                    for idx_key, result in results.items():
+                        slot['inference_results'][idx_key] = result
                         changed = True
-                    except ValueError:
-                        pass
+                elif ms_info is not None:
+                    # マルチソース推論
+                    device = next(slot['model'].parameters()).device
+                    results = self._run_extra_multi_source_inference(
+                        [current_index], slot['model'], ms_info, device,
+                        downscale_factor=downscale_factor
+                    )
+                    for idx_key, result in results.items():
+                        slot['inference_results'][idx_key] = result
+                        changed = True
+                else:
+                    # シングルソース推論
+                    extra_results = batch_inference(
+                        [current_img_path],
+                        method="model",
+                        model_type=extra_model_type,
+                        model_path=extra_model_path,
+                        force_reload=False,
+                        downscale_factor=downscale_factor
+                    )
+                    for img_path_key, result in extra_results.items():
+                        try:
+                            idx = self.images.index(img_path_key)
+                            slot['inference_results'][idx] = result
+                            changed = True
+                        except ValueError:
+                            pass
             except Exception as e:
                 print(f"追加モデル{slot_idx + 2}の逐次推論エラー: {e}")
 
@@ -6646,6 +8627,178 @@ class ImageAnnotationTool(QMainWindow):
             self._update_extra_inference_info_panels()
             self._update_extra_inference_points()
             self.main_image_view.update()
+
+    def _run_extra_multi_source_inference(self, target_indices, model, ms_info, device, downscale_factor=1.0):
+        """追加スロット用マルチソース推論
+
+        Args:
+            target_indices: 推論対象インデックスリスト
+            model: 読み込み済みマルチソースモデル
+            ms_info: detect_multi_source_from_checkpoint() の返値
+            device: torch.device
+            downscale_factor: ピクセレーション係数
+
+        Returns:
+            dict: {index: {angle, throttle, x, y, [attention_weights]}}
+        """
+        sources = ms_info.get('selected_sources') or []
+        num_sources = ms_info['num_sources']
+        image_groups = getattr(self, 'image_groups', {})
+
+        if not image_groups or not sources:
+            print(f"追加スロットマルチソース推論: image_groups または sources が空 (sources={sources})")
+            return {}
+
+        transform = model.get_preprocess()
+        results = {}
+
+        with torch.no_grad():
+            for idx in target_indices:
+                try:
+                    group = image_groups.get(idx, {})
+                    img_paths = []
+                    missing = False
+                    for src in sources:
+                        if src in group:
+                            img_paths.append(group[src])
+                        else:
+                            missing = True
+                            break
+
+                    if missing or len(img_paths) != num_sources:
+                        continue
+
+                    tensors = []
+                    first_img_size = None
+                    for path in img_paths:
+                        img = Image.open(path).convert('RGB')
+                        if first_img_size is None:
+                            first_img_size = img.size
+                        if downscale_factor < 1.0:
+                            W2, H2 = img.size
+                            pw = max(1, int(W2 * downscale_factor))
+                            ph = max(1, int(H2 * downscale_factor))
+                            img = img.resize((pw, ph), Image.NEAREST).resize((W2, H2), Image.NEAREST)
+                        tensors.append(transform(img))
+
+                    stacked = torch.cat(tensors, dim=0).unsqueeze(0).to(device)
+                    output = model(stacked)
+                    output_values = output[0].cpu().numpy()
+                    output_values = np.clip(output_values, -1.0, 1.0)
+
+                    # Attention 重みの取得
+                    attn_scores = None
+                    raw_weights = getattr(model, 'last_attn_weights', None)
+                    if raw_weights is not None:
+                        col_mean = raw_weights[0].mean(dim=0).cpu().numpy()
+                        total = col_mean.sum()
+                        if total > 0:
+                            col_mean = col_mean / total
+                        attn_scores = {src: float(col_mean[i]) for i, src in enumerate(sources)}
+
+                    img_width, img_height = first_img_size
+                    angle = float(output_values[0])
+                    throttle = float(output_values[1])
+                    x = max(0, min(int((angle + 1) / 2 * img_width), img_width - 1))
+                    y = max(0, min(int((1 - throttle) / 2 * img_height), img_height - 1))
+
+                    results[idx] = {"angle": angle, "throttle": throttle, "x": x, "y": y}
+                    if attn_scores is not None:
+                        results[idx]["attention_weights"] = attn_scores
+
+                except Exception as e:
+                    print(f"追加スロットマルチソース推論エラー (index={idx}): {e}")
+
+        return results
+
+    def _run_extra_virtual_source_inference(self, target_indices, model, ms_info, device, downscale_factor=1.0):
+        """追加スロット用仮想ソース推論 (crop/scale/temporal)"""
+        virtual_type = ms_info.get('virtual_source_type')
+        num_sources = ms_info['num_sources']
+        temporal_interval = ms_info.get('temporal_interval', 10)
+        source_names = (ms_info.get('selected_sources') or
+                        VirtualSourceDataset.source_names(virtual_type, num_sources, temporal_interval))
+
+        transform = model.get_preprocess()
+        results = {}
+
+        with torch.no_grad():
+            for idx in target_indices:
+                try:
+                    if idx < 0 or idx >= len(self.images):
+                        continue
+                    img_path = self.images[idx]
+                    img = Image.open(img_path).convert('RGB')
+                    W, H = img.size
+
+                    if virtual_type == 'crop':
+                        step = W / num_sources
+                        overlap = step * 0.15
+                        source_imgs = []
+                        for i in range(num_sources):
+                            x0 = max(0, int(step * i - overlap))
+                            x1 = min(W, int(step * (i + 1) + overlap))
+                            source_imgs.append(img.crop((x0, 0, x1, H)))
+                    elif virtual_type == 'scale':
+                        source_imgs = [img]
+                        scale = 0.55
+                        for _ in range(num_sources - 1):
+                            cw = max(1, int(W * scale))
+                            ch = max(1, int(H * scale))
+                            x0, y0 = (W - cw) // 2, (H - ch) // 2
+                            cropped = img.crop((x0, y0, x0 + cw, y0 + ch))
+                            source_imgs.append(cropped.resize((W, H), Image.LANCZOS))
+                            scale *= 0.55
+                    elif virtual_type == 'temporal':
+                        source_imgs = []
+                        for k in range(num_sources):
+                            prev_idx = max(0, idx - k * temporal_interval)
+                            source_imgs.append(Image.open(self.images[prev_idx]).convert('RGB'))
+                    else:
+                        source_imgs = [img] * num_sources
+
+                    # 解像度ダウンスケール（ピクセレーション）を各ソースに適用
+                    if downscale_factor < 1.0:
+                        pixelated = []
+                        for s in source_imgs:
+                            sw2, sh2 = s.size
+                            pw = max(1, int(sw2 * downscale_factor))
+                            ph = max(1, int(sh2 * downscale_factor))
+                            pixelated.append(s.resize((pw, ph), Image.NEAREST).resize((sw2, sh2), Image.NEAREST))
+                        source_imgs = pixelated
+
+                    tensors = [transform(s) for s in source_imgs]
+                    stacked = torch.cat(tensors, dim=0).unsqueeze(0).to(device)
+                    output = model(stacked)
+                    output_values = output[0].cpu().numpy()
+                    output_values = np.clip(output_values, -1.0, 1.0)
+
+                    attn_scores = None
+                    raw_weights = getattr(model, 'last_attn_weights', None)
+                    if raw_weights is not None:
+                        col_mean = raw_weights[0].mean(dim=0).cpu().numpy()
+                        total = col_mean.sum()
+                        if total > 0:
+                            col_mean = col_mean / total
+                        attn_scores = {src: float(col_mean[i]) for i, src in enumerate(source_names)}
+
+                    angle = float(output_values[0])
+                    throttle = float(output_values[1])
+                    x = max(0, min(int((angle + 1) / 2 * W), W - 1))
+                    y = max(0, min(int((1 - throttle) / 2 * H), H - 1))
+
+                    results[idx] = {"angle": angle, "throttle": throttle, "x": x, "y": y}
+                    if attn_scores:
+                        results[idx]["attention_weights"] = attn_scores
+
+                except Exception as e:
+                    print(f"追加スロット仮想ソース推論エラー (index={idx}): {e}")
+
+        return results
+
+    def _update_model_combo_tooltip(self, index):
+        """model_comboの選択変更時にコンボ本体のツールチップを更新"""
+        self.model_combo.setToolTip(self.model_combo.itemText(index))
 
     def _refresh_extra_model_list(self, model_combo, method_combo):
         """追加モデルスロットのモデルリストを更新"""
@@ -6669,15 +8822,25 @@ class ImageAnnotationTool(QMainWindow):
         model_files.sort(key=lambda f: os.path.getmtime(os.path.join(models_dir, f)), reverse=True)
         for model_file in model_files:
             model_combo.addItem(model_file)
+            model_combo.setItemData(model_combo.count() - 1, model_file, Qt.ToolTipRole)
+        if model_combo.count() > 0:
+            model_combo.setToolTip(model_combo.currentText())
+        model_combo.currentIndexChanged.connect(
+            lambda idx, mc=model_combo: mc.setToolTip(mc.itemText(idx))
+        )
 
     def _toggle_extra_inference_display(self, state, slot_index):
         """追加モデルの推論表示の切り替え"""
         if slot_index >= len(self.extra_model_slots):
             return
-        show = (state == Qt.Checked)
         # キャンバスを更新
         self._update_extra_inference_points()
-        self.main_image_view.update()
+        # ラジオボタン下線と結合画像の枠色を再描画
+        self.update_variant_buttons()
+        if getattr(self, 'current_variant', None) == '__combined__':
+            self.display_current_image()
+        else:
+            self.main_image_view.update()
 
     def _update_extra_inference_points(self):
         """追加モデルの推論ポイントをImageLabelに設定する"""
@@ -6696,6 +8859,13 @@ class ImageAnnotationTool(QMainWindow):
                 point = QPoint(inf['x'], inf['y'])
             points.append((point, color, show))
         self.main_image_view.extra_inference_points = points
+
+    def get_selected_model_filename(self):
+        """model_comboから実際のファイル名を取得する（マルチソースマーカー付き表示名に対応）"""
+        data = self.model_combo.currentData()
+        if data:
+            return data
+        return self.model_combo.currentText()
 
     def refresh_model_list(self):
         """保存されているモデルのリストを更新 - モデルアーキによるフィルタリング機能付き"""
@@ -6733,10 +8903,30 @@ class ImageAnnotationTool(QMainWindow):
         # カスタムサフィックスが追加された場合でも正しくソートされるよう、mtimeを使用
         model_files.sort(key=lambda f: os.path.getmtime(os.path.join(models_dir, f)), reverse=True)
         
-        # コンボボックスに追加
+        # コンボボックスに追加（マルチソースモデルはマーカー付き）
+        from model_catalog import detect_multi_source_from_checkpoint
         for model_file in model_files:
-            self.model_combo.addItem(model_file)
-                
+            model_full_path = os.path.join(models_dir, model_file)
+            ms_info = detect_multi_source_from_checkpoint(model_full_path)
+            if ms_info['num_sources'] > 1:
+                marker = get_text('label_multi_source_model_marker',
+                                  ms_info['num_sources'],
+                                  ms_info['fusion_method'] or '?')
+                display_name = f"{model_file} {marker}"
+            else:
+                display_name = model_file
+            self.model_combo.addItem(display_name, model_file)  # userData=実ファイル名
+            self.model_combo.setItemData(self.model_combo.count() - 1, display_name, Qt.ToolTipRole)
+
+        # 選択中アイテムのツールチップを同期（折りたたみ状態でもホバー表示）
+        if self.model_combo.count() > 0:
+            self.model_combo.setToolTip(self.model_combo.currentText())
+        try:
+            self.model_combo.currentIndexChanged.disconnect(self._update_model_combo_tooltip)
+        except TypeError:
+            pass
+        self.model_combo.currentIndexChanged.connect(self._update_model_combo_tooltip)
+
         # 更新完了メッセージ
         self.statusBar().showMessage(get_text('status_models_loaded', len(model_files), current_arch), 3000)
 
@@ -6849,10 +9039,31 @@ class ImageAnnotationTool(QMainWindow):
             base_variant = self.available_variants[0]
             self.images = self.variant_images[base_variant]
             print(f"結合表示モード: ベースキー '{base_variant}' の画像数: {len(self.images)}")
+            # ズーム自動調整: 列数に応じてスケールダウンしてキャンバス幅に収める
+            if hasattr(self, 'canvas_zoom_slider') and hasattr(self, 'main_image_view'):
+                grid = getattr(self, '_combined_grid', '2x1')
+                cols = {'2x1': 2, '1x2': 1, '3x1': 3, '2x2': 2, '3x3': 3}.get(grid, 2)
+                canvas_w = self.main_image_view.width()
+                orig_w = getattr(self, 'original_image_width', None)
+                if orig_w and orig_w > 0 and canvas_w > 0:
+                    # combined画像幅 = orig_w * cols なので収まるズームを計算
+                    fit_zoom = canvas_w / (orig_w * cols)
+                    slider_val = max(10, min(50, round(fit_zoom * 10)))
+                else:
+                    # フォールバック: 列数で割るだけ
+                    slider_val = max(10, self.canvas_zoom_slider.value() // cols)
+                # 結合表示→結合表示のグリッド変更時は上書きしない
+                if not hasattr(self, '_pre_combined_zoom'):
+                    self._pre_combined_zoom = self.canvas_zoom_slider.value()
+                self.canvas_zoom_slider.setValue(slider_val)
         elif hasattr(self, 'variant_images') and variant in self.variant_images:
             # キー別の画像リストを設定
             self.images = self.variant_images[variant]
             print(f"キー '{variant}' の画像数: {len(self.images)}")
+            # 結合表示から戻る場合はズームを復元
+            if hasattr(self, '_pre_combined_zoom') and hasattr(self, 'canvas_zoom_slider'):
+                self.canvas_zoom_slider.setValue(self._pre_combined_zoom)
+                del self._pre_combined_zoom
         else:
             return
 
@@ -6926,9 +9137,42 @@ class ImageAnnotationTool(QMainWindow):
             self.variant_button_group = QButtonGroup(self)
             self.variant_button_group.setExclusive(True)
 
+        # 推論対象ソースとモデルカラーを収集（結合表示時のみ）
+        is_combined = getattr(self, 'current_variant', None) == '__combined__'
+        source_colors = {}  # {source_name: [color_hex, ...]}
+        if is_combined:
+            # メインモデル (#009999)
+            ms_config = getattr(self, '_multi_source_config', None)
+            if ms_config:
+                for src in ms_config.get('sources', []):
+                    source_colors.setdefault(src, []).append('#009999')
+            elif getattr(self, 'model', None):
+                # 単一ソースモデル: 選択中の推論対象ソースに下線
+                infer_src = getattr(self, '_combined_inference_source', None)
+                tgt = (infer_src if (infer_src and infer_src in self.available_variants)
+                       else self.available_variants[0])
+                source_colors.setdefault(tgt, []).append('#009999')
+            # 追加スロット（チェック済みのみ）
+            for i, slot in enumerate(getattr(self, 'extra_model_slots', [])):
+                if slot.get('model') is None or not slot['checkbox'].isChecked():
+                    continue
+                slot_color = self.extra_model_colors[i]
+                for src in slot.get('selected_sources', []):
+                    source_colors.setdefault(src, []).append(slot_color)
+
         # 新しいキーボタンを追加
         for var in self.available_variants:
             rb = QRadioButton(var)
+            colors = source_colors.get(var, []) if is_combined else []
+            if colors:
+                if len(colors) == 1:
+                    style = f"QRadioButton {{ border-bottom: 3px solid {colors[0]}; padding-bottom: 2px; }}"
+                else:
+                    n = len(colors)
+                    stops = " ".join(f"stop:{i/(n-1):.2f} {c}" for i, c in enumerate(colors))
+                    style = (f"QRadioButton {{ border-bottom: 3px solid "
+                             f"qlineargradient(x1:0, y1:0, x2:1, y2:0, {stops}); padding-bottom: 2px; }}")
+                rb.setStyleSheet(style)
             variant_layout.addWidget(rb)
             self.variant_button_group.addButton(rb)
             if var == self.current_variant:
@@ -6942,6 +9186,98 @@ class ImageAnnotationTool(QMainWindow):
             combined_button.clicked.connect(self._show_combined_view_dialog)
             variant_layout.addWidget(combined_button)
 
+        # 仮想ソースオーバーレイ表示モード選択（常時表示・仮想ソース未ロード時はグレーアウト）
+        overlay_combo = QComboBox()
+        overlay_combo.setToolTip(get_text('tip_virtual_overlay'))
+        overlay_combo.addItem(get_text('opt_virtual_overlay_none'), 'none')
+        overlay_combo.addItem(get_text('opt_virtual_overlay_crop'), 'crop')
+        overlay_combo.addItem(get_text('opt_virtual_overlay_scale'), 'scale')
+        overlay_combo.addItem(get_text('opt_virtual_overlay_temporal'), 'temporal')
+        current_type = getattr(self, '_virtual_overlay_type', 'none')
+        for idx in range(overlay_combo.count()):
+            if overlay_combo.itemData(idx) == current_type:
+                overlay_combo.setCurrentIndex(idx)
+                break
+        overlay_combo.currentIndexChanged.connect(
+            lambda i, cb=overlay_combo: self._on_virtual_source_type_changed(cb.itemData(i))
+        )
+        variant_layout.addWidget(overlay_combo)
+        self._virtual_overlay_combo = overlay_combo
+
+        # 時間差インターバルスピナー（temporalのときのみ表示）
+        overlay_interval_spin = QSpinBox()
+        overlay_interval_spin.setRange(1, 300)
+        overlay_interval_spin.setValue(getattr(self, '_temporal_interval', 10))
+        overlay_interval_spin.setSuffix('f')
+        overlay_interval_spin.setFixedWidth(68)
+        overlay_interval_spin.setToolTip(get_text('label_temporal_interval'))
+        overlay_interval_spin.setVisible(current_type == 'temporal')
+        overlay_interval_spin.valueChanged.connect(self._on_temporal_interval_changed)
+        variant_layout.addWidget(overlay_interval_spin)
+        self._overlay_interval_spin = overlay_interval_spin
+
+        def _sync_interval_spin_visibility(idx, cb=overlay_combo):
+            is_temporal = cb.itemData(idx) == 'temporal'
+            overlay_interval_spin.setVisible(is_temporal)
+        overlay_combo.currentIndexChanged.connect(_sync_interval_spin_visibility)
+
+    def _on_temporal_interval_changed(self, value: int):
+        """オーバーレイの時間差インターバルが変更されたときの処理"""
+        self._temporal_interval = value
+        # crop_overlay_config が temporal の場合は再生成して再描画
+        cfg = getattr(self.main_image_view, 'crop_overlay_config', None)
+        if cfg and cfg.get('virtual_type') == 'temporal':
+            from model_catalog import VirtualSourceDataset
+            n = cfg['num_sources']
+            names = VirtualSourceDataset.source_names('temporal', n, value)
+            cfg['temporal_interval'] = value
+            cfg['source_names'] = names
+        self.main_image_view._temporal_thumb_cache.clear()
+        self.main_image_view.update()
+
+    # 仮想ソースタイプごとのツールチップ（学習ダイアログとの対応を説明）
+    _VIRTUAL_TYPE_TIPS = {
+        'none': None,
+        'crop': '画像を水平方向に {n} 分割して複数ソースを生成します。\n学習ダイアログ → 仮想ソース生成 → 空間クロップ を選ぶと\nこのプレビューと同じ入力形式で学習できます。',
+        'scale': '中央部を段階的にズームして {n} 段階のソースを生成します。\n学習ダイアログ → 仮想ソース生成 → スケールピラミッド を選ぶと\nこのプレビューと同じ入力形式で学習できます。',
+        'temporal': '現在フレームと過去 {n} フレームを重ねて入力します。\n学習ダイアログ → 仮想ソース生成 → 時間差スタック を選ぶと\nこのプレビューと同じ入力形式で学習できます。',
+    }
+
+    def _on_virtual_source_type_changed(self, type_str: str):
+        """仮想ソース可視化タイプが変更されたときの処理"""
+        self._virtual_overlay_type = type_str
+
+        if type_str == 'none':
+            self.main_image_view.crop_overlay_config = None
+            tip = get_text('tip_virtual_overlay')
+        else:
+            # ロード済みモデルのconfigと一致する場合はそちらを優先
+            vs_config = getattr(self, '_virtual_source_config', None)
+            if vs_config and vs_config.get('virtual_type') == type_str:
+                config = vs_config
+            else:
+                from model_catalog import VirtualSourceDataset
+                n = 3
+                t_interval = getattr(self, '_temporal_interval', 10)
+                names = VirtualSourceDataset.source_names(type_str, n, t_interval)
+                config = {
+                    'virtual_type': type_str,
+                    'num_sources': n,
+                    'source_names': names,
+                    'temporal_interval': t_interval,
+                }
+            self.main_image_view.crop_overlay_config = config
+            self.main_image_view.virtual_overlay_mode = 'fill'
+            n_actual = config['num_sources']
+            tip_template = self._VIRTUAL_TYPE_TIPS.get(type_str, '')
+            tip = tip_template.format(n=n_actual) if tip_template else get_text('tip_virtual_overlay')
+
+        # ドロップダウンのツールチップを動的更新
+        if hasattr(self, '_virtual_overlay_combo'):
+            self._virtual_overlay_combo.setToolTip(tip)
+
+        self.main_image_view.update()
+
     def _show_combined_view_dialog(self):
         """結合表示の設定ダイアログを表示"""
         if not hasattr(self, 'available_variants') or len(self.available_variants) < 2:
@@ -6949,7 +9285,7 @@ class ImageAnnotationTool(QMainWindow):
 
         dialog = QDialog(self)
         dialog.setWindowTitle(get_text('dlg_combined_view'))
-        dialog.setMinimumWidth(350)
+        dialog.setMinimumWidth(400)
         layout = QVBoxLayout(dialog)
 
         # --- グリッドレイアウト選択 ---
@@ -6961,6 +9297,7 @@ class ImageAnnotationTool(QMainWindow):
         grid_options = [
             ("2 x 1", '2x1'),
             ("1 x 2", '1x2'),
+            ("3 x 1", '3x1'),
             ("2 x 2", '2x2'),
             ("3 x 3", '3x3'),
         ]
@@ -6972,53 +9309,124 @@ class ImageAnnotationTool(QMainWindow):
             grid_layout.addWidget(rb)
         layout.addWidget(grid_group)
 
-        # --- ソース順序選択 ---
+        # --- ソース選択（行ウィジェット方式: 表示チェック | 推論対象ラジオ） ---
         order_group = QGroupBox(get_text('label_source_order'))
         order_layout = QVBoxLayout(order_group)
+        order_layout.setSpacing(0)
+        order_layout.setContentsMargins(4, 4, 4, 4)
 
-        # 現在の順序を取得
         current_order = getattr(self, '_combined_sources', list(self.available_variants))
+        current_infer = getattr(self, '_combined_inference_source', None)
 
-        list_widget = QListWidget()
-        for var in current_order:
-            if var in self.available_variants:
-                item = QListWidgetItem(var)
-                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                item.setCheckState(Qt.Checked)
-                list_widget.addItem(item)
-        # current_orderに含まれないバリアントを追加（未チェック）
-        for var in self.available_variants:
-            if var not in current_order:
-                item = QListWidgetItem(var)
-                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                item.setCheckState(Qt.Unchecked)
-                list_widget.addItem(item)
+        all_vars_ordered = list(current_order) + [
+            v for v in self.available_variants if v not in current_order
+        ]
 
-        list_widget.setDragDropMode(QListWidget.InternalMove)
-        order_layout.addWidget(list_widget)
+        # ---- ヘッダー行 ----
+        _COL1_W = 60
+        hdr_widget = QWidget()
+        hdr_widget.setStyleSheet("background: palette(dark); color: palette(bright-text);")
+        hdr_layout = QHBoxLayout(hdr_widget)
+        hdr_layout.setContentsMargins(6, 3, 6, 3)
+        hdr_lbl_src = QLabel("ソース")
+        hdr_lbl_infer = QLabel("推論")
+        hdr_lbl_infer.setFixedWidth(_COL1_W)
+        hdr_lbl_infer.setAlignment(Qt.AlignCenter)
+        hdr_layout.addWidget(hdr_lbl_src, 1)
+        hdr_layout.addWidget(hdr_lbl_infer, 0)
+        order_layout.addWidget(hdr_widget)
 
-        # 上下ボタン
+        # 区切り線
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        order_layout.addWidget(sep)
+
+        # ---- データ行 ----
+        # row_items: [(chk: QCheckBox, rb: QRadioButton, row_widget: QWidget), ...]
+        row_items = []
+        all_radio_btns = []
+        selected_idx = [-1]   # 上下ボタン用の選択行インデックス
+
+        def _make_exclusive(checked, triggered_rb):
+            if checked:
+                for _rb in all_radio_btns:
+                    if _rb is not triggered_rb:
+                        _rb.blockSignals(True)
+                        _rb.setChecked(False)
+                        _rb.blockSignals(False)
+
+        def _highlight(idx):
+            for j, (_, _, rw) in enumerate(row_items):
+                rw.setStyleSheet(
+                    "background: palette(highlight);" if j == idx else ""
+                )
+
+        def _select(idx):
+            selected_idx[0] = idx
+            _highlight(idx)
+
+        for var in all_vars_ordered:
+            row_w = QWidget()
+            row_l = QHBoxLayout(row_w)
+            row_l.setContentsMargins(6, 2, 6, 2)
+            row_l.setSpacing(4)
+
+            chk = QCheckBox(var)
+            chk.setChecked(var in current_order)
+
+            rb = QRadioButton()
+            rb.setChecked(var == current_infer)
+            rb.setFixedWidth(_COL1_W)
+            all_radio_btns.append(rb)
+            rb.toggled.connect(lambda checked, r=rb: _make_exclusive(checked, r))
+
+            row_l.addWidget(chk, 1)
+            row_l.addWidget(rb, 0)
+
+            idx = len(row_items)
+            row_w.mousePressEvent = lambda e, i=idx: _select(i)
+
+            order_layout.addWidget(row_w)
+            row_items.append((chk, rb, row_w))
+
+        layout.addWidget(order_group)
+
+        # ---- 上下ボタン ----
         btn_layout = QHBoxLayout()
         up_btn = QPushButton(get_text('btn_move_up'))
         down_btn = QPushButton(get_text('btn_move_down'))
 
-        def move_item(direction):
-            row = list_widget.currentRow()
-            if row < 0:
+        def move_row(direction):
+            idx = selected_idx[0]
+            if idx < 0:
                 return
-            new_row = row + direction
-            if 0 <= new_row < list_widget.count():
-                item = list_widget.takeItem(row)
-                list_widget.insertItem(new_row, item)
-                list_widget.setCurrentRow(new_row)
+            new_idx = idx + direction
+            if not (0 <= new_idx < len(row_items)):
+                return
+            # 内容（テキスト・状態）を隣行と入れ替える
+            chk_a, rb_a, _ = row_items[idx]
+            chk_b, rb_b, _ = row_items[new_idx]
 
-        up_btn.clicked.connect(lambda: move_item(-1))
-        down_btn.clicked.connect(lambda: move_item(1))
+            t_a, c_a = chk_a.text(), chk_a.isChecked()
+            t_b, c_b = chk_b.text(), chk_b.isChecked()
+            chk_a.setText(t_b); chk_a.setChecked(c_b)
+            chk_b.setText(t_a); chk_b.setChecked(c_a)
+
+            rb_ca, rb_cb = rb_a.isChecked(), rb_b.isChecked()
+            rb_a.blockSignals(True); rb_b.blockSignals(True)
+            rb_a.setChecked(rb_cb); rb_b.setChecked(rb_ca)
+            rb_a.blockSignals(False); rb_b.blockSignals(False)
+
+            selected_idx[0] = new_idx
+            _highlight(new_idx)
+
+        up_btn.clicked.connect(lambda: move_row(-1))
+        down_btn.clicked.connect(lambda: move_row(1))
         btn_layout.addWidget(up_btn)
         btn_layout.addWidget(down_btn)
         btn_layout.addStretch()
-        order_layout.addLayout(btn_layout)
-        layout.addWidget(order_group)
+        layout.addLayout(btn_layout)
 
         # --- OK / キャンセル ---
         dialog_buttons = QHBoxLayout()
@@ -7026,16 +9434,17 @@ class ImageAnnotationTool(QMainWindow):
         cancel_btn = QPushButton(get_text('btn_cancel'))
 
         def on_ok():
-            # グリッド設定を保存
             selected_rb = grid_button_group.checkedButton()
             self._combined_grid = selected_rb.property("grid_value") if selected_rb else '2x1'
 
-            # ソース順序を保存（チェック済みのみ）
             sources = []
-            for i in range(list_widget.count()):
-                item = list_widget.item(i)
-                if item.checkState() == Qt.Checked:
-                    sources.append(item.text())
+            selected_infer = None
+            for chk, rb, _ in row_items:
+                var = chk.text()
+                if chk.isChecked():
+                    sources.append(var)
+                if rb.isChecked():
+                    selected_infer = var
 
             if not sources:
                 QMessageBox.warning(dialog, get_text('dlg_warning'),
@@ -7043,8 +9452,7 @@ class ImageAnnotationTool(QMainWindow):
                 return
 
             self._combined_sources = sources
-
-            # 結合表示モードに切り替え
+            self._combined_inference_source = selected_infer if selected_infer in sources else None
             self.on_variant_changed('__combined__')
             dialog.accept()
 
@@ -7055,6 +9463,7 @@ class ImageAnnotationTool(QMainWindow):
         dialog_buttons.addWidget(cancel_btn)
         layout.addLayout(dialog_buttons)
 
+        dialog.adjustSize()
         dialog.exec_()
 
     def update_images_for_variant(self):
@@ -7320,8 +9729,12 @@ class ImageAnnotationTool(QMainWindow):
             self.detection_mode_button.setChecked(False)
             self.segmentation_mode_button.setChecked(False)
             self.waypoint_mode_button.setChecked(False)
-            self.waypoint_control_widget.setVisible(False)  # waypoint制御パネルを非表示
-            self.segmentation_control_widget.setVisible(False)  # セグメンテーション制御パネルを非表示
+            self.auto_driving_control_widget.setVisible(True)
+            self.waypoint_control_widget.setVisible(False)
+            self.segmentation_control_widget.setVisible(False)
+            self.apply_last_bbox_checkbox.setVisible(False)
+            self.apply_last_segmentation_checkbox.setVisible(False)
+            self._bbox_fixed_advance_checkbox.setVisible(False)
             self.statusBar().showMessage(get_text('status_switched_to_auto_driving'), 3000)
         elif sender == self.detection_mode_button:
             self.current_mode = 1
@@ -7329,26 +9742,44 @@ class ImageAnnotationTool(QMainWindow):
             self.detection_mode_button.setChecked(True)
             self.segmentation_mode_button.setChecked(False)
             self.waypoint_mode_button.setChecked(False)
-            self.waypoint_control_widget.setVisible(False)  # waypoint制御パネルを非表示
-            self.segmentation_control_widget.setVisible(False)  # セグメンテーション制御パネルを非表示
+            self.auto_driving_control_widget.setVisible(False)
+            self.waypoint_control_widget.setVisible(False)
+            self.segmentation_control_widget.setVisible(False)
+            self.apply_last_bbox_checkbox.setVisible(True)
+            self.apply_last_segmentation_checkbox.setVisible(False)
+            self._bbox_fixed_advance_checkbox.setVisible(True)
             self.statusBar().showMessage(get_text('status_switched_to_detection'), 3000)
         elif sender == self.segmentation_mode_button:
-            self.current_mode = 2  # 新規追加
+            self.current_mode = 2
             self.auto_mode_button.setChecked(False)
             self.detection_mode_button.setChecked(False)
             self.segmentation_mode_button.setChecked(True)
             self.waypoint_mode_button.setChecked(False)
-            self.waypoint_control_widget.setVisible(False)  # waypoint制御パネルを非表示
-            self.segmentation_control_widget.setVisible(True)  # セグメンテーション制御パネルを表示
+            self.auto_driving_control_widget.setVisible(False)
+            self.waypoint_control_widget.setVisible(False)
+            self.segmentation_control_widget.setVisible(True)
+            self.apply_last_bbox_checkbox.setVisible(False)
+            self.apply_last_segmentation_checkbox.setVisible(True)
+            self._bbox_fixed_advance_checkbox.setVisible(False)
+            # ツールをポリゴンにリセット
+            self._seg_polygon_btn.setChecked(True)
+            self.main_image_view.seg_tool_mode = 'polygon'
+            self.main_image_view.is_painting = False
+            self.main_image_view.current_paint_strokes = []
+            self.main_image_view.setCursor(Qt.ArrowCursor)
             self.statusBar().showMessage(get_text('status_switched_to_segmentation'), 3000)
         elif sender == self.waypoint_mode_button:
-            self.current_mode = 3  # waypoint mode
+            self.current_mode = 3
             self.auto_mode_button.setChecked(False)
             self.detection_mode_button.setChecked(False)
             self.segmentation_mode_button.setChecked(False)
             self.waypoint_mode_button.setChecked(True)
-            self.waypoint_control_widget.setVisible(True)  # waypoint制御パネルを表示
-            self.segmentation_control_widget.setVisible(False)  # セグメンテーション制御パネルを非表示
+            self.auto_driving_control_widget.setVisible(False)
+            self.waypoint_control_widget.setVisible(True)
+            self.segmentation_control_widget.setVisible(False)
+            self.apply_last_bbox_checkbox.setVisible(False)
+            self.apply_last_segmentation_checkbox.setVisible(False)
+            self._bbox_fixed_advance_checkbox.setVisible(False)
             self.statusBar().showMessage(get_text('status_switched_to_waypoint'), 3000)
         else:
             # Bキーでの切り替え（4つのモードをサイクル）
@@ -7358,32 +9789,48 @@ class ImageAnnotationTool(QMainWindow):
                 self.detection_mode_button.setChecked(False)
                 self.segmentation_mode_button.setChecked(False)
                 self.waypoint_mode_button.setChecked(False)
+                self.auto_driving_control_widget.setVisible(True)
                 self.waypoint_control_widget.setVisible(False)
                 self.segmentation_control_widget.setVisible(False)
+                self.apply_last_bbox_checkbox.setVisible(False)
+                self.apply_last_segmentation_checkbox.setVisible(False)
+                self._bbox_fixed_advance_checkbox.setVisible(False)
                 self.statusBar().showMessage(get_text('status_switched_to_auto_driving'), 3000)
             elif self.current_mode == 1:
                 self.auto_mode_button.setChecked(False)
                 self.detection_mode_button.setChecked(True)
                 self.segmentation_mode_button.setChecked(False)
                 self.waypoint_mode_button.setChecked(False)
+                self.auto_driving_control_widget.setVisible(False)
                 self.waypoint_control_widget.setVisible(False)
                 self.segmentation_control_widget.setVisible(False)
+                self.apply_last_bbox_checkbox.setVisible(True)
+                self.apply_last_segmentation_checkbox.setVisible(False)
+                self._bbox_fixed_advance_checkbox.setVisible(True)
                 self.statusBar().showMessage(get_text('status_switched_to_detection'), 3000)
             elif self.current_mode == 2:
                 self.auto_mode_button.setChecked(False)
                 self.detection_mode_button.setChecked(False)
                 self.segmentation_mode_button.setChecked(True)
                 self.waypoint_mode_button.setChecked(False)
+                self.auto_driving_control_widget.setVisible(False)
                 self.waypoint_control_widget.setVisible(False)
                 self.segmentation_control_widget.setVisible(True)
+                self.apply_last_bbox_checkbox.setVisible(False)
+                self.apply_last_segmentation_checkbox.setVisible(True)
+                self._bbox_fixed_advance_checkbox.setVisible(False)
                 self.statusBar().showMessage(get_text('status_switched_to_segmentation'), 3000)
             else:  # current_mode == 3
                 self.auto_mode_button.setChecked(False)
                 self.detection_mode_button.setChecked(False)
                 self.segmentation_mode_button.setChecked(False)
                 self.waypoint_mode_button.setChecked(True)
+                self.auto_driving_control_widget.setVisible(False)
                 self.waypoint_control_widget.setVisible(True)
                 self.segmentation_control_widget.setVisible(False)
+                self.apply_last_bbox_checkbox.setVisible(False)
+                self.apply_last_segmentation_checkbox.setVisible(False)
+                self._bbox_fixed_advance_checkbox.setVisible(False)
                 self.statusBar().showMessage(get_text('status_switched_to_waypoint'), 3000)
         
         self.main_image_view.update()
@@ -7512,30 +9959,162 @@ class ImageAnnotationTool(QMainWindow):
         if not self.images or not polygon_data:
             return
 
-        # インデックスベースに変更
         current_index = self.current_index
 
         if current_index not in self.segmentation_annotations:
             self.segmentation_annotations[current_index] = []
 
-        # polygon_dataをディープコピーしてから追加（参照の共有を防ぐ）
+        # 領域結合モード: 同じクラスの既存アノテーションにマスクをOR合成
+        if getattr(self.main_image_view, 'seg_merge_enabled', False):
+            class_name = polygon_data.get('class')
+            existing_anns = self.segmentation_annotations.get(current_index, [])
+            target_seg = next(
+                (s for s in existing_anns if s is not None and s.get('class') == class_name),
+                None
+            )
+            if target_seg is not None:
+                try:
+                    from PIL import Image as _PILImage
+                    import numpy as _np
+                    img = _PILImage.open(self.images[current_index]).convert('RGB')
+                    img_arr = _np.array(img)
+                    img_h, img_w = img_arr.shape[:2]
+                    ex_mask = _seg_annotation_to_mask(target_seg, img_h, img_w)
+                    new_mask = _seg_annotation_to_mask(polygon_data, img_h, img_w)
+                    if ex_mask is not None and new_mask is not None:
+                        merged_mask = ex_mask | new_mask
+                        target_seg.clear()
+                        target_seg.update({
+                            'type': 'fill',
+                            'class': class_name,
+                            'rle': _mask_to_rle(merged_mask),
+                            'img_size': (img_w, img_h),
+                            'offset': [0, 0],
+                            'source': 'manual',
+                        })
+                        self.last_segmentation = deepcopy(target_seg)
+                        self.last_segmentations = [deepcopy(s) for s in existing_anns if s is not None]
+                        self.main_image_view.update()
+                        self.update_gallery()
+                        if getattr(self, '_seg_fixed_class_advance', False):
+                            skip = self.skip_count_spin.value()
+                            QTimer.singleShot(80, lambda: self.skip_images(skip))
+                        return
+                except Exception:
+                    pass  # 失敗時は通常追加にフォールスルー
+
+        # 通常追加
         self.segmentation_annotations[current_index].append(deepcopy(polygon_data))
-
-        # 前回のセグメンテーションとして保存（ディープコピーで完全に独立させる）
         self.last_segmentation = deepcopy(polygon_data)
-
-        # データクリーンアップ: Noneエントリを削除
         self.segmentation_annotations[current_index] = [
             seg for seg in self.segmentation_annotations[current_index] if seg is not None
         ]
-
-        # 現在のすべてのセグメンテーションを保存（ディープコピーで完全に独立させる）
         self.last_segmentations = [deepcopy(seg) for seg in self.segmentation_annotations[current_index]]
-
-        # UI更新
         self.main_image_view.update()
         self.update_gallery()
+
+        # クラス固定で次に進む
+        if getattr(self, '_seg_fixed_class_advance', False):
+            skip = self.skip_count_spin.value()
+            QTimer.singleShot(80, lambda: self.skip_images(skip))
             
+    def clear_segmentation_annotations(self):
+        """現在の画像のセグメンテーションアノテーションをすべて削除"""
+        if not self.images:
+            return
+        idx = self.current_index
+        count = len(self.segmentation_annotations.get(idx, []))
+        if count == 0:
+            return
+        reply = QMessageBox.question(
+            self, "セグメンテーションクリア",
+            f"現在の画像のセグメンテーションアノテーション {count} 件をすべて削除しますか？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.segmentation_annotations[idx] = []
+        if hasattr(self.main_image_view, 'selected_segmentation_index'):
+            self.main_image_view.selected_segmentation_index = None
+        self.main_image_view.update()
+        self.update_gallery()
+
+    def complete_paint_annotation(self, strokes):
+        """ペイントストロークをクラス選択後にアノテーションとして保存"""
+        if not strokes:
+            return
+        class_name = self.select_object_class()
+        if not class_name:
+            return
+        # 左右下端まで塗りつぶし: ストロークをマスク化して下端まで拡張し fill 型で保存
+        if getattr(self.main_image_view, 'polygon_fill_to_bottom', False) and self.images:
+            try:
+                from PIL import Image as _PILImage
+                import numpy as _np
+                img = _PILImage.open(self.images[self.current_index]).convert('RGB')
+                img_arr = _np.array(img)
+                img_h, img_w = img_arr.shape[:2]
+                mask = _np.zeros((img_h, img_w), dtype=bool)
+                ys, xs = _np.ogrid[:img_h, :img_w]
+                for cx, cy, r in strokes:
+                    mask |= ((xs - cx) ** 2 + (ys - cy) ** 2) <= r ** 2
+                mask = _apply_fill_to_bottom(mask)
+                fill_data = {
+                    'type': 'fill',
+                    'class': class_name,
+                    'rle': _mask_to_rle(mask),
+                    'img_size': (img_w, img_h),
+                    'offset': [0, 0],
+                    'source': 'manual',
+                }
+                self.add_segmentation_annotation(fill_data)
+                return
+            except Exception:
+                pass  # 失敗時は通常の brush 型にフォールスルー
+        brush_data = {
+            'type': 'brush',
+            'class': class_name,
+            'strokes': strokes,
+            'source': 'manual',
+        }
+        self.add_segmentation_annotation(brush_data)
+
+    def complete_fill_annotation(self, seed_x, seed_y, tolerance):
+        """フラッドフィルでマスクを生成してアノテーション保存"""
+        if not self.images:
+            return
+        current_path = self.images[self.current_index]
+        from PIL import Image as _PILImage
+        import numpy as _np
+        try:
+            img = _PILImage.open(current_path).convert('RGB')
+        except Exception:
+            return
+        img_array = _np.array(img)
+        mask = _compute_flood_fill(img_array, seed_x, seed_y, tolerance)
+        if mask is None or not mask.any():
+            QMessageBox.information(self, "塗りつぶし",
+                "クリック位置で塗りつぶせる領域が見つかりませんでした。\n許容差を上げてお試しください。")
+            return
+        # モルフォロジークロージングで床の線などを跨いで塗る
+        close_enabled = getattr(self.main_image_view, 'fill_close_enabled', False)
+        if close_enabled:
+            kernel = getattr(self.main_image_view, 'fill_close_kernel', 11)
+            mask = _morphological_close(mask, kernel)
+        class_name = self.select_object_class()
+        if not class_name:
+            return
+        img_h, img_w = img_array.shape[:2]
+        fill_data = {
+            'type': 'fill',
+            'class': class_name,
+            'rle': _mask_to_rle(mask),
+            'img_size': (img_w, img_h),
+            'offset': [0, 0],
+            'source': 'manual',
+        }
+        self.add_segmentation_annotation(fill_data)
+
     def train_yolo_unified(self):
         """統合されたYOLO学習 - 学習時にタスクを選択（MLflow統合版）"""
         
@@ -8028,20 +10607,15 @@ class ImageAnnotationTool(QMainWindow):
         # セグメンテーションアノテーションがあるインデックスのみを取得
         valid_indices = []
         for idx, segments in self.segmentation_annotations.items():
-            if segments and len(segments) > 0:
-                # 各セグメンテーションに有効な座標があるかチェック
-                has_valid_segments = False
-                for seg in segments:
-                    points = None
-                    if isinstance(seg, dict):
-                        points = seg.get('points', [])
-                    else:
-                        points = getattr(seg, 'points', [])
-                    
-                    if points and len(points) >= 3:  # 最低3点必要
-                        has_valid_segments = True
-                        break
-                
+            if segments:
+                has_valid_segments = any(
+                    seg is not None and
+                    len(_seg_to_polygon_points(
+                        seg if isinstance(seg, dict) else {'points': getattr(seg, 'points', [])},
+                        1, 1  # img_size は validity チェックのみなので任意の値でよい
+                    )) >= 3
+                    for seg in segments
+                )
                 if has_valid_segments:
                     valid_indices.append(idx)
         
@@ -8246,44 +10820,40 @@ class ImageAnnotationTool(QMainWindow):
                     with open(label_path, 'w') as f:
                         for seg in self.segmentation_annotations[idx]:
                             # クラス名を取得
-                            class_name = None
                             if isinstance(seg, dict):
                                 class_name = seg.get('class') or seg.get('class_name')
-                                points = seg.get('points', [])
+                                seg_d = seg
                             else:
                                 class_name = getattr(seg, 'class', None) or getattr(seg, 'class_name', None)
-                                points = getattr(seg, 'points', [])
-                            
-                            if class_name and class_name in class_to_index and points and len(points) >= 3:
-                                class_id = class_to_index[class_name]
-                                
-                                # ポイントを正規化座標に変換
-                                normalized_points = []
-                                for point in points:
-                                    # アプリではピクセル座標で保存されているため正規化が必要
-                                    if isinstance(point, (list, tuple)) and len(point) >= 2:
-                                        # タプル/リスト形式: (x, y)
-                                        x = point[0] / img_width
-                                        y = point[1] / img_height
-                                    elif isinstance(point, dict):
-                                        # 辞書形式: {'x': x, 'y': y}
-                                        x = point.get('x', 0) / img_width
-                                        y = point.get('y', 0) / img_height
-                                    else:
-                                        # オブジェクト形式: point.x, point.y
-                                        x = getattr(point, 'x', 0) / img_width
-                                        y = getattr(point, 'y', 0) / img_height
-                                    
-                                    # 座標を0-1の範囲にクランプ
-                                    x = max(0.0, min(1.0, x))
-                                    y = max(0.0, min(1.0, y))
-                                    
-                                    normalized_points.extend([x, y])
-                                
-                                # YOLO セグメンテーション形式で書き込み
-                                if len(normalized_points) >= 6:  # 最低3点 (6座標)
-                                    points_str = ' '.join([f"{coord:.6f}" for coord in normalized_points])
-                                    f.write(f"{class_id} {points_str}\n")
+                                seg_d = {'points': getattr(seg, 'points', [])}
+
+                            if not class_name or class_name not in class_to_index:
+                                continue
+
+                            # polygon / fill / brush すべて対応した輪郭点取得
+                            points = _seg_to_polygon_points(seg_d, img_width, img_height)
+                            if len(points) < 3:
+                                continue
+
+                            class_id = class_to_index[class_name]
+
+                            # ポイントを正規化座標に変換
+                            normalized_points = []
+                            for point in points:
+                                if isinstance(point, (list, tuple)) and len(point) >= 2:
+                                    x, y = point[0] / img_width, point[1] / img_height
+                                elif isinstance(point, dict):
+                                    x, y = point.get('x', 0) / img_width, point.get('y', 0) / img_height
+                                else:
+                                    x, y = getattr(point, 'x', 0) / img_width, getattr(point, 'y', 0) / img_height
+                                normalized_points.extend([
+                                    max(0.0, min(1.0, x)),
+                                    max(0.0, min(1.0, y))
+                                ])
+
+                            if len(normalized_points) >= 6:  # 最低3点 (6座標)
+                                points_str = ' '.join([f"{coord:.6f}" for coord in normalized_points])
+                                f.write(f"{class_id} {points_str}\n")
                     
                     success_count += 1
                     
@@ -8331,26 +10901,22 @@ class ImageAnnotationTool(QMainWindow):
                 if segments and len(segments) > 0:
                     total_segments += len(segments)
                     for seg in segments:
-                        points = None
-                        if isinstance(seg, dict):
-                            points = seg.get('points', [])
-                        else:
-                            points = getattr(seg, 'points', [])
-                        
-                        if points and len(points) >= 3:  # 最低3点必要
+                        seg_d = seg if isinstance(seg, dict) else {'points': getattr(seg, 'points', [])}
+                        pts = _seg_to_polygon_points(seg_d, 1, 1)
+                        if len(pts) >= 3:
                             valid_segments += 1
                             image_has_valid_segments = True
-                
+
                 if image_has_valid_segments:
                     valid_images += 1
-            
+
             print(f"\n=== セグメンテーションアノテーション確認 ===")
             print(f"アノテーション辞書数: {len(annotations)}")
             print(f"総セグメンテーション数: {total_segments}")
             print(f"有効なセグメンテーション数: {valid_segments}")
             print(f"有効なセグメンテーションがある画像数: {valid_images}")
             print("=" * 50)
-            
+
             if valid_segments == 0:
                 QMessageBox.critical(
                     self,
@@ -9694,7 +12260,7 @@ class ImageAnnotationTool(QMainWindow):
         
         classes_layout = QHBoxLayout()
         classes_layout.addWidget(QLabel(get_text('label_detection_classes')))
-        current_classes = self.classes_input.text() if hasattr(self, 'classes_input') and self.classes_input.text().strip() else "car,red_sign,green_sign,dog"
+        current_classes = self.classes_input.text() if hasattr(self, 'classes_input') and self.classes_input.text().strip() else "car,red_sign,green_sign,dog,wall,road"
         classes_input = QLineEdit(current_classes)
         classes_input.setPlaceholderText(get_text('placeholder_classes'))
         classes_layout.addWidget(classes_input)
@@ -10059,19 +12625,18 @@ class ImageAnnotationTool(QMainWindow):
                         class_name = seg.get('class', 'unknown')
                         if class_name in classes:
                             class_id = classes.index(class_name)
-                            
-                            # ポリゴンポイントを正規化
+
+                            # polygon / fill / brush すべて対応
+                            points = _seg_to_polygon_points(seg, img_width, img_height)
+
                             normalized_points = []
-                            points = seg.get('points', [])
-                            
                             for point in points:
                                 if isinstance(point, (list, tuple)) and len(point) >= 2:
-                                    norm_x = point[0] / img_width
-                                    norm_y = point[1] / img_height
+                                    norm_x = max(0.0, min(1.0, point[0] / img_width))
+                                    norm_y = max(0.0, min(1.0, point[1] / img_height))
                                     normalized_points.extend([norm_x, norm_y])
-                            
-                            if normalized_points:
-                                # YOLO形式でポリゴンを出力
+
+                            if len(normalized_points) >= 6:
                                 points_str = ' '.join(f"{p:.6f}" for p in normalized_points)
                                 f.write(f"{class_id} {points_str}\n")
         
@@ -10216,21 +12781,22 @@ class ImageAnnotationTool(QMainWindow):
                 if hasattr(self, 'segmentation_annotations') and img_path in self.segmentation_annotations:
                     for seg in self.segmentation_annotations[img_path]:
                         class_name = seg.get('class', 'unknown')
-                        points = seg.get('points', [])
-                        
+
+                        # polygon / fill / brush すべて対応
+                        points = _seg_to_polygon_points(seg, img_width, img_height)
+
                         if class_name in classes and len(points) >= 3:
                             class_id = classes.index(class_name)
-                            
-                            # ポリゴンの座標を正規化
+
                             normalized_points = []
                             for x, y in points:
-                                norm_x = x / img_width
-                                norm_y = y / img_height
+                                norm_x = max(0.0, min(1.0, x / img_width))
+                                norm_y = max(0.0, min(1.0, y / img_height))
                                 normalized_points.extend([norm_x, norm_y])
-                            
-                            # YOLO セグメンテーション形式
-                            line = f"{class_id} " + " ".join(f"{coord:.6f}" for coord in normalized_points)
-                            f.write(line + '\n')
+
+                            if len(normalized_points) >= 6:
+                                line = f"{class_id} " + " ".join(f"{coord:.6f}" for coord in normalized_points)
+                                f.write(line + '\n')
         
         # classes.txtを作成
         classes_path = os.path.join(output_folder, 'classes.txt')
@@ -10603,8 +13169,8 @@ class ImageAnnotationTool(QMainWindow):
     #         text, ok = QInputDialog.getText(
     #             self, 
     #             "クラス情報", 
-    #             "クラス名をカンマで区切って入力してください（例: car,red_sign,green_sign,dog）:",
-    #             text=self.classes_input.text() if hasattr(self, 'classes_input') else "car,red_sign,green_sign,dog"
+    #             "クラス名をカンマで区切って入力してください（例: car,red_sign,green_sign,dog,wall,road）:",
+    #             text=self.classes_input.text() if hasattr(self, 'classes_input') else "car,red_sign,green_sign,dog,wall,road"
     #         )
             
     #         if ok and text:
@@ -10887,14 +13453,14 @@ class ImageAnnotationTool(QMainWindow):
 
     def _get_classes_from_user(self):
         """ユーザーからクラス情報を取得"""
-        default_classes = "car,red_sign,green_sign,dog"
+        default_classes = "car,red_sign,green_sign,dog,wall,road"
         if hasattr(self, 'classes_input') and self.classes_input.text():
             default_classes = self.classes_input.text()
         
         text, ok = QInputDialog.getText(
             self,
             "クラス情報",
-            "クラス名をカンマで区切って入力してください（例: car,red_sign,green_sign,dog）:",
+            "クラス名をカンマで区切って入力してください（例: car,red_sign,green_sign,dog,wall,road）:",
             text=default_classes
         )
         
@@ -11533,8 +14099,9 @@ class ImageAnnotationTool(QMainWindow):
             result_data = {
                 'segments': segments,
                 'bboxes': bboxes,
-                'masks': masks,  # マスク配列を追加
-                'classes': class_ids  # クラスIDを追加
+                'masks': masks,
+                'classes': class_ids,
+                'success': True  # 推論成功フラグ（例外結果と区別するため）
             }
             self.segmentation_inference_results[current_img_path] = result_data
             # インデックスでもアクセスできるように保存
@@ -11571,7 +14138,9 @@ class ImageAnnotationTool(QMainWindow):
             print(f"YOLOセグメンテーション推論エラー: {e}")
             import traceback
             traceback.print_exc()
-            self.segmentation_inference_results[current_img_path] = {'segments': [], 'bboxes': []}
+            # 例外時はキャッシュしない → 次回ナビゲーション時に再試行できる
+            if current_img_path in self.segmentation_inference_results:
+                del self.segmentation_inference_results[current_img_path]
             return False
 
     def test_model_comparison(self):
@@ -12064,12 +14633,21 @@ class ImageAnnotationTool(QMainWindow):
 
     def select_object_class(self):
             """物体クラスを選択するダイアログを表示 - 動的クラス対応"""
+            # クラス固定モード: 前回のクラスをダイアログなしで返す
+            mode = getattr(self, 'current_mode', 0)
+            if mode == 1 and getattr(self, '_bbox_fixed_class_advance', False):
+                if self.last_selected_bbox_class:
+                    return self.last_selected_bbox_class
+            if mode == 2 and getattr(self, '_seg_fixed_class_advance', False):
+                if self.last_selected_bbox_class:
+                    return self.last_selected_bbox_class
+
             classes = self.get_current_classes()
-            
+
             if not classes:
                 QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_no_classes'))
                 return None
-            
+
             # 前回選択したクラスのインデックスを取得
             default_index = 0
             if self.last_selected_bbox_class and self.last_selected_bbox_class in classes:
@@ -12314,13 +14892,15 @@ class ImageAnnotationTool(QMainWindow):
     # ===========================================
 
     def _check_databricks_connection_on_startup(self):
-        """起動時にDatabricks接続を確認"""
+        """起動時にDatabricks接続を確認
+        注意: Databricksはデフォルト無効。ユーザーが設定画面から有効化した場合のみ接続を試行する。
+        """
         try:
             # Databricks連携が有効な場合のみ接続確認
             if self.mlflow_manager.use_databricks:
                 print("起動時Databricks接続確認中...")
 
-                # 接続を試みる（ダイアログなしでバックグラウンドで実行）
+                # 接続を試みる（タイムアウト付きで実行）
                 self.mlflow_manager.is_initialized = False
                 success = self.mlflow_manager.initialize(self.mlflow_manager.folder_path, parent_widget=None)
 
@@ -12331,6 +14911,8 @@ class ImageAnnotationTool(QMainWindow):
 
                 # ステータスラベルを更新
                 self._update_databricks_status_label()
+            else:
+                print("Databricks連携: 無効（設定画面から有効化できます）")
         except Exception as e:
             print(f"起動時Databricks接続確認エラー: {e}")
 
@@ -12343,19 +14925,35 @@ class ImageAnnotationTool(QMainWindow):
 
         # 有効にした場合は接続を試みる
         if enabled:
+            self.statusBar().showMessage("Databricks接続を試行中...", 0)
+            QApplication.processEvents()
+
             self.mlflow_manager.is_initialized = False
             success = self.mlflow_manager.initialize(self.mlflow_manager.folder_path, parent_widget=self)
-            if not success:
+
+            self.statusBar().clearMessage()
+
+            if not self.mlflow_manager._databricks_connected:
                 QMessageBox.warning(
                     self,
                     get_text('dlg_databricks_connection_error'),
-                    get_text('msg_databricks_connection_error_env')
+                    get_text('msg_databricks_connection_error_env') +
+                    "\n\nDatabricksへの接続に失敗しました。\n"
+                    "環境変数 DATABRICKS_HOST と DATABRICKS_TOKEN が正しく設定されているか確認してください。"
                 )
                 self.databricks_checkbox.setChecked(False)
+            else:
+                QMessageBox.information(
+                    self,
+                    "Databricks接続",
+                    "Databricksに接続しました。\n"
+                    "学習結果はローカルとDatabricksの両方に記録されます。"
+                )
         else:
             # ローカルモードに戻す
             self.mlflow_manager.is_initialized = False
             self.mlflow_manager.initialize(self.mlflow_manager.folder_path, parent_widget=self)
+            self.statusBar().showMessage("Databricks連携を無効化しました。ローカルのみに記録します。", 3000)
 
         # 状態ラベルを更新
         self._update_databricks_status_label()
@@ -14176,6 +16774,11 @@ class ImageAnnotationTool(QMainWindow):
         self.main_image_view.update()
         self.update_gallery()
 
+        # クラス固定で次に進む
+        if getattr(self, '_bbox_fixed_class_advance', False):
+            skip = self.skip_count_spin.value()
+            QTimer.singleShot(80, lambda: self.skip_images(skip))
+
     def add_session_check_to_init_ui(self):
         """init_uiメソッドの最後に追加する初期セッション確認コード"""
         # メインウィンドウを最前面にアクティブ化
@@ -14185,7 +16788,17 @@ class ImageAnnotationTool(QMainWindow):
         
         # 保存されたセッション情報を読み込む
         session_info = self.load_session_info()
-        
+        self._pending_session_info = session_info  # モデル復元のために保持
+
+        # max_speedの復元
+        if session_info and "max_speed" in session_info:
+            self.main_image_view.max_speed = session_info["max_speed"]
+
+        # 検知クラスの復元
+        if session_info and "detection_classes" in session_info and session_info["detection_classes"]:
+            if hasattr(self, 'classes_input'):
+                self.classes_input.setText(session_info["detection_classes"])
+
         # 複数フォルダを優先的に使用
         has_folders = False
         
@@ -14855,6 +17468,49 @@ class ImageAnnotationTool(QMainWindow):
         self.main_image_view.zoom_factor = zoom
         self.main_image_view.update()
 
+    def _on_resolution_scale_changed(self, value):
+        """解像度スライダーの値が変更されたときの処理"""
+        self.main_image_view.resolution_scale = value / 100.0
+        self.resolution_value_label.setText(f"{value}%")
+        self._update_resolution_size_label()
+        self.main_image_view.update()
+
+        # 推論再実行（デバウンス: スライダー操作が止まってから300ms後に実行）
+        if not hasattr(self, '_resolution_inference_timer'):
+            from PyQt5.QtCore import QTimer
+            self._resolution_inference_timer = QTimer(self)
+            self._resolution_inference_timer.setSingleShot(True)
+            self._resolution_inference_timer.timeout.connect(self._run_inference_for_resolution)
+        self._resolution_inference_timer.start(300)
+
+    def _run_inference_for_resolution(self):
+        """解像度変更後の推論再実行（モデルが読み込まれている場合のみ）"""
+        if not self.images or not getattr(self, 'model', None):
+            return
+        if not getattr(self, 'inference_checkbox', None) or not self.inference_checkbox.isChecked():
+            return
+        res_scale = getattr(self.main_image_view, 'resolution_scale', 1.0)
+        self.run_inference_check(all_images=False)
+        # 追加モデルも解像度を反映して強制再推論
+        if self.extra_model_slots:
+            self._run_extra_model_inference_for_current(force_update=True, downscale_factor=res_scale)
+            self.update_inference_display()
+            self.main_image_view.update()
+
+    def _update_resolution_size_label(self):
+        """解像度スライダー左の画像サイズ表示を更新"""
+        if not hasattr(self, 'image_size_label'):
+            return
+        pix = self.main_image_view.pixmap() if hasattr(self, 'main_image_view') else None
+        if pix is None or pix.isNull():
+            self.image_size_label.setText("---")
+            return
+        pw, ph = pix.width(), pix.height()
+        val = self.resolution_slider.value() if hasattr(self, 'resolution_slider') else 100
+        sw = max(1, int(pw * val / 100))
+        sh = max(1, int(ph * val / 100))
+        self.image_size_label.setText(f"{sw}×{sh}px")
+
     def slider_changed(self, value):
         """スライダーの値が変更されたときの処理"""
         if self.images and value != self.current_index:
@@ -14930,12 +17586,12 @@ class ImageAnnotationTool(QMainWindow):
         # セグメンテーション推論表示の更新
         if hasattr(self, 'segmentation_inference_checkbox') and self.segmentation_inference_checkbox.isChecked():
             current_img_path = self.images[self.current_index]
-            # 推論結果がまだない場合のみ推論を実行
-            if current_img_path not in self.segmentation_inference_results:
-                self.run_single_yolo_segmentation_inference()
-            else:
-                # 既にある結果の表示を更新
+            cached = self.segmentation_inference_results.get(current_img_path)
+            # success=True の成功済みキャッシュがある場合のみスキップ
+            if cached and cached.get('success'):
                 self.update_segmentation_inference_display()
+            else:
+                self.run_single_yolo_segmentation_inference()
 
     def toggle_future_annotation_display(self, state):
         """将来アノテーション表示の切り替え"""
@@ -15131,11 +17787,22 @@ class ImageAnnotationTool(QMainWindow):
         """推論を実行するメソッド - モデル情報表示を強化、推論実行後に推論表示をオン"""
         if not self.images:
             return
-        
+
         # 現在のモデル情報を取得
         model_type = self.auto_method_combo.currentText()
-        selected_model = self.model_combo.currentText()
-        
+        selected_model = self.get_selected_model_filename()
+
+        # 結合表示モードで推論ソースが指定されている場合はそのソースの画像を使用
+        _infer_src = (
+            self._combined_inference_source
+            if getattr(self, 'current_variant', None) == '__combined__'
+               and getattr(self, '_combined_inference_source', None)
+               and hasattr(self, 'variant_images')
+               and self._combined_inference_source in self.variant_images
+            else None
+        )
+        _infer_images = self.variant_images[_infer_src] if _infer_src else self.images
+
         # 推論対象の画像を決定
         if all_images:
             # 既存の推論結果がある場合は確認ダイアログを表示
@@ -15147,21 +17814,21 @@ class ImageAnnotationTool(QMainWindow):
                     QMessageBox.Yes | QMessageBox.No,
                     QMessageBox.Yes
                 )
-                
+
                 if reply == QMessageBox.No:
                     return  # 操作をキャンセル
-            
-            target_images = self.images
+
+            target_images = _infer_images
             progress_title = get_text('msg_inference_all_running')
         else:
-            target_images = [self.images[self.current_index]]
+            target_images = [_infer_images[self.current_index]] if self.current_index < len(_infer_images) else []
             progress_title = get_text('msg_inference_running')
-        
+
         # モデルのパスを取得 (コンボボックスから選択されたモデル)
         model_path = None
-        if hasattr(self, 'model_combo') and self.model_combo.currentText() not in [get_text('combo_model_not_found'), get_text('combo_select_folder')] and "not found" not in self.model_combo.currentText().lower():
-            # アノテーションフォルダ内のモデルのフルパスを作成
-            selected_model = self.model_combo.currentText()
+        if hasattr(self, 'model_combo') and selected_model not in [get_text('combo_model_not_found'), get_text('combo_select_folder')] and "not found" not in selected_model.lower():
+            # アノテーションフォルダ内のモデルのフルパスを作成（マルチソースマーカー対応）
+            selected_model = self.get_selected_model_filename()
             # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
             model_path = os.path.join(models_dir, selected_model)
             
@@ -15185,41 +17852,67 @@ class ImageAnnotationTool(QMainWindow):
             self.statusBar().showMessage(get_text('status_inference_processing', model_type, model_desc))
             QApplication.processEvents()
 
-            # 推論を実行
-            if model_type in list_available_models():
-                # モデルを使用した推論 - force_reloadはモデル変更時のみTrue
+            # モデルタイプを判定して推論ルートを選択
+            ms_config = getattr(self, '_multi_source_config', None)
+            vs_config = getattr(self, '_virtual_source_config', None)
+
+            if vs_config and model_path:
+                # 仮想ソース推論 (crop/scale/temporal)
+                if all_images:
+                    target_indices = list(range(len(self.images)))
+                else:
+                    target_indices = [self.current_index]
+                inference_results = self._run_virtual_source_inference(
+                    target_indices, model_path, force_reload=force_reload
+                )
+            elif ms_config and model_path:
+                # マルチソース推論
+                if all_images:
+                    target_indices = list(range(len(self.images)))
+                else:
+                    target_indices = [self.current_index]
+                inference_results = self._run_multi_source_inference(
+                    target_indices, model_path, force_reload=force_reload
+                )
+            elif model_type in list_available_models():
+                # 通常のシングルソース推論 - force_reloadはモデル変更時のみTrue
                 inference_results = batch_inference(
-                    target_images, 
-                    method="model", 
+                    target_images,
+                    method="model",
                     model_type=model_type,
                     model_path=model_path,
-                    force_reload=force_reload
+                    force_reload=force_reload,
+                    downscale_factor=getattr(self.main_image_view, 'resolution_scale', 1.0)
                 )
             else:
                 QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_inference_method_not_supported'))
                 return
-            
+
             # 推論結果を保存（インデックスベースに変換）
             old_count = len(self.inference_results)
-            
-            # 画像パスからインデックスに変換して保存
-            for img_path, result in inference_results.items():
-                # 画像パスから対応するインデックスを取得
-                try:
-                    img_index = self.images.index(img_path)
-                    self.inference_results[img_index] = result
-                    print(f"推論結果保存: インデックス{img_index} <- {os.path.basename(img_path)}")
-                    
-                    # 差分ベクトルの計算と保存
-                    self.calculate_and_store_diff_vector(img_index)
-                    
-                except ValueError:
-                    print(f"警告: 画像パス {img_path} がself.imagesに見つかりません")
-                    # パスでも保存（後方互換性のため）
-                    self.inference_results[img_path] = result
-            
+
+            # 画像パスまたはインデックスから変換して保存
+            for key, result in inference_results.items():
+                if isinstance(key, int):
+                    # マルチソース推論: キーはすでにインデックス
+                    self.inference_results[key] = result
+                    print(f"推論結果保存: インデックス{key}")
+                    self.calculate_and_store_diff_vector(key)
+                else:
+                    # 通常推論: キーは画像パス
+                    try:
+                        # 結合表示時は推論ソースのパスリストで検索
+                        search_list = _infer_images if _infer_src else self.images
+                        img_index = search_list.index(key)
+                        self.inference_results[img_index] = result
+                        print(f"推論結果保存: インデックス{img_index} <- {os.path.basename(key)}")
+                        self.calculate_and_store_diff_vector(img_index)
+                    except ValueError:
+                        print(f"警告: 画像パス {key} が画像リストに見つかりません")
+                        self.inference_results[key] = result
+
             new_count = len(self.inference_results)
-            
+
             # 推論表示チェックボックスを自動的にオンにする
             was_checked = self.inference_checkbox.isChecked()
             self.inference_checkbox.setChecked(True)
@@ -15260,16 +17953,268 @@ class ImageAnnotationTool(QMainWindow):
                 get_text('msg_inference_processing_error', str(e))
             )
 
+    def _run_multi_source_inference(self, target_indices, model_path=None, force_reload=False):
+        """マルチソースモデルで推論を実行する
+
+        Args:
+            target_indices: 推論対象のインデックスリスト
+            model_path: モデルファイルのパス（キャッシュ更新用）
+            force_reload: キャッシュを無視して再読み込みするか
+
+        Returns:
+            dict: {index: {angle, throttle, x, y, ...}} 推論結果
+        """
+        config = getattr(self, '_multi_source_config', None)
+        if not config:
+            print("マルチソース推論設定がありません")
+            return {}
+
+        sources = config['sources']
+        num_sources = config['num_sources']
+        image_groups = getattr(self, 'image_groups', {})
+        variant_images = getattr(self, 'variant_images', {})
+
+        if not image_groups:
+            print("image_groupsが空です - マルチソース推論不可")
+            return {}
+
+        # モデルを取得（self.modelから）
+        model = getattr(self, 'model', None)
+        if model is None:
+            print("モデルが読み込まれていません")
+            return {}
+
+        device = next(model.parameters()).device
+        transform = model.get_preprocess()
+
+        results = {}
+        with torch.no_grad():
+            for idx in target_indices:
+                try:
+                    group = image_groups.get(idx, {})
+
+                    # 全ソースの画像パスを取得
+                    img_paths = []
+                    missing_source = False
+                    for src in sources:
+                        if src in group:
+                            img_paths.append(group[src])
+                        else:
+                            missing_source = True
+                            break
+
+                    if missing_source or len(img_paths) != num_sources:
+                        continue
+
+                    # 各ソース画像を読み込み・前処理してチャネル連結
+                    tensors = []
+                    first_img_size = None
+                    for path in img_paths:
+                        img = Image.open(path).convert('RGB')
+                        if first_img_size is None:
+                            first_img_size = img.size  # (width, height)
+                        t = transform(img)
+                        tensors.append(t)
+
+                    # [num_sources*3, H, W] -> [1, num_sources*3, H, W]
+                    stacked = torch.cat(tensors, dim=0).unsqueeze(0).to(device)
+
+                    # 推論
+                    output = model(stacked)
+                    output_values = output[0].cpu().numpy()
+                    output_values = np.clip(output_values, -1.0, 1.0)
+
+                    # Attention 重みの取得（attention 融合モデルのみ）
+                    attn_scores = None
+                    raw_weights = getattr(model, 'last_attn_weights', None)
+                    if raw_weights is not None:
+                        # (batch, S, S) → 列方向平均 → (S,) = 各カメラの貢献スコア
+                        col_mean = raw_weights[0].mean(dim=0).cpu().numpy()
+                        total = col_mean.sum()
+                        if total > 0:
+                            col_mean = col_mean / total
+                        attn_scores = {src: float(col_mean[i]) for i, src in enumerate(sources)}
+
+                    img_width, img_height = first_img_size
+                    num_out = len(output_values)
+                    angle = output_values[0]
+                    throttle = output_values[1]
+
+                    speed = None
+                    if num_out == 3 or num_out >= 9:
+                        speed = output_values[2]
+
+                    x = int((angle + 1) / 2 * img_width)
+                    y = int((1 - throttle) / 2 * img_height)
+                    x = max(0, min(x, img_width - 1))
+                    y = max(0, min(y, img_height - 1))
+
+                    results[idx] = {
+                        "angle": float(angle),
+                        "throttle": float(throttle),
+                        "x": x,
+                        "y": y,
+                    }
+                    if attn_scores is not None:
+                        results[idx]["attention_weights"] = attn_scores
+
+                    if speed is not None:
+                        results[idx]["speed"] = float(speed)
+
+                    # 将来予測の出力
+                    if num_out >= 9:
+                        for fi, offset in enumerate([5, 10]):
+                            base = 3 + fi * 3
+                            f_angle = output_values[base]
+                            f_throttle = output_values[base + 1]
+                            f_speed = output_values[base + 2]
+                            f_x = int((f_angle + 1) / 2 * img_width)
+                            f_y = int((1 - f_throttle) / 2 * img_height)
+                            f_x = max(0, min(f_x, img_width - 1))
+                            f_y = max(0, min(f_y, img_height - 1))
+                            results[idx][f"future_{offset}"] = {
+                                "angle": float(f_angle),
+                                "throttle": float(f_throttle),
+                                "speed": float(f_speed),
+                                "x": f_x, "y": f_y
+                            }
+                    elif num_out == 6:
+                        for fi, offset in enumerate([5, 10]):
+                            base = 2 + fi * 2
+                            f_angle = output_values[base]
+                            f_throttle = output_values[base + 1]
+                            f_x = int((f_angle + 1) / 2 * img_width)
+                            f_y = int((1 - f_throttle) / 2 * img_height)
+                            f_x = max(0, min(f_x, img_width - 1))
+                            f_y = max(0, min(f_y, img_height - 1))
+                            results[idx][f"future_{offset}"] = {
+                                "angle": float(f_angle),
+                                "throttle": float(f_throttle),
+                                "x": f_x, "y": f_y
+                            }
+
+                except Exception as e:
+                    print(f"マルチソース推論エラー (index={idx}): {e}")
+
+        return results
+
+    def _run_virtual_source_inference(self, target_indices, model_path=None, force_reload=False):
+        """仮想ソースモデル（crop/scale/temporal）で推論を実行する
+
+        Args:
+            target_indices: 推論対象インデックスリスト
+            model_path: モデルファイルのパス（ログ用）
+
+        Returns:
+            dict: {index: {angle, throttle, x, y, [attention_weights]}}
+        """
+        config = getattr(self, '_virtual_source_config', None)
+        if not config:
+            print("仮想ソース推論設定がありません")
+            return {}
+
+        virtual_type = config['virtual_type']
+        num_sources = config['num_sources']
+        source_names = config['source_names']
+        temporal_interval = config.get('temporal_interval', 10)
+
+        model = getattr(self, 'model', None)
+        if model is None:
+            return {}
+
+        device = next(model.parameters()).device
+        transform = model.get_preprocess()
+
+        results = {}
+        with torch.no_grad():
+            for idx in target_indices:
+                try:
+                    if idx < 0 or idx >= len(self.images):
+                        continue
+                    img_path = self.images[idx]
+                    img = Image.open(img_path).convert('RGB')
+                    W, H = img.size
+
+                    # 仮想ソース生成
+                    if virtual_type == 'crop':
+                        n = num_sources
+                        step = W / n
+                        overlap = step * 0.15
+                        source_imgs = []
+                        for i in range(n):
+                            x0 = max(0, int(step * i - overlap))
+                            x1 = min(W, int(step * (i + 1) + overlap))
+                            source_imgs.append(img.crop((x0, 0, x1, H)))
+                    elif virtual_type == 'scale':
+                        source_imgs = [img]
+                        scale = 0.55
+                        for _ in range(num_sources - 1):
+                            cw = max(1, int(W * scale))
+                            ch = max(1, int(H * scale))
+                            x0, y0 = (W - cw) // 2, (H - ch) // 2
+                            cropped = img.crop((x0, y0, x0 + cw, y0 + ch))
+                            source_imgs.append(cropped.resize((W, H), Image.LANCZOS))
+                            scale *= 0.55
+                    elif virtual_type == 'temporal':
+                        source_imgs = []
+                        for k in range(num_sources):
+                            prev_idx = max(0, idx - k * temporal_interval)
+                            source_imgs.append(Image.open(self.images[prev_idx]).convert('RGB'))
+                    else:
+                        source_imgs = [img] * num_sources
+
+                    # 解像度ダウンスケール（ピクセレーション）を各ソースに適用
+                    res_scale = getattr(self.main_image_view, 'resolution_scale', 1.0)
+                    if res_scale < 1.0:
+                        pixelated = []
+                        for s in source_imgs:
+                            sw2, sh2 = s.size
+                            pw = max(1, int(sw2 * res_scale))
+                            ph = max(1, int(sh2 * res_scale))
+                            pixelated.append(s.resize((pw, ph), Image.NEAREST).resize((sw2, sh2), Image.NEAREST))
+                        source_imgs = pixelated
+
+                    tensors = [transform(s) for s in source_imgs]
+                    stacked = torch.cat(tensors, dim=0).unsqueeze(0).to(device)
+
+                    output = model(stacked)
+                    output_values = output[0].cpu().numpy()
+                    output_values = np.clip(output_values, -1.0, 1.0)
+
+                    # Attention 重みの取得
+                    attn_scores = None
+                    raw_weights = getattr(model, 'last_attn_weights', None)
+                    if raw_weights is not None:
+                        col_mean = raw_weights[0].mean(dim=0).cpu().numpy()
+                        total = col_mean.sum()
+                        if total > 0:
+                            col_mean = col_mean / total
+                        attn_scores = {src: float(col_mean[i]) for i, src in enumerate(source_names)}
+
+                    angle = float(output_values[0])
+                    throttle = float(output_values[1])
+                    x = max(0, min(int((angle + 1) / 2 * W), W - 1))
+                    y = max(0, min(int((1 - throttle) / 2 * H), H - 1))
+
+                    results[idx] = {"angle": angle, "throttle": throttle, "x": x, "y": y}
+                    if attn_scores:
+                        results[idx]["attention_weights"] = attn_scores
+
+                except Exception as e:
+                    print(f"仮想ソース推論エラー (index={idx}): {e}")
+
+        return results
+
     def run_batch_inference(self):
         """全ての画像に対して推論を実行する"""
         if not self.images:
             QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_no_images'))
             return
-        
+
         # 現在のモデル情報を取得
         model_type = self.auto_method_combo.currentText()
-        selected_model = self.model_combo.currentText()
-        
+        selected_model = self.get_selected_model_filename()
+
         # モデルのパスを取得
         model_path = None
         if selected_model not in [get_text('combo_model_not_found'), get_text('combo_select_folder')] and "not found" not in selected_model.lower():
@@ -15370,31 +18315,44 @@ class ImageAnnotationTool(QMainWindow):
                 
                 # 推論を実行
                 try:
-                    batch_results = batch_inference(
-                        batch_to_process, 
-                        method="model", 
-                        model_type=model_type,
-                        model_path=model_path,
-                        force_reload=(batch_idx == 0)  # 最初のバッチのみ強制再読込
-                    )
-                    
-                    # 結果をインデックスベースで保存（ここが重要な修正点）
-                    for img_path, result in batch_results.items():
-                        # 画像パスから対応するインデックスを取得
-                        try:
-                            img_index = self.images.index(img_path)
-                            self.inference_results[img_index] = result
+                    ms_config = getattr(self, '_multi_source_config', None)
+                    if ms_config and model_path:
+                        # マルチソース推論（インデックスベースで実行）
+                        batch_indices = []
+                        for img_path in batch_to_process:
+                            try:
+                                batch_indices.append(self.images.index(img_path))
+                            except ValueError:
+                                pass
+                        batch_results = self._run_multi_source_inference(
+                            batch_indices, model_path, force_reload=(batch_idx == 0)
+                        )
+                    else:
+                        batch_results = batch_inference(
+                            batch_to_process,
+                            method="model",
+                            model_type=model_type,
+                            model_path=model_path,
+                            force_reload=(batch_idx == 0)  # 最初のバッチのみ強制再読込
+                        )
+
+                    # 結果をインデックスベースで保存
+                    for key, result in batch_results.items():
+                        if isinstance(key, int):
+                            self.inference_results[key] = result
                             success_count += 1
-                            print(f"推論結果保存: インデックス{img_index} <- {os.path.basename(img_path)}")
-                            
-                            # 差分ベクトルの計算と保存
-                            self.calculate_and_store_diff_vector(img_index)
-                            
-                        except ValueError:
-                            print(f"警告: 画像パス {img_path} がself.imagesに見つかりません")
-                            # パスでも保存（後方互換性のため）
-                            self.inference_results[img_path] = result
-                            success_count += 1
+                            self.calculate_and_store_diff_vector(key)
+                        else:
+                            try:
+                                img_index = self.images.index(key)
+                                self.inference_results[img_index] = result
+                                success_count += 1
+                                print(f"推論結果保存: インデックス{img_index} <- {os.path.basename(key)}")
+                                self.calculate_and_store_diff_vector(img_index)
+                            except ValueError:
+                                print(f"警告: 画像パス {key} がself.imagesに見つかりません")
+                                self.inference_results[key] = result
+                                success_count += 1
                     
                 except Exception as e:
                     print(f"バッチ {batch_idx+1} 処理中にエラー: {e}")
@@ -15501,11 +18459,11 @@ class ImageAnnotationTool(QMainWindow):
         """位置推論を実行するメソッド"""
         if not self.images:
             return
-        
+
         # 現在のモデル情報を取得
         model_type = self.auto_method_combo.currentText()
-        selected_model = self.model_combo.currentText()
-        
+        selected_model = self.get_selected_model_filename()
+
         # 推論対象の画像を決定
         if all_images:
             target_images = self.images
@@ -15513,10 +18471,10 @@ class ImageAnnotationTool(QMainWindow):
         else:
             target_images = [self.images[self.current_index]]
             progress_title = get_text('msg_location_inference_running')
-        
+
         # モデルのパスを取得
         model_path = None
-        if hasattr(self, 'model_combo') and self.model_combo.currentText() not in [get_text('combo_model_not_found'), get_text('combo_select_folder')] and "not found" not in self.model_combo.currentText().lower():
+        if hasattr(self, 'model_combo') and selected_model not in [get_text('combo_model_not_found'), get_text('combo_select_folder')] and "not found" not in selected_model.lower():
             # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
             model_path = os.path.join(models_dir, selected_model)
             
@@ -15672,6 +18630,24 @@ class ImageAnnotationTool(QMainWindow):
                 inference_text += f"<div style='display: inline-block; background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 5px; border-radius: 5px;'>"
                 inference_text += get_text('label_inference_location', location) + "</div></div>"
 
+            # Attention スコアの表示（マルチソース attention モデルのみ）
+            attn_weights = inference.get("attention_weights")
+            if attn_weights:
+                inference_text += f"<br><b>{get_text('label_attention_weights')}</b><br>"
+                for cam_name, score in attn_weights.items():
+                    bar_len = max(1, round(score * 8))
+                    # スコアに応じて青→緑でグラデーション
+                    r = int((1 - score) * 80)
+                    g = int(score * 200 + 55)
+                    b = int((1 - score) * 200 + 55)
+                    color = f"#{r:02x}{g:02x}{b:02x}"
+                    bar = '█' * bar_len
+                    inference_text += (
+                        f"<font face='monospace'>{cam_name}: "
+                        f"<font color='{color}'>{bar}</font>"
+                        f" {score:.0%}</font><br>"
+                    )
+
             # リッチテキストとして設定
             self.inference_info_label.setText(inference_text)
             self.inference_info_label.setTextFormat(Qt.RichText)
@@ -15711,6 +18687,23 @@ class ImageAnnotationTool(QMainWindow):
                 text = f"<b>{get_text('label_driving_model_n_inference', i+2)}</b><br>"
                 text += f"angle = <span style='color: {color};'>{angle:.4f}</span><br>"
                 text += f"throttle = <span style='color: {color};'>{throttle:.4f}</span>"
+
+                # Attention 貢献度バー表示
+                attn = inf.get("attention_weights")
+                if attn:
+                    text += f"<br><b>{get_text('label_attention_weights')}</b><br>"
+                    max_blocks = 8
+                    for src, score in attn.items():
+                        blocks = int(round(score * max_blocks))
+                        pct = int(round(score * 100))
+                        intensity = int(score * 200)
+                        r = min(255, 55 + intensity)
+                        g = max(0, 200 - intensity)
+                        b = 80
+                        bar_color = f"#{r:02x}{g:02x}{b:02x}"
+                        bar = f"<span style='color:{bar_color};'>{'█' * blocks}</span>"
+                        text += f"{src}: {bar} {pct}%<br>"
+
                 slot['info_label'].setText(text)
                 slot['info_label'].setTextFormat(Qt.RichText)
             else:
@@ -15735,6 +18728,8 @@ class ImageAnnotationTool(QMainWindow):
         treeView = dialog.findChild(QTreeView)
         if treeView:
             treeView.setSelectionMode(QAbstractItemView.ExtendedSelection)
+
+        dialog.resize(dialog.sizeHint().width() * 2, dialog.sizeHint().height() * 2)
 
         # 選択されたフォルダを取得
         if not dialog.exec_():
@@ -16092,6 +19087,9 @@ class ImageAnnotationTool(QMainWindow):
         
         # セッション情報を保存
         self.save_session_info()
+
+        # 前回のモデルを復元（画像読み込み完了後）
+        QTimer.singleShot(300, self._try_restore_session_models)
 
     def run_inference_after_image_source_change(self):
         """画像ソース切り替え後の推論実行"""
@@ -16460,15 +19458,15 @@ class ImageAnnotationTool(QMainWindow):
         if not self.images:
             QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_no_images'))
             return
-        
-        # モデル情報を取得
+
+        # モデル情報を取得（マルチソースマーカー対応）
         model_type = self.auto_method_combo.currentText()
-        selected_model = self.model_combo.currentText()
-        
+        selected_model = self.get_selected_model_filename()
+
         if selected_model == get_text('combo_model_not_found') or selected_model == get_text('combo_select_folder') or "not found" in selected_model.lower():
             QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_valid_model_selected'))
             return
-        
+
         # モデルのパスを取得
         # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
         model_path = os.path.join(models_dir, selected_model)
@@ -16477,7 +19475,114 @@ class ImageAnnotationTool(QMainWindow):
         if not os.path.exists(model_path):
             QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_selected_model_not_found', selected_model))
             return
-        
+
+        # マルチソースモデル検出
+        from model_catalog import detect_multi_source_from_checkpoint
+        ms_info = detect_multi_source_from_checkpoint(model_path, verbose=True)
+        is_multi_source = ms_info['num_sources'] > 1
+        multi_source_selected = None  # マルチソース推論用に選択されたソース名リスト
+
+        if is_multi_source and hasattr(self, '_session_restore_sources') and self._session_restore_sources is not None:
+            # セッション復元: ダイアログをスキップして保存済みソースを使用
+            multi_source_selected = list(self._session_restore_sources)
+            self._session_restore_sources = None
+            if len(multi_source_selected) >= 2:
+                self._combined_sources = list(multi_source_selected)
+                n = len(multi_source_selected)
+                self._combined_grid = {2: '2x1', 3: '3x1', 4: '2x2'}.get(n, '3x3' if n >= 5 else '2x1')
+                self.on_variant_changed('__combined__')
+
+        elif is_multi_source:
+            # マルチソースモデルの場合、ソース選択ダイアログを表示
+            ms_dialog = QDialog(self)
+            ms_dialog.setWindowTitle(get_text('dlg_multi_source_select'))
+            ms_dialog.setMinimumWidth(400)
+            ms_layout = QVBoxLayout(ms_dialog)
+
+            # モデル情報
+            info_label = QLabel(get_text('label_multi_source_model_info',
+                                         ms_info['num_sources'],
+                                         ms_info['fusion_method'] or '?'))
+            info_label.setWordWrap(True)
+            ms_layout.addWidget(info_label)
+
+            # 学習時のソース情報
+            if ms_info['selected_sources']:
+                trained_label = QLabel(get_text('label_multi_source_trained_sources',
+                                                ', '.join(ms_info['selected_sources'])))
+                trained_label.setStyleSheet("color: #888; font-style: italic;")
+                ms_layout.addWidget(trained_label)
+
+            # ソース選択
+            ms_layout.addWidget(QLabel(get_text('label_multi_source_select_sources')))
+
+            available = getattr(self, 'available_variants', [])
+            trained_sources = ms_info['selected_sources'] or []
+            ms_checkboxes = []
+            for var in available:
+                cb = QCheckBox(var)
+                # 学習時のソースと一致する場合はデフォルトでチェック
+                if var in trained_sources:
+                    cb.setChecked(True)
+                ms_checkboxes.append(cb)
+                ms_layout.addWidget(cb)
+
+            # 選択数の表示ラベル
+            count_label = QLabel(get_text('msg_multi_source_need_sources',
+                                          ms_info['num_sources'], 0))
+            count_label.setStyleSheet("color: #cc6600;")
+            ms_layout.addWidget(count_label)
+
+            def update_count():
+                checked = sum(1 for cb in ms_checkboxes if cb.isChecked())
+                count_label.setText(get_text('msg_multi_source_need_sources',
+                                             ms_info['num_sources'], checked))
+                if checked == ms_info['num_sources']:
+                    count_label.setStyleSheet("color: #00aa00;")
+                else:
+                    count_label.setStyleSheet("color: #cc6600;")
+
+            for cb in ms_checkboxes:
+                cb.toggled.connect(lambda _: update_count())
+            update_count()
+
+            # 結合表示リンクチェックボックス
+            link_combined_cb = QCheckBox(get_text('label_multi_source_link_combined'))
+            link_combined_cb.setChecked(True)
+            ms_layout.addWidget(link_combined_cb)
+
+            # OK / キャンセル
+            ms_btn_layout = QHBoxLayout()
+            ms_ok_btn = QPushButton("OK")
+            ms_cancel_btn = QPushButton(get_text('btn_cancel'))
+            ms_btn_layout.addStretch()
+            ms_btn_layout.addWidget(ms_ok_btn)
+            ms_btn_layout.addWidget(ms_cancel_btn)
+            ms_layout.addLayout(ms_btn_layout)
+
+            ms_ok_btn.clicked.connect(ms_dialog.accept)
+            ms_cancel_btn.clicked.connect(ms_dialog.reject)
+
+            if ms_dialog.exec_() != QDialog.Accepted:
+                return
+
+            # 選択されたソースを取得
+            multi_source_selected = [cb.text() for cb in ms_checkboxes if cb.isChecked()]
+            if len(multi_source_selected) != ms_info['num_sources']:
+                QMessageBox.warning(self, get_text('dlg_warning'),
+                                    get_text('msg_multi_source_need_sources',
+                                             ms_info['num_sources'], len(multi_source_selected)))
+                return
+
+            # 結合表示に連携
+            if link_combined_cb.isChecked() and len(multi_source_selected) >= 2:
+                self._combined_sources = list(multi_source_selected)
+                # ソース数に応じてグリッドを自動設定
+                n = len(multi_source_selected)
+                auto_grid = {2: '2x1', 3: '3x1', 4: '2x2'}.get(n, '3x3' if n >= 5 else '2x1')
+                self._combined_grid = auto_grid
+                self.on_variant_changed('__combined__')
+
         # 進捗ダイアログを表示
         progress = QProgressDialog(
             get_text('msg_loading_model', model_type, selected_model),
@@ -16507,16 +19612,16 @@ class ImageAnnotationTool(QMainWindow):
                 QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
                 QMessageBox.Yes
             )
-            
+
             if reply == QMessageBox.Cancel:
                 progress.cancel()
                 return  # 操作をキャンセル
-            
+
             clear_inference = (reply == QMessageBox.Yes)
-            
+
             # 進捗ダイアログを再表示
             progress.show()
-        
+
         try:
             # 推論結果をクリアする場合
             if clear_inference:
@@ -16554,7 +19659,7 @@ class ImageAnnotationTool(QMainWindow):
             progress.setLabelText(get_text('msg_running_inference', os.path.basename(current_img_path)))
             progress.setValue(70)
             QApplication.processEvents()
-            
+
             # モデルを明示的に読み込み（self.modelに保存）
             from model_catalog import get_model, load_model_weights, detect_num_outputs_from_checkpoint, detect_input_size_from_checkpoint
 
@@ -16575,45 +19680,132 @@ class ImageAnnotationTool(QMainWindow):
             num_outputs = detect_num_outputs_from_checkpoint(model_path, device)
             input_size = detect_input_size_from_checkpoint(model_path, device)
 
-            # モデルインスタンスを作成（検出した出力数と入力サイズで）
-            self.model = get_model(actual_model_type, pretrained=False, input_size=input_size, num_outputs=num_outputs)
+            virtual_type = ms_info.get('virtual_source_type') if ms_info else None
 
-            # 重みを読み込み
-            load_model_weights(self.model, model_path, device)
-            self.model.eval()
+            if virtual_type:
+                # 仮想ソースモデルの読み込み（crop/scale/temporal）
+                from model_catalog import create_multi_source_model, VirtualSourceDataset
+                base_model_name = ms_info['base_model_name'] or actual_model_type
+                self.model = create_multi_source_model(
+                    base_model_name=base_model_name,
+                    num_sources=ms_info['num_sources'],
+                    fusion_method=ms_info['fusion_method'] or 'concat',
+                    pretrained=False,
+                    num_outputs=num_outputs,
+                    input_size=input_size
+                )
+                load_model_weights(self.model, model_path, device)
+                self.model.eval()
+
+                _t_interval = ms_info.get('temporal_interval', 10)
+                src_names = (ms_info.get('selected_sources') or
+                             VirtualSourceDataset.source_names(virtual_type, ms_info['num_sources'], _t_interval))
+                self._virtual_source_config = {
+                    'virtual_type': virtual_type,
+                    'num_sources': ms_info['num_sources'],
+                    'source_names': src_names,
+                    'temporal_interval': _t_interval,
+                }
+                self.main_image_view.crop_overlay_config = self._virtual_source_config
+                self.main_image_view.virtual_overlay_mode = 'fill'
+                # ドロップダウンをモデルのタイプに自動同期
+                self._virtual_overlay_type = virtual_type
+                if hasattr(self, '_virtual_overlay_combo'):
+                    for _i in range(self._virtual_overlay_combo.count()):
+                        if self._virtual_overlay_combo.itemData(_i) == virtual_type:
+                            self._virtual_overlay_combo.blockSignals(True)
+                            self._virtual_overlay_combo.setCurrentIndex(_i)
+                            self._virtual_overlay_combo.blockSignals(False)
+                            break
+                self._multi_source_config = None
+                inference_results = self._run_virtual_source_inference(
+                    [self.current_index], model_path, force_reload=True
+                )
+            elif is_multi_source:
+                # マルチソースモデルの読み込み
+                from model_catalog import create_multi_source_model
+                base_model_name = ms_info['base_model_name'] or actual_model_type
+                self.model = create_multi_source_model(
+                    base_model_name=base_model_name,
+                    num_sources=ms_info['num_sources'],
+                    fusion_method=ms_info['fusion_method'] or 'concat',
+                    pretrained=False,
+                    num_outputs=num_outputs,
+                    input_size=input_size
+                )
+                load_model_weights(self.model, model_path, device)
+                self.model.eval()
+
+                self._multi_source_config = {
+                    'sources': multi_source_selected,
+                    'num_sources': ms_info['num_sources'],
+                    'fusion_method': ms_info['fusion_method'] or 'concat',
+                    'base_model_name': base_model_name,
+                }
+                self._virtual_source_config = None
+                self.main_image_view.crop_overlay_config = None
+                inference_results = self._run_multi_source_inference(
+                    [self.current_index], model_path, force_reload=True
+                )
+            else:
+                # 通常のシングルソースモデルの読み込み
+                self.model = get_model(actual_model_type, pretrained=False, input_size=input_size, num_outputs=num_outputs)
+                load_model_weights(self.model, model_path, device)
+                self.model.eval()
+
+                self._multi_source_config = None
+                self._virtual_source_config = None
+                self.main_image_view.crop_overlay_config = None
+                inference_results = batch_inference(
+                    [current_img_path],
+                    method="model",
+                    model_type=model_type,
+                    model_path=model_path,
+                    force_reload=True
+                )
             
-            # モデルを強制的に再読み込み（現在表示中の画像だけ推論）
-            inference_results = batch_inference(
-                [current_img_path],
-                method="model", 
-                model_type=model_type,
-                model_path=model_path,
-                force_reload=True  # 強制再読み込み
-            )
-            
+            # モデルの入力サイズに合わせて解像度スライダーを同期
+            if input_size is not None and hasattr(self, 'resolution_slider'):
+                orig_h = getattr(self, 'original_image_height', None)
+                orig_w = getattr(self, 'original_image_width', None)
+                if orig_h and orig_w and orig_h > 0 and orig_w > 0:
+                    scale = min(input_size[0] / orig_h, input_size[1] / orig_w)
+                    slider_val = max(10, min(100, round(scale * 100 / 5) * 5))
+                    self.resolution_slider.setValue(slider_val)
+
+            # モデル入力サイズラベルを更新
+            if hasattr(self, 'model_input_size_label'):
+                if input_size is not None:
+                    self.model_input_size_label.setText(f"入力:{input_size[1]}×{input_size[0]}")
+                else:
+                    self.model_input_size_label.setText("")
+
             progress.setLabelText(get_text('msg_saving_inference'))
             progress.setValue(80)
             QApplication.processEvents()
-            
+
             # 推論結果を保存（インデックスベースに変換）
             old_count = len(self.inference_results)
-            
-            # 画像パスからインデックスに変換して保存
-            for img_path, result in inference_results.items():
-                # 画像パスから対応するインデックスを取得
-                try:
-                    img_index = self.images.index(img_path)
+
+            # 画像パスまたはインデックスから変換して保存
+            for key, result in inference_results.items():
+                if isinstance(key, int):
+                    # マルチソース推論: キーはすでにインデックス
+                    img_index = key
                     self.inference_results[img_index] = result
-                    print(f"推論結果保存: インデックス{img_index} <- {os.path.basename(img_path)}")
-                    
-                    # 差分ベクトルの計算と保存
+                    print(f"推論結果保存: インデックス{img_index}")
                     self.calculate_and_store_diff_vector(img_index)
-                    
-                except ValueError:
-                    print(f"警告: 画像パス {img_path} がself.imagesに見つかりません")
-                    # パスでも保存（後方互換性のため）
-                    self.inference_results[img_path] = result
-            
+                else:
+                    # 通常推論: キーは画像パス
+                    try:
+                        img_index = self.images.index(key)
+                        self.inference_results[img_index] = result
+                        print(f"推論結果保存: インデックス{img_index} <- {os.path.basename(key)}")
+                        self.calculate_and_store_diff_vector(img_index)
+                    except ValueError:
+                        print(f"警告: 画像パス {key} がself.imagesに見つかりません")
+                        self.inference_results[key] = result
+
             # モデル変更を検出するための状態を保持
             self._last_model_info = (model_type, model_path)
 
@@ -16636,33 +19828,71 @@ class ImageAnnotationTool(QMainWindow):
                         from model_catalog import get_model as get_model_fn, load_model_weights as load_weights_fn
                         from model_catalog import detect_num_outputs_from_checkpoint as detect_outputs_fn
                         from model_catalog import detect_input_size_from_checkpoint as detect_input_fn
+                        from model_catalog import detect_multi_source_from_checkpoint, create_multi_source_model
 
                         extra_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                         extra_num_outputs = detect_outputs_fn(extra_model_path, extra_device)
                         extra_input_size = detect_input_fn(extra_model_path, extra_device)
-                        extra_model = get_model_fn(extra_model_type, pretrained=False, input_size=extra_input_size, num_outputs=extra_num_outputs)
-                        load_weights_fn(extra_model, extra_model_path, extra_device)
-                        extra_model.eval()
-                        slot['model'] = extra_model
 
-                        # 現在の画像に対して推論実行
-                        extra_inference_results = batch_inference(
-                            [current_img_path],
-                            method="model",
-                            model_type=extra_model_type,
-                            model_path=extra_model_path,
-                            force_reload=True
-                        )
+                        # マルチソース検出
+                        extra_ms_info = detect_multi_source_from_checkpoint(extra_model_path, extra_device, verbose=True)
+                        slot['selected_sources'] = extra_ms_info.get('selected_sources') or []
 
-                        # 推論結果をインデックスベースで保存
-                        if clear_inference:
-                            slot['inference_results'] = {}
-                        for img_path_key, result in extra_inference_results.items():
-                            try:
-                                idx = self.images.index(img_path_key)
-                                slot['inference_results'][idx] = result
-                            except ValueError:
-                                pass
+                        if extra_ms_info['num_sources'] > 1:
+                            # 仮想ソース or マルチソースモデルの読み込み
+                            slot['ms_info'] = extra_ms_info
+                            extra_base_model = extra_ms_info['base_model_name'] or extra_model_type
+                            extra_model = create_multi_source_model(
+                                base_model_name=extra_base_model,
+                                num_sources=extra_ms_info['num_sources'],
+                                fusion_method=extra_ms_info['fusion_method'] or 'concat',
+                                pretrained=False,
+                                num_outputs=extra_num_outputs,
+                                input_size=extra_input_size
+                            )
+                            load_weights_fn(extra_model, extra_model_path, extra_device)
+                            extra_model.eval()
+                            slot['model'] = extra_model
+
+                            # 仮想ソース or マルチソース推論を実行（現在のインデックス）
+                            if clear_inference:
+                                slot['inference_results'] = {}
+                            extra_vtype = extra_ms_info.get('virtual_source_type')
+                            if extra_vtype:
+                                ms_results = self._run_extra_virtual_source_inference(
+                                    [self.current_index], extra_model, extra_ms_info, extra_device
+                                )
+                            else:
+                                ms_results = self._run_extra_multi_source_inference(
+                                    [self.current_index], extra_model, extra_ms_info, extra_device
+                                )
+                            slot['inference_results'].update(ms_results)
+                        else:
+                            # シングルソースモデルの読み込み
+                            slot['ms_info'] = None
+                            extra_model = get_model_fn(extra_model_type, pretrained=False, input_size=extra_input_size, num_outputs=extra_num_outputs)
+                            load_weights_fn(extra_model, extra_model_path, extra_device)
+                            extra_model.eval()
+                            slot['model'] = extra_model
+
+                            # 現在の画像に対して推論実行
+                            extra_inference_results = batch_inference(
+                                [current_img_path],
+                                method="model",
+                                model_type=extra_model_type,
+                                model_path=extra_model_path,
+                                force_reload=True
+                            )
+
+                            # 推論結果をインデックスベースで保存
+                            if clear_inference:
+                                slot['inference_results'] = {}
+                            for img_path_key, result in extra_inference_results.items():
+                                try:
+                                    idx = self.images.index(img_path_key)
+                                    slot['inference_results'][idx] = result
+                                except ValueError:
+                                    pass
 
                         # チェックボックスを有効化
                         slot['checkbox'].setEnabled(True)
@@ -16672,6 +19902,8 @@ class ImageAnnotationTool(QMainWindow):
                     except Exception as e:
                         print(f"追加モデル{slot_idx + 2}の読み込みエラー: {e}")
                         slot['model'] = None
+                        slot['ms_info'] = None
+                        slot['selected_sources'] = []
 
             # 推論表示チェックボックスを有効にして自動的にオンにする
             progress.setLabelText(get_text('msg_updating_inference'))
@@ -16696,6 +19928,7 @@ class ImageAnnotationTool(QMainWindow):
             
             # 推論表示を更新
             self.update_inference_display()
+            self.update_variant_buttons()
             self.update_ui()
             
             # ダークモードの状態を再適用（モデル読み込み後のスタイルリセット対策）
@@ -16712,10 +19945,17 @@ class ImageAnnotationTool(QMainWindow):
             message_suffix = ""
             if clear_inference:
                 message_suffix = get_text('msg_model_loaded_suffix')
-            self.statusBar().showMessage(get_text('msg_model_loaded', model_type, selected_model, message_suffix), 3000)
+            if is_multi_source:
+                self.statusBar().showMessage(
+                    get_text('status_multi_source_model_loaded',
+                             ms_info['num_sources'], ms_info['fusion_method'] or '?'), 5000)
+            else:
+                self.statusBar().showMessage(get_text('msg_model_loaded', model_type, selected_model, message_suffix), 3000)
 
             # 確認ダイアログ
             confirm_message = get_text('msg_model_loaded_detail', model_type, selected_model)
+            if is_multi_source and multi_source_selected:
+                confirm_message += f"\n[{ms_info['num_sources']}src:{ms_info['fusion_method']}] sources: {', '.join(multi_source_selected)}"
             if clear_inference:
                 confirm_message += get_text('msg_new_inference_available', len(self.inference_results))
             else:
@@ -16769,6 +20009,9 @@ class ImageAnnotationTool(QMainWindow):
 
         # 問題を診断するためのデバッグ情報
         print(f"カタログフォルダを読み込み中: {catalog_folder}")
+
+        # 逆引きマップをリセット（新規読み込みのため）
+        self._manifest_image_to_entry = {}
 
         try:
             # manifest.jsonの確認
@@ -16979,7 +20222,15 @@ class ImageAnnotationTool(QMainWindow):
                             location = entry.get('user/loc', entry.get('pilot/loc', None))
 
                             # Speed情報を取得
-                            speed = entry.get('speed', entry.get('user/speed', entry.get('pilot/speed', None)))
+                            # user/speed → その他の */speed（pilot/speed除く）→ speed → pilot/speed の優先順で取得
+                            speed = entry.get('user/speed')
+                            if speed is None:
+                                for _k, _v in entry.items():
+                                    if _k.endswith('/speed') and _k != 'pilot/speed' and _k != 'user/speed':
+                                        speed = _v
+                                        break
+                            if speed is None:
+                                speed = entry.get('speed', entry.get('pilot/speed', None))
 
                             # 座標に変換
                             x = int((angle + 1) / 2 * img_width)
@@ -17018,6 +20269,8 @@ class ImageAnnotationTool(QMainWindow):
                                 if key in ['user/angle', 'pilot/angle', 'user/throttle', 'pilot/throttle',
                                            'user/loc', 'pilot/loc', 'speed', 'user/speed', 'pilot/speed']:
                                     continue
+                                if key.endswith('/speed'):  # */speed は上で処理済み
+                                    continue
                                 # 数値データのみ保存
                                 if isinstance(value, (int, float)):
                                     self.annotations[actual_index][key] = value
@@ -17032,6 +20285,12 @@ class ImageAnnotationTool(QMainWindow):
                             # 削除されたエントリの場合、削除インデックスリストに追加
                             if is_deleted:
                                 deleted_actual_indexes.append(actual_index)
+
+                            # 画像インデックス ↔ カタログエントリインデックスの逆引きマップを記録
+                            if entry_index is not None:
+                                if not hasattr(self, '_manifest_image_to_entry'):
+                                    self._manifest_image_to_entry = {}
+                                self._manifest_image_to_entry[actual_index] = entry_index
 
                             loaded_count += 1
                             
@@ -17243,48 +20502,113 @@ class ImageAnnotationTool(QMainWindow):
         # ダイアログで選択されたソース順序を使用
         source_order = getattr(self, '_combined_sources', list(self.available_variants))
 
-        pil_images = []
+        # ソース順序に沿って (name, image_or_None) のリストを作成
+        # 画像が取得できないスロットも位置を保持してプレースホルダーを表示する
+        cell_slots = []  # [(source_name, PIL.Image or None), ...]
         for var in source_order:
             if var in group:
                 img = load_image_safely(group[var])
                 if img is not None:
                     if img.mode != 'RGB':
                         img = img.convert('RGB')
-                    pil_images.append(img)
+                    cell_slots.append((var, img))
+                else:
+                    cell_slots.append((var, None))
+            else:
+                cell_slots.append((var, None))
 
-        if not pil_images:
+        if not any(img is not None for _, img in cell_slots):
             return None
+
+        # 各モデルの推論ソースとカラーを収集: {source: [(rgb, inset_index)]}
+        source_model_colors = {}  # {source_name: [rgb_tuple, ...]}
+        ms_config = getattr(self, '_multi_source_config', None)
+        if ms_config:
+            main_srcs = ms_config.get('sources', [])
+        else:
+            # 推論対象ソースが明示指定されていればそちらを優先、なければ先頭ソース
+            infer_src = getattr(self, '_combined_inference_source', None)
+            if infer_src and infer_src in self.available_variants:
+                base_variant = infer_src
+            else:
+                base_variant = self.available_variants[0] if self.available_variants else None
+            main_srcs = [base_variant] if base_variant else []
+        for src in main_srcs:
+            source_model_colors.setdefault(src, []).append((0, 153, 153))  # #009999
+        for i, slot in enumerate(getattr(self, 'extra_model_slots', [])):
+            if slot.get('model') is None or not slot['checkbox'].isChecked():
+                continue
+            hex_c = self.extra_model_colors[i].lstrip('#')
+            rgb = tuple(int(hex_c[j:j+2], 16) for j in (0, 2, 4))
+            for src in slot.get('selected_sources', []):
+                source_model_colors.setdefault(src, []).append(rgb)
 
         # ダイアログで選択されたグリッドサイズを使用
         grid = getattr(self, '_combined_grid', '2x1')
-        grid_map = {'2x1': (2, 1), '1x2': (1, 2), '2x2': (2, 2), '3x3': (3, 3)}
+        grid_map = {'2x1': (2, 1), '1x2': (1, 2), '3x1': (3, 1), '2x2': (2, 2), '3x3': (3, 3)}
         cols, rows = grid_map.get(grid, (2, 1))
 
-        # キャンバスサイズ（元の画像サイズ）
-        canvas_w = getattr(self, 'original_image_width', 320)
-        canvas_h = getattr(self, 'original_image_height', 240)
+        # ソース数がグリッドより少ない場合はグリッドを縮小して黒帯を避ける
+        n_slots = len(cell_slots)
+        if n_slots > 0 and n_slots < cols * rows:
+            cols = min(cols, n_slots)
+            rows = max(1, (n_slots + cols - 1) // cols)
 
-        cell_w = canvas_w // cols
-        cell_h = canvas_h // rows
+        # キャンバスサイズ（元の画像サイズ × グリッド数で横幅を確保）
+        base_w = getattr(self, 'original_image_width', 320)
+        base_h = getattr(self, 'original_image_height', 240)
+        cell_w = base_w
+        cell_h = base_h
+        canvas_w = cell_w * cols
+        canvas_h = cell_h * rows
 
         combined = Image.new('RGB', (canvas_w, canvas_h), (32, 32, 32))
+        draw = ImageDraw.Draw(combined)
 
-        for i, img in enumerate(pil_images):
+        for i, (src_name, img) in enumerate(cell_slots):
             if i >= cols * rows:
                 break
-            row = i // cols
-            col = i % cols
+            r = i // cols
+            c = i % cols
+            cell_x0 = c * cell_w
+            cell_y0 = r * cell_h
 
-            # アスペクト比を維持してセル内にフィット
-            scale = min(cell_w / img.width, cell_h / img.height)
-            new_w = int(img.width * scale)
-            new_h = int(img.height * scale)
-            resized = img.resize((new_w, new_h), Image.LANCZOS)
+            if img is not None:
+                # アスペクト比を維持してセル内にフィット
+                scale = min(cell_w / img.width, cell_h / img.height)
+                new_w = int(img.width * scale)
+                new_h = int(img.height * scale)
+                resized = img.resize((new_w, new_h), Image.LANCZOS)
 
-            # セル内で中央配置
-            x = col * cell_w + (cell_w - new_w) // 2
-            y = row * cell_h + (cell_h - new_h) // 2
-            combined.paste(resized, (x, y))
+                # セル内で中央配置
+                x = cell_x0 + (cell_w - new_w) // 2
+                y = cell_y0 + (cell_h - new_h) // 2
+                combined.paste(resized, (x, y))
+            else:
+                # 画像が取得できない場合: グレーのプレースホルダー + ソース名テキスト
+                draw.rectangle(
+                    [cell_x0 + 2, cell_y0 + 2, cell_x0 + cell_w - 3, cell_y0 + cell_h - 3],
+                    outline=(80, 80, 80)
+                )
+                label = f"{src_name}\nN/A"
+                draw.text(
+                    (cell_x0 + cell_w // 2 - 20, cell_y0 + cell_h // 2 - 10),
+                    label,
+                    fill=(120, 120, 120)
+                )
+
+            # 各モデルの色でセル枠を描画（外側から順に重ねる）
+            colors_for_src = source_model_colors.get(src_name, [])
+            if colors_for_src:
+                border_w = max(2, min(canvas_w, canvas_h) // 120)
+                for ci, color_rgb in enumerate(colors_for_src):
+                    inset = ci * border_w
+                    x0 = cell_x0 + inset
+                    y0 = cell_y0 + inset
+                    x1 = cell_x0 + cell_w - 1 - inset
+                    y1 = cell_y0 + cell_h - 1 - inset
+                    for b in range(border_w):
+                        draw.rectangle([x0 + b, y0 + b, x1 - b, y1 - b], outline=color_rgb)
 
         return combined
 
@@ -17292,6 +20616,10 @@ class ImageAnnotationTool(QMainWindow):
         """現在の画像を表示（YOLOアノテーションも含む）"""
         if not self.images or self.current_index >= len(self.images):
             return
+
+        # 時系列サムネイルキャッシュをクリア（フレームが変わると前後フレームも変わる）
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view._temporal_thumb_cache.clear()
 
         current_image_path = self.images[self.current_index]
 
@@ -17315,6 +20643,7 @@ class ImageAnnotationTool(QMainWindow):
             # main_image_viewに画像を設定
             if hasattr(self, 'main_image_view'):
                 self.main_image_view.setPixmap(pixmap)
+                self._update_resolution_size_label()
                 
                 # バウンディングボックスアノテーションがあれば表示用データを設定
                 if hasattr(self, 'bbox_annotations') and self.current_index in self.bbox_annotations:
@@ -17957,12 +21286,11 @@ class ImageAnnotationTool(QMainWindow):
 
         # セグメンテーション推論表示の更新
         if hasattr(self, 'segmentation_inference_checkbox') and self.segmentation_inference_checkbox.isChecked():
-            # 推論結果がまだない場合のみ推論を実行
-            if new_img_path not in self.segmentation_inference_results:
-                self.run_single_yolo_segmentation_inference()
-            else:
-                # 既にある結果の表示を更新
+            cached = self.segmentation_inference_results.get(new_img_path)
+            if cached and cached.get('success'):
                 self.update_segmentation_inference_display()
+            else:
+                self.run_single_yolo_segmentation_inference()
 
         # 画面を更新 - ギャラリーは遅延更新でパフォーマンス改善
         # 再生中はデバウンスをスキップして直接更新（タイマーリセット問題を回避）
@@ -18461,22 +21789,24 @@ class ImageAnnotationTool(QMainWindow):
             with open(label_path, 'w') as f:
                 for seg_idx, seg_data in enumerate(segmentations):
                     class_name = seg_data.get('class', 'unknown')
-                    points = seg_data.get('points', [])
-                    
+
+                    # polygon / fill / brush すべてに対応した輪郭点取得
+                    points = _seg_to_polygon_points(seg_data, img_width, img_height)
+
                     # クラスインデックスを取得
                     if class_name not in class_to_index:
                         print(f"警告: 未知のクラス '{class_name}' をスキップします")
                         continue
-                    
+
                     class_idx = class_to_index[class_name]
-                    
+
                     # ポイント数の確認
                     if len(points) < 3:
                         print(f"警告: ポイント数が不足しています ({len(points)}点) - セグメンテーション {seg_idx}")
                         continue
-                    
+
                     print(f"  セグメンテーション {seg_idx}: クラス={class_name}({class_idx}), ポイント数={len(points)}")
-                    
+
                     # YOLO セグメンテーション形式のコーディネートに変換
                     normalized_coords = []
                     for point_idx, (px, py) in enumerate(points):
@@ -19079,14 +22409,19 @@ class ImageAnnotationTool(QMainWindow):
         # 学習設定ダイアログを表示
         training_settings = QDialog(self)
         training_settings.setWindowTitle(get_text('dlg_training_settings'))
-        training_settings.setMinimumWidth(1000)  # 2カラムレイアウト用に幅を広げる
+        training_settings.setMinimumSize(1150, 500)
+        training_settings.resize(1350, 750)
+        training_settings.setSizeGripEnabled(True)
 
         settings_layout = QVBoxLayout(training_settings)
 
         # タブウィジェットを作成
         tabs = QTabWidget()
 
-        # 基本設定タブ
+        # 基本設定タブ（スクロールエリアでラップして縦に収まるように）
+        basic_scroll = QScrollArea()
+        basic_scroll.setWidgetResizable(True)
+        basic_scroll.setFrameShape(QScrollArea.NoFrame)
         basic_tab = QWidget()
         basic_layout = QHBoxLayout(basic_tab)
         left_column = QVBoxLayout()
@@ -19215,7 +22550,7 @@ class ImageAnnotationTool(QMainWindow):
             if filtered:
                 finetune_model_combo.addItems(filtered)
                 # 現在選択されているモデルがリストにあればデフォルトにする
-                current_model = self.model_combo.currentText()
+                current_model = self.get_selected_model_filename()
                 if current_model in filtered:
                     finetune_model_combo.setCurrentText(current_model)
                 # ファインチューニングオプションを有効化
@@ -19239,7 +22574,7 @@ class ImageAnnotationTool(QMainWindow):
         # 初期リストを設定
         if has_valid_models:
             finetune_model_combo.addItems(filtered_models)
-            current_model = self.model_combo.currentText()
+            current_model = self.get_selected_model_filename()
             if current_model in filtered_models:
                 finetune_model_combo.setCurrentText(current_model)
         else:
@@ -19292,7 +22627,8 @@ class ImageAnnotationTool(QMainWindow):
             speed_row_layout.addWidget(speed_normalize_label)
             speed_normalize_spin = QDoubleSpinBox()
             speed_normalize_spin.setRange(0.1, 100.0)
-            speed_normalize_spin.setValue(10.0)
+            _default_max_speed = MAX_SPEED
+            speed_normalize_spin.setValue(_default_max_speed)
             speed_normalize_spin.setDecimals(1)
             speed_normalize_spin.setSingleStep(1.0)
             speed_normalize_spin.setToolTip(get_text('tip_speed_normalize'))
@@ -19327,9 +22663,294 @@ class ImageAnnotationTool(QMainWindow):
         future_detail_label.setWordWrap(True)
         output_settings_layout.addWidget(future_detail_label)
 
+        output_settings_layout.addSpacing(10)
+
+        # 将来フレームをラベルとして使用する設定
+        future_label_row = QHBoxLayout()
+        future_label_row.setSpacing(6)
+        future_label_check = QCheckBox(get_text('chk_future_label_output'))
+        future_label_check.setChecked(False)
+        future_label_check.setToolTip(get_text('tip_future_label_output'))
+        future_label_row.addWidget(future_label_check)
+
+        future_label_spin = QSpinBox()
+        future_label_spin.setRange(1, 100)
+        future_label_spin.setValue(5)
+        future_label_spin.setEnabled(False)
+        future_label_spin.setFixedWidth(60)
+        future_label_row.addWidget(future_label_spin)
+
+        future_label_frames_label = QLabel(get_text('label_future_label_frames'))
+        future_label_row.addWidget(future_label_frames_label)
+        future_label_row.addStretch()
+        output_settings_layout.addLayout(future_label_row)
+
+        future_label_info_label = QLabel(get_text('label_future_label_info'))
+        future_label_info_label.setStyleSheet("color: #666;")
+        future_label_info_label.setWordWrap(True)
+        output_settings_layout.addWidget(future_label_info_label)
+
+        future_label_check.toggled.connect(future_label_spin.setEnabled)
+
         output_settings_layout.addStretch()
         output_settings_group.setLayout(output_settings_layout)
         left_column.addWidget(output_settings_group)
+
+        # 入力画像ソース選択グループ
+        image_source_group = QGroupBox(get_text('label_training_image_sources'))
+        image_source_layout = QVBoxLayout()
+
+        # 説明ラベル
+        image_source_info = QLabel(get_text('label_training_image_sources_info'))
+        image_source_info.setStyleSheet("color: #666;")
+        image_source_info.setWordWrap(True)
+        image_source_layout.addWidget(image_source_info)
+
+        # 画像ソースチェックボックスを作成
+        training_source_checkboxes = {}
+        available_sources = {}
+        if hasattr(self, 'source_images_map') and self.source_images_map:
+            available_sources = self.source_images_map
+        elif hasattr(self, 'variant_images') and self.variant_images:
+            available_sources = self.variant_images
+
+        current_var = getattr(self, 'current_variant', None)
+
+        if available_sources:
+            for variant, img_list in available_sources.items():
+                img_count = len(img_list)
+                if variant == current_var:
+                    label_text = get_text('label_current_source_marker', variant, img_count)
+                else:
+                    label_text = get_text('label_other_source_marker', variant, img_count)
+                cb = QCheckBox(label_text)
+                cb.setProperty("variant", variant)
+                # 現在表示中のソースはデフォルトでチェック
+                if variant == current_var:
+                    cb.setChecked(True)
+                training_source_checkboxes[variant] = cb
+                image_source_layout.addWidget(cb)
+        else:
+            # 単一ソースの場合（バリアント情報なし）
+            cb = QCheckBox(get_text('label_current_source_marker', 'cam', len(self.images)))
+            cb.setProperty("variant", "cam")
+            cb.setChecked(True)
+            cb.setEnabled(False)
+            training_source_checkboxes['cam'] = cb
+            image_source_layout.addWidget(cb)
+
+        # 選択状況ラベル
+        training_sources_count_label = QLabel("")
+        training_sources_count_label.setStyleSheet("color: #2E7D32; font-weight: bold;")
+        image_source_layout.addWidget(training_sources_count_label)
+
+        def update_training_sources_count():
+            checked_sources = [name for name, cb in training_source_checkboxes.items() if cb.isChecked()]
+            n_sources = len(checked_sources)
+            if n_sources > 1:
+                # マルチソース: サンプル数 = 最初のソースの画像数
+                first_src = checked_sources[0]
+                n_samples = len(available_sources.get(first_src, self.images))
+                training_sources_count_label.setText(
+                    get_text('label_training_sources_count_multi', n_sources, n_samples, n_sources)
+                )
+            else:
+                estimated_count = 0
+                for src_name in checked_sources:
+                    if src_name in available_sources:
+                        estimated_count += len(available_sources[src_name])
+                    else:
+                        estimated_count += len(self.images)
+                training_sources_count_label.setText(
+                    get_text('label_training_sources_count', n_sources, estimated_count)
+                )
+            # データ選択のサンプル数も更新
+            if 'update_data_selection_ui' in dir():
+                update_data_selection_ui()
+
+        for cb in training_source_checkboxes.values():
+            cb.stateChanged.connect(update_training_sources_count)
+
+        update_training_sources_count()
+
+        image_source_group.setLayout(image_source_layout)
+        left_column.addWidget(image_source_group)
+
+        # 特徴融合設定グループ（マルチソース時のみ表示）
+        fusion_group = QGroupBox(get_text('label_fusion_settings'))
+        fusion_layout = QVBoxLayout()
+
+        fusion_info = QLabel(get_text('label_fusion_info'))
+        fusion_info.setStyleSheet("color: #666;")
+        fusion_info.setWordWrap(True)
+        fusion_layout.addWidget(fusion_info)
+
+        fusion_method_layout = QHBoxLayout()
+        fusion_method_layout.addWidget(QLabel(get_text('label_fusion_method')))
+        fusion_combo = QComboBox()
+        fusion_combo.addItem(get_text('fusion_concat'), 'concat')
+        fusion_combo.addItem(get_text('fusion_attention'), 'attention')
+        fusion_combo.setCurrentIndex(1)  # デフォルト: attention
+        fusion_method_layout.addWidget(fusion_combo)
+        fusion_method_layout.addStretch()
+        fusion_layout.addLayout(fusion_method_layout)
+
+        fusion_note = QLabel(get_text('label_multi_source_note'))
+        fusion_note.setStyleSheet("color: #E65100; font-weight: bold;")
+        fusion_note.setWordWrap(True)
+        fusion_layout.addWidget(fusion_note)
+
+        fusion_group.setLayout(fusion_layout)
+        fusion_group.setVisible(False)  # 初期状態では非表示
+        left_column.addWidget(fusion_group)
+
+        def update_fusion_visibility():
+            checked_count = sum(1 for cb in training_source_checkboxes.values() if cb.isChecked())
+            fusion_group.setVisible(checked_count > 1)
+            virtual_group.setVisible(checked_count == 1)
+
+        for cb in training_source_checkboxes.values():
+            cb.stateChanged.connect(update_fusion_visibility)
+
+        # 仮想ソース生成設定グループ（単一ソース選択時のみ表示）
+        virtual_group = QGroupBox(get_text('label_virtual_source_settings'))
+        virtual_layout = QVBoxLayout()
+
+        virtual_type_row = QHBoxLayout()
+        virtual_type_row.addWidget(QLabel(get_text('label_virtual_source_type')))
+        virtual_type_combo = QComboBox()
+        virtual_type_combo.addItem(get_text('opt_virtual_none'),     None)
+        virtual_type_combo.addItem(get_text('opt_virtual_crop'),     'crop')
+        virtual_type_combo.addItem(get_text('opt_virtual_scale'),    'scale')
+        virtual_type_combo.addItem(get_text('opt_virtual_temporal'), 'temporal')
+        virtual_type_row.addWidget(virtual_type_combo)
+        virtual_type_row.addStretch()
+        virtual_layout.addLayout(virtual_type_row)
+
+        virtual_nsrc_row_widget = QWidget()
+        virtual_nsrc_row = QHBoxLayout(virtual_nsrc_row_widget)
+        virtual_nsrc_row.setContentsMargins(0, 0, 0, 0)
+        virtual_nsrc_row.addWidget(QLabel(get_text('label_virtual_num_sources')))
+        virtual_nsrc_spin = QSpinBox()
+        virtual_nsrc_spin.setRange(2, 4)
+        virtual_nsrc_spin.setValue(3)
+        virtual_nsrc_row.addWidget(virtual_nsrc_spin)
+        virtual_nsrc_row.addStretch()
+        virtual_nsrc_label = QLabel()  # "left / center / right" などの説明ラベル
+        virtual_nsrc_row.addWidget(virtual_nsrc_label)
+        virtual_layout.addWidget(virtual_nsrc_row_widget)
+
+        # 時間差インターバル行（temporalのみ表示）
+        temporal_interval_row_widget = QWidget()
+        temporal_interval_row = QHBoxLayout(temporal_interval_row_widget)
+        temporal_interval_row.setContentsMargins(0, 0, 0, 0)
+        temporal_interval_row.addWidget(QLabel(get_text('label_temporal_interval')))
+        temporal_interval_spin = QSpinBox()
+        temporal_interval_spin.setRange(1, 300)
+        temporal_interval_spin.setValue(getattr(self, '_temporal_interval', 10))
+        temporal_interval_spin.setSuffix(' frames')
+        temporal_interval_row.addWidget(temporal_interval_spin)
+        temporal_interval_row.addStretch()
+        virtual_layout.addWidget(temporal_interval_row_widget)
+
+        virtual_note = QLabel(get_text('label_virtual_source_note'))
+        virtual_note.setStyleSheet("color: #1565C0; font-style: italic;")
+        virtual_note.setWordWrap(True)
+        virtual_layout.addWidget(virtual_note)
+
+        def _update_virtual_nsrc_label():
+            from model_catalog import VirtualSourceDataset
+            vtype = virtual_type_combo.currentData()
+            n = virtual_nsrc_spin.value()
+            interval = temporal_interval_spin.value()
+            if vtype:
+                names = VirtualSourceDataset.source_names(vtype, n, interval)
+                virtual_nsrc_label.setText(' / '.join(names))
+            else:
+                virtual_nsrc_label.setText('')
+            virtual_nsrc_row_widget.setVisible(vtype is not None)
+            temporal_interval_row_widget.setVisible(vtype == 'temporal')
+
+        virtual_type_combo.currentIndexChanged.connect(_update_virtual_nsrc_label)
+        virtual_nsrc_spin.valueChanged.connect(_update_virtual_nsrc_label)
+        temporal_interval_spin.valueChanged.connect(_update_virtual_nsrc_label)
+        _update_virtual_nsrc_label()
+
+        virtual_group.setLayout(virtual_layout)
+        left_column.addWidget(virtual_group)
+        update_fusion_visibility()  # 初期表示時に正しい可視状態を設定
+
+        # 解像度モードグループ（常時表示、スライダーと連動）
+        _main_slider = getattr(self, 'resolution_slider', None)
+        res_val = _main_slider.value() if _main_slider else 100
+        resolution_mode_group = QGroupBox(get_text('label_resolution_mode_group'))
+        resolution_mode_layout = QVBoxLayout()
+
+        # 解像度スライダー（メインキャンバスのスライダーと双方向連動）
+        res_slider_row = QHBoxLayout()
+        res_dlg_label = QLabel(get_text('label_resolution_scale'))
+        res_dlg_label.setFixedWidth(50)
+        res_slider_row.addWidget(res_dlg_label)
+        res_dlg_slider = QSlider(Qt.Horizontal)
+        res_dlg_slider.setMinimum(10)
+        res_dlg_slider.setMaximum(100)
+        res_dlg_slider.setValue(res_val)
+        res_dlg_slider.setTickPosition(QSlider.TicksBelow)
+        res_dlg_slider.setTickInterval(10)
+        res_dlg_slider.setSingleStep(5)
+        res_slider_row.addWidget(res_dlg_slider, 1)
+        res_dlg_value_label = QLabel(f"{res_val}%")
+        res_dlg_value_label.setFixedWidth(38)
+        res_dlg_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        res_slider_row.addWidget(res_dlg_value_label)
+        resolution_mode_layout.addLayout(res_slider_row)
+
+        pixelate_radio = QRadioButton(get_text('opt_resolution_pixelate'))
+        resize_radio = QRadioButton(get_text('opt_resolution_resize'))
+        # スライダーが100%未満ならデフォルトを縮小モードにする
+        if res_val < 100:
+            resize_radio.setChecked(True)
+        else:
+            pixelate_radio.setChecked(True)
+        resolution_mode_layout.addWidget(pixelate_radio)
+        resolution_mode_layout.addWidget(resize_radio)
+
+        def _on_dlg_res_slider_changed(v):
+            res_dlg_value_label.setText(f"{v}%")
+            # メインスライダーと連動
+            if _main_slider:
+                _main_slider.blockSignals(True)
+                _main_slider.setValue(v)
+                _main_slider.blockSignals(False)
+                if hasattr(self, 'main_image_view'):
+                    self.main_image_view.resolution_scale = v / 100.0
+                if hasattr(self, 'resolution_value_label'):
+                    self.resolution_value_label.setText(f"{v}%")
+                if hasattr(self, '_update_resolution_size_label'):
+                    self._update_resolution_size_label()
+                if hasattr(self, 'main_image_view'):
+                    self.main_image_view.update()
+            # 100%未満でリサイズをデフォルトに
+            if v < 100 and not resize_radio.isChecked() and not pixelate_radio.isChecked():
+                resize_radio.setChecked(True)
+
+        res_dlg_slider.valueChanged.connect(_on_dlg_res_slider_changed)
+
+        # メインスライダー → ダイアログスライダーへの連動（ダイアログ閉時に切断）
+        if _main_slider:
+            def _sync_from_main(v):
+                try:
+                    res_dlg_slider.blockSignals(True)
+                    res_dlg_slider.setValue(v)
+                    res_dlg_value_label.setText(f"{v}%")
+                    res_dlg_slider.blockSignals(False)
+                except RuntimeError:
+                    pass
+            _main_slider.valueChanged.connect(_sync_from_main)
+            training_settings.finished.connect(lambda: _main_slider.valueChanged.disconnect(_sync_from_main))
+
+        resolution_mode_group.setLayout(resolution_mode_layout)
+        left_column.addWidget(resolution_mode_group)
 
         # 学習パラメータグループ
         training_params_group = QGroupBox(get_text('label_training_params'))
@@ -19609,8 +23230,9 @@ class ImageAnnotationTool(QMainWindow):
         basic_layout.addLayout(left_column)
         basic_layout.addLayout(right_column)
 
-        # タブに追加
-        tabs.addTab(basic_tab, get_text('tab_basic_settings'))
+        # スクロールエリアにセットしてタブに追加
+        basic_scroll.setWidget(basic_tab)
+        tabs.addTab(basic_scroll, get_text('tab_basic_settings'))
         
         # データオーグメンテーションタブ
         aug_tab = QWidget()
@@ -19754,25 +23376,231 @@ class ImageAnnotationTool(QMainWindow):
         
         aug_options_layout.addLayout(erase_details_layout)
         
+        # =====================================================================
+        # ドメインランダマイゼーション グループ (A-D)
+        # =====================================================================
+        dr_group = QGroupBox(get_text('group_domain_randomization'))
+        dr_layout = QVBoxLayout()
+
+        def _dr_row(check_key, checked_default, *param_widgets):
+            row = QHBoxLayout()
+            cb = QCheckBox(get_text(check_key))
+            cb.setChecked(checked_default)
+            row.addWidget(cb)
+            for w in param_widgets:
+                row.addWidget(w)
+            row.addStretch()
+            dr_layout.addLayout(row)
+            return cb
+
+        # A: 色相シフト
+        aug_hue_range_label = QLabel(get_text('label_hue_range'))
+        aug_hue_range = QDoubleSpinBox()
+        aug_hue_range.setRange(0.01, 0.5)
+        aug_hue_range.setSingleStep(0.01)
+        aug_hue_range.setValue(0.1)
+        aug_hue_prob_label = QLabel(get_text('label_hue_prob'))
+        aug_hue_prob = QDoubleSpinBox()
+        aug_hue_prob.setRange(0.05, 1.0)
+        aug_hue_prob.setSingleStep(0.05)
+        aug_hue_prob.setValue(0.5)
+        aug_hue_checkbox = _dr_row('chk_aug_hue', False, aug_hue_range_label, aug_hue_range,
+                                   aug_hue_prob_label, aug_hue_prob)
+
+        # A: グレースケール化
+        aug_grayscale_prob_label = QLabel(get_text('label_grayscale_prob'))
+        aug_grayscale_prob = QDoubleSpinBox()
+        aug_grayscale_prob.setRange(0.01, 1.0)
+        aug_grayscale_prob.setSingleStep(0.05)
+        aug_grayscale_prob.setValue(0.1)
+        aug_grayscale_checkbox = _dr_row('chk_aug_grayscale', False, aug_grayscale_prob_label, aug_grayscale_prob)
+
+        # A: ガウシアンノイズ
+        aug_noise_std_label = QLabel(get_text('label_noise_std'))
+        aug_noise_std = QDoubleSpinBox()
+        aug_noise_std.setRange(0.005, 0.15)
+        aug_noise_std.setSingleStep(0.005)
+        aug_noise_std.setValue(0.03)
+        aug_noise_prob_label = QLabel(get_text('label_noise_prob'))
+        aug_noise_prob = QDoubleSpinBox()
+        aug_noise_prob.setRange(0.05, 1.0)
+        aug_noise_prob.setSingleStep(0.05)
+        aug_noise_prob.setValue(0.5)
+        aug_noise_checkbox = _dr_row('chk_aug_noise', False, aug_noise_std_label, aug_noise_std,
+                                     aug_noise_prob_label, aug_noise_prob)
+
+        # B: ガウシアンブラー
+        aug_blur_kernel_label = QLabel(get_text('label_blur_kernel'))
+        aug_blur_kernel = QSpinBox()
+        aug_blur_kernel.setRange(3, 21)
+        aug_blur_kernel.setSingleStep(2)
+        aug_blur_kernel.setValue(5)
+        aug_blur_prob_label = QLabel(get_text('label_blur_prob'))
+        aug_blur_prob = QDoubleSpinBox()
+        aug_blur_prob.setRange(0.05, 1.0)
+        aug_blur_prob.setSingleStep(0.05)
+        aug_blur_prob.setValue(0.5)
+        aug_blur_checkbox = _dr_row('chk_aug_blur', False, aug_blur_kernel_label, aug_blur_kernel,
+                                    aug_blur_prob_label, aug_blur_prob)
+
+        # B: モーションブラー
+        aug_motion_kernel_label = QLabel(get_text('label_motion_kernel'))
+        aug_motion_kernel = QSpinBox()
+        aug_motion_kernel.setRange(3, 25)
+        aug_motion_kernel.setSingleStep(2)
+        aug_motion_kernel.setValue(9)
+        aug_motion_prob_label = QLabel(get_text('label_motion_prob'))
+        aug_motion_prob = QDoubleSpinBox()
+        aug_motion_prob.setRange(0.05, 1.0)
+        aug_motion_prob.setSingleStep(0.05)
+        aug_motion_prob.setValue(0.5)
+        aug_motion_blur_checkbox = _dr_row('chk_aug_motion_blur', False, aug_motion_kernel_label, aug_motion_kernel,
+                                           aug_motion_prob_label, aug_motion_prob)
+
+        # D: 霧・霞
+        aug_fog_intensity_label = QLabel(get_text('label_fog_intensity'))
+        aug_fog_intensity = QDoubleSpinBox()
+        aug_fog_intensity.setRange(0.05, 0.8)
+        aug_fog_intensity.setSingleStep(0.05)
+        aug_fog_intensity.setValue(0.3)
+        aug_fog_prob_label = QLabel(get_text('label_fog_prob'))
+        aug_fog_prob = QDoubleSpinBox()
+        aug_fog_prob.setRange(0.05, 1.0)
+        aug_fog_prob.setSingleStep(0.05)
+        aug_fog_prob.setValue(0.5)
+        aug_fog_checkbox = _dr_row('chk_aug_fog', False, aug_fog_intensity_label, aug_fog_intensity,
+                                   aug_fog_prob_label, aug_fog_prob)
+
+        dr_group.setLayout(dr_layout)
+        aug_options_layout.addWidget(dr_group)
+
+        # =====================================================================
+        # 強光・路面グレア グループ
+        # =====================================================================
+        sun_group = QGroupBox(get_text('group_sunlight'))
+        sun_layout = QVBoxLayout()
+
+        def _sun_row(check_key, checked_default, *param_widgets):
+            row = QHBoxLayout()
+            cb = QCheckBox(get_text(check_key))
+            cb.setChecked(checked_default)
+            row.addWidget(cb)
+            for w in param_widgets:
+                row.addWidget(w)
+            row.addStretch()
+            sun_layout.addLayout(row)
+            return cb
+
+        # サンスポット
+        aug_sunspot_intensity_label = QLabel(get_text('label_sunspot_intensity'))
+        aug_sunspot_intensity = QDoubleSpinBox()
+        aug_sunspot_intensity.setRange(0.1, 0.95)
+        aug_sunspot_intensity.setSingleStep(0.05)
+        aug_sunspot_intensity.setValue(0.55)
+        aug_sunspot_num_label = QLabel(get_text('label_sunspot_num'))
+        aug_sunspot_num = QSpinBox()
+        aug_sunspot_num.setRange(1, 8)
+        aug_sunspot_num.setValue(1)
+        aug_sunspot_prob_label = QLabel(get_text('label_sunspot_prob'))
+        aug_sunspot_prob = QDoubleSpinBox()
+        aug_sunspot_prob.setRange(0.05, 1.0)
+        aug_sunspot_prob.setSingleStep(0.05)
+        aug_sunspot_prob.setValue(0.5)
+        aug_sunspot_checkbox = _sun_row('chk_aug_sunspot', False,
+                                        aug_sunspot_intensity_label, aug_sunspot_intensity,
+                                        aug_sunspot_num_label, aug_sunspot_num,
+                                        aug_sunspot_prob_label, aug_sunspot_prob)
+
+        # ガンマ変動
+        aug_gamma_min_label = QLabel(get_text('label_gamma_min'))
+        aug_gamma_min = QDoubleSpinBox()
+        aug_gamma_min.setRange(0.3, 1.0)
+        aug_gamma_min.setSingleStep(0.05)
+        aug_gamma_min.setValue(0.5)
+        aug_gamma_max_label = QLabel(get_text('label_gamma_max'))
+        aug_gamma_max = QDoubleSpinBox()
+        aug_gamma_max.setRange(1.0, 3.0)
+        aug_gamma_max.setSingleStep(0.1)
+        aug_gamma_max.setValue(1.8)
+        aug_gamma_prob_label = QLabel(get_text('label_gamma_prob'))
+        aug_gamma_prob = QDoubleSpinBox()
+        aug_gamma_prob.setRange(0.05, 1.0)
+        aug_gamma_prob.setSingleStep(0.05)
+        aug_gamma_prob.setValue(0.5)
+        aug_gamma_checkbox = _sun_row('chk_aug_gamma', False,
+                                      aug_gamma_min_label, aug_gamma_min,
+                                      aug_gamma_max_label, aug_gamma_max,
+                                      aug_gamma_prob_label, aug_gamma_prob)
+
+        # 影コントラスト
+        aug_shadow_darkness_label = QLabel(get_text('label_shadow_darkness'))
+        aug_shadow_darkness = QDoubleSpinBox()
+        aug_shadow_darkness.setRange(0.1, 0.9)
+        aug_shadow_darkness.setSingleStep(0.05)
+        aug_shadow_darkness.setValue(0.5)
+        aug_shadow_prob_label = QLabel(get_text('label_shadow_prob'))
+        aug_shadow_prob = QDoubleSpinBox()
+        aug_shadow_prob.setRange(0.05, 1.0)
+        aug_shadow_prob.setSingleStep(0.05)
+        aug_shadow_prob.setValue(0.5)
+        aug_shadow_checkbox = _sun_row('chk_aug_shadow', False,
+                                       aug_shadow_darkness_label, aug_shadow_darkness,
+                                       aug_shadow_prob_label, aug_shadow_prob)
+
+        sun_group.setLayout(sun_layout)
+        aug_options_layout.addWidget(sun_group)
+
         # プレビューボタン
         preview_layout = QHBoxLayout()
         preview_button = QPushButton(get_text('btn_aug_preview'))
-        preview_button.clicked.connect(lambda: self.show_augmentation_preview_dialog({
-            'enabled': aug_enable_check.isChecked(),
-            'use_flip': aug_flip_checkbox.isChecked(),
-            'flip_prob': aug_flip_proba.value(),
-            'use_color': aug_color_checkbox.isChecked(),
-            'brightness': aug_brightness.value(),
-            'contrast': aug_contrast.value(),
-            'saturation': aug_saturation.value(),
-            'use_geometry': aug_geometry_checkbox.isChecked(),
-            'rotation_degrees': aug_rotation.value(),
-            'translate_ratio': aug_translate.value(),
-            'use_erase': aug_erase_checkbox.isChecked(),
-            'erase_prob': aug_erase_proba.value(),
-            'erase_min_ratio': aug_erase_min_ratio.value(),
-            'erase_max_ratio': aug_erase_max_ratio.value()
-        }))
+        def _build_aug_params():
+            return {
+                'enabled': aug_enable_check.isChecked(),
+                'use_flip': aug_flip_checkbox.isChecked(),
+                'flip_prob': aug_flip_proba.value(),
+                'use_color': aug_color_checkbox.isChecked(),
+                'brightness': aug_brightness.value(),
+                'contrast': aug_contrast.value(),
+                'saturation': aug_saturation.value(),
+                'use_geometry': aug_geometry_checkbox.isChecked(),
+                'rotation_degrees': aug_rotation.value(),
+                'translate_ratio': aug_translate.value(),
+                'use_erase': aug_erase_checkbox.isChecked(),
+                'erase_prob': aug_erase_proba.value(),
+                'erase_min_ratio': aug_erase_min_ratio.value(),
+                'erase_max_ratio': aug_erase_max_ratio.value(),
+                # Domain randomization
+                'use_hue': aug_hue_checkbox.isChecked(),
+                'hue_range': aug_hue_range.value(),
+                'hue_prob': aug_hue_prob.value(),
+                'use_grayscale': aug_grayscale_checkbox.isChecked(),
+                'grayscale_prob': aug_grayscale_prob.value(),
+                'use_noise': aug_noise_checkbox.isChecked(),
+                'noise_std': aug_noise_std.value(),
+                'noise_prob': aug_noise_prob.value(),
+                'use_blur': aug_blur_checkbox.isChecked(),
+                'blur_kernel': aug_blur_kernel.value(),
+                'blur_prob': aug_blur_prob.value(),
+                'use_motion_blur': aug_motion_blur_checkbox.isChecked(),
+                'motion_kernel': aug_motion_kernel.value(),
+                'motion_prob': aug_motion_prob.value(),
+                'use_fog': aug_fog_checkbox.isChecked(),
+                'fog_intensity': aug_fog_intensity.value(),
+                'fog_prob': aug_fog_prob.value(),
+                # Sunlight
+                'use_sunspot': aug_sunspot_checkbox.isChecked(),
+                'sunspot_intensity': aug_sunspot_intensity.value(),
+                'sunspot_num': aug_sunspot_num.value(),
+                'sunspot_prob': aug_sunspot_prob.value(),
+                'use_gamma': aug_gamma_checkbox.isChecked(),
+                'gamma_min': aug_gamma_min.value(),
+                'gamma_max': aug_gamma_max.value(),
+                'gamma_prob': aug_gamma_prob.value(),
+                'use_shadow': aug_shadow_checkbox.isChecked(),
+                'shadow_darkness': aug_shadow_darkness.value(),
+                'shadow_prob': aug_shadow_prob.value(),
+            }
+        preview_button.clicked.connect(lambda: self.show_augmentation_preview_dialog(_build_aug_params()))
         preview_layout.addStretch()
         preview_layout.addWidget(preview_button)
         aug_options_layout.addLayout(preview_layout)
@@ -19792,8 +23620,25 @@ class ImageAnnotationTool(QMainWindow):
         # タブに追加
         tabs.addTab(aug_tab, get_text('tab_data_augmentation'))
 
-        # タブをレイアウトに追加
-        settings_layout.addWidget(tabs)
+        # タブをレイアウトに追加（残りスペースを全て使う）
+        settings_layout.addWidget(tabs, 1)
+
+        # ===== 固定フッターエリア（モデル名・コメント・ボタン）=====
+        # 区切り線
+        _sep = QFrame()
+        _sep.setFrameShape(QFrame.HLine)
+        _sep.setFrameShadow(QFrame.Sunken)
+        settings_layout.addWidget(_sep)
+
+        # 固定エリアコンテナ（わずかに暗い背景で視覚的に区別）
+        _footer = QFrame()
+        _footer.setStyleSheet(
+            "QFrame { background-color: #e8eaed; border-radius: 0px; }"
+            "QGroupBox { background-color: transparent; }"
+        )
+        _footer_layout = QVBoxLayout(_footer)
+        _footer_layout.setContentsMargins(8, 6, 8, 6)
+        _footer_layout.setSpacing(6)
 
         # モデル名とコメント欄を横並びで追加
         name_comment_layout = QHBoxLayout()
@@ -19827,13 +23672,24 @@ class ImageAnnotationTool(QMainWindow):
         model_name_note.setStyleSheet("color: #888; font-style: italic;")
         model_name_layout.addWidget(model_name_note)
 
-        # モデルタイプが変更されたらプレフィックスと注釈を更新
-        def update_model_name_prefix():
+        # モデルタイプ・ソース数・融合方法が変わったらプレフィックスと注釈を更新
+        def get_current_model_prefix():
             selected_type = model_type_combo.currentText()
-            prefix_label.setText(f"{selected_type}_")
-            model_name_note.setText(get_text('label_model_name_note_pth', selected_type))
+            checked = [n for n, cb in training_source_checkboxes.items() if cb.isChecked()]
+            if len(checked) > 1:
+                fusion = fusion_combo.currentData() if fusion_combo.currentData() else 'concat'
+                return f"multi{len(checked)}_{fusion}_{selected_type}_"
+            return f"{selected_type}_"
+
+        def update_model_name_prefix():
+            prefix = get_current_model_prefix()
+            prefix_label.setText(prefix)
+            model_name_note.setText(get_text('label_model_name_note_pth', prefix.rstrip('_')))
 
         model_type_combo.currentIndexChanged.connect(update_model_name_prefix)
+        fusion_combo.currentIndexChanged.connect(update_model_name_prefix)
+        for cb in training_source_checkboxes.values():
+            cb.stateChanged.connect(update_model_name_prefix)
 
         name_comment_layout.addWidget(model_name_group)
 
@@ -19849,14 +23705,16 @@ class ImageAnnotationTool(QMainWindow):
 
         name_comment_layout.addWidget(comment_group)
 
-        settings_layout.addLayout(name_comment_layout)
+        _footer_layout.addLayout(name_comment_layout)
 
         # ボタンの配置
         button_box = QDialogButtonBox(QDialogButtonBox.Cancel)
         start_button = button_box.addButton(get_text('btn_start_training'), QDialogButtonBox.AcceptRole)
         button_box.accepted.connect(training_settings.accept)
         button_box.rejected.connect(training_settings.reject)
-        settings_layout.addWidget(button_box)
+        _footer_layout.addWidget(button_box)
+
+        settings_layout.addWidget(_footer)
 
         # ダイアログを表示
         if not training_settings.exec_():
@@ -19865,7 +23723,13 @@ class ImageAnnotationTool(QMainWindow):
         # 設定値の取得
         # ダイアログで選択されたモデルタイプを使用
         model_type = model_type_combo.currentText()
-        autonomous_prefix = f"{model_type}_"
+        # マルチソース時はソース数と融合方法をプレフィックスに含める
+        _checked_sources = [n for n, cb in training_source_checkboxes.items() if cb.isChecked()]
+        if len(_checked_sources) > 1:
+            _fusion = fusion_combo.currentData() if fusion_combo.currentData() else 'concat'
+            autonomous_prefix = f"multi{len(_checked_sources)}_{_fusion}_{model_type}_"
+        else:
+            autonomous_prefix = f"{model_type}_"
 
         num_epochs = epoch_spin.value()
         use_early_stopping = early_stopping_check.isChecked()
@@ -19902,7 +23766,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # Speed出力設定の取得
         use_speed_output = False
-        speed_normalize_value = 10.0
+        speed_normalize_value = MAX_SPEED
         if has_speed_data and speed_output_check is not None:
             use_speed_output = speed_output_check.isChecked()
             if speed_normalize_spin is not None:
@@ -19910,6 +23774,10 @@ class ImageAnnotationTool(QMainWindow):
 
         # 将来予測出力設定の取得
         use_future_output = future_output_check.isChecked()
+
+        # 将来フレームラベル設定の取得
+        use_future_label = future_label_check.isChecked()
+        future_label_offset = future_label_spin.value() if use_future_label else 0
 
         # データ選択設定の取得
         use_all = data_radio_all.isChecked()
@@ -19924,28 +23792,37 @@ class ImageAnnotationTool(QMainWindow):
         exclude_downsampled = exclude_downsampled_check.isChecked()
 
         # オーグメンテーション設定の取得
-        augmentation_params = {
-            'enabled': aug_enable_check.isChecked(),
-            'use_flip': aug_flip_checkbox.isChecked(),
-            'flip_prob': aug_flip_proba.value(),
-            'use_color': aug_color_checkbox.isChecked(),
-            'brightness': aug_brightness.value(),
-            'contrast': aug_contrast.value(),
-            'saturation': aug_saturation.value(),
-            'use_geometry': aug_geometry_checkbox.isChecked(),
-            'rotation_degrees': aug_rotation.value(),
-            'translate_ratio': aug_translate.value(),
-            'use_erase': aug_erase_checkbox.isChecked(),
-            'erase_prob': aug_erase_proba.value(),
-            'erase_min_ratio': aug_erase_min_ratio.value(),
-            'erase_max_ratio': aug_erase_max_ratio.value()
-        }
+        augmentation_params = _build_aug_params()
+
+        # 選択された画像ソースを取得
+        selected_sources = [name for name, cb in training_source_checkboxes.items() if cb.isChecked()]
+        if not selected_sources:
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_select_at_least_one_source'))
+            return
+
+        # 仮想ソースモード判定
+        training_virtual_type = virtual_type_combo.currentData()  # None / 'crop' / 'scale' / 'temporal'
+        training_virtual_nsrc = virtual_nsrc_spin.value() if training_virtual_type else 1
+        training_temporal_interval = temporal_interval_spin.value() if training_virtual_type == 'temporal' else 10
+        training_downscale_mode = 'resize' if resize_radio.isChecked() else 'pixelate'
+
+        # マルチソースモード判定と融合方法の取得
+        is_virtual_source = training_virtual_type is not None and len(selected_sources) == 1
+        is_multi_source = len(selected_sources) > 1 and not is_virtual_source
+        training_fusion_method = fusion_combo.currentData() if is_multi_source else None
+        training_num_sources = (training_virtual_nsrc if is_virtual_source
+                                else len(selected_sources) if is_multi_source else 1)
 
         try:
             # 学習データの準備（データ選択設定を適用）
             image_paths = []
+            annotation_values = []
+            multi_source_paths = []  # マルチソースモード用: [[src1, src2, ...], ...]
             downsampled_set = set(getattr(self, 'downsampled_indexes', []))
+            has_image_groups = hasattr(self, 'image_groups') and self.image_groups
 
+            # まず有効なインデックスを収集
+            valid_indexes = []
             for idx in self.annotations.keys():
                 # 削除済みインデックスをスキップ（actual_indexで判定）
                 if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
@@ -19955,32 +23832,66 @@ class ImageAnnotationTool(QMainWindow):
                 if exclude_downsampled and idx in downsampled_set:
                     continue
 
-                if isinstance(idx, int) and 0 <= idx < len(self.images):
-                    # データ選択条件に基づいてフィルタリング
-                    if use_all:
-                        # 全データ使用
+                if not isinstance(idx, int) or idx < 0 or idx >= len(self.images):
+                    continue
+
+                # データ選択条件に基づいてフィルタリング
+                if use_all:
+                    valid_indexes.append(idx)
+                elif use_skip:
+                    if idx % skip_count == 0:
+                        valid_indexes.append(idx)
+                elif use_range:
+                    if range_start <= idx <= range_end:
+                        valid_indexes.append(idx)
+
+            # 各有効インデックスについて画像パスを収集
+            deleted_indexes_set = set(getattr(self, 'deleted_indexes', []))
+            for idx in valid_indexes:
+                # 将来フレームラベル: ラベルとなるフレームの有効性チェック
+                label_idx = idx + future_label_offset if use_future_label else idx
+                if use_future_label:
+                    if label_idx >= len(self.images):
+                        continue
+                    if label_idx in deleted_indexes_set:
+                        continue
+                    if label_idx not in self.annotations:
+                        continue
+                ann = deepcopy(self.annotations[label_idx])
+
+                if is_multi_source and has_image_groups:
+                    # マルチソースモード: 全ソースの画像が揃っているインデックスのみ使用
+                    group = self.image_groups.get(idx, {})
+                    paths_for_idx = []
+                    all_found = True
+                    for source in selected_sources:
+                        if source in group:
+                            paths_for_idx.append(group[source])
+                        else:
+                            all_found = False
+                            break
+                    if all_found:
+                        multi_source_paths.append(paths_for_idx)
+                        image_paths.append(paths_for_idx[0])  # 代表パス（サイズ検出用）
+                        annotation_values.append(deepcopy(ann))
+                elif has_image_groups:
+                    # シングルソースモード（image_groupsあり）
+                    group = self.image_groups.get(idx, {})
+                    source = selected_sources[0]
+                    if source in group:
+                        image_paths.append(group[source])
+                        annotation_values.append(deepcopy(ann))
+                    elif source == getattr(self, 'current_variant', None):
                         image_paths.append(self.images[idx])
-                    elif use_skip:
-                        # スキップ設定による間引き
-                        if idx % skip_count == 0:
-                            image_paths.append(self.images[idx])
-                    elif use_range:
-                        # インデックス範囲フィルタリング
-                        if range_start <= idx <= range_end:
-                            image_paths.append(self.images[idx]) 
-                                            
+                        annotation_values.append(deepcopy(ann))
+                else:
+                    # image_groupsがない場合は従来どおり
+                    image_paths.append(self.images[idx])
+                    annotation_values.append(deepcopy(ann))
+
             if not image_paths:
                 QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_training_data'))
                 return
-            
-            # 対応するアノテーション値を取得
-            annotation_values = []
-            for img_path in image_paths:
-                # パスからインデックスを逆引き
-                idx = self.images.index(img_path)
-                if idx in self.annotations:
-                    # ディープコピーして元のデータを変更しないようにする
-                    annotation_values.append(deepcopy(self.annotations[idx]))
 
             # Speed値の正規化（speedが含まれている場合）
             if use_speed_output and speed_normalize_value > 0:
@@ -20021,8 +23932,14 @@ class ImageAnnotationTool(QMainWindow):
             print(f"[出力設定]")
             print(f"  Speed出力: {use_speed_output}")
             print(f"  将来予測出力: {use_future_output}")
+            print(f"  将来フレームラベル: {use_future_label}" + (f", +{future_label_offset}フレーム先" if use_future_label else ""))
             print(f"[データ設定]")
-            print(f"  学習データ数: {len(image_paths)}枚")
+            print(f"  画像ソース: {selected_sources}")
+            if is_multi_source:
+                print(f"  マルチソースモード: {training_num_sources}ソース, 融合方法: {training_fusion_method}")
+                print(f"  学習データ数: {len(multi_source_paths)}サンプル ({training_num_sources}画像/サンプル)")
+            else:
+                print(f"  学習データ数: {len(image_paths)}枚")
             print(f"  データ選択: {'全て' if use_all else ('スキップ' if use_skip else 'インデックス範囲')}")
             if use_skip:
                 print(f"  スキップ枚数: {skip_count}")
@@ -20076,13 +23993,18 @@ class ImageAnnotationTool(QMainWindow):
                 val_split=val_split,  # 検証データ割合
                 use_speed=use_speed_output,  # Speed出力を使用するかどうか
                 use_future=use_future_output,  # 将来予測出力を使用するかどうか
-                num_outputs=num_outputs  # 出力数を指定
+                num_outputs=num_outputs,  # 出力数を指定
+                multi_source_paths=multi_source_paths if is_multi_source else None,
+                num_sources=training_num_sources,
+                fusion_method=training_fusion_method or 'concat',
+                virtual_source_type=training_virtual_type if is_virtual_source else None,
+                downscale_factor=getattr(self, 'resolution_slider', None) and self.resolution_slider.value() / 100.0 or 1.0,
+                downscale_mode=training_downscale_mode,
+                temporal_interval=training_temporal_interval
             )
 
-            # 最初の画像から実際のサイズを取得
-            sample_img_path = image_paths[0]
-            sample_img = Image.open(sample_img_path)
-            input_size = (sample_img.height, sample_img.width)  # 高さ、幅の順
+            # モデル入力サイズを取得（downscale_mode='resize'時はcreate_datasets内で縮小済み）
+            input_size = dataset_info['actual_image_size']
 
             progress.setLabelText(get_text('msg_preparing_with_input_size', input_size))
             progress.setValue(10)
@@ -20099,7 +24021,7 @@ class ImageAnnotationTool(QMainWindow):
                 save_dir=models_dir,
                 progress_callback=update_progress,
                 pretrained=use_pretrained,  # 事前学習済みの重みを使用するか
-                model_path=model_path if load_weights else None,  # ファインチューニングの場合はパスを指定
+                model_path=model_path if load_weights else None,
                 num_epochs=num_epochs,  # 指定されたエポック数
                 learning_rate=learning_rate,  # 指定された学習率
                 weight_decay=weight_decay,  # L2正則化
@@ -20110,7 +24032,16 @@ class ImageAnnotationTool(QMainWindow):
                 scheduler_name=scheduler_name,  # 学習率スケジューラ
                 custom_model_name=model_name if model_name else None,  # カスタムモデル名
                 num_outputs=num_outputs,  # 出力数を指定
-                input_size=input_size  # 実際の画像サイズを渡す
+                input_size=input_size,  # 実際の画像サイズを渡す
+                num_sources=training_num_sources,
+                fusion_method=training_fusion_method or 'concat',
+                selected_sources=(
+                    VirtualSourceDataset.source_names(training_virtual_type, training_virtual_nsrc, training_temporal_interval)
+                    if is_virtual_source else
+                    (selected_sources if is_multi_source else selected_sources)
+                ),
+                virtual_source_type=training_virtual_type if is_virtual_source else None,
+                temporal_interval=training_temporal_interval
             )
             
             progress.close()
@@ -20151,7 +24082,11 @@ class ImageAnnotationTool(QMainWindow):
                     "augmentation_params": augmentation_params,
                     "data_folder": self.folder_path if hasattr(self, 'folder_path') and self.folder_path else "unknown",
                     "model_name": model_name,
-                    "comment": comment
+                    "comment": comment,
+                    "is_multi_source": is_multi_source,
+                    "num_sources": training_num_sources,
+                    "fusion_method": training_fusion_method if is_multi_source else None,
+                    "selected_sources": selected_sources if is_multi_source else None,
                 },
                 dataset_info={
                     "total_annotations": len(self.annotations),
@@ -20159,7 +24094,8 @@ class ImageAnnotationTool(QMainWindow):
                     "train_samples": len(train_loader.dataset),
                     "val_samples": len(val_loader.dataset),
                     "input_shape": input_size,
-                    "deleted_samples": len(getattr(self, 'deleted_indexes', []))
+                    "deleted_samples": len(getattr(self, 'deleted_indexes', [])),
+                    "num_sources": training_num_sources,
                 },
                 image_paths=image_paths
             )
@@ -20183,7 +24119,11 @@ class ImageAnnotationTool(QMainWindow):
                     "load_weights": load_weights,
                     "use_random_init": use_random_init,
                     "selected_model": selected_finetune_model if load_weights else None,
-                    "data_folder": os.path.basename(self.folder_path) if hasattr(self, 'folder_path') and self.folder_path else "unknown"
+                    "data_folder": os.path.basename(self.folder_path) if hasattr(self, 'folder_path') and self.folder_path else "unknown",
+                    "is_multi_source": is_multi_source,
+                    "num_sources": training_num_sources,
+                    "fusion_method": training_fusion_method if is_multi_source else None,
+                    "selected_sources": selected_sources if is_multi_source else None,
                 },
                 dataset_info={
                     "image_paths_count": len(image_paths),
@@ -20375,6 +24315,32 @@ class ImageAnnotationTool(QMainWindow):
 
         arch_specific_layout.addStretch()
         arch_layout.addLayout(arch_specific_layout)
+
+        # マルチカメラ融合方法（同じ行に配置）
+        fusion_layout = QHBoxLayout()
+        fusion_layout.addWidget(QLabel(get_text('label_fusion_method')))
+        fusion_combo = QComboBox()
+        fusion_combo.addItem(get_text('opt_fusion_concat'), 'concat')
+        fusion_combo.addItem(get_text('opt_fusion_attention'), 'attention')
+        fusion_layout.addWidget(fusion_combo)
+
+        attn_heads_label = QLabel(get_text('label_attn_heads'))
+        fusion_layout.addWidget(attn_heads_label)
+        attn_heads_spin = QSpinBox()
+        attn_heads_spin.setRange(1, 8)
+        attn_heads_spin.setValue(SEQ_DEFAULT_ATTN_HEADS)
+        fusion_layout.addWidget(attn_heads_spin)
+        attn_heads_label.setVisible(False)
+        attn_heads_spin.setVisible(False)
+
+        def on_fusion_changed(idx):
+            is_attn = (fusion_combo.currentData() == 'attention')
+            attn_heads_label.setVisible(is_attn)
+            attn_heads_spin.setVisible(is_attn)
+
+        fusion_combo.currentIndexChanged.connect(on_fusion_changed)
+        fusion_layout.addStretch()
+        arch_layout.addLayout(fusion_layout)
 
         def update_arch_widgets():
             arch = arch_combo.currentData()
@@ -20661,6 +24627,10 @@ class ImageAnnotationTool(QMainWindow):
         elif selected_arch == 'causal_cnn':
             config['kernel_size'] = cnn_kernel_spin.value()
             config['cnn_channels'] = SEQ_CAUSAL_CNN_DEFAULT_CHANNELS
+
+        # マルチカメラ融合パラメータ
+        config['fusion_method'] = fusion_combo.currentData()
+        config['attn_heads'] = attn_heads_spin.value()
 
         try:
             # 進捗ダイアログ
@@ -21012,7 +24982,13 @@ class ImageAnnotationTool(QMainWindow):
         dialog.setMinimumWidth(800)
         dlg_layout = QVBoxLayout(dialog)
 
-        title_label = QLabel(f"{model_type} モデルを学習し保存しました: {os.path.basename(training_results['model_path'])}")
+        if training_params.get('is_multi_source'):
+            num_src = training_params.get('num_sources', 1)
+            fusion = training_params.get('fusion_method', 'concat')
+            title_text = f"[{num_src}ソース/{fusion}] {model_type} モデルを学習し保存しました: {os.path.basename(training_results['model_path'])}"
+        else:
+            title_text = f"{model_type} モデルを学習し保存しました: {os.path.basename(training_results['model_path'])}"
+        title_label = QLabel(title_text)
         title_label.setStyleSheet("font-weight: bold;")
         dlg_layout.addWidget(title_label)
 
@@ -21196,14 +25172,14 @@ class ImageAnnotationTool(QMainWindow):
 
         # 選択された学習方法（モデル）を取得
         model_type = self.auto_method_combo.currentText()
-        selected_model = self.model_combo.currentText()
-        
+        selected_model = self.get_selected_model_filename()
+
         # モデルのパスを取得
         model_path = None
         if hasattr(self, 'model_combo') and selected_model not in [get_text('combo_model_not_found'), get_text('combo_select_folder')] and "not found" not in selected_model.lower():
             # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
             model_path = os.path.join(models_dir, selected_model)
-            
+
             # モデルが存在するか確認
             if not os.path.exists(model_path):
                 model_path = None
@@ -21277,13 +25253,20 @@ class ImageAnnotationTool(QMainWindow):
 
                 # 推論を実行
                 try:
-                    inference_results = batch_inference(
-                        current_batch_paths,
-                        method="model",
-                        model_type=model_type,
-                        model_path=model_path,
-                        force_reload=(batch_idx == 0)  # 最初のバッチのみ強制再読込
-                    )
+                    ms_config = getattr(self, '_multi_source_config', None)
+                    if ms_config and model_path:
+                        # マルチソース推論
+                        inference_results = self._run_multi_source_inference(
+                            current_batch_indices, model_path, force_reload=(batch_idx == 0)
+                        )
+                    else:
+                        inference_results = batch_inference(
+                            current_batch_paths,
+                            method="model",
+                            model_type=model_type,
+                            model_path=model_path,
+                            force_reload=(batch_idx == 0)  # 最初のバッチのみ強制再読込
+                        )
 
                     # サブ進捗表示
                     current_batch_size = len(current_batch_indices)
@@ -21291,8 +25274,9 @@ class ImageAnnotationTool(QMainWindow):
                         if progress.wasCanceled():
                             break
 
+                        # マルチソース推論はインデックスキー、通常はパスキー
                         img_path = self.images[img_index]
-                        result = inference_results.get(img_path, {})
+                        result = inference_results.get(img_index, inference_results.get(img_path, {}))
 
                         if not result:
                             continue
@@ -21940,7 +25924,7 @@ class ImageAnnotationTool(QMainWindow):
             print("サンプル生成開始...")
             samples = generate_augmentation_samples(
                 current_img_path,
-                num_samples=5,  # オリジナル含め5枚表示
+                num_samples=5,
                 use_flip=aug_params['use_flip'],
                 flip_prob=aug_params['flip_prob'],
                 use_color=aug_params['use_color'],
@@ -21953,7 +25937,35 @@ class ImageAnnotationTool(QMainWindow):
                 use_erase=aug_params['use_erase'],
                 erase_prob=aug_params['erase_prob'],
                 erase_min_ratio=aug_params['erase_min_ratio'],
-                erase_max_ratio=aug_params['erase_max_ratio']
+                erase_max_ratio=aug_params['erase_max_ratio'],
+                use_hue=aug_params.get('use_hue', False),
+                hue_range=aug_params.get('hue_range', 0.1),
+                hue_prob=aug_params.get('hue_prob', 0.5),
+                use_grayscale=aug_params.get('use_grayscale', False),
+                grayscale_prob=aug_params.get('grayscale_prob', 0.1),
+                use_noise=aug_params.get('use_noise', False),
+                noise_std=aug_params.get('noise_std', 0.03),
+                noise_prob=aug_params.get('noise_prob', 0.5),
+                use_blur=aug_params.get('use_blur', False),
+                blur_kernel=aug_params.get('blur_kernel', 5),
+                blur_prob=aug_params.get('blur_prob', 0.5),
+                use_motion_blur=aug_params.get('use_motion_blur', False),
+                motion_kernel=aug_params.get('motion_kernel', 9),
+                motion_prob=aug_params.get('motion_prob', 0.5),
+                use_fog=aug_params.get('use_fog', False),
+                fog_intensity=aug_params.get('fog_intensity', 0.3),
+                fog_prob=aug_params.get('fog_prob', 0.5),
+                use_sunspot=aug_params.get('use_sunspot', False),
+                sunspot_intensity=aug_params.get('sunspot_intensity', 0.55),
+                sunspot_num=aug_params.get('sunspot_num', 1),
+                sunspot_prob=aug_params.get('sunspot_prob', 0.5),
+                use_gamma=aug_params.get('use_gamma', False),
+                gamma_min=aug_params.get('gamma_min', 0.5),
+                gamma_max=aug_params.get('gamma_max', 1.8),
+                gamma_prob=aug_params.get('gamma_prob', 0.5),
+                use_shadow=aug_params.get('use_shadow', False),
+                shadow_darkness=aug_params.get('shadow_darkness', 0.5),
+                shadow_prob=aug_params.get('shadow_prob', 0.5),
             )
             print(f"サンプル生成完了: {len(samples)}枚")
             
@@ -21976,15 +25988,29 @@ class ImageAnnotationTool(QMainWindow):
             if aug_params['use_flip']:
                 settings_text += f"・水平反転 (確率: {aug_params['flip_prob']})\n"
             if aug_params['use_color']:
-                settings_text += f"・色調整 (明るさ: ±{aug_params['brightness']}, "
-                settings_text += f"コントラスト: ±{aug_params['contrast']}, "
-                settings_text += f"彩度: ±{aug_params['saturation']})\n"
+                settings_text += f"・色調整 (明るさ: ±{aug_params['brightness']}, コントラスト: ±{aug_params['contrast']}, 彩度: ±{aug_params['saturation']})\n"
+            if aug_params.get('use_hue'):
+                settings_text += f"・色相シフト (±{aug_params.get('hue_range', 0.1)})\n"
+            if aug_params.get('use_grayscale'):
+                settings_text += f"・グレースケール化 (確率: {aug_params.get('grayscale_prob', 0.1)})\n"
             if aug_params['use_geometry']:
-                settings_text += f"・幾何変換 (回転: ±{aug_params['rotation_degrees']}度, "
-                settings_text += f"平行移動: ±{aug_params['translate_ratio']})\n"
+                settings_text += f"・幾何変換 (回転: ±{aug_params['rotation_degrees']}度, 平行移動: ±{aug_params['translate_ratio']})\n"
+            if aug_params.get('use_blur'):
+                settings_text += f"・ガウシアンブラー (kernel={aug_params.get('blur_kernel', 5)})\n"
+            if aug_params.get('use_motion_blur'):
+                settings_text += f"・モーションブラー (kernel={aug_params.get('motion_kernel', 9)})\n"
+            if aug_params.get('use_fog'):
+                settings_text += f"・霧 (強度: {aug_params.get('fog_intensity', 0.3)})\n"
             if aug_params['use_erase']:
-                settings_text += f"・ランダムイレース (確率: {aug_params['erase_prob']}, "
-                settings_text += f"範囲: {aug_params['erase_min_ratio']}～{aug_params['erase_max_ratio']})\n"
+                settings_text += f"・ランダムイレース (確率: {aug_params['erase_prob']}, 範囲: {aug_params['erase_min_ratio']}～{aug_params['erase_max_ratio']})\n"
+            if aug_params.get('use_noise'):
+                settings_text += f"・ガウシアンノイズ (std: {aug_params.get('noise_std', 0.03)})\n"
+            if aug_params.get('use_sunspot'):
+                settings_text += f"・サンスポット (強度: {aug_params.get('sunspot_intensity', 0.55)}, 数: {aug_params.get('sunspot_num', 3)})\n"
+            if aug_params.get('use_gamma'):
+                settings_text += f"・ガンマ変動 (γ {aug_params.get('gamma_min', 0.5)}～{aug_params.get('gamma_max', 1.8)})\n"
+            if aug_params.get('use_shadow'):
+                settings_text += f"・影コントラスト (暗さ: {aug_params.get('shadow_darkness', 0.5)})\n"
                 
             settings_label = QLabel(settings_text)
             settings_label.setStyleSheet("font-size: 12px;")
@@ -22136,9 +26162,30 @@ class ImageAnnotationTool(QMainWindow):
                 }}
             """)
             
+            # カウントをプロパティとして保持（表示更新用）
+            button.setProperty("location_count", 0)
             # レイアウトに追加
             self.location_buttons_layout.addWidget(button)
             self.location_buttons.append(button)
+
+        # 初期表示を適用
+        self._update_location_button_display()
+
+    def _update_location_button_display(self):
+        """位置/コーナーモードに応じてボタンのテキスト・アイコンを更新する"""
+        mode = getattr(self, '_location_display_mode', 'position')
+        for btn in self.location_buttons:
+            loc_val = btn.property("location_value")
+            count = btn.property("location_count") or 0
+            if mode == 'corner' and loc_val is not None and loc_val < len(_CORNER_INFO):
+                _, label = _CORNER_INFO[loc_val]
+                angle, _ = _CORNER_INFO[loc_val]
+                btn.setText(f"{count} | {label}")
+                btn.setIcon(_make_corner_icon(angle))
+                btn.setIconSize(QSize(24, 24))
+            else:
+                btn.setText(get_text('btn_location_with_count', count, loc_val))
+                btn.setIcon(QIcon())
 
     def add_location_model_section(self):
         """位置推論モデルのセクションを追加する"""
@@ -24434,27 +28481,20 @@ class ImageAnnotationTool(QMainWindow):
                     for seg_idx, seg in enumerate(self.segmentation_annotations[idx]):
                         # クラス名を取得 - 複数のキーを試す
                         class_name = None
-                        points = []
-                        
                         if isinstance(seg, dict):
-                            # 複数のキー名で試行
                             class_name = seg.get('class_name') or seg.get('class') or seg.get('label')
-                            points = seg.get('points', [])
-                            
-                            print(f"  セグメント {seg_idx}: 辞書キー={list(seg.keys())}")
-                            print(f"    class_name={seg.get('class_name')}, class={seg.get('class')}")
-                            
+                            seg_d = seg
                         else:
-                            # オブジェクト形式の場合
-                            class_name = (getattr(seg, 'class_name', None) or 
-                                        getattr(seg, 'class', None) or 
-                                        getattr(seg, 'label', None))
-                            points = getattr(seg, 'points', [])
-                        
-                        print(f"  セグメント {seg_idx}: 最終クラス名={class_name}, ポイント数={len(points)}")
-                        
+                            class_name = (getattr(seg, 'class_name', None) or
+                                          getattr(seg, 'class', None) or
+                                          getattr(seg, 'label', None))
+                            seg_d = {'points': getattr(seg, 'points', [])}
+
+                        # polygon / fill / brush すべてに対応した輪郭点取得
+                        points = _seg_to_polygon_points(seg_d, img_width, img_height)
+
                         # クラス名が有効で、期待されるクラスリストに含まれているかチェック
-                        if class_name and class_name in class_to_index and points and len(points) >= 3:
+                        if class_name and class_name in class_to_index and len(points) >= 3:
                             class_id = class_to_index[class_name]
                             
                             # ポイントを正規化座標に変換
@@ -24643,14 +28683,10 @@ class ImageAnnotationTool(QMainWindow):
                         if class_name:
                             class_names_found.add(class_name)
                         
-                        # ポイント数チェック
-                        points = None
-                        if isinstance(seg, dict):
-                            points = seg.get('points', [])
-                        else:
-                            points = getattr(seg, 'points', [])
-                        
-                        if class_name and points and len(points) >= 3:
+                        # ポイント数チェック（polygon / fill / brush すべて対応）
+                        seg_d = seg if isinstance(seg, dict) else {'points': getattr(seg, 'points', [])}
+                        pts = _seg_to_polygon_points(seg_d, 1, 1)
+                        if class_name and len(pts) >= 3:
                             valid_segments += 1
                             image_has_valid_segments = True
                 
