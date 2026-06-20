@@ -49,7 +49,8 @@ class MLflowManager:
     def __init__(self, folder_path=None, use_databricks=None):
         self.folder_path = folder_path
         self.tracking_uri = None
-        self.local_tracking_uri = None  # ローカル用URI（常に保持）
+        self.local_tracking_uri = None  # ローカル用URI（常に保持・MLflow3ではsqlite）
+        self.local_artifact_root = None  # ローカル用アーティファクトルート（file://）
         self.current_experiment = None
         self.is_initialized = False
 
@@ -264,8 +265,31 @@ class MLflowManager:
             print(f"Databricksディレクトリ作成エラー: {e}")
             return False
 
+    def _build_local_uris(self, base_dir):
+        """ローカル用の tracking URI(sqlite) と artifact ルート(file) を構築
+
+        MLflow 3 ではファイルストア(file://)が非推奨のため、トラッキングDBは
+        sqlite を使用し、アーティファクトは file:// の別ルートに保存する。
+
+        Returns:
+            tuple: (tracking_uri, artifact_root)
+        """
+        os.makedirs(base_dir, exist_ok=True)
+        normalized_path = os.path.normpath(base_dir).replace('\\', '/')
+
+        # sqlite トラッキングDB（Windows: sqlite:///C:/path/mlflow.db）
+        tracking_uri = f"sqlite:///{normalized_path}/mlflow.db"
+
+        # アーティファクトルート（file://）
+        if sys.platform.startswith('win'):
+            artifact_root = f"file:///{normalized_path}/mlartifacts"
+        else:
+            artifact_root = f"file://{normalized_path}/mlartifacts"
+
+        return tracking_uri, artifact_root
+
     def _initialize_local(self, folder_path=None):
-        """ローカルMLflowの初期化"""
+        """ローカルMLflowの初期化（MLflow3: sqliteバックエンド）"""
         if folder_path:
             self.folder_path = folder_path
 
@@ -274,30 +298,24 @@ class MLflowManager:
             return False
 
         try:
-            # MLflow用のディレクトリを作成
-            mlflow_dir = self.folder_path
-            os.makedirs(mlflow_dir, exist_ok=True)
-
-            # パスの正規化
-            normalized_path = os.path.normpath(mlflow_dir).replace('\\', '/')
-
-            # Windows環境での正しいURI形式を構築
-            if sys.platform.startswith('win'):
-                self.local_tracking_uri = f"file:///{normalized_path}"
-            else:
-                self.local_tracking_uri = f"file://{normalized_path}"
+            # MLflow用のディレクトリを作成し、sqlite URI / artifactルートを構築
+            self.local_tracking_uri, self.local_artifact_root = self._build_local_uris(self.folder_path)
 
             # メインのtracking_uriも設定
             self.tracking_uri = self.local_tracking_uri
 
             print(f"ローカルMLflowトラッキングURI: {self.local_tracking_uri}")
+            print(f"ローカルアーティファクトルート: {self.local_artifact_root}")
             mlflow.set_tracking_uri(self.local_tracking_uri)
 
-            # 全ての実験を作成
+            # 全ての実験を作成（アーティファクトは file:// ルートに保存）
             for model_type, experiment_name in self.EXPERIMENT_NAMES.items():
                 experiment = mlflow.get_experiment_by_name(experiment_name)
                 if experiment is None:
-                    mlflow.create_experiment(experiment_name)
+                    mlflow.create_experiment(
+                        experiment_name,
+                        artifact_location=f"{self.local_artifact_root}/{experiment_name}"
+                    )
                     print(f"ローカル実験を作成: {experiment_name}")
 
             self._local_initialized = True
@@ -475,22 +493,18 @@ class MLflowManager:
             return
 
         try:
-            # 特定の実験を指定した場合、その実験にフォーカス
-            experiment_filter = ""
-            if model_type:
-                experiment_name = self.EXPERIMENT_NAMES[model_type]
-                # MLflow UIでは実験IDでフィルタリング
-                experiment = mlflow.get_experiment_by_name(experiment_name)
-                if experiment:
-                    experiment_filter = f" --default-artifact-root {experiment.artifact_location}"
+            # MLflow3(sqlite)ではアーティファクトルートも指定する
+            artifact_opt = ""
+            if self.local_artifact_root:
+                artifact_opt = f" --default-artifact-root {self.local_artifact_root}"
 
             # 環境に応じてコマンドを構築
             if sys.platform.startswith('win'):  # Windows
-                cmd = f'start cmd /k "mlflow ui --backend-store-uri {self.tracking_uri}{experiment_filter}"'
+                cmd = f'start cmd /k "mlflow ui --backend-store-uri {self.tracking_uri}{artifact_opt}"'
                 print(f"実行コマンド: {cmd}")
                 subprocess.Popen(cmd, shell=True)
             else:  # Mac/Linux
-                cmd = f'mlflow ui --backend-store-uri {self.tracking_uri}{experiment_filter}'
+                cmd = f'mlflow ui --backend-store-uri {self.tracking_uri}{artifact_opt}'
                 subprocess.Popen(cmd, shell=True)
 
             if parent_widget:
@@ -1124,14 +1138,11 @@ class MLflowManager:
             return {"status": "error", "message": "記録に失敗しました"}
 
     def _get_default_mlflow_uri(self):
-        """デフォルトのmlrunsディレクトリURIを取得"""
+        """デフォルトのmlrunsディレクトリURI(sqlite)を取得"""
         try:
             from config import mlflow_dir
-            normalized_path = os.path.normpath(mlflow_dir).replace('\\', '/')
-            if sys.platform.startswith('win'):
-                return f"file:///{normalized_path}"
-            else:
-                return f"file://{normalized_path}"
+            tracking_uri, _ = self._build_local_uris(mlflow_dir)
+            return tracking_uri
         except ImportError:
             return self.local_tracking_uri
 

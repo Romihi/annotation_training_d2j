@@ -205,7 +205,9 @@ criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
 # 学習ループ
-with mlflow.start_run():
+# log_system_metrics=True (MLflow 3): 学習中のGPU/CPU/メモリ使用率を自動記録
+# （GPUメトリクスには nvidia-ml-py、CPU/メモリには psutil が必要）
+with mlflow.start_run(log_system_metrics=True):
     # パラメータを記録
     mlflow.log_params({
         "batch_size": BATCH_SIZE,
@@ -260,8 +262,29 @@ with mlflow.start_run():
             best_val_loss = val_loss
             torch.save(model.state_dict(), "/tmp/best_model.pt")
 
-    # モデルを記録
-    mlflow.pytorch.log_model(model, "model")
+    # モデルを記録（MLflow 3: artifact_path は非推奨のため name= を使用）
+    # ベスト重みをロードしてから記録
+    model.load_state_dict(torch.load("/tmp/best_model.pt"))
+    model.eval()
+
+    # signature と input_example を付与（モデルサービング/検証で利用可能）
+    from mlflow.models.signature import infer_signature
+    sample_images, _ = next(iter(val_loader))
+    sample_images = sample_images.to(device)
+    with torch.no_grad():
+        sample_output = model(sample_images)
+    input_example = sample_images[:1].cpu().numpy()
+    signature = infer_signature(
+        sample_images.cpu().numpy(),
+        sample_output.cpu().numpy()
+    )
+
+    mlflow.pytorch.log_model(
+        model,
+        name="model",
+        signature=signature,
+        input_example=input_example,
+    )
     mlflow.log_artifact("/tmp/best_model.pt")
 
     print(f"\n学習完了! Best Val Loss: {best_val_loss:.4f}")
