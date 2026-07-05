@@ -34,6 +34,21 @@ MLflow 3 では `log_model` の第2位置引数 `artifact_path` が **非推奨*
 | 6 | `tools/migrate_mlflow_to_sqlite.py` | 既存ファイルストアのRunをSQLiteへ移行するツール（パラメータ/タグ/メトリクス履歴/アーティファクトを保全、冪等） |
 | 7 | `managers/mlflow_ai_analyzer.py` | **MLflow 3 GenAI連携**: 実験RunをClaudeに分析させる新機能。`mlflow.anthropic.autolog()` でClaude呼び出しをMLflowトレースとして記録 |
 
+## 2.6 Python 3.14 + mlflow 3.14 の既知問題（パッチ対応済み）
+
+venv環境は **Python 3.14 / mlflow 3.14** だが、mlflow 3.14 のFastAPIサーバ
+（`mlflow ui`）が `from importlib.abc import Traversable` を実行する。
+`Traversable` は **Python 3.14 で `importlib.abc` から削除**されたため、
+`mlflow ui` 起動時に `ImportError` で停止する。
+
+- 対策: `mlflow/assistant/skill_installer.py` の該当importを新旧両対応に修正（適用済み・動作確認済み）。
+- **再インストールで消える**ため、`pip install` でmlflowを入れ直したら再適用すること:
+  ```bash
+  venv\Scripts\python tools/patch_mlflow_py314.py
+  ```
+- あわせて、アプリの **2つ目のUI起動経路** `main.py: _open_local_mlflow_ui` も
+  `file://` → `sqlite:///` に修正（`open_ui` と同様）。
+
 ## 3. ファイルストアバックエンドの非推奨 → SQLite移行（実施済み）
 
 MLflow 3 では **ファイルストア（`file://` / `./mlruns`）が 2026年2月をもって非推奨**となった

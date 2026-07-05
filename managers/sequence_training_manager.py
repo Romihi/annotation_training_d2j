@@ -112,13 +112,15 @@ class SequenceTrainingManager:
         val_dataset = torch.utils.data.Subset(val_dataset_no_aug, val_indices)
 
         # 3. DataLoader
+        # pin_memory は CUDA 利用時のみ有効（CPU環境での警告と無駄を回避）
+        use_pin_memory = (device.type == 'cuda')
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True,
-            num_workers=0, pin_memory=True
+            num_workers=0, pin_memory=use_pin_memory
         )
         val_loader = DataLoader(
             val_dataset, batch_size=batch_size, shuffle=False,
-            num_workers=0, pin_memory=True
+            num_workers=0, pin_memory=use_pin_memory
         )
 
         # 4. Model構築
@@ -130,6 +132,21 @@ class SequenceTrainingManager:
             optimizer, mode='min', factor=0.5, patience=5
         )
         criterion = nn.MSELoss()
+
+        # モデルのパラメータ数（記録用）
+        model_params_total = sum(p.numel() for p in model.parameters())
+        model_params_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+        # 早期終了の設定
+        use_early_stopping = config.get('use_early_stopping', True)
+        patience = config.get('patience', 10)
+        epochs_no_improve = 0
+        early_stopped = False
+
+        # 入力/出力テンソル形状（signature相当の記録用。最初のバッチで取得）
+        input_image_shape = None
+        ego_state_dim = None
+        output_shape = None
 
         # 5. Training loop
         train_losses = []
@@ -144,11 +161,18 @@ class SequenceTrainingManager:
             model.train()
             running_loss = 0.0
             num_batches = 0
+            total_train_batches = len(train_loader)
 
             for batch_idx, batch in enumerate(train_loader):
                 images_batch = batch['images'].to(device)
                 ego_states = batch['ego_states'].to(device)
                 targets = batch['targets'].to(device)
+
+                # 入力/出力形状を最初のバッチで記録（signature相当）
+                if input_image_shape is None:
+                    input_image_shape = tuple(int(x) for x in images_batch.shape[1:])
+                    ego_state_dim = int(ego_states.shape[-1])
+                    output_shape = tuple(int(x) for x in targets.shape[1:])
 
                 optimizer.zero_grad()
                 predictions = model(images_batch, ego_states)
@@ -159,6 +183,17 @@ class SequenceTrainingManager:
 
                 running_loss += loss.item()
                 num_batches += 1
+
+                # エポック内でも定期的にUIを更新してフリーズを防ぐ（CPU学習時は特に重要）
+                # キャンセルも即時反映できるようにする
+                if progress_callback and (batch_idx % 5 == 0 or batch_idx == total_train_batches - 1):
+                    batch_msg = (
+                        f"[{model_arch.upper()}] エポック {epoch + 1}/{epochs} 学習中...\n"
+                        f"バッチ {batch_idx + 1}/{total_train_batches}"
+                    )
+                    cont = progress_callback(epoch, epochs, batch_msg)
+                    if cont is False:
+                        return {"status": "cancelled"}
 
             train_loss = running_loss / max(num_batches, 1)
             train_losses.append(train_loss)
@@ -186,6 +221,9 @@ class SequenceTrainingManager:
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
 
             epoch_time = time.time() - epoch_start
             epoch_times.append(epoch_time)
@@ -229,6 +267,16 @@ class SequenceTrainingManager:
                         }
                     return {"status": "cancelled"}
 
+            # 早期終了判定（patienceエポック改善なしで打ち切り）
+            if use_early_stopping and epochs_no_improve >= patience:
+                early_stopped = True
+                if progress_callback:
+                    progress_callback(
+                        epoch + 1, epochs,
+                        f"[{model_arch.upper()}] 早期終了: {patience}エポック改善なし (epoch {epoch + 1})"
+                    )
+                break
+
         # 6. Save best model
         total_time = time.time() - start_time
 
@@ -248,13 +296,21 @@ class SequenceTrainingManager:
             "val_losses": val_losses,
             "best_val_loss": best_val_loss,
             "final_train_loss": train_losses[-1] if train_losses else 0.0,
-            "epochs_trained": epochs,
+            "epochs_trained": len(train_losses),
             "total_time": total_time,
             "avg_epoch_time": sum(epoch_times) / len(epoch_times) if epoch_times else 0.0,
             "train_samples": train_size,
             "val_samples": val_size,
-            "total_sequences": len(dataset)
+            "total_sequences": len(dataset),
+            "early_stopped": early_stopped
         }
+
+        # ベスト検証損失のエポックを特定（記録用）
+        best_epoch = (val_losses.index(best_val_loss) + 1) if val_losses else 0
+        completed_epochs = len(train_losses)
+
+        # 学習曲線グラフを生成（MLflowアーティファクトとして添付）
+        curve_path = self._save_training_curve(model_path, train_losses, val_losses, model_arch)
 
         # MLflow logging
         if self.mlflow_manager:
@@ -266,6 +322,7 @@ class SequenceTrainingManager:
                     "seq_len": seq_len,
                     "pred_horizon": pred_horizon,
                     "hidden_dim": hidden_dim,
+                    "num_layers": config.get('num_layers', 1),
                     "dropout": dropout,
                     "num_epochs": epochs,
                     "learning_rate": learning_rate,
@@ -273,15 +330,44 @@ class SequenceTrainingManager:
                     "num_image_sources": num_image_sources,
                     "selected_sources": ",".join(selected_sources),
                     "augmentation_enabled": augment,
-                    "stride": stride
+                    "stride": stride,
+                    # アーキテクチャ/学習設定（他モデルと同等の情報量に揃える）
+                    "img_size": img_size,
+                    "val_split": val_split,
+                    "weight_decay": 1e-4,
+                    "fusion_method": config.get('fusion_method'),
+                    "attn_heads": config.get('attn_heads'),
+                    "kernel_size": config.get('kernel_size'),
+                    "tcn_channels": config.get('tcn_channels'),
+                    "cnn_channels": config.get('cnn_channels'),
+                    "comment": config.get('comment'),
+                    "model_name": config.get('model_name'),
+                    # 早期終了
+                    "use_early_stopping": use_early_stopping,
+                    "patience": patience,
+                    # モデルI/Oスキーマ（signature相当）
+                    "input_image_shape": input_image_shape,
+                    "ego_state_dim": ego_state_dim,
+                    "output_shape": output_shape,
+                    # モデル・実行環境メタデータ
+                    "model_params_total": model_params_total,
+                    "model_params_trainable": model_params_trainable,
+                    "device": str(device),
+                    "torch_version": torch.__version__,
+                    "cuda_version": torch.version.cuda,
                 }
                 metrics = {
                     "best_val_loss": best_val_loss,
                     "final_train_loss": result["final_train_loss"],
+                    "final_val_loss": val_losses[-1] if val_losses else 0.0,
+                    "best_epoch": best_epoch,
                     "total_training_time": total_time,
                     "avg_epoch_time": result["avg_epoch_time"],
-                    "completed_epochs": epochs,
-                    "status": "completed"
+                    "completed_epochs": completed_epochs,
+                    "status": "completed",
+                    # 学習曲線（エポック毎の損失）— 他モデルと同様にMLflowに記録
+                    "train_losses": train_losses,
+                    "val_losses": val_losses,
                 }
                 dataset_info = {
                     "train_samples": train_size,
@@ -289,7 +375,8 @@ class SequenceTrainingManager:
                     "total_sequences": len(dataset)
                 }
                 self.mlflow_manager.log_sequence_model(
-                    model_path, training_params, metrics, dataset_info
+                    model_path, training_params, metrics, dataset_info,
+                    extra_artifacts=[curve_path] if curve_path else None
                 )
             except Exception as e:
                 print(f"MLflow logging failed: {e}")
@@ -310,6 +397,35 @@ class SequenceTrainingManager:
             return f"{minutes}分{secs:02d}秒"
         else:
             return f"{secs}秒"
+
+    def _save_training_curve(self, model_path, train_losses, val_losses, model_arch):
+        """学習曲線(train/val loss)をPNGとして保存し、パスを返す（失敗時None）"""
+        if not train_losses:
+            return None
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+
+            curve_path = os.path.splitext(model_path)[0] + "_training_curve.png"
+            plt.figure(figsize=(8, 5))
+            plt.plot(range(1, len(train_losses) + 1), train_losses,
+                     label='Train Loss', color='#1f77b4')
+            if val_losses:
+                plt.plot(range(1, len(val_losses) + 1), val_losses,
+                         label='Val Loss', color='#ff7f0e')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss (MSE)')
+            plt.title(f'{model_arch.upper()} Training Curve')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(curve_path, dpi=100)
+            plt.close()
+            return curve_path
+        except Exception as e:
+            print(f"学習曲線の保存に失敗: {e}")
+            return None
 
     def _save_model(self, model_state_dict, config, selected_sources,
                     train_losses, val_losses, epochs_trained, num_image_sources):
@@ -471,3 +587,56 @@ class SequenceTrainingManager:
             "config": cfg,
             "total_predictions": len(predictions)
         }
+
+    def predict_current(self, model, cfg, selected_sources, target_index,
+                        annotations, images, source_images_map, device,
+                        deleted_indexes=None):
+        """ロード済みモデルで単一フレーム(target_index)の予測を返す（逐次推論用）。
+
+        target_index を入力シーケンスの末尾フレームとして予測する。
+        必要な履歴(seq_len)・未来(pred_horizon)フレームが揃わない場合はNoneを返す。
+
+        Returns:
+            list | None — [[steering, throttle], ...] (pred_horizon個) または None
+        """
+        seq_len = cfg.get('seq_len', 8)
+        pred_horizon = cfg.get('pred_horizon', 10)
+        img_size = cfg.get('img_size', (128, 128))
+
+        start = target_index - seq_len + 1
+        end = target_index + pred_horizon  # 含む
+        if start < 0 or end >= len(images):
+            return None
+
+        deleted = deleted_indexes or set()
+        window = list(range(start, end + 1))
+        # 連続窓に削除フレームが含まれるとシーケンスを作れない
+        for idx in window:
+            if idx in deleted:
+                return None
+
+        dataset = SequenceDataset(
+            valid_indexes=window,
+            annotations=annotations,
+            images=images,
+            source_images_map=source_images_map,
+            selected_sources=selected_sources,
+            seq_len=seq_len,
+            pred_horizon=pred_horizon,
+            stride=1,
+            img_size=img_size,
+            augment=False
+        )
+        if len(dataset) == 0:
+            return None
+
+        # target_index を末尾入力に持つシーケンスを探して推論
+        for si, (input_indexes, _) in enumerate(dataset.sequences):
+            if input_indexes[-1] == target_index:
+                sample = dataset[si]
+                with torch.no_grad():
+                    imgs = sample['images'].unsqueeze(0).to(device)
+                    ego = sample['ego_states'].unsqueeze(0).to(device)
+                    traj = model(imgs, ego).cpu().numpy()[0]
+                return traj.tolist()
+        return None

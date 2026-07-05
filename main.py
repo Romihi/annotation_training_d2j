@@ -12,6 +12,12 @@ from datetime import datetime
 import math
 from copy import deepcopy
 
+# Windows + CUDA版PyTorch環境でのDLLロード順競合(アクセス違反 0xC0000005)回避:
+# pandas(およびmlflow)を torch / ultralytics より前に読み込んでおく必要がある。
+# これより後にtorch等を読み込んでからpandasを初めてimportするとプロセスが
+# ネイティブクラッシュするため、必ず先頭で読み込む。
+import pandas  # noqa: F401,E402
+
 import matplotlib
 matplotlib.use('Agg')  # GUIバックエンドを使用しない設定
 import matplotlib.pyplot as plt
@@ -1604,6 +1610,7 @@ class ImageLabel(QLabel):
         if getattr(self, 'show_gru_prediction', False) and getattr(self, 'sequence_prediction_points', []):
             traj_color = QColor(0, 200, 0)  # 緑
             traj_border = QColor(0, 128, 0)  # 濃い緑
+            tp1_border = QColor(0, 90, 0)    # t+1強調用の深緑
             n_pts = len(self.sequence_prediction_points)
             base_r = ANNOTATION_CIRCLE_SIZE - 1  # t+1のサイズ（アノテーション円より1pt小さい）
             min_r = 3
@@ -1616,13 +1623,13 @@ class ImageLabel(QLabel):
                 sy = int(target_rect.y() + rel_y * target_rect.height())
                 scaled_points.append((sx, sy))
 
-            # 矢印で接続（t+1 → t+2 → ...）
+            # 矢印で接続（遠い区間から描画し、手前(t+1側)の区間が上に重なるようにする）
             if len(scaled_points) >= 2:
                 painter.setPen(QPen(traj_color, 2))
                 painter.setBrush(QBrush(traj_color))
                 arrow_len = 8
                 arrow_angle = math.pi / 6
-                for i in range(len(scaled_points) - 1):
+                for i in range(len(scaled_points) - 2, -1, -1):
                     x1, y1 = scaled_points[i]
                     x2, y2 = scaled_points[i + 1]
                     painter.drawLine(x1, y1, x2, y2)
@@ -1641,8 +1648,10 @@ class ImageLabel(QLabel):
                             QPoint(int(ax2), int(ay2))
                         ]))
 
-            # 中実三角を描画（t+1が最大、段階的に縮小、次の点の方向を向く）
-            for i, (sx, sy) in enumerate(scaled_points):
+            # 中実三角を描画（遠い点から手前へ → 直近のt+1が最前面に来る）
+            # t+1(i=0)は深緑の枠付きで強調して見分けやすくする
+            for i in range(len(scaled_points) - 1, -1, -1):
+                sx, sy = scaled_points[i]
                 r = max(min_r, int(base_r - (base_r - min_r) * i / max(n_pts - 1, 1)))
                 # 三角の向きを決定（次の点方向、最後の点は前の点からの方向を継続）
                 if i < len(scaled_points) - 1:
@@ -1658,13 +1667,23 @@ class ImageLabel(QLabel):
                 left_y = sy + int(r * math.sin(ang + 2.4))
                 right_x = sx + int(r * math.cos(ang - 2.4))
                 right_y = sy + int(r * math.sin(ang - 2.4))
-                painter.setPen(QPen(traj_border, 1))
+                if i == 0:
+                    # t+1: 深緑の太枠で強調
+                    painter.setPen(QPen(tp1_border, 2))
+                else:
+                    painter.setPen(QPen(traj_border, 1))
                 painter.setBrush(QBrush(traj_color))
                 painter.drawPolygon(QPolygon([
                     QPoint(tip_x, tip_y),
                     QPoint(left_x, left_y),
                     QPoint(right_x, right_y)
                 ]))
+                # t+1はさらに深緑のリングで囲んで明示する
+                if i == 0:
+                    frame_r = r + 3
+                    painter.setPen(QPen(tp1_border, 2))
+                    painter.setBrush(QBrush())
+                    painter.drawEllipse(sx - frame_r, sy - frame_r, frame_r * 2, frame_r * 2)
 
     def draw_vector_arrow(self, painter, start_x, start_y, end_x, end_y):
         """教師データから推論結果への矢印を描画する"""
@@ -6225,7 +6244,10 @@ class ImageAnnotationTool(QMainWindow):
         auto_driving_control_layout.setContentsMargins(0, 2, 0, 2)
         auto_driving_control_layout.setSpacing(3)
 
-        # 行1: [✓ 走行軌跡を表示]  最大舵角: [25.0°]
+        # ラベル/チェックボックスが縦方向に潰れないための高さ（フォント高さ基準）
+        _label_h = self.fontMetrics().height() + 4
+
+        # 行1: [✓ 走行軌跡を表示]（チェックボックスは単独行にしてラベルの見切れを防ぐ）
         traj_row = QHBoxLayout()
         traj_row.setSpacing(4)
         self.show_auto_driving_direction_checkbox = QCheckBox(get_text('chk_show_auto_driving_direction'))
@@ -6233,49 +6255,64 @@ class ImageAnnotationTool(QMainWindow):
         self.show_auto_driving_direction_checkbox.setToolTip(get_text('tip_auto_driving_direction'))
         self.show_auto_driving_direction_checkbox.stateChanged.connect(self.toggle_auto_driving_direction)
         self.show_auto_driving_direction_checkbox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        self.show_auto_driving_direction_checkbox.setMinimumWidth(145)
+        self.show_auto_driving_direction_checkbox.setMinimumHeight(_label_h)
         traj_row.addWidget(self.show_auto_driving_direction_checkbox)
-        traj_row.addSpacing(6)
-        traj_row.addWidget(QLabel(get_text('label_auto_max_steering')))
-        self.auto_max_steering_spin = QDoubleSpinBox()
-        self.auto_max_steering_spin.setRange(0.1, 90.0)
-        self.auto_max_steering_spin.setSuffix("°")
-        self.auto_max_steering_spin.setDecimals(1)
-        self.auto_max_steering_spin.setFixedWidth(76)
-        self.auto_max_steering_spin.setToolTip(get_text('tip_auto_max_steering'))
-        self.auto_max_steering_spin.valueChanged.connect(self.update_auto_max_steering_angle)
-        self.auto_max_steering_spin.setValue(25.0)
-        traj_row.addWidget(self.auto_max_steering_spin)
         traj_row.addStretch()
         auto_driving_control_layout.addLayout(traj_row)
 
-        # 行2: 俯角:[°]  FOV:[°]  ←stretch
-        cam_row = QHBoxLayout()
-        cam_row.setSpacing(3)
-        cam_row.addWidget(QLabel(get_text('label_auto_cam_pitch')))
-        self.auto_cam_pitch_spin = QDoubleSpinBox()
-        self.auto_cam_pitch_spin.setRange(0.0, 89.0)
-        self.auto_cam_pitch_spin.setSuffix("°")
-        self.auto_cam_pitch_spin.setDecimals(1)
-        self.auto_cam_pitch_spin.setFixedWidth(76)
+        # 行2: 最大舵角 / 俯角 / FOV を横に並べる（各列：ラベルを値の上に配置）
+        #   狭いパネル幅でもラベルが全部見えるよう、1項目=1列(ラベル＋入力欄)とする
+        params_row = QHBoxLayout()
+        params_row.setSpacing(10)
+
+        def _mk_spin(decimals, lo, hi, width=64):
+            sb = QDoubleSpinBox()
+            sb.setRange(lo, hi)
+            sb.setSuffix("°")
+            sb.setDecimals(decimals)
+            sb.setFixedWidth(width)
+            sb.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            return sb
+
+        def _add_param_col(label_key, spin):
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            col.setContentsMargins(0, 0, 0, 0)
+            lbl = QLabel(get_text(label_key))
+            lbl.setAlignment(Qt.AlignLeft | Qt.AlignBottom)
+            # ラベルが縦に潰れないよう、フォント高さ分を固定で確保する
+            lbl.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+            lbl.setMinimumHeight(_label_h)
+            col.addWidget(lbl)
+            col.addWidget(spin)
+            params_row.addLayout(col)
+
+        # 最大舵角
+        self.auto_max_steering_spin = _mk_spin(1, 0.1, 90.0)
+        self.auto_max_steering_spin.setToolTip(get_text('tip_auto_max_steering'))
+        self.auto_max_steering_spin.valueChanged.connect(self.update_auto_max_steering_angle)
+        self.auto_max_steering_spin.setValue(25.0)
+        _add_param_col('label_auto_max_steering', self.auto_max_steering_spin)
+
+        # カメラ俯角
+        self.auto_cam_pitch_spin = _mk_spin(1, 0.0, 89.0)
         self.auto_cam_pitch_spin.setToolTip(get_text('tip_auto_cam_pitch'))
         self.auto_cam_pitch_spin.valueChanged.connect(self.update_auto_cam_pitch)
         self.auto_cam_pitch_spin.setValue(20.0)
-        cam_row.addWidget(self.auto_cam_pitch_spin)
-        cam_row.addSpacing(6)
-        cam_row.addWidget(QLabel(get_text('label_auto_fov')))
-        self.auto_fov_spin = QDoubleSpinBox()
-        self.auto_fov_spin.setRange(60.0, 220.0)
-        self.auto_fov_spin.setSuffix("°")
-        self.auto_fov_spin.setDecimals(0)
-        self.auto_fov_spin.setFixedWidth(76)
+        _add_param_col('label_auto_cam_pitch', self.auto_cam_pitch_spin)
+
+        # 画角(FOV)
+        self.auto_fov_spin = _mk_spin(0, 60.0, 220.0)
         self.auto_fov_spin.setToolTip(get_text('tip_auto_fov'))
         self.auto_fov_spin.valueChanged.connect(self.update_auto_fov_deg)
         self.auto_fov_spin.setValue(160.0)
-        cam_row.addWidget(self.auto_fov_spin)
-        cam_row.addStretch()
-        auto_driving_control_layout.addLayout(cam_row)
+        _add_param_col('label_auto_fov', self.auto_fov_spin)
 
+        params_row.addStretch()
+        auto_driving_control_layout.addLayout(params_row)
+
+        # ウィジェット全体が縦方向に圧縮されないようにする（ラベルの潰れ防止）
+        self.auto_driving_control_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         self.auto_driving_control_widget.setVisible(True)  # 初期は自動運転モードで表示
         location_layout.addWidget(self.auto_driving_control_widget)
 
@@ -14981,22 +15018,39 @@ class ImageAnnotationTool(QMainWindow):
         try:
             import subprocess
             import sys
+            import socket
             import webbrowser
             from config import mlflow_dir
 
+            # 既にMLflow UIが起動中(ポート5000使用中)なら二重起動せずブラウザを開く
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
+                _s.settimeout(0.3)
+                already_running = (_s.connect_ex(("127.0.0.1", 5000)) == 0)
+
+            if already_running:
+                webbrowser.open('http://127.0.0.1:5000')
+                QMessageBox.information(
+                    self,
+                    get_text('dlg_mlflow_ui'),
+                    get_text('msg_mlflow_ui_started')
+                )
+                return
+
             # パスの正規化
+            # MLflow 3 ではファイルストア(file://)が使用不可のため sqlite バックエンドを使用
             normalized_path = os.path.normpath(mlflow_dir).replace('\\', '/')
+            tracking_uri = f"sqlite:///{normalized_path}/mlflow.db"
             if sys.platform.startswith('win'):
-                tracking_uri = f"file:///{normalized_path}"
+                artifact_root = f"file:///{normalized_path}/mlartifacts"
             else:
-                tracking_uri = f"file://{normalized_path}"
+                artifact_root = f"file://{normalized_path}/mlartifacts"
 
             # MLflow UIを起動
             if sys.platform.startswith('win'):
-                cmd = f'start cmd /k "mlflow ui --backend-store-uri {tracking_uri} --workers 1"'
+                cmd = f'start cmd /k "mlflow ui --backend-store-uri {tracking_uri} --default-artifact-root {artifact_root} --workers 1"'
                 subprocess.Popen(cmd, shell=True)
             else:
-                cmd = f'mlflow ui --backend-store-uri {tracking_uri}'
+                cmd = f'mlflow ui --backend-store-uri {tracking_uri} --default-artifact-root {artifact_root}'
                 subprocess.Popen(cmd, shell=True)
 
             # サーバー起動を待ってからブラウザを開く（3秒後）
@@ -24157,6 +24211,9 @@ class ImageAnnotationTool(QMainWindow):
             self.main_image_view.update()
             return
 
+        # 逐次推論: 現在フレームが未推論ならその場で推論する
+        self._ensure_gru_current_prediction(current_index)
+
         predictions = getattr(self, 'gru_predictions', {})
         if current_index not in predictions:
             self.main_image_view.sequence_prediction_points = []
@@ -24186,8 +24243,17 @@ class ImageAnnotationTool(QMainWindow):
             self.inference_info_label.setTextFormat(Qt.RichText)
 
         # 画像上に全軌道点を設定
-        img_w = self.main_image_view.pixmap().width() if self.main_image_view.pixmap() else 0
-        img_h = self.main_image_view.pixmap().height() if self.main_image_view.pixmap() else 0
+        # 運転アノテーション点(anno['x'])は「元画像サイズ(original_image_width)」基準で
+        # 保存されるため、時系列予測点も同じ基準で保存する。
+        # 描画側(draw_control_points)はアノテーションと同じ _get_annotation_draw_params の
+        # 実効ピクセル幅で正規化するため、結合表示（マルチカメラ）でも運転アノテーションと
+        # 同じサブ画像・同じ位置に軌道が描画される。
+        view = self.main_image_view
+        img_w = getattr(self, 'original_image_width', 0)
+        img_h = getattr(self, 'original_image_height', 0)
+        if not img_w or not img_h:
+            img_w = view.pixmap().width() if view.pixmap() else 0
+            img_h = view.pixmap().height() if view.pixmap() else 0
         if img_w > 0 and img_h > 0 and trajectory:
             points = []
             for s, t in trajectory:
@@ -24466,6 +24532,22 @@ class ImageAnnotationTool(QMainWindow):
         aug_check.setChecked(True)
         training_layout.addWidget(aug_check)
 
+        # 早期終了（Early Stopping）: 有効/無効 と patience
+        early_stop_layout = QHBoxLayout()
+        early_stop_check = QCheckBox(get_text('chk_early_stopping'))
+        early_stop_check.setChecked(True)
+        early_stop_layout.addWidget(early_stop_check)
+        early_stop_layout.addWidget(QLabel(get_text('label_patience')))
+        patience_spin = QSpinBox()
+        patience_spin.setRange(1, 100)
+        patience_spin.setValue(10)
+        early_stop_layout.addWidget(patience_spin)
+        early_stop_layout.addStretch()
+        # patience入力の有効/無効をチェックボックスに連動
+        patience_spin.setEnabled(early_stop_check.isChecked())
+        early_stop_check.toggled.connect(patience_spin.setEnabled)
+        training_layout.addLayout(early_stop_layout)
+
         training_group.setLayout(training_layout)
         right_column.addWidget(training_group)
 
@@ -24616,6 +24698,8 @@ class ImageAnnotationTool(QMainWindow):
             'learning_rate': float(lr_combo.currentText()),
             'val_split': val_split_spin.value(),
             'augment': aug_check.isChecked(),
+            'use_early_stopping': early_stop_check.isChecked(),
+            'patience': patience_spin.value(),
         }
 
         # アーキテクチャ固有パラメータ
@@ -24748,21 +24832,98 @@ class ImageAnnotationTool(QMainWindow):
             import traceback
             traceback.print_exc()
 
-    def run_gru_prediction(self):
-        """時系列モデルの推論を実行（コンボボックスで選択されたモデルを使用）"""
+    def _load_gru_model(self):
+        """コンボボックスで選択された時系列モデルをロードしてキャッシュする。
+
+        Returns:
+            bool — 成功でTrue
+        """
         if not self.annotations:
             QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_need_annotations_to_train'))
-            return
+            return False
 
-        # コンボボックスから選択されたモデルを取得
         selected_model_name = self.traj_model_combo.currentText()
         if not selected_model_name or selected_model_name == get_text('combo_model_not_found'):
             QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_traj_models'))
-            return
+            return False
 
         selected_model_path = os.path.join(models_dir, selected_model_name)
         if not os.path.exists(selected_model_path):
             QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_traj_models'))
+            return False
+
+        # 既に同じモデルをロード済みなら再利用
+        if self._gru_model is not None and self._gru_model_path == selected_model_path:
+            return True
+
+        try:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            model, cfg, sources = SequenceTrainingManager.load_model(selected_model_path, device)
+            model.eval()
+            self._gru_model = model
+            self._gru_cfg = cfg
+            self._gru_sources = sources
+            self._gru_device = device
+            self._gru_model_path = selected_model_path
+            self._gru_manager = SequenceTrainingManager(models_dir)
+            # モデルが変わったので予測キャッシュをクリア
+            self.gru_predictions = {}
+            self.gru_prediction_config = cfg
+            return True
+        except Exception as e:
+            QMessageBox.critical(
+                self, get_text('dlg_error'),
+                f"時系列モデルの読み込みに失敗しました: {str(e)}"
+            )
+            return False
+
+    def _ensure_gru_current_prediction(self, current_index):
+        """逐次推論: 現在フレームの予測が未キャッシュなら計算してキャッシュする"""
+        if not getattr(self, '_gru_infer_enabled', False):
+            return
+        if self._gru_model is None or self._gru_manager is None:
+            return
+        if current_index in self.gru_predictions:
+            return
+        try:
+            deleted = getattr(self, 'deleted_indexes', set())
+            traj = self._gru_manager.predict_current(
+                self._gru_model, self._gru_cfg, self._gru_sources,
+                current_index, self.annotations, self.images,
+                getattr(self, 'source_images_map', None),
+                self._gru_device, deleted
+            )
+            if traj is not None:
+                self.gru_predictions[current_index] = traj
+        except Exception as e:
+            print(f"時系列逐次推論エラー: {e}")
+
+    def run_gru_prediction(self):
+        """時系列モデルを読み込み、読み込み直後に現在フレームの推論結果を表示する。
+        以降はナビゲーション時に現在画像へ逐次推論する（自動運転モデルと同じ挙動）。"""
+        if not self._load_gru_model():
+            return
+
+        self._gru_infer_enabled = True
+        self.show_gru_predictions = True
+        if hasattr(self, 'gru_prediction_checkbox'):
+            self.gru_prediction_checkbox.setChecked(True)
+
+        # 読み込み直後に現在の画像を推論して即座に表示する
+        current_index = getattr(self, 'current_index', 0)
+        self._ensure_gru_current_prediction(current_index)
+        # 情報パネル＋画像の両方を更新（自動運転の推論表示と同様）
+        if hasattr(self, 'update_inference_display'):
+            self.update_inference_display()
+        self._update_gru_prediction_display(current_index)
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+        QApplication.processEvents()
+        self.statusBar().showMessage(get_text('status_traj_infer_enabled'), 4000)
+
+    def run_gru_prediction_all(self):
+        """全画像に対して時系列推論を実行（バッチ・自動運転の全画像推論と同じ挙動）"""
+        if not self._load_gru_model():
             return
 
         # valid_indexes構築
@@ -24780,9 +24941,7 @@ class ImageAnnotationTool(QMainWindow):
 
         try:
             progress = QProgressDialog(
-                get_text('msg_traj_predicting'),
-                get_text('btn_cancel') if 'btn_cancel' in dir() else "キャンセル",
-                0, 100, self
+                get_text('msg_traj_predicting'), "キャンセル", 0, 100, self
             )
             progress.setWindowTitle(get_text('dlg_traj_prediction'))
             progress.setWindowModality(Qt.WindowModal)
@@ -24796,9 +24955,8 @@ class ImageAnnotationTool(QMainWindow):
                 QApplication.processEvents()
                 return not progress.wasCanceled()
 
-            manager = SequenceTrainingManager(models_dir)
-            result = manager.predict(
-                model_path=selected_model_path,
+            result = self._gru_manager.predict(
+                model_path=self._gru_model_path,
                 valid_indexes=valid_indexes,
                 annotations=self.annotations,
                 images=self.images,
@@ -24819,14 +24977,15 @@ class ImageAnnotationTool(QMainWindow):
                 self.statusBar().showMessage(get_text('status_training_cancelled'), 5000)
                 return
 
-            self.gru_predictions = result.get('predictions', {})
+            # 全画像分の予測をキャッシュにマージ
+            self.gru_predictions.update(result.get('predictions', {}))
             self.gru_prediction_config = result.get('config', {})
             self.show_gru_predictions = True
+            self._gru_infer_enabled = True
 
             if hasattr(self, 'gru_prediction_checkbox'):
                 self.gru_prediction_checkbox.setChecked(True)
 
-            # 現在の画像で推論結果を即座に表示
             current_index = getattr(self, 'current_index', 0)
             self._update_gru_prediction_display(current_index)
 
@@ -26428,11 +26587,18 @@ class ImageAnnotationTool(QMainWindow):
         traj_buttons_layout.addWidget(traj_train_button)
 
         traj_predict_button = QPushButton(get_text('btn_traj_predict'))
+        traj_predict_button.setToolTip(get_text('status_traj_infer_enabled'))
         traj_predict_button.clicked.connect(self.run_gru_prediction)
         apply_style(traj_predict_button, 'model')
         traj_buttons_layout.addWidget(traj_predict_button)
 
         gru_content_layout.addLayout(traj_buttons_layout)
+
+        # 全画像を推論（バッチ）ボタン
+        traj_predict_all_button = QPushButton(get_text('btn_traj_predict_all'))
+        traj_predict_all_button.clicked.connect(self.run_gru_prediction_all)
+        apply_style(traj_predict_all_button, 'model')
+        gru_content_layout.addWidget(traj_predict_all_button)
 
         # 予測表示チェックボックス
         self.gru_prediction_checkbox = QCheckBox(get_text('chk_show_traj_prediction'))
@@ -26451,6 +26617,14 @@ class ImageAnnotationTool(QMainWindow):
         self.gru_predictions = {}
         self.gru_prediction_config = {}
         self.show_gru_predictions = False
+
+        # 逐次推論用のロード済みモデルキャッシュ
+        self._gru_model = None
+        self._gru_cfg = None
+        self._gru_sources = None
+        self._gru_model_path = None
+        self._gru_device = None
+        self._gru_infer_enabled = False  # 逐次推論(現在画像)が有効か
 
         # モデルリストを初期化
         self.refresh_traj_model_list()

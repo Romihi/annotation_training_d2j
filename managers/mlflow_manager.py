@@ -432,8 +432,14 @@ class MLflowManager:
 
     def _log_run_to_target(self, target: str, model_type: ModelType, run_name: str,
                            params: dict, run_metrics: dict, tags: dict,
-                           dataset_info: dict, metrics: dict, model_path: str):
-        """指定されたターゲット（local/databricks）にログを記録"""
+                           dataset_info: dict, metrics: dict, model_path: str,
+                           extra_artifacts: list = None):
+        """指定されたターゲット（local/databricks）にログを記録
+
+        Args:
+            extra_artifacts: 追加で記録するファイルのリスト。各要素は
+                str（パス）または (path, artifact_subdir) のタプル。
+        """
         try:
             if not self.set_experiment(model_type, target):
                 return False
@@ -483,6 +489,18 @@ class MLflowManager:
                         model_path = os.path.normpath(model_path)
                     mlflow.log_artifact(model_path, "model")
 
+                # 追加アーティファクト（学習曲線PNG等）を記録
+                if extra_artifacts:
+                    for item in extra_artifacts:
+                        if isinstance(item, (tuple, list)):
+                            art_path, art_dir = item[0], item[1]
+                        else:
+                            art_path, art_dir = item, None
+                        if art_path and os.path.exists(art_path):
+                            if sys.platform.startswith('win'):
+                                art_path = os.path.normpath(art_path)
+                            mlflow.log_artifact(art_path, art_dir)
+
             print(f"モデルを{target}に記録しました: {run_name}")
             return True
 
@@ -492,12 +510,13 @@ class MLflowManager:
 
     def _log_with_local_fallback(self, model_type: ModelType, run_name: str,
                                   params: dict, run_metrics: dict, tags: dict,
-                                  dataset_info: dict, metrics: dict, model_path: str):
+                                  dataset_info: dict, metrics: dict, model_path: str,
+                                  extra_artifacts: list = None):
         """ローカルに記録し、Databricks有効時は追加でDatabricksにも記録"""
         # まずローカルに記録（必須）
         local_success = self._log_run_to_target(
             "local", model_type, run_name, params, run_metrics, tags,
-            dataset_info, metrics, model_path
+            dataset_info, metrics, model_path, extra_artifacts
         )
 
         # Databricks有効時は追加で記録（タイムアウト付き）
@@ -506,7 +525,7 @@ class MLflowManager:
             print(f"Databricksに記録中... (タイムアウト: {self.DATABRICKS_LOG_TIMEOUT}秒)")
             databricks_success = self._log_to_databricks_with_timeout(
                 model_type, run_name, params, run_metrics, tags,
-                dataset_info, metrics, model_path
+                dataset_info, metrics, model_path, extra_artifacts
             )
             if databricks_success:
                 print(f"Databricksにも記録しました: {run_name}")
@@ -523,7 +542,7 @@ class MLflowManager:
 
     def _log_to_databricks_with_timeout(self, model_type, run_name, params,
                                          run_metrics, tags, dataset_info, metrics,
-                                         model_path):
+                                         model_path, extra_artifacts=None):
         """Databricksへの記録をタイムアウト付きで実行（UIフリーズ防止）"""
         import threading
 
@@ -534,7 +553,7 @@ class MLflowManager:
             try:
                 result[0] = self._log_run_to_target(
                     "databricks", model_type, run_name, params, run_metrics, tags,
-                    dataset_info, metrics, model_path
+                    dataset_info, metrics, model_path, extra_artifacts
                 )
             except Exception as e:
                 error_msg[0] = str(e)
@@ -1151,10 +1170,23 @@ class MLflowManager:
         else:
             return {"status": "error", "message": "記録に失敗しました"}
 
-    def log_sequence_model(self, model_path, training_params, metrics, dataset_info):
-        """時系列モデルの学習結果を記録（ローカル併用記録対応）"""
+    def log_sequence_model(self, model_path, training_params, metrics, dataset_info,
+                           extra_artifacts: list = None):
+        """時系列モデルの学習結果を記録（ローカル併用記録対応）
+
+        Args:
+            extra_artifacts: 追加で記録するファイル（学習曲線PNG等）のリスト
+        """
 
         arch = training_params.get("model_arch", "gru")
+
+        # リスト等はMLflowパラメータ用に文字列化
+        def _as_param(v):
+            if v is None:
+                return None
+            if isinstance(v, (list, tuple)):
+                return ",".join(map(str, v))
+            return v
 
         params = {
             "framework": "pytorch",
@@ -1164,8 +1196,9 @@ class MLflowManager:
             "task_type": "sequence_prediction",
             "seq_len": training_params.get("seq_len", 8),
             "pred_horizon": training_params.get("pred_horizon", 10),
-            "hidden_size": training_params.get("gru_hidden", 256),
-            "num_layers": training_params.get("gru_layers", 1),
+            # 旧キー(gru_hidden/gru_layers)もフォールバックで参照しつつ、正しい値を記録
+            "hidden_size": training_params.get("hidden_dim", training_params.get("gru_hidden", 256)),
+            "num_layers": training_params.get("num_layers", training_params.get("gru_layers", 1)),
             "dropout": training_params.get("dropout", 0.1),
             "epochs": training_params.get("num_epochs", 0),
             "learning_rate": training_params.get("learning_rate", 0.001),
@@ -1174,11 +1207,39 @@ class MLflowManager:
             "selected_sources": training_params.get("selected_sources", ""),
             "augmentation_enabled": training_params.get("augmentation_enabled", False),
             "stride": training_params.get("stride", 1),
+            # 追加: 学習・アーキテクチャ設定（Noneは_log_run_to_targetで除外される）
+            "img_size": _as_param(training_params.get("img_size")),
+            "val_split": training_params.get("val_split"),
+            "weight_decay": training_params.get("weight_decay"),
+            "fusion_method": training_params.get("fusion_method"),
+            "attn_heads": training_params.get("attn_heads"),
+            "kernel_size": training_params.get("kernel_size"),
+            "tcn_channels": _as_param(training_params.get("tcn_channels")),
+            "cnn_channels": _as_param(training_params.get("cnn_channels")),
+            # 早期終了の設定
+            "early_stopping": "enabled" if training_params.get("use_early_stopping") else "disabled",
+            "patience": training_params.get("patience"),
+            # モデルI/Oスキーマ（signature相当・再現性/比較用）
+            "input_image_shape": _as_param(training_params.get("input_image_shape")),
+            "ego_state_dim": training_params.get("ego_state_dim"),
+            "output_shape": _as_param(training_params.get("output_shape")),
+            # モデル・実行環境メタデータ
+            "model_params_total": training_params.get("model_params_total"),
+            "model_params_trainable": training_params.get("model_params_trainable"),
+            "device": training_params.get("device"),
+            "torch_version": training_params.get("torch_version"),
+            "cuda_version": training_params.get("cuda_version"),
         }
+
+        # コメントがあれば追加
+        if training_params.get("comment"):
+            params["comment"] = training_params["comment"]
 
         run_metrics = {
             "best_val_loss": metrics.get("best_val_loss", 0.0),
             "final_train_loss": metrics.get("final_train_loss", 0.0),
+            "final_val_loss": metrics.get("final_val_loss", 0.0),
+            "best_epoch": metrics.get("best_epoch", 0),
             "total_training_time": metrics.get("total_training_time", 0.0),
             "avg_epoch_time": metrics.get("avg_epoch_time", 0.0),
             "completed_epochs": metrics.get("completed_epochs", 0)
@@ -1201,11 +1262,17 @@ class MLflowManager:
                 "total_sequences": dataset_info.get("total_sequences", 0)
             })
 
-        run_name = f"sequence_{arch}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        # カスタムモデル名が指定されていればそれを実行名に使用（他モデルと同様）
+        custom_name = training_params.get('model_name', '')
+        if custom_name:
+            run_name = custom_name
+        else:
+            run_name = f"sequence_{arch}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
         success = self._log_with_local_fallback(
             ModelType.SEQUENCE, run_name, params, run_metrics, tags,
-            dataset_info if dataset_info else {}, metrics, model_path
+            dataset_info if dataset_info else {}, metrics, model_path,
+            extra_artifacts=extra_artifacts
         )
 
         if success:

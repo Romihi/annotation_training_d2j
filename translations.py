@@ -1085,8 +1085,8 @@ TRANSLATIONS = {
         'label_auto_max_steering': '最大舵角:',
         'tip_auto_cam_pitch': 'カメラ俯角（度）。カメラが水平から何度下を向いているか。大きいほど軌跡が画像上部まで伸びる',
         'tip_auto_fov': 'カメラの対角FOV（度）。160°魚眼レンズなら160。等距離射影モデルを使用',
-        'label_auto_cam_pitch': '俯角:',
-        'label_auto_fov': 'FOV:',
+        'label_auto_cam_pitch': 'カメラ俯角:',
+        'label_auto_fov': '画角FOV:',
         'tip_seg_class_id': '走行可能エリアのセグメンテーションクラスID',
         'tip_seg_y_coordinate': '走行方向計算に使用するY座標（画像上からのピクセル）',
         'tip_seg_max_steering': '走行軌跡計算に使用する最大舵角（度）',
@@ -1614,7 +1614,9 @@ Google Cloud Console での OAuth設定手順
         'label_traj_seq_info': '入力: {0}フレーム → 予測: {1}フレーム',
 
         # 時系列推論関連
-        'btn_traj_predict': '推論実行',
+        'btn_traj_predict': 'モデル読込',
+        'btn_traj_predict_all': '全画像を推論',
+        'status_traj_infer_enabled': '時系列モデルを読み込みました（現在フレームを推論・以降は画像切替で逐次推論）',
         'dlg_traj_predict_settings': '時系列モデル - 推論設定',
         'dlg_traj_prediction': '時系列モデル',
         'msg_traj_predicting': '時系列モデルの推論中...',
@@ -2648,7 +2650,7 @@ Google Cloud Console での OAuth設定手順
         'label_auto_max_steering': 'Max Steering:',
         'tip_auto_cam_pitch': 'Camera depression angle (deg). How far below horizontal the camera points. Higher = trajectory extends further up image',
         'tip_auto_fov': 'Camera diagonal FOV (deg). Use 160 for a 160° fisheye. Uses equidistant projection model',
-        'label_auto_cam_pitch': 'Pitch:',
+        'label_auto_cam_pitch': 'Cam Pitch:',
         'label_auto_fov': 'FOV:',
         'tip_seg_class_id': 'Segmentation class ID for drivable area',
         'tip_seg_y_coordinate': 'Y coordinate used for direction calculation (pixels from top)',
@@ -3179,7 +3181,9 @@ Notes
         'label_traj_seq_info': 'Input: {0} frames → Predict: {1} frames',
 
         # Time-Series Inference
-        'btn_traj_predict': 'Run Inference',
+        'btn_traj_predict': 'Load Model',
+        'btn_traj_predict_all': 'Infer All Images',
+        'status_traj_infer_enabled': 'Sequence model loaded (current frame inferred; subsequent frames inferred on navigation)',
         'dlg_traj_predict_settings': 'Time-Series Sequence - Inference Settings',
         'dlg_traj_prediction': 'Time-Series Sequence Prediction',
         'msg_traj_predicting': 'Running time-series sequence inference...',
