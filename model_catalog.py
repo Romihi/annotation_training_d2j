@@ -1442,7 +1442,11 @@ class MultiCameraAttentionFusion(nn.Module):
     def forward(self, x):
         # x: (B*T, S, feat_dim)
         attn_out, attn_weights = self.attn(x, x, x, need_weights=True, average_attn_weights=True)
-        self.last_attn_weights = attn_weights.detach()  # (B*T, S, S) — 可視化用
+        # 属性ミューテーションは ONNX dynamo export で禁止されるため
+        # export / tracing / compile 中はスキップする
+        if not (torch.jit.is_tracing()
+                or (hasattr(torch.compiler, 'is_compiling') and torch.compiler.is_compiling())):
+            self.last_attn_weights = attn_weights.detach()  # (B*T, S, S) — 可視化用
         x = self.norm(x + attn_out)   # residual + LayerNorm
         return x.mean(dim=1)          # (B*T, feat_dim)
 
@@ -1753,7 +1757,7 @@ class AnnotationDataset(torch.utils.data.Dataset):
         """アノテーションからangle, throttle, speedを取得"""
         angle = annotation.get("angle", 0.0)
         throttle = annotation.get("throttle", 0.0)
-        _raw_speed = annotation.get("speed", annotation.get("user/speed", annotation.get("pilot/speed", 0.0)))
+        _raw_speed = annotation.get("enc/speed", annotation.get("speed", annotation.get("user/speed", annotation.get("pilot/speed", 0.0))))
         speed = max(0.0, min(1.0, _raw_speed / _MAX_SPEED)) if _MAX_SPEED > 0 else 0.0
         return angle, throttle, speed
 
@@ -1925,7 +1929,11 @@ class MultiSourceModel(BaseModel):
             seq = seq + self.pos_embed  # 位置情報を加算してソース順序を保持
             attn_out, attn_weights = self.attention(seq, seq, seq,
                                                     need_weights=True, average_attn_weights=True)
-            self.last_attn_weights = attn_weights.detach()  # (batch, S, S) — 可視化用
+            # 属性ミューテーションは ONNX dynamo export で禁止されるため
+            # export / tracing / compile 中はスキップする
+            if not (torch.jit.is_tracing()
+                    or (hasattr(torch.compiler, 'is_compiling') and torch.compiler.is_compiling())):
+                self.last_attn_weights = attn_weights.detach()  # (batch, S, S) — 可視化用
             norm_out = self.norm(seq + attn_out)
             fused = norm_out[:, 0, :]  # インデックス0=現在フレームの出力を使用
 
@@ -1997,7 +2005,7 @@ class MultiSourceDataset(torch.utils.data.Dataset):
         """アノテーションからangle, throttle, speedを取得"""
         angle = annotation.get("angle", 0.0)
         throttle = annotation.get("throttle", 0.0)
-        _raw_speed = annotation.get("speed", annotation.get("user/speed", annotation.get("pilot/speed", 0.0)))
+        _raw_speed = annotation.get("enc/speed", annotation.get("speed", annotation.get("user/speed", annotation.get("pilot/speed", 0.0))))
         speed = max(0.0, min(1.0, _raw_speed / _MAX_SPEED)) if _MAX_SPEED > 0 else 0.0
         return angle, throttle, speed
 
@@ -2090,7 +2098,7 @@ class VirtualSourceDataset(torch.utils.data.Dataset):
     def _get_annotation_values(self, annotation):
         angle = annotation.get("angle", 0.0)
         throttle = annotation.get("throttle", 0.0)
-        _raw_speed = annotation.get("speed", annotation.get("user/speed", annotation.get("pilot/speed", 0.0)))
+        _raw_speed = annotation.get("enc/speed", annotation.get("speed", annotation.get("user/speed", annotation.get("pilot/speed", 0.0))))
         speed = max(0.0, min(1.0, _raw_speed / _MAX_SPEED)) if _MAX_SPEED > 0 else 0.0
         return angle, throttle, speed
 

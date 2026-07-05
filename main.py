@@ -20276,11 +20276,13 @@ class ImageAnnotationTool(QMainWindow):
                             location = entry.get('user/loc', entry.get('pilot/loc', None))
 
                             # Speed情報を取得
-                            # user/speed → その他の */speed（pilot/speed除く）→ speed → pilot/speed の優先順で取得
-                            speed = entry.get('user/speed')
+                            # user/speed → enc/speed（融合済み観測車速）→ その他の */speed
+                            # （pilot/speed除く）→ speed → pilot/speed の優先順で取得
+                            speed = entry.get('user/speed', entry.get('enc/speed'))
                             if speed is None:
                                 for _k, _v in entry.items():
-                                    if _k.endswith('/speed') and _k != 'pilot/speed' and _k != 'user/speed':
+                                    if (_k.endswith('/speed') and _k != 'pilot/speed'
+                                            and _k != 'user/speed' and _k != 'enc/speed'):
                                         speed = _v
                                         break
                             if speed is None:
@@ -20321,7 +20323,7 @@ class ImageAnnotationTool(QMainWindow):
                                 if key.startswith('_') or key.endswith('/image_array'):
                                     continue
                                 if key in ['user/angle', 'pilot/angle', 'user/throttle', 'pilot/throttle',
-                                           'user/loc', 'pilot/loc', 'speed', 'user/speed', 'pilot/speed']:
+                                           'user/loc', 'pilot/loc', 'speed', 'enc/speed', 'user/speed', 'pilot/speed']:
                                     continue
                                 if key.endswith('/speed'):  # */speed は上で処理済み
                                     continue
@@ -22453,7 +22455,7 @@ class ImageAnnotationTool(QMainWindow):
         has_speed_data = False
         speed_count = 0
         for idx, ann in self.annotations.items():
-            if 'speed' in ann or 'user/speed' in ann or 'pilot/speed' in ann:
+            if 'enc/speed' in ann or 'speed' in ann or 'user/speed' in ann or 'pilot/speed' in ann:
                 speed_count += 1
 
         if speed_count > 0:
