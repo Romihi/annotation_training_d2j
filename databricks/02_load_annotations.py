@@ -11,8 +11,12 @@
 
 # COMMAND ----------
 
+# パイプライン実行用パラメータ（手動実行時は下のデフォルト値が使われます）
+dbutils.widgets.text("data_path", "")
+
 # 展開済みデータのパス
-DATA_PATH = "/Volumes/workspace/default/annotation_data/annotation_20251201_001802"
+_data_path_param = dbutils.widgets.get("data_path")
+DATA_PATH = _data_path_param if _data_path_param else EXTRACT_PATH
 
 print(f"データパス: {DATA_PATH}")
 

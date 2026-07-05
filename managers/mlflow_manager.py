@@ -9,7 +9,7 @@ from enum import Enum
 
 # Databricks設定をインポート
 try:
-    from config_databricks import (
+    from databricks.config_databricks import (
         DATABRICKS_ENABLED,
         DATABRICKS_HOST,
         DATABRICKS_TOKEN,
@@ -29,6 +29,8 @@ class ModelType(Enum):
     WAYPOINT_REGRESSION = "waypoint_regression"
     YOLO_DETECTION = "yolo_detection"
     YOLO_SEGMENTATION = "yolo_segmentation"
+    SEQUENCE = "sequence"
+    GRU_TRAJECTORY = "gru_trajectory"  # 後方互換
 
 class MLflowManager:
     """実験別MLflow統合管理クラス（Databricks対応・ローカル併用記録）"""
@@ -39,19 +41,24 @@ class MLflowManager:
         ModelType.POSITION_ESTIMATION: "position_estimation_models",
         ModelType.WAYPOINT_REGRESSION: "waypoint_regression_models",
         ModelType.YOLO_DETECTION: "yolo_detection_models",
-        ModelType.YOLO_SEGMENTATION: "yolo_segmentation_models"
+        ModelType.YOLO_SEGMENTATION: "yolo_segmentation_models",
+        ModelType.SEQUENCE: "sequence_models",
+        ModelType.GRU_TRAJECTORY: "gru_trajectory_models"  # 後方互換
     }
 
     def __init__(self, folder_path=None, use_databricks=None):
         self.folder_path = folder_path
         self.tracking_uri = None
-        self.local_tracking_uri = None  # ローカル用URI（常に保持）
+        self.local_tracking_uri = None  # ローカル用URI（常に保持・MLflow3ではsqlite）
+        self.local_artifact_root = None  # ローカル用アーティファクトルート（file://）
         self.current_experiment = None
         self.is_initialized = False
 
-        # Databricks使用フラグ（Noneの場合はconfig_databricks.pyの設定を使用）
+        # Databricks使用フラグ
+        # デフォルトはFalse（ユーザーが設定画面から明示的に有効化する必要がある）
+        # use_databricks=Trueが明示的に渡された場合のみ有効化
         if use_databricks is None:
-            self.use_databricks = DATABRICKS_ENABLED if DATABRICKS_CONFIG_AVAILABLE else False
+            self.use_databricks = False
         else:
             self.use_databricks = use_databricks
 
@@ -97,10 +104,19 @@ class MLflowManager:
             print("警告: config_databricks.py が見つかりません")
             return False
 
-        # 設定の検証
+        # 設定の検証（validate_databricks_configはDATABRICKS_ENABLEDフラグに依存するため、
+        # UIから有効化した場合も考慮してHOST/TOKENを直接チェックする）
         errors = validate_databricks_config()
         if errors:
             print(f"Databricks設定エラー: {errors}")
+            return False
+
+        # HOST/TOKENが空の場合はエラー（環境変数未設定でUIから有効化した場合）
+        if not DATABRICKS_HOST:
+            print("Databricks設定エラー: DATABRICKS_HOST が設定されていません")
+            return False
+        if not DATABRICKS_TOKEN:
+            print("Databricks設定エラー: DATABRICKS_TOKEN が設定されていません")
             return False
 
         try:
@@ -126,6 +142,8 @@ class MLflowManager:
                     return False
 
             # 実験を作成（Databricksワークスペース内）
+            experiment_failures = 0
+            total_experiments = len(self.EXPERIMENT_NAMES)
             for model_type, experiment_name in self.EXPERIMENT_NAMES.items():
                 # Databricksでは実験パスを使用
                 experiment_path = f"{DATABRICKS_EXPERIMENT_PREFIX}/{experiment_name}"
@@ -135,7 +153,14 @@ class MLflowManager:
                         mlflow.create_experiment(experiment_path)
                         print(f"Databricks実験を作成: {experiment_path}")
                 except Exception as exp_error:
+                    experiment_failures += 1
                     print(f"実験作成警告 ({experiment_path}): {exp_error}")
+
+            # 全ての実験操作が失敗した場合は接続失敗とみなす
+            if experiment_failures == total_experiments:
+                print("Databricks接続失敗: 全ての実験操作が失敗しました（認証情報を確認してください）")
+                self._databricks_connected = False
+                return False
 
             self._databricks_connected = True
             self.is_initialized = True
@@ -242,8 +267,31 @@ class MLflowManager:
             print(f"Databricksディレクトリ作成エラー: {e}")
             return False
 
+    def _build_local_uris(self, base_dir):
+        """ローカル用の tracking URI(sqlite) と artifact ルート(file) を構築
+
+        MLflow 3 ではファイルストア(file://)が非推奨のため、トラッキングDBは
+        sqlite を使用し、アーティファクトは file:// の別ルートに保存する。
+
+        Returns:
+            tuple: (tracking_uri, artifact_root)
+        """
+        os.makedirs(base_dir, exist_ok=True)
+        normalized_path = os.path.normpath(base_dir).replace('\\', '/')
+
+        # sqlite トラッキングDB（Windows: sqlite:///C:/path/mlflow.db）
+        tracking_uri = f"sqlite:///{normalized_path}/mlflow.db"
+
+        # アーティファクトルート（file://）
+        if sys.platform.startswith('win'):
+            artifact_root = f"file:///{normalized_path}/mlartifacts"
+        else:
+            artifact_root = f"file://{normalized_path}/mlartifacts"
+
+        return tracking_uri, artifact_root
+
     def _initialize_local(self, folder_path=None):
-        """ローカルMLflowの初期化"""
+        """ローカルMLflowの初期化（MLflow3: sqliteバックエンド）"""
         if folder_path:
             self.folder_path = folder_path
 
@@ -252,30 +300,24 @@ class MLflowManager:
             return False
 
         try:
-            # MLflow用のディレクトリを作成
-            mlflow_dir = self.folder_path
-            os.makedirs(mlflow_dir, exist_ok=True)
-
-            # パスの正規化
-            normalized_path = os.path.normpath(mlflow_dir).replace('\\', '/')
-
-            # Windows環境での正しいURI形式を構築
-            if sys.platform.startswith('win'):
-                self.local_tracking_uri = f"file:///{normalized_path}"
-            else:
-                self.local_tracking_uri = f"file://{normalized_path}"
+            # MLflow用のディレクトリを作成し、sqlite URI / artifactルートを構築
+            self.local_tracking_uri, self.local_artifact_root = self._build_local_uris(self.folder_path)
 
             # メインのtracking_uriも設定
             self.tracking_uri = self.local_tracking_uri
 
             print(f"ローカルMLflowトラッキングURI: {self.local_tracking_uri}")
+            print(f"ローカルアーティファクトルート: {self.local_artifact_root}")
             mlflow.set_tracking_uri(self.local_tracking_uri)
 
-            # 全ての実験を作成
+            # 全ての実験を作成（アーティファクトは file:// ルートに保存）
             for model_type, experiment_name in self.EXPERIMENT_NAMES.items():
                 experiment = mlflow.get_experiment_by_name(experiment_name)
                 if experiment is None:
-                    mlflow.create_experiment(experiment_name)
+                    mlflow.create_experiment(
+                        experiment_name,
+                        artifact_location=f"{self.local_artifact_root}/{experiment_name}"
+                    )
                     print(f"ローカル実験を作成: {experiment_name}")
 
             self._local_initialized = True
@@ -285,6 +327,9 @@ class MLflowManager:
         except Exception as e:
             print(f"ローカルMLflow初期化エラー: {e}")
             return False
+
+    # Databricks初期化のタイムアウト（秒）
+    DATABRICKS_INIT_TIMEOUT = 15
 
     def initialize(self, folder_path=None, parent_widget=None):
         """MLflowの初期化と設定を行う（ローカル併用記録対応）
@@ -300,12 +345,23 @@ class MLflowManager:
         # 常にローカルを初期化
         local_result = self._initialize_local(folder_path)
 
-        # Databricksモードの場合は追加で初期化
+        # Databricksモードの場合は追加で初期化（タイムアウト付き）
         if self.use_databricks:
-            databricks_result = self._initialize_databricks(parent_widget)
+            print(f"Databricks接続を試行中... (タイムアウト: {self.DATABRICKS_INIT_TIMEOUT}秒)")
+            databricks_result = self._initialize_databricks_with_timeout(parent_widget)
             if not databricks_result:
-                print("Databricks接続に失敗しました。ローカルのみに記録します。")
+                print("Databricks接続に失敗またはタイムアウトしました。ローカルのみに記録します。")
                 self._databricks_connected = False
+                if parent_widget:
+                    QMessageBox.warning(
+                        parent_widget,
+                        "Databricks接続",
+                        "Databricksへの接続に失敗またはタイムアウトしました。\n"
+                        "学習結果はローカルのみに記録されます。\n\n"
+                        "Databricks連携を使用するには、設定画面から明示的に有効化してください。"
+                    )
+            else:
+                print("Databricks接続成功 - ローカル＋Databricks併用モードで記録します")
 
         # ローカルに戻しておく
         if self.local_tracking_uri:
@@ -313,6 +369,29 @@ class MLflowManager:
 
         self.is_initialized = local_result
         return local_result
+
+    def _initialize_databricks_with_timeout(self, parent_widget=None):
+        """Databricks初期化をタイムアウト付きで実行（UIフリーズ防止）"""
+        import threading
+
+        result = [False]
+
+        def _do_init():
+            try:
+                result[0] = self._initialize_databricks(parent_widget)
+            except Exception as e:
+                print(f"Databricks初期化エラー（スレッド内）: {e}")
+                result[0] = False
+
+        thread = threading.Thread(target=_do_init, daemon=True)
+        thread.start()
+        thread.join(timeout=self.DATABRICKS_INIT_TIMEOUT)
+
+        if thread.is_alive():
+            print(f"Databricks初期化がタイムアウトしました ({self.DATABRICKS_INIT_TIMEOUT}秒)")
+            return False
+
+        return result[0]
     
     def set_experiment(self, model_type: ModelType, target: str = "local"):
         """指定されたモデルタイプの実験を設定
@@ -353,8 +432,14 @@ class MLflowManager:
 
     def _log_run_to_target(self, target: str, model_type: ModelType, run_name: str,
                            params: dict, run_metrics: dict, tags: dict,
-                           dataset_info: dict, metrics: dict, model_path: str):
-        """指定されたターゲット（local/databricks）にログを記録"""
+                           dataset_info: dict, metrics: dict, model_path: str,
+                           extra_artifacts: list = None):
+        """指定されたターゲット（local/databricks）にログを記録
+
+        Args:
+            extra_artifacts: 追加で記録するファイルのリスト。各要素は
+                str（パス）または (path, artifact_subdir) のタプル。
+        """
         try:
             if not self.set_experiment(model_type, target):
                 return False
@@ -404,6 +489,18 @@ class MLflowManager:
                         model_path = os.path.normpath(model_path)
                     mlflow.log_artifact(model_path, "model")
 
+                # 追加アーティファクト（学習曲線PNG等）を記録
+                if extra_artifacts:
+                    for item in extra_artifacts:
+                        if isinstance(item, (tuple, list)):
+                            art_path, art_dir = item[0], item[1]
+                        else:
+                            art_path, art_dir = item, None
+                        if art_path and os.path.exists(art_path):
+                            if sys.platform.startswith('win'):
+                                art_path = os.path.normpath(art_path)
+                            mlflow.log_artifact(art_path, art_dir)
+
             print(f"モデルを{target}に記録しました: {run_name}")
             return True
 
@@ -413,30 +510,68 @@ class MLflowManager:
 
     def _log_with_local_fallback(self, model_type: ModelType, run_name: str,
                                   params: dict, run_metrics: dict, tags: dict,
-                                  dataset_info: dict, metrics: dict, model_path: str):
+                                  dataset_info: dict, metrics: dict, model_path: str,
+                                  extra_artifacts: list = None):
         """ローカルに記録し、Databricks有効時は追加でDatabricksにも記録"""
         # まずローカルに記録（必須）
         local_success = self._log_run_to_target(
             "local", model_type, run_name, params, run_metrics, tags,
-            dataset_info, metrics, model_path
+            dataset_info, metrics, model_path, extra_artifacts
         )
 
-        # Databricks有効時は追加で記録
+        # Databricks有効時は追加で記録（タイムアウト付き）
         databricks_success = False
         if self.use_databricks and self._databricks_connected:
-            databricks_success = self._log_run_to_target(
-                "databricks", model_type, run_name, params, run_metrics, tags,
-                dataset_info, metrics, model_path
+            print(f"Databricksに記録中... (タイムアウト: {self.DATABRICKS_LOG_TIMEOUT}秒)")
+            databricks_success = self._log_to_databricks_with_timeout(
+                model_type, run_name, params, run_metrics, tags,
+                dataset_info, metrics, model_path, extra_artifacts
             )
             if databricks_success:
                 print(f"Databricksにも記録しました: {run_name}")
             else:
-                print(f"Databricksへの記録に失敗しましたが、ローカルには記録済みです")
+                print(f"Databricksへの記録に失敗またはタイムアウトしましたが、ローカルには記録済みです")
 
         # ローカルに戻す
         mlflow.set_tracking_uri(self.local_tracking_uri)
 
         return local_success
+
+    # Databricksログ記録のタイムアウト（秒）
+    DATABRICKS_LOG_TIMEOUT = 30
+
+    def _log_to_databricks_with_timeout(self, model_type, run_name, params,
+                                         run_metrics, tags, dataset_info, metrics,
+                                         model_path, extra_artifacts=None):
+        """Databricksへの記録をタイムアウト付きで実行（UIフリーズ防止）"""
+        import threading
+
+        result = [False]
+        error_msg = [None]
+
+        def _do_log():
+            try:
+                result[0] = self._log_run_to_target(
+                    "databricks", model_type, run_name, params, run_metrics, tags,
+                    dataset_info, metrics, model_path, extra_artifacts
+                )
+            except Exception as e:
+                error_msg[0] = str(e)
+                result[0] = False
+
+        thread = threading.Thread(target=_do_log, daemon=True)
+        thread.start()
+        thread.join(timeout=self.DATABRICKS_LOG_TIMEOUT)
+
+        if thread.is_alive():
+            print(f"Databricksへの記録がタイムアウトしました ({self.DATABRICKS_LOG_TIMEOUT}秒)")
+            self._databricks_connected = False
+            return False
+
+        if error_msg[0]:
+            print(f"Databricks記録エラー: {error_msg[0]}")
+
+        return result[0]
     
     def open_ui(self, parent_widget=None, model_type: ModelType = None):
         """MLflow UIを開く"""
@@ -453,22 +588,18 @@ class MLflowManager:
             return
 
         try:
-            # 特定の実験を指定した場合、その実験にフォーカス
-            experiment_filter = ""
-            if model_type:
-                experiment_name = self.EXPERIMENT_NAMES[model_type]
-                # MLflow UIでは実験IDでフィルタリング
-                experiment = mlflow.get_experiment_by_name(experiment_name)
-                if experiment:
-                    experiment_filter = f" --default-artifact-root {experiment.artifact_location}"
+            # MLflow3(sqlite)ではアーティファクトルートも指定する
+            artifact_opt = ""
+            if self.local_artifact_root:
+                artifact_opt = f" --default-artifact-root {self.local_artifact_root}"
 
             # 環境に応じてコマンドを構築
             if sys.platform.startswith('win'):  # Windows
-                cmd = f'start cmd /k "mlflow ui --backend-store-uri {self.tracking_uri}{experiment_filter}"'
+                cmd = f'start cmd /k "mlflow ui --backend-store-uri {self.tracking_uri}{artifact_opt}"'
                 print(f"実行コマンド: {cmd}")
                 subprocess.Popen(cmd, shell=True)
             else:  # Mac/Linux
-                cmd = f'mlflow ui --backend-store-uri {self.tracking_uri}{experiment_filter}'
+                cmd = f'mlflow ui --backend-store-uri {self.tracking_uri}{artifact_opt}'
                 subprocess.Popen(cmd, shell=True)
 
             if parent_widget:
@@ -1039,15 +1170,122 @@ class MLflowManager:
         else:
             return {"status": "error", "message": "記録に失敗しました"}
 
+    def log_sequence_model(self, model_path, training_params, metrics, dataset_info,
+                           extra_artifacts: list = None):
+        """時系列モデルの学習結果を記録（ローカル併用記録対応）
+
+        Args:
+            extra_artifacts: 追加で記録するファイル（学習曲線PNG等）のリスト
+        """
+
+        arch = training_params.get("model_arch", "gru")
+
+        # リスト等はMLflowパラメータ用に文字列化
+        def _as_param(v):
+            if v is None:
+                return None
+            if isinstance(v, (list, tuple)):
+                return ",".join(map(str, v))
+            return v
+
+        params = {
+            "framework": "pytorch",
+            "model_type": "sequence",
+            "model_arch": arch,
+            "data_folder": training_params.get("data_folder", "unknown"),
+            "task_type": "sequence_prediction",
+            "seq_len": training_params.get("seq_len", 8),
+            "pred_horizon": training_params.get("pred_horizon", 10),
+            # 旧キー(gru_hidden/gru_layers)もフォールバックで参照しつつ、正しい値を記録
+            "hidden_size": training_params.get("hidden_dim", training_params.get("gru_hidden", 256)),
+            "num_layers": training_params.get("num_layers", training_params.get("gru_layers", 1)),
+            "dropout": training_params.get("dropout", 0.1),
+            "epochs": training_params.get("num_epochs", 0),
+            "learning_rate": training_params.get("learning_rate", 0.001),
+            "batch_size": training_params.get("batch_size", 32),
+            "num_image_sources": training_params.get("num_image_sources", 1),
+            "selected_sources": training_params.get("selected_sources", ""),
+            "augmentation_enabled": training_params.get("augmentation_enabled", False),
+            "stride": training_params.get("stride", 1),
+            # 追加: 学習・アーキテクチャ設定（Noneは_log_run_to_targetで除外される）
+            "img_size": _as_param(training_params.get("img_size")),
+            "val_split": training_params.get("val_split"),
+            "weight_decay": training_params.get("weight_decay"),
+            "fusion_method": training_params.get("fusion_method"),
+            "attn_heads": training_params.get("attn_heads"),
+            "kernel_size": training_params.get("kernel_size"),
+            "tcn_channels": _as_param(training_params.get("tcn_channels")),
+            "cnn_channels": _as_param(training_params.get("cnn_channels")),
+            # 早期終了の設定
+            "early_stopping": "enabled" if training_params.get("use_early_stopping") else "disabled",
+            "patience": training_params.get("patience"),
+            # モデルI/Oスキーマ（signature相当・再現性/比較用）
+            "input_image_shape": _as_param(training_params.get("input_image_shape")),
+            "ego_state_dim": training_params.get("ego_state_dim"),
+            "output_shape": _as_param(training_params.get("output_shape")),
+            # モデル・実行環境メタデータ
+            "model_params_total": training_params.get("model_params_total"),
+            "model_params_trainable": training_params.get("model_params_trainable"),
+            "device": training_params.get("device"),
+            "torch_version": training_params.get("torch_version"),
+            "cuda_version": training_params.get("cuda_version"),
+        }
+
+        # コメントがあれば追加
+        if training_params.get("comment"):
+            params["comment"] = training_params["comment"]
+
+        run_metrics = {
+            "best_val_loss": metrics.get("best_val_loss", 0.0),
+            "final_train_loss": metrics.get("final_train_loss", 0.0),
+            "final_val_loss": metrics.get("final_val_loss", 0.0),
+            "best_epoch": metrics.get("best_epoch", 0),
+            "total_training_time": metrics.get("total_training_time", 0.0),
+            "avg_epoch_time": metrics.get("avg_epoch_time", 0.0),
+            "completed_epochs": metrics.get("completed_epochs", 0)
+        }
+
+        tags = {
+            "model_category": "sequence",
+            "model_arch": arch,
+            "task_type": "sequence_prediction",
+            "framework": "pytorch",
+            "status": metrics.get("status", "completed"),
+            "image_sources": training_params.get("selected_sources", ""),
+            "training_environment": training_params.get("training_environment", "local")
+        }
+
+        if dataset_info:
+            params.update({
+                "train_samples": dataset_info.get("train_samples", 0),
+                "val_samples": dataset_info.get("val_samples", 0),
+                "total_sequences": dataset_info.get("total_sequences", 0)
+            })
+
+        # カスタムモデル名が指定されていればそれを実行名に使用（他モデルと同様）
+        custom_name = training_params.get('model_name', '')
+        if custom_name:
+            run_name = custom_name
+        else:
+            run_name = f"sequence_{arch}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        success = self._log_with_local_fallback(
+            ModelType.SEQUENCE, run_name, params, run_metrics, tags,
+            dataset_info if dataset_info else {}, metrics, model_path,
+            extra_artifacts=extra_artifacts
+        )
+
+        if success:
+            return {"status": "success", "run_name": run_name}
+        else:
+            return {"status": "error", "message": "記録に失敗しました"}
+
     def _get_default_mlflow_uri(self):
-        """デフォルトのmlrunsディレクトリURIを取得"""
+        """デフォルトのmlrunsディレクトリURI(sqlite)を取得"""
         try:
             from config import mlflow_dir
-            normalized_path = os.path.normpath(mlflow_dir).replace('\\', '/')
-            if sys.platform.startswith('win'):
-                return f"file:///{normalized_path}"
-            else:
-                return f"file://{normalized_path}"
+            tracking_uri, _ = self._build_local_uris(mlflow_dir)
+            return tracking_uri
         except ImportError:
             return self.local_tracking_uri
 

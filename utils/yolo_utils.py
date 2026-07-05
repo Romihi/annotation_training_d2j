@@ -420,6 +420,11 @@ class TrainingOutputDialog(QDialog):
 
     def append_log(self, text):
         """ログテキストを追加"""
+        # ANSI エスケープシーケンスを除去（端末制御文字・カラーコード）
+        import re as _re
+        text = _re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', text)   # CSI シーケンス
+        text = _re.sub(r'\x1b[()][0-9A-Za-z]', '', text)      # その他エスケープ
+        text = text.replace('\r', '')                          # キャリッジリターン
         # すべてのテキストをログに追加（フィルタリングを緩める）
         if text.strip():
             # 改行がない場合は現在の行に追加
@@ -915,7 +920,7 @@ def batch_detect_objects(image_paths, model=None, conf_threshold=0.25, progress_
     
     return results
 
-def batch_detect_objects_and_segments(image_paths, model=None, conf_threshold=0.25, progress_callback=None, use_index_keys=False):
+def batch_detect_objects_and_segments(image_paths, model=None, conf_threshold=0.25, progress_callback=None, indices=None):
     """
     複数の画像で物体検出とセグメンテーションを実行する
     Args:
@@ -923,25 +928,26 @@ def batch_detect_objects_and_segments(image_paths, model=None, conf_threshold=0.
         model: YOLOモデル (セグメンテーション対応)
         conf_threshold: 信頼度のしきい値
         progress_callback: 進捗コールバック関数
-        use_index_keys: Trueの場合、インデックスをキーにして結果を返す
+        indices: 画像に対応するインデックスのリスト（指定された場合、このインデックスをキーとして使用）
     Returns:
-        検出結果の辞書 {画像パス or インデックス: {'detections': [...], 'segments': [...]}, ...}
+        検出結果の辞書 {インデックス: {'detections': [...], 'segments': [...]}, ...}
     """
     if model is None:
         model = get_yolo_model()
-    
+
     results = {}
     total = len(image_paths)
-    
+
     for i, img_path in enumerate(image_paths):
         if progress_callback:
             if not progress_callback(i, total, f"画像 {i+1}/{total} を処理中: {os.path.basename(img_path)}"):
                 break
-                
+
         result = detect_objects_and_segments(img_path, model, conf_threshold)
-        key = i if use_index_keys else img_path
+        # indicesが指定されている場合は対応するインデックスを使用
+        key = indices[i] if indices is not None else i
         results[key] = result
-    
+
     return results
 
 def draw_detection_preview(image_path, detections, output_path=None):

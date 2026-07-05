@@ -16,7 +16,7 @@ from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.files import FilesAPI
 
 from utils.export_utils import export_to_donkey
-import config_databricks
+from databricks import config_databricks
 
 
 def debug_print(message: str):
@@ -370,6 +370,64 @@ class DatabricksTransferManager:
                 debug_print("一時ディレクトリ削除完了")
             except Exception as e:
                 debug_print(f"一時ディレクトリの削除に失敗: {e}")
+
+    def submit_training_workflow(self, zip_remote_path: str, notebook_base_path: str, cluster_id: str) -> dict:
+        """
+        Databricks Runs Submit APIで3ノートブックをチェーン実行
+
+        Args:
+            zip_remote_path: アップロード済みZIPファイルのリモートパス
+            notebook_base_path: ノートブックのワークスペースベースパス
+            cluster_id: 既存クラスターID
+
+        Returns:
+            {"run_id": int, "run_url": str}
+
+        Raises:
+            Exception: ジョブ送信に失敗した場合
+        """
+        from databricks.sdk.service.jobs import SubmitTask, NotebookTask, TaskDependency
+
+        extract_path = zip_remote_path.replace(".zip", "")
+
+        debug_print(f"ワークフロー送信: zip={zip_remote_path}, notebooks={notebook_base_path}, cluster={cluster_id}")
+
+        wait = self.client.jobs.submit(
+            run_name=f"auto_train_{os.path.basename(zip_remote_path)}",
+            tasks=[
+                SubmitTask(
+                    task_key="extract",
+                    existing_cluster_id=cluster_id,
+                    notebook_task=NotebookTask(
+                        notebook_path=f"{notebook_base_path}/01_extract_annotations",
+                        base_parameters={"zip_path": zip_remote_path}
+                    )
+                ),
+                SubmitTask(
+                    task_key="load",
+                    depends_on=[TaskDependency(task_key="extract")],
+                    existing_cluster_id=cluster_id,
+                    notebook_task=NotebookTask(
+                        notebook_path=f"{notebook_base_path}/02_load_annotations",
+                        base_parameters={"data_path": extract_path}
+                    )
+                ),
+                SubmitTask(
+                    task_key="train",
+                    depends_on=[TaskDependency(task_key="load")],
+                    existing_cluster_id=cluster_id,
+                    notebook_task=NotebookTask(
+                        notebook_path=f"{notebook_base_path}/03_train_model",
+                        base_parameters={"data_path": extract_path}
+                    )
+                ),
+            ]
+        )
+
+        run_id = wait.response.run_id
+        run_url = f"{config_databricks.DATABRICKS_HOST}#job/{run_id}"
+        debug_print(f"ワークフロー送信完了: run_id={run_id}, url={run_url}")
+        return {"run_id": run_id, "run_url": run_url}
 
     def list_remote_files(self, remote_path: str = "") -> List[dict]:
         """リモートのファイル一覧を取得

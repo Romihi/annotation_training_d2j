@@ -9,10 +9,16 @@
 # MAGIC %md
 # MAGIC ## 設定
 
+%pip install torch torchvision
+
 # COMMAND ----------
 
+# パイプライン実行用パラメータ（手動実行時は下のデフォルト値が使われます）
+dbutils.widgets.text("data_path", "")
+
 # 展開済みデータのパス
-DATA_PATH = "/Volumes/workspace/default/annotation_data/annotation_20251201_001802"
+_data_path_param = dbutils.widgets.get("data_path")
+DATA_PATH = _data_path_param if _data_path_param else "/Volumes/workspace/default/annotation_data/annotation_20251201_001802"
 
 # 学習設定
 BATCH_SIZE = 32
@@ -123,8 +129,8 @@ print(f"検証データ数: {len(val_annotations)}")
 train_dataset = DonkeyDataset(train_annotations, images_dir, IMAGE_COLUMN)
 val_dataset = DonkeyDataset(val_annotations, images_dir, IMAGE_COLUMN)
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
 # COMMAND ----------
 
@@ -183,16 +189,25 @@ print(f"モデルパラメータ数: {sum(p.numel() for p in model.parameters())
 
 import mlflow
 import mlflow.pytorch
+import getpass
 
-# MLflow実験を設定
-mlflow.set_experiment("/Users/your-email@example.com/donkey_training")
+# MLflow実験を設定（ユーザー名を自動取得してパスを生成）
+user_email = (
+    dbutils.notebook.entry_point.getDbutils()
+    .notebook().getContext().userName().get()
+)
+experiment_path = f"/Users/{user_email}/annotation_training_d2j/autonomous_driving_models"
+mlflow.set_experiment(experiment_path)
+
 
 # 損失関数とオプティマイザ
 criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
 # 学習ループ
-with mlflow.start_run():
+# log_system_metrics=True (MLflow 3): 学習中のGPU/CPU/メモリ使用率を自動記録
+# （GPUメトリクスには nvidia-ml-py、CPU/メモリには psutil が必要）
+with mlflow.start_run(log_system_metrics=True):
     # パラメータを記録
     mlflow.log_params({
         "batch_size": BATCH_SIZE,
@@ -247,8 +262,29 @@ with mlflow.start_run():
             best_val_loss = val_loss
             torch.save(model.state_dict(), "/tmp/best_model.pt")
 
-    # モデルを記録
-    mlflow.pytorch.log_model(model, "model")
+    # モデルを記録（MLflow 3: artifact_path は非推奨のため name= を使用）
+    # ベスト重みをロードしてから記録
+    model.load_state_dict(torch.load("/tmp/best_model.pt"))
+    model.eval()
+
+    # signature と input_example を付与（モデルサービング/検証で利用可能）
+    from mlflow.models.signature import infer_signature
+    sample_images, _ = next(iter(val_loader))
+    sample_images = sample_images.to(device)
+    with torch.no_grad():
+        sample_output = model(sample_images)
+    input_example = sample_images[:1].cpu().numpy()
+    signature = infer_signature(
+        sample_images.cpu().numpy(),
+        sample_output.cpu().numpy()
+    )
+
+    mlflow.pytorch.log_model(
+        model,
+        name="model",
+        signature=signature,
+        input_example=input_example,
+    )
     mlflow.log_artifact("/tmp/best_model.pt")
 
     print(f"\n学習完了! Best Val Loss: {best_val_loss:.4f}")

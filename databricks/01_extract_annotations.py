@@ -11,8 +11,12 @@
 
 # COMMAND ----------
 
+# パイプライン実行用パラメータ（手動実行時は下のデフォルト値が使われます）
+dbutils.widgets.text("zip_path", "")
+
 # ZIPファイルのパス（転送時に表示されたパスを指定）
-ZIP_PATH = "/Volumes/workspace/default/annotation_data/annotation_20251201_001802.zip"
+_zip_path_param = dbutils.widgets.get("zip_path")
+ZIP_PATH = _zip_path_param if _zip_path_param else "/Volumes/workspace/default/annotation_data/annotation_20251201_001802.zip"
 
 # 展開先のパス（ZIPファイル名から.zipを除いたパス）
 EXTRACT_PATH = ZIP_PATH.replace(".zip", "")
@@ -97,3 +101,8 @@ for i, line in enumerate(lines):
 # MAGIC
 # MAGIC - `02_load_annotations.py` - アノテーションデータの読み込み
 # MAGIC - `03_train_model.py` - モデルの学習
+
+# COMMAND ----------
+
+# パイプライン実行時に展開先パスを次のノートブックに渡す
+dbutils.notebook.exit(EXTRACT_PATH)

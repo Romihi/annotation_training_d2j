@@ -16,28 +16,30 @@ from model_catalog import get_model, list_available_models
 _MODEL_CACHE = {}
 
 def batch_inference(
-    image_paths: List[str], 
-    method: str = "model", 
+    image_paths: List[str],
+    method: str = "model",
     model_type: Optional[str] = None,
     model_path: Optional[str] = None,
-    force_reload: bool = False  # 必要な場合にのみTrueに設定
+    force_reload: bool = False,
+    downscale_factor: float = 1.0
 ) -> Dict[str, Dict[str, Any]]:
     """画像バッチに対して推論を実行する"""
     results = {}
-    
+
     if method == "model" and model_type:
         # モデルを使用した推論
-        results = _infer_with_model(image_paths, model_type, model_path, force_reload)
+        results = _infer_with_model(image_paths, model_type, model_path, force_reload, downscale_factor)
     else:
         raise ValueError(f"サポートされていない推論方法: {method}")
     
     return results
 
 def _infer_with_model(
-    image_paths: List[str], 
-    model_type: str, 
+    image_paths: List[str],
+    model_type: str,
     model_path: Optional[str] = None,
-    force_reload: bool = False
+    force_reload: bool = False,
+    downscale_factor: float = 1.0
 ) -> Dict[str, Dict[str, Any]]:
     """モデルを使用して推論する"""
     global _MODEL_CACHE
@@ -57,8 +59,9 @@ def _infer_with_model(
         else:
             print(f"新しくモデルをロード: {model_type}, パス: {model_path}")
 
-            # チェックポイントから出力数を検出
+            # チェックポイントから出力数と入力サイズを検出
             num_outputs = 2  # デフォルトは2出力
+            input_size = None
             if model_path and os.path.exists(model_path):
                 try:
                     checkpoint = torch.load(model_path, map_location=device)
@@ -71,11 +74,16 @@ def _infer_with_model(
                     elif 'regressor.weight' in state_dict:
                         num_outputs = state_dict['regressor.weight'].shape[0]
                         print(f"チェックポイントから出力数を検出: {num_outputs}")
-                except Exception as e:
-                    print(f"出力数の検出に失敗: {e}")
 
-            # モデルの初期化（検出した出力数で）
-            model = get_model(model_type, pretrained=False, num_outputs=num_outputs)
+                    # 入力サイズを検出
+                    if isinstance(checkpoint, dict) and 'input_size' in checkpoint:
+                        input_size = tuple(checkpoint['input_size'])
+                        print(f"チェックポイントから入力サイズを検出: {input_size}")
+                except Exception as e:
+                    print(f"出力数/入力サイズの検出に失敗: {e}")
+
+            # モデルの初期化（検出した出力数と入力サイズで）
+            model = get_model(model_type, pretrained=False, input_size=input_size, num_outputs=num_outputs)
 
             # モデルパスが指定されていない場合は、最新のモデルファイルを探す
             if not model_path:
@@ -118,7 +126,13 @@ def _infer_with_model(
                     # 画像を読み込む
                     img = Image.open(img_path).convert('RGB')
                     img_width, img_height = img.size
-                    
+
+                    # 解像度ダウンスケール（ピクセレーション）
+                    if downscale_factor < 1.0:
+                        sw = max(1, int(img_width * downscale_factor))
+                        sh = max(1, int(img_height * downscale_factor))
+                        img = img.resize((sw, sh), Image.NEAREST).resize((img_width, img_height), Image.NEAREST)
+
                     # 前処理
                     img_tensor = transform(img)
                     img_tensor = img_tensor.unsqueeze(0).to(device)
@@ -126,6 +140,9 @@ def _infer_with_model(
                     # 推論
                     output = model(img_tensor)
                     output_values = output[0].cpu().numpy()
+
+                    # 推論値を[-1, 1]にクリッピング
+                    output_values = np.clip(output_values, -1.0, 1.0)
 
                     # 出力数に応じて値を取得
                     # データセットの順序: [angle, throttle, ...]
