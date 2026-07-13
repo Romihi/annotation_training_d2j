@@ -1,0 +1,1 @@
+セッション情報を保存しました: C:\Users\hkior\projects\togikaidrive-dev-togivad\togikaidrive-dev\annotation_training_d2j\sessions\session.json
