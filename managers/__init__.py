@@ -6,6 +6,7 @@ except ImportError:
     MLflowManager = None
     ModelType = None
 from .datasetmanager import YOLODatasetManager
+from .pose_manager import PoseSourceManager, PoseSample
 
 # 時系列モデル（model_catalog.py に統合済み）
 from model_catalog import (
@@ -22,6 +23,7 @@ GRUTrainingManager = SequenceTrainingManager
 
 __all__ = [
     'AnnotationDataManager', 'MLflowManager', 'ModelType', 'YOLODatasetManager',
+    'PoseSourceManager', 'PoseSample',
     # sequence models
     'ImageEncoder', 'BaseSequenceModel',
     'GRUSequenceModel', 'TCNSequenceModel', 'CausalCNNSequenceModel',

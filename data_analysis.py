@@ -75,7 +75,9 @@ class CollapsibleSection(QWidget):
         self.content_widget.setLayout(layout)
 
 # 日本語フォントの設定
-plt.rcParams['font.family'] = ['MS Gothic', 'Yu Gothic', 'Meiryo', 'sans-serif']
+# 注意: "MS Gothic" はこの環境のmatplotlib(FreeType)でテキストが完全に不可視になる
+# 既知の不具合があるため使用しない（Yu Gothic/Meiryoは正常に描画される）。
+plt.rcParams['font.family'] = ['Yu Gothic', 'Meiryo', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False
 
 # 色のパレット

@@ -79,7 +79,8 @@ from model_training import generate_augmentation_samples
 from styles import get_location_color, apply_style, set_theme, get_current_theme, PRIMARY_STYLE, MODEL_STYLE, TRAINING_STYLE, EXPORT_STYLE, SPECIAL_STYLE, DESTRUCTIVE_STYLE, NAV_STYLE
 
 
-from managers import AnnotationDataManager, MLflowManager, ModelType, SequenceTrainingManager
+from managers import AnnotationDataManager, MLflowManager, ModelType, SequenceTrainingManager, PoseSourceManager
+from map_view import MapViewDialog
 from utils.yolo_utils import train_yolo_with_ui, TrainingOutputDialog
 from data_analysis import DataAnalysisDialog
 from utils.databricks_transfer import DatabricksTransferManager
@@ -831,8 +832,11 @@ class ImageLabel(QLabel):
         # セグメンテーション走行方向矢印を描画
         self.draw_seg_driving_direction(self.pix_width, self.pix_height, painter, self.target_rect)
 
-        # 自動運転アノテーション走行軌跡を描画
+        # 自動運転アノテーション操舵軌道（angle値からの予測円弧）を描画
         self.draw_auto_driving_direction(_ann_pw, _ann_ph, painter, _ann_rect)
+
+        # 記録された自己位置からの実測走行軌道を描画
+        self.draw_recorded_trajectory(_ann_pw, _ann_ph, painter, _ann_rect)
 
         # SpeedGaugeWidget（画像外の独立ウィジェット）を更新
         if self.main_window and hasattr(self.main_window, 'speed_gauge'):
@@ -2008,7 +2012,7 @@ class ImageLabel(QLabel):
 
         painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
         painter.setOpacity(1.0)
-        traj_color = QColor(255, 120, 0, 220)
+        traj_color = QColor(255, 0, 0, 220)  # 赤（走行軌道のオレンジと区別）
 
         # ── 地面座標 → スクリーン座標（等距離射影魚眼）──────────────────
         # 地面座標系: gx = 横方向(右正), gy = 前方距離。車両=原点、高さ正規化(h=1)
@@ -2098,6 +2102,90 @@ class ImageLabel(QLabel):
             painter.drawText(tx + odx, ty + ody, info_text)
         painter.setPen(QPen(QColor(255, 255, 255)))
         painter.drawText(tx, ty, info_text)
+
+    def draw_recorded_trajectory(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
+        """記録された自己位置データから計算した実際の走行軌道を描画（等距離射影魚眼モデル）
+
+        draw_auto_driving_direction（操舵軌道 = angle値からの予測円弧）と同じ投影モデルを
+        使うが、こちらは pose_manager.compute_future_trajectory の実測ego軌道
+        （+X前方/+Y左, メートル単位）を描く。地面座標はカメラ高さで正規化(h=1)されて
+        いるため、メートル値を auto_cam_height_m で割ってスケールを合わせる。
+        """
+        if not getattr(self.main_window, 'show_recorded_trajectory', False):
+            return
+
+        current_index = self.main_window.current_index
+        if current_index is None:
+            return
+        pose_manager = getattr(self.main_window, 'pose_manager', None)
+        if pose_manager is None or not pose_manager.has_any_pose():
+            return
+
+        horizon = max(1, int(getattr(self.main_window, 'recorded_traj_points', 20)))
+        traj = pose_manager.compute_future_trajectory(current_index, horizon=horizon, dt=0.05)
+        if traj is None or len(traj) == 0:
+            return
+
+        cam_pitch_rad = math.radians(getattr(self.main_window, 'auto_cam_pitch_deg', 20.0))
+        fov_deg       = getattr(self.main_window, 'auto_fov_deg', 160.0)
+        cam_height_m  = max(1e-3, getattr(self.main_window, 'auto_cam_height_m', 0.15))
+
+        cx = pix_width  / 2.0
+        cy = pix_height / 2.0
+        half_diag_px  = math.sqrt((pix_width / 2.0) ** 2 + (pix_height / 2.0) ** 2)
+        fov_half_rad  = math.radians(fov_deg / 2.0)
+        f_fish        = half_diag_px / fov_half_rad  # pixels / radian
+
+        def ground_to_screen(gx, gy):
+            X_c = gx
+            Z_c = gy * math.cos(cam_pitch_rad) + math.sin(cam_pitch_rad)
+            Y_c = -gy * math.sin(cam_pitch_rad) + math.cos(cam_pitch_rad)
+            if Z_c < 1e-6:
+                return None
+            r3d = math.sqrt(X_c * X_c + Y_c * Y_c)
+            theta = math.atan2(r3d, Z_c)
+            if theta >= fov_half_rad:
+                return None
+            r_img = f_fish * theta
+            if r3d > 1e-9:
+                ix = cx + r_img * X_c / r3d
+                iy = cy + r_img * Y_c / r3d
+            else:
+                ix, iy = cx, cy
+            sx = target_rect.x() + (ix / pix_width)  * target_rect.width()
+            sy = target_rect.y() + (iy / pix_height) * target_rect.height()
+            return sx, sy
+
+        # ego座標(+X前方/+Y左, m) → 地面座標(gx=右正, gy=前方, h=1正規化)
+        screen_pts = []
+        for x_ego, y_ego in traj:
+            if x_ego <= 0.0:
+                continue  # 後退・停止区間は描画しない（投影が破綻するため）
+            gx = -float(y_ego) / cam_height_m
+            gy = float(x_ego) / cam_height_m
+            pt = ground_to_screen(gx, gy)
+            if pt is not None:
+                screen_pts.append(pt)
+
+        if len(screen_pts) < 2:
+            return
+
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        painter.setOpacity(1.0)
+        traj_color = QColor(0, 200, 0, 220)  # 緑（操舵軌道の赤と区別）
+
+        painter.setClipRect(target_rect)
+        painter.setPen(QPen(traj_color, 3))
+        painter.setBrush(Qt.NoBrush)
+        for i in range(len(screen_pts) - 1):
+            x1, y1 = screen_pts[i]
+            x2, y2 = screen_pts[i + 1]
+            painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+        # 軌道点にも小さな丸を描いて実測点であることを示す
+        painter.setBrush(traj_color)
+        for x, y in screen_pts:
+            painter.drawEllipse(int(x) - 2, int(y) - 2, 4, 4)
+        painter.setClipping(False)
 
     def draw_segmentation_inference_results(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
         """セグメンテーション推論結果の描画"""
@@ -4906,6 +4994,7 @@ class ImageAnnotationTool(QMainWindow):
         
         self.data_manager = AnnotationDataManager()
         self.mlflow_manager = MLflowManager(mlflow_dir)
+        self.pose_manager = PoseSourceManager()
 
         # Initialize state
         self.folder_path = ""
@@ -4938,8 +5027,11 @@ class ImageAnnotationTool(QMainWindow):
         self.show_seg_driving_direction = False  # 走行方向矢印の表示フラグ
         self.seg_max_steering_angle = 30.0  # 最大舵角（度）
         self.seg_display_mode = 'trajectory'  # 表示モード: 'trajectory' or 'waypoint'
-        self.show_auto_driving_direction = False  # 自動運転アノテーション走行軌跡表示フラグ
-        self.auto_max_steering_angle = 25.0  # 自動運転走行軌跡の最大舵角（度）
+        self.show_auto_driving_direction = False  # 自動運転アノテーション操舵軌道表示フラグ
+        self.show_recorded_trajectory = False  # 記録された自己位置からの走行軌道表示フラグ
+        self.recorded_traj_points = 20  # 走行軌道の表示点数（1点=0.05秒先。プレースホルダー空欄時のデフォルト）
+        self.auto_cam_height_m = 0.15  # 走行軌道の投影スケールに使うカメラ地上高（m）※spinbox初期値と一致させること
+        self.auto_max_steering_angle = 25.0  # 自動運転操舵軌道の最大舵角（度）
         self.auto_cam_pitch_deg = 20.0        # カメラ俯角（度）※spinbox初期値と一致させること
         self.auto_fov_deg = 160.0             # カメラ対角FOV（度）※spinbox初期値と一致させること
 
@@ -5185,6 +5277,264 @@ class ImageAnnotationTool(QMainWindow):
 
         self.addToolBar(Qt.TopToolBarArea, toolbar)
         self.settings_toolbar = toolbar
+
+    def open_map_view(self):
+        """走行軌跡マップビューを別ウィンドウで開く（データ分析ダイアログと同様の方式）"""
+        if not self.pose_manager.has_any_pose():
+            QMessageBox.warning(self, get_text('dialog_warning'), get_text('map_view_no_pose_data'))
+            return
+
+        self.map_view_dialog = MapViewDialog(parent=self)
+        self.map_view_dialog.set_pose_manager(self.pose_manager)
+        self.map_view_dialog.jump_to_image.connect(self.jump_to_index_from_map_view)
+        self.map_view_dialog.highlight_frame(self.current_index)
+        self.map_view_dialog.show()
+
+    def jump_to_index_from_map_view(self, index):
+        """マップビューでの軌跡クリックからのジャンプ要求を処理"""
+        if 0 <= index < len(self.images):
+            self.current_index = index
+            self.display_current_image()
+            self.update_gallery()
+            if hasattr(self, 'image_slider'):
+                self.image_slider.setValue(index)
+            if hasattr(self, 'slider_value_label'):
+                self.slider_value_label.setText(f"{index + 1}/{len(self.images)}")
+            self.statusBar().showMessage(get_text('status_jumped_to_index', index), 3000)
+
+    def mark_indices_as_deleted(self, indices, parent_widget=None):
+        """指定インデックス群（マップビューの品質フィルタ検出結果など）を削除済みとしてマークする
+
+        既存の delete_clip_range と同じ確認→実行→UI更新→結果表示の流儀に合わせる。
+
+        parent_widget: 確認・結果ダイアログの親。マップビューダイアログは常に最前面
+        （WindowStaysOnTopHint）のため、メインウィンドウを親にするとモーダルダイアログが
+        その裏に隠れて全入力をブロックし、アプリが固まったように見える。呼び出し元の
+        ダイアログを親にすることで必ず前面に表示される。
+        """
+        if not indices:
+            return
+        target_indices = sorted(set(i for i in indices if 0 <= i < len(self.images)))
+        if not target_indices:
+            return
+
+        parent = parent_widget if parent_widget is not None else self
+
+        reply = QMessageBox.question(
+            parent, get_text('map_view_quality_confirm_title'),
+            get_text('map_view_quality_confirm_msg', len(target_indices)),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        marked_count = 0
+        for idx in target_indices:
+            if idx in self.deleted_indexes:
+                continue
+            self.deleted_indexes.append(idx)
+            marked_count += 1
+
+        self.deleted_indexes = sorted(set(self.deleted_indexes))
+        self.annotated_count = len(self.annotations)
+
+        self.display_current_image()
+        self._schedule_gallery_update()
+        self.update_location_button_counts()
+        self._schedule_distribution_graph_update()
+        self.update_slider_deleted_indexes()
+
+        QMessageBox.information(
+            parent, get_text('map_view_quality_confirm_title'),
+            f"{marked_count}個のフレームを削除済みとしてマークしました。\n"
+            f"削除済みインデックスの合計数: {len(self.deleted_indexes)}"
+        )
+
+    def write_back_future_trajectories(self, horizon: int, dt: float, parent_widget=None):
+        """マップビューで選択・編集した自己位置から将来軌道（togivad学習用の教師ラベル
+        togivad/future_traj）を計算し、catalogファイルへ保存する
+        （togivad/tools/dagger_aggregate.py と同じキー規約: togivad/future_traj, dagger/source）。
+
+        書き換え前に各catalogファイルの .bak バックアップを作成する。
+        軌道計算は全て完了してからファイルへ書き込むため、計算中のキャンセルは安全
+        （ファイルは一切変更されない）。
+
+        parent_widget: 確認・進捗・結果ダイアログの親。マップビューダイアログは常に最前面
+        （WindowStaysOnTopHint）のため、メインウィンドウを親にするとモーダルダイアログが
+        その裏に隠れて全入力をブロックし、アプリが固まったように見える。呼び出し元の
+        ダイアログを親にすることで必ず前面に表示される。
+        """
+        parent = parent_widget if parent_widget is not None else self
+
+        manifest_path = getattr(self, 'last_manifest_path', None)
+        if not manifest_path or not os.path.exists(manifest_path):
+            QMessageBox.warning(
+                parent, get_text('map_view_writeback_confirm_title'),
+                get_text('map_view_writeback_no_manifest')
+            )
+            return
+
+        try:
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            if len(lines) < 5:
+                QMessageBox.warning(
+                    parent, get_text('map_view_writeback_confirm_title'),
+                    get_text('map_view_writeback_no_manifest')
+                )
+                return
+            catalog_info = json.loads(lines[4])
+            catalog_files = catalog_info.get('paths', [])
+        except Exception as e:
+            QMessageBox.critical(
+                parent, get_text('map_view_writeback_confirm_title'),
+                get_text('map_view_writeback_error', str(e))
+            )
+            return
+
+        if not catalog_files:
+            QMessageBox.warning(
+                parent, get_text('map_view_writeback_confirm_title'),
+                get_text('map_view_writeback_no_manifest')
+            )
+            return
+
+        reply = QMessageBox.question(
+            parent, get_text('map_view_writeback_confirm_title'),
+            get_text('map_view_writeback_confirm_msg', len(self.images), len(catalog_files)),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        image_to_entry = getattr(self, '_manifest_image_to_entry', {})
+        excluded = set(self.deleted_indexes)
+
+        # --- 進捗ダイアログ（load_catalog_annotations と同じ QProgressDialog 方式） ---
+        total = len(self.images)
+        progress = QProgressDialog(
+            get_text('map_view_writeback_progress', 0, total),
+            get_text('btn_cancel'), 0, 100, parent
+        )
+        progress.setWindowTitle(get_text('map_view_writeback_confirm_title'))
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+
+        traj_by_entry_index = {}
+        written_img_indexes = []
+        written = 0
+        skipped = 0
+        excluded_count = 0
+        cancelled = False
+        for img_idx in range(total):
+            if img_idx % 50 == 0:
+                progress.setLabelText(get_text('map_view_writeback_progress', img_idx, total))
+                # 計算フェーズに進捗の80%を割り当て（残り20%はファイル保存）
+                progress.setValue(int(img_idx / max(1, total) * 80))
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    cancelled = True
+                    break
+
+            if img_idx in excluded:
+                excluded_count += 1
+                continue
+            entry_index = image_to_entry.get(img_idx)
+            if entry_index is None:
+                continue
+            traj = self.pose_manager.compute_future_trajectory(
+                img_idx, horizon=horizon, dt=dt, exclude=excluded)
+            if traj is None:
+                skipped += 1
+                continue
+            traj_by_entry_index[entry_index] = traj
+            written_img_indexes.append(img_idx)
+            written += 1
+
+        if cancelled:
+            progress.close()
+            QMessageBox.information(
+                parent, get_text('map_view_writeback_confirm_title'),
+                get_text('map_view_writeback_cancelled')
+            )
+            return
+
+        if not traj_by_entry_index:
+            progress.close()
+            QMessageBox.information(
+                parent, get_text('map_view_writeback_confirm_title'),
+                get_text('map_view_writeback_result', 0, skipped, excluded_count)
+            )
+            return
+
+        progress.setLabelText(get_text('map_view_writeback_saving'))
+        progress.setValue(80)
+        QApplication.processEvents()
+
+        base_dir = os.path.dirname(manifest_path)
+        try:
+            for file_i, catalog_file in enumerate(catalog_files):
+                catalog_path = os.path.join(base_dir, catalog_file)
+                if not os.path.exists(catalog_path):
+                    continue
+
+                with open(catalog_path, 'r', encoding='utf-8') as f:
+                    catalog_lines = f.readlines()
+
+                modified = False
+                new_lines = []
+                for line in catalog_lines:
+                    stripped = line.strip()
+                    if not stripped:
+                        new_lines.append(line)
+                        continue
+                    row = json.loads(stripped)
+                    entry_index = row.get('_index')
+                    traj = traj_by_entry_index.get(entry_index)
+                    if traj is not None:
+                        row['togivad/future_traj'] = [
+                            [round(float(x), 4), round(float(y), 4)] for x, y in traj
+                        ]
+                        row['dagger/source'] = 'annotation_tool'
+                        new_lines.append(json.dumps(row, ensure_ascii=False) + '\n')
+                        modified = True
+                    else:
+                        new_lines.append(line)
+
+                if modified:
+                    shutil.copy2(catalog_path, catalog_path + '.bak')
+                    with open(catalog_path, 'w', encoding='utf-8') as f:
+                        f.writelines(new_lines)
+
+                progress.setValue(80 + int((file_i + 1) / len(catalog_files) * 20))
+                QApplication.processEvents()
+
+            progress.setValue(100)
+            progress.close()
+
+            # 保存済みラベルとしてマークし、マップビューの外枠表示を更新
+            self.pose_manager.mark_future_traj(written_img_indexes)
+            if (hasattr(self, 'map_view_dialog') and self.map_view_dialog is not None
+                    and self.map_view_dialog.isVisible()):
+                self.map_view_dialog.map_widget.refresh()
+
+            QMessageBox.information(
+                parent, get_text('map_view_writeback_confirm_title'),
+                get_text('map_view_writeback_result', written, skipped, excluded_count)
+            )
+            print(f"future_traj保存完了: written={written}, skipped={skipped}, "
+                  f"excluded={excluded_count}")
+
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(
+                parent, get_text('map_view_writeback_confirm_title'),
+                get_text('map_view_writeback_error', str(e))
+            )
+            print(f"future_traj保存エラー: {e}")
 
     def _show_mlflow_menu(self):
         """MLflowメニューを表示"""
@@ -5786,6 +6136,13 @@ class ImageAnnotationTool(QMainWindow):
         apply_style(self.data_analysis_button, 'special')
         graph_title_layout.addWidget(self.data_analysis_button)
 
+        self.map_view_button = QPushButton("🗺")
+        self.map_view_button.setToolTip(get_text('toolbar_map_view'))
+        self.map_view_button.clicked.connect(self.open_map_view)
+        self.map_view_button.setFixedWidth(36)
+        apply_style(self.map_view_button, 'special')
+        graph_title_layout.addWidget(self.map_view_button)
+
         info_layout.addLayout(graph_title_layout)
 
         # 分布グラフ用ラベル - 固定サイズで配置
@@ -6247,7 +6604,7 @@ class ImageAnnotationTool(QMainWindow):
         # ラベル/チェックボックスが縦方向に潰れないための高さ（フォント高さ基準）
         _label_h = self.fontMetrics().height() + 4
 
-        # 行1: [✓ 走行軌跡を表示]（チェックボックスは単独行にしてラベルの見切れを防ぐ）
+        # 行1: [✓ 操舵軌道を表示] [✓ 走行軌道を表示]（チェックボックスは単独行にしてラベルの見切れを防ぐ）
         traj_row = QHBoxLayout()
         traj_row.setSpacing(4)
         self.show_auto_driving_direction_checkbox = QCheckBox(get_text('chk_show_auto_driving_direction'))
@@ -6257,6 +6614,24 @@ class ImageAnnotationTool(QMainWindow):
         self.show_auto_driving_direction_checkbox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.show_auto_driving_direction_checkbox.setMinimumHeight(_label_h)
         traj_row.addWidget(self.show_auto_driving_direction_checkbox)
+
+        # 走行軌道（記録された自己位置からの実測軌道）表示
+        self.show_recorded_trajectory_checkbox = QCheckBox(get_text('chk_show_recorded_trajectory'))
+        self.show_recorded_trajectory_checkbox.setChecked(False)
+        self.show_recorded_trajectory_checkbox.setToolTip(get_text('tip_recorded_trajectory'))
+        self.show_recorded_trajectory_checkbox.stateChanged.connect(self.toggle_recorded_trajectory)
+        self.show_recorded_trajectory_checkbox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.show_recorded_trajectory_checkbox.setMinimumHeight(_label_h)
+        traj_row.addWidget(self.show_recorded_trajectory_checkbox)
+
+        # 走行軌道の表示点数（プレースホルダーで調整。空欄はデフォルト20点=1秒先）
+        self.recorded_traj_points_input = QLineEdit()
+        self.recorded_traj_points_input.setPlaceholderText(get_text('placeholder_recorded_traj_points'))
+        self.recorded_traj_points_input.setToolTip(get_text('tip_recorded_traj_points'))
+        self.recorded_traj_points_input.setFixedWidth(44)
+        self.recorded_traj_points_input.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.recorded_traj_points_input.textChanged.connect(self.update_recorded_traj_points)
+        traj_row.addWidget(self.recorded_traj_points_input)
         traj_row.addStretch()
         auto_driving_control_layout.addLayout(traj_row)
 
@@ -6307,6 +6682,19 @@ class ImageAnnotationTool(QMainWindow):
         self.auto_fov_spin.valueChanged.connect(self.update_auto_fov_deg)
         self.auto_fov_spin.setValue(160.0)
         _add_param_col('label_auto_fov', self.auto_fov_spin)
+
+        # カメラ地上高（走行軌道の投影スケール用。単位がmなので_mk_spinは使わない）
+        self.auto_cam_height_spin = QDoubleSpinBox()
+        self.auto_cam_height_spin.setRange(0.01, 2.0)
+        self.auto_cam_height_spin.setSuffix(" m")
+        self.auto_cam_height_spin.setDecimals(2)
+        self.auto_cam_height_spin.setSingleStep(0.01)
+        self.auto_cam_height_spin.setFixedWidth(64)
+        self.auto_cam_height_spin.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.auto_cam_height_spin.setToolTip(get_text('tip_auto_cam_height'))
+        self.auto_cam_height_spin.valueChanged.connect(self.update_auto_cam_height)
+        self.auto_cam_height_spin.setValue(0.15)
+        _add_param_col('label_auto_cam_height', self.auto_cam_height_spin)
 
         params_row.addStretch()
         auto_driving_control_layout.addLayout(params_row)
@@ -7690,13 +8078,35 @@ class ImageAnnotationTool(QMainWindow):
                 self.statusBar().showMessage(get_text('status_auto_advance_mode'), 2000)
 
     def toggle_auto_driving_direction(self, state):
-        """自動運転モード走行軌跡の表示/非表示を切り替え"""
+        """自動運転モード操舵軌道（angle値からの予測円弧）の表示/非表示を切り替え"""
         self.show_auto_driving_direction = (state == Qt.Checked)
         if hasattr(self, 'main_image_view'):
             self.main_image_view.update()
 
+    def toggle_recorded_trajectory(self, state):
+        """記録された自己位置からの走行軌道の表示/非表示を切り替え"""
+        self.show_recorded_trajectory = (state == Qt.Checked)
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def update_recorded_traj_points(self, text):
+        """走行軌道の表示点数を更新（空欄はデフォルト20点=1秒先）"""
+        text = text.strip()
+        if not text:
+            self.recorded_traj_points = 20
+        else:
+            try:
+                value = int(text)
+            except ValueError:
+                return  # 数値以外の入力途中は無視
+            if value < 1:
+                return
+            self.recorded_traj_points = min(value, 200)
+        if hasattr(self, 'main_image_view') and self.show_recorded_trajectory:
+            self.main_image_view.update()
+
     def update_auto_max_steering_angle(self, value):
-        """自動運転走行軌跡の最大舵角を更新"""
+        """自動運転操舵軌道の最大舵角を更新"""
         self.auto_max_steering_angle = value
         if hasattr(self, 'main_image_view') and self.show_auto_driving_direction:
             self.main_image_view.update()
@@ -7704,13 +8114,21 @@ class ImageAnnotationTool(QMainWindow):
     def update_auto_cam_pitch(self, value):
         """カメラ俯角補正を更新"""
         self.auto_cam_pitch_deg = value
-        if hasattr(self, 'main_image_view') and self.show_auto_driving_direction:
+        if hasattr(self, 'main_image_view') and (self.show_auto_driving_direction
+                                                 or self.show_recorded_trajectory):
             self.main_image_view.update()
 
     def update_auto_fov_deg(self, value):
         """カメラ対角FOVを更新"""
         self.auto_fov_deg = value
-        if hasattr(self, 'main_image_view') and self.show_auto_driving_direction:
+        if hasattr(self, 'main_image_view') and (self.show_auto_driving_direction
+                                                 or self.show_recorded_trajectory):
+            self.main_image_view.update()
+
+    def update_auto_cam_height(self, value):
+        """走行軌道の投影スケールに使うカメラ地上高を更新"""
+        self.auto_cam_height_m = value
+        if hasattr(self, 'main_image_view') and self.show_recorded_trajectory:
             self.main_image_view.update()
 
     def toggle_seg_driving_direction(self, state):
@@ -19061,6 +19479,7 @@ class ImageAnnotationTool(QMainWindow):
         self.annotation_timestamps = {}
         self.inference_results = {}
         self.location_annotations = {}
+        self.pose_manager.reset()
 
         if hasattr(self, 'deleted_indexes'):
             self.deleted_indexes = []
@@ -20337,6 +20756,9 @@ class ImageAnnotationTool(QMainWindow):
 
                             # タイムスタンプを保存
                             self.annotation_timestamps[actual_index] = entry.get('_timestamp_ms', int(time.time() * 1000))
+
+                            # 自己位置情報（pose/slam/vslam/aruco）を取り込む
+                            self.pose_manager.ingest_entry(actual_index, entry)
                             
                             # 削除されたエントリの場合、削除インデックスリストに追加
                             if is_deleted:
@@ -20434,6 +20856,11 @@ class ImageAnnotationTool(QMainWindow):
             
             # スライダーの削除インデックスを更新
             self.update_slider_deleted_indexes()
+
+            # 走行軌跡マップビューが開いていれば更新
+            if hasattr(self, 'map_view_dialog') and self.map_view_dialog is not None and self.map_view_dialog.isVisible():
+                self.map_view_dialog.set_pose_manager(self.pose_manager)
+
             return self.annotated_count > 0
                 
         except Exception as e:
@@ -20454,22 +20881,27 @@ class ImageAnnotationTool(QMainWindow):
         self.annotation_timestamps = {}
         self.inference_results = {}
         self.location_annotations = {}
-        
+        self.pose_manager.reset()
+
         if hasattr(self, 'deleted_indexes'):
             self.deleted_indexes = []
-        
+
         # UI更新
         self.display_current_image()
         self.update_gallery()
         self.update_slider_deleted_indexes()
-        
+
         # 位置ボタンのカウント表示を更新
         self.update_location_button_counts()
-        
+
         # 分布グラフを更新
         if hasattr(self, 'distribution_label'):
             self.distribution_label.clear()
             self.distribution_label.setText(get_text('label_no_annotations'))
+
+        # 走行軌跡マップビューが開いていれば更新
+        if hasattr(self, 'map_view_dialog') and self.map_view_dialog is not None and self.map_view_dialog.isVisible():
+            self.map_view_dialog.set_pose_manager(self.pose_manager)
 
         print("アノテーションデータをクリアしました")
 
@@ -20678,6 +21110,10 @@ class ImageAnnotationTool(QMainWindow):
             self.main_image_view._temporal_thumb_cache.clear()
 
         current_image_path = self.images[self.current_index]
+
+        # 走行軌跡マップビューが開いていれば現在フレームハイライトを更新
+        if hasattr(self, 'map_view_dialog') and self.map_view_dialog is not None and self.map_view_dialog.isVisible():
+            self.map_view_dialog.highlight_frame(self.current_index)
 
         try:
             # 結合表示モードの場合
