@@ -5286,6 +5286,10 @@ class ImageAnnotationTool(QMainWindow):
 
         self.map_view_dialog = MapViewDialog(parent=self)
         self.map_view_dialog.set_pose_manager(self.pose_manager)
+        # 走行に紐づく地図（同梱スナップショット / map_ref.json / 同TS地図、
+        # 無ければ直近に保存された地図）を背景へ自動読み込み
+        if getattr(self, 'folder_path', None):
+            self.map_view_dialog.auto_load_background(self.folder_path)
         self.map_view_dialog.jump_to_image.connect(self.jump_to_index_from_map_view)
         self.map_view_dialog.highlight_frame(self.current_index)
         self.map_view_dialog.show()

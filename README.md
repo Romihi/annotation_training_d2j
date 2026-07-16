@@ -1432,3 +1432,24 @@ This project is licensed under the **GNU General Public License v3.0** - see the
 ## 謝辞
 
 このツールは、Togikaidrive、DonkeycarやJetracerなどのAIミニカープロジェクトをサポートするために開発されました。
+## 地図の自動読み込み（utils/map_utils.py）
+
+走行データフォルダに紐づく占有格子地図を自動解決して表示に使える
+（togikaidrive-dev 側 `docs/RECORD_KEY_NAMING.md` §7 の `map_ref.json` /
+`map/` スナップショット仕様に対応。本リポジトリ単体・zip転送後でも動く）。
+
+```python
+from utils.map_utils import find_map_for_run, load_map
+
+hit = find_map_for_run(data_dir)        # None = 地図なし表示
+if hit:                                  # source: snapshot / map_ref / inferred
+    m = load_map(hit["map_yaml"])        # MapData(image, resolution, origin)
+    ax.imshow(m.image, cmap="gray", extent=m.extent, origin="upper")
+    col, row = m.world_to_px(x, y)       # 記録の slam/x,y [m] → 画素
+```
+
+解決順: ①`<data_dir>/map/` 同梱スナップショット → ②`map_ref.json` の
+map_dir（togikaidrive-dev と同居時） → ③データフォルダと同タイムスタンプの
+地図（旧データ用の推定、`source="inferred"`）。
+
+確認CLI: `python -m utils.map_utils <data_dir> [--preview out.png]`

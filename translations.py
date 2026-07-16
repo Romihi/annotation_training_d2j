@@ -1688,6 +1688,7 @@ Google Cloud Console での OAuth設定手順
         'map_view_legend_slip': 'スリップ',
         'map_view_legend_rough': '悪路',
         'map_view_background_load_error': '地図の読み込みに失敗しました: {0}',
+        'map_view_auto_loaded': '地図を自動読み込み: {0}（{1}）',
 
         # map_view_quality_ / map_view_segment_ / map_view_interp_ / map_view_writeback_ : Phase 2 編集機能
         'map_view_quality_label': '品質フィルタ:',
@@ -3322,6 +3323,7 @@ Notes
         'map_view_legend_slip': 'Slip',
         'map_view_legend_rough': 'Rough road',
         'map_view_background_load_error': 'Failed to load map: {0}',
+        'map_view_auto_loaded': 'Map auto-loaded: {0} ({1})',
 
         # map_view_quality_ / map_view_segment_ / map_view_interp_ / map_view_writeback_ : Phase 2 editing
         'map_view_quality_label': 'Quality filter:',

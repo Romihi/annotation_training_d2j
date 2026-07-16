@@ -168,6 +168,29 @@ class MapViewWidget(QWidget):
         self._bg_extent = extent
         self.refresh()
 
+    def auto_load_background(self, data_dir: str) -> None:
+        """データフォルダに紐づく地図（無ければ直近に保存された地図）を自動で
+        背景に読み込む。解決順: ①<data_dir>/map/ 同梱スナップショット
+        ②map_ref.json ③同タイムスタンプの地図 ④maps配下の最新地図。
+        手動で背景を設定済みの場合や見つからない場合は何もしない。
+        """
+        if self._bg_image_path or not data_dir:
+            return
+        try:
+            from utils.map_utils import resolve_background_map
+            hit = resolve_background_map(data_dir)
+        except Exception as e:
+            self.status_label.setText(get_text('map_view_background_load_error', str(e)))
+            return
+        if not hit:
+            return
+        self.set_background_map(hit["map_yaml"])
+        if self._bg_image_path:   # 読み込み成功時のみ由来を表示
+            self.status_label.setText(get_text(
+                'map_view_auto_loaded',
+                os.path.basename(os.path.dirname(hit["map_yaml"])),
+                hit["source"]))
+
     def clear_background_map(self) -> None:
         self._bg_image_path = None
         self._bg_extent = None
@@ -473,6 +496,10 @@ class MapViewDialog(QDialog):
         self.quality_result_label.setText("")
         self.interp_result_label.setText("")
         self._refresh_segment_controls(pose_manager)
+
+    def auto_load_background(self, data_dir: str) -> None:
+        """走行データフォルダに紐づく地図を背景へ自動読み込み（widget へ委譲）"""
+        self.map_widget.auto_load_background(data_dir)
 
     def _refresh_segment_controls(self, pose_manager) -> None:
         known = pose_manager.known_indexes() if pose_manager else []
