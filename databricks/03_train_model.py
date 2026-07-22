@@ -8,8 +8,8 @@
 
 # MAGIC %md
 # MAGIC ## 設定
-
-%pip install torch torchvision
+# MAGIC
+# MAGIC %pip install torch torchvision
 
 # COMMAND ----------
 
@@ -62,6 +62,18 @@ def load_annotations(data_path):
 
     return annotations
 
+# widgetのdata_pathが無効な場合は、最新のannotationディレクトリを自動選択
+if not os.path.exists(DATA_PATH):
+    annotation_dir = "/Volumes/workspace/default/annotation_data"
+    subdirs = [d for d in os.listdir(annotation_dir)
+               if os.path.isdir(os.path.join(annotation_dir, d)) and d.startswith('annotation_')]
+    if subdirs:
+        latest_annotation = sorted(subdirs)[-1]
+        DATA_PATH = os.path.join(annotation_dir, latest_annotation)
+        print(f"Using latest annotation data: {DATA_PATH}")
+    else:
+        raise FileNotFoundError(f"No annotation data found in {annotation_dir}")
+
 annotations = load_annotations(DATA_PATH)
 print(f"アノテーション数: {len(annotations)}")
 
@@ -72,65 +84,67 @@ print(f"アノテーション数: {len(annotations)}")
 
 # COMMAND ----------
 
-import torch
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-
-class DonkeyDataset(Dataset):
-    """Donkeycar形式のデータセット"""
-
-    def __init__(self, annotations, images_dir, image_column, transform=None):
-        self.annotations = annotations
-        self.images_dir = images_dir
-        self.image_column = image_column
-        self.transform = transform or transforms.Compose([
-            transforms.Resize((120, 160)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                               std=[0.229, 0.224, 0.225])
-        ])
-
-    def __len__(self):
-        return len(self.annotations)
-
-    def __getitem__(self, idx):
-        record = self.annotations[idx]
-
-        # 画像を読み込み
-        img_name = record[self.image_column]
-        img_path = os.path.join(self.images_dir, img_name)
-        image = Image.open(img_path).convert('RGB')
-
-        if self.transform:
-            image = self.transform(image)
-
-        # ラベル（angle, throttle）
-        angle = record['user/angle']
-        throttle = record['user/throttle']
-        label = torch.tensor([angle, throttle], dtype=torch.float32)
-
-        return image, label
-
-# データセットを作成
-images_dir = os.path.join(DATA_PATH, "images")
-
-# データを分割
-np.random.seed(42)
-indices = np.random.permutation(len(annotations))
-train_size = int(len(annotations) * TRAIN_RATIO)
-
-train_annotations = [annotations[i] for i in indices[:train_size]]
-val_annotations = [annotations[i] for i in indices[train_size:]]
-
-print(f"学習データ数: {len(train_annotations)}")
-print(f"検証データ数: {len(val_annotations)}")
-
-# データセットとDataLoaderを作成
-train_dataset = DonkeyDataset(train_annotations, images_dir, IMAGE_COLUMN)
-val_dataset = DonkeyDataset(val_annotations, images_dir, IMAGE_COLUMN)
-
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+# MAGIC %pip install torch torchvision
+# MAGIC import torch
+# MAGIC
+# MAGIC from torch.utils.data import Dataset, DataLoader
+# MAGIC from torchvision import transforms
+# MAGIC
+# MAGIC class DonkeyDataset(Dataset):
+# MAGIC     """Donkeycar形式のデータセット"""
+# MAGIC
+# MAGIC     def __init__(self, annotations, images_dir, image_column, transform=None):
+# MAGIC         self.annotations = annotations
+# MAGIC         self.images_dir = images_dir
+# MAGIC         self.image_column = image_column
+# MAGIC         self.transform = transform or transforms.Compose([
+# MAGIC             transforms.Resize((120, 160)),
+# MAGIC             transforms.ToTensor(),
+# MAGIC             transforms.Normalize(mean=[0.485, 0.456, 0.406],
+# MAGIC                                std=[0.229, 0.224, 0.225])
+# MAGIC         ])
+# MAGIC
+# MAGIC     def __len__(self):
+# MAGIC         return len(self.annotations)
+# MAGIC
+# MAGIC     def __getitem__(self, idx):
+# MAGIC         record = self.annotations[idx]
+# MAGIC
+# MAGIC         # 画像を読み込み
+# MAGIC         img_name = record[self.image_column]
+# MAGIC         img_path = os.path.join(self.images_dir, img_name)
+# MAGIC         image = Image.open(img_path).convert('RGB')
+# MAGIC
+# MAGIC         if self.transform:
+# MAGIC             image = self.transform(image)
+# MAGIC
+# MAGIC         # ラベル（angle, throttle）
+# MAGIC         angle = record['user/angle']
+# MAGIC         throttle = record['user/throttle']
+# MAGIC         label = torch.tensor([angle, throttle], dtype=torch.float32)
+# MAGIC
+# MAGIC         return image, label
+# MAGIC
+# MAGIC # データセットを作成
+# MAGIC images_dir = os.path.join(DATA_PATH, "images")
+# MAGIC
+# MAGIC # データを分割
+# MAGIC np.random.seed(42)
+# MAGIC indices = np.random.permutation(len(annotations))
+# MAGIC train_size = int(len(annotations) * TRAIN_RATIO)
+# MAGIC
+# MAGIC train_annotations = [annotations[i] for i in indices[:train_size]]
+# MAGIC val_annotations = [annotations[i] for i in indices[train_size:]]
+# MAGIC
+# MAGIC print(f"学習データ数: {len(train_annotations)}")
+# MAGIC print(f"検証データ数: {len(val_annotations)}")
+# MAGIC
+# MAGIC # データセットとDataLoaderを作成
+# MAGIC train_dataset = DonkeyDataset(train_annotations, images_dir, IMAGE_COLUMN)
+# MAGIC val_dataset = DonkeyDataset(val_annotations, images_dir, IMAGE_COLUMN)
+# MAGIC
+# MAGIC train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+# MAGIC val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
 # COMMAND ----------
 
@@ -337,8 +351,14 @@ plt.show()
 
 # COMMAND ----------
 
-# モデルを保存
-model_save_path = "/Volumes/workspace/default/annotation_data/models/donkey_model.pt"
+# モデルを保存（データのVolumesルート直下 models/ = アプリの取り込みと同じ場所）
+# 命名はアプリのローカル学習と同じ規則: "{model_type}_{timestamp}.pth"
+# （拡張子 .pth・プレフィックスにmodel_typeを付けることで、アプリの自動運転
+#  モデル一覧にそのまま認識される）
+from datetime import datetime, timezone
+_ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+_volumes_root = os.path.dirname(DATA_PATH.rstrip('/'))
+model_save_path = os.path.join(_volumes_root, "models", f"donkeycar_{_ts}.pth")
 os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
 
 torch.save({

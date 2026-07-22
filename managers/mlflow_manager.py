@@ -8,19 +8,18 @@ import torch
 from enum import Enum
 
 # Databricks設定をインポート
+# 注意: 設定はアプリ内で編集・保存できる（再起動不要）。値は都度 db_config.X で
+# 参照すること（トップレベルで from ... import した名前は reload 後も更新されない）。
 try:
+    import databricks.config_databricks as db_config
     from databricks.config_databricks import (
-        DATABRICKS_ENABLED,
-        DATABRICKS_HOST,
-        DATABRICKS_TOKEN,
-        DATABRICKS_EXPERIMENT_PREFIX,
         validate_databricks_config,
-        get_databricks_status
+        get_databricks_status,
     )
     DATABRICKS_CONFIG_AVAILABLE = True
 except ImportError:
+    db_config = None
     DATABRICKS_CONFIG_AVAILABLE = False
-    DATABRICKS_ENABLED = False
 
 class ModelType(Enum):
     """モデルタイプの定義"""
@@ -30,6 +29,7 @@ class ModelType(Enum):
     YOLO_DETECTION = "yolo_detection"
     YOLO_SEGMENTATION = "yolo_segmentation"
     SEQUENCE = "sequence"
+    TOGIVAD = "togivad"
     GRU_TRAJECTORY = "gru_trajectory"  # 後方互換
 
 class MLflowManager:
@@ -43,6 +43,7 @@ class MLflowManager:
         ModelType.YOLO_DETECTION: "yolo_detection_models",
         ModelType.YOLO_SEGMENTATION: "yolo_segmentation_models",
         ModelType.SEQUENCE: "sequence_models",
+        ModelType.TOGIVAD: "togivad_models",
         ModelType.GRU_TRAJECTORY: "gru_trajectory_models"  # 後方互換
     }
 
@@ -78,7 +79,7 @@ class MLflowManager:
         if self.use_databricks and self._databricks_connected:
             return {
                 "type": "databricks+local",
-                "host": DATABRICKS_HOST if DATABRICKS_CONFIG_AVAILABLE else "",
+                "host": db_config.DATABRICKS_HOST if DATABRICKS_CONFIG_AVAILABLE else "",
                 "tracking_uri": self.tracking_uri,
                 "local_tracking_uri": self.local_tracking_uri,
                 "status": "接続済み（ローカル併用）"
@@ -86,7 +87,7 @@ class MLflowManager:
         elif self.use_databricks and not self._databricks_connected:
             return {
                 "type": "databricks",
-                "host": DATABRICKS_HOST if DATABRICKS_CONFIG_AVAILABLE else "",
+                "host": db_config.DATABRICKS_HOST if DATABRICKS_CONFIG_AVAILABLE else "",
                 "tracking_uri": None,
                 "status": "未接続"
             }
@@ -104,6 +105,9 @@ class MLflowManager:
             print("警告: config_databricks.py が見つかりません")
             return False
 
+        # アプリ内で保存された最新設定を反映（再起動不要）
+        db_config.reload()
+
         # 設定の検証（validate_databricks_configはDATABRICKS_ENABLEDフラグに依存するため、
         # UIから有効化した場合も考慮してHOST/TOKENを直接チェックする）
         errors = validate_databricks_config()
@@ -112,17 +116,17 @@ class MLflowManager:
             return False
 
         # HOST/TOKENが空の場合はエラー（環境変数未設定でUIから有効化した場合）
-        if not DATABRICKS_HOST:
+        if not db_config.DATABRICKS_HOST:
             print("Databricks設定エラー: DATABRICKS_HOST が設定されていません")
             return False
-        if not DATABRICKS_TOKEN:
+        if not db_config.DATABRICKS_TOKEN:
             print("Databricks設定エラー: DATABRICKS_TOKEN が設定されていません")
             return False
 
         try:
             # Databricks認証情報を環境変数に設定
-            os.environ["DATABRICKS_HOST"] = DATABRICKS_HOST
-            os.environ["DATABRICKS_TOKEN"] = DATABRICKS_TOKEN
+            os.environ["DATABRICKS_HOST"] = db_config.DATABRICKS_HOST
+            os.environ["DATABRICKS_TOKEN"] = db_config.DATABRICKS_TOKEN
 
             # MLflowのトラッキングURIをDatabricksに設定
             self.tracking_uri = "databricks"
@@ -146,7 +150,7 @@ class MLflowManager:
             total_experiments = len(self.EXPERIMENT_NAMES)
             for model_type, experiment_name in self.EXPERIMENT_NAMES.items():
                 # Databricksでは実験パスを使用
-                experiment_path = f"{DATABRICKS_EXPERIMENT_PREFIX}/{experiment_name}"
+                experiment_path = f"{db_config.DATABRICKS_EXPERIMENT_PREFIX}/{experiment_name}"
                 try:
                     experiment = mlflow.get_experiment_by_name(experiment_path)
                     if experiment is None:
@@ -164,7 +168,7 @@ class MLflowManager:
 
             self._databricks_connected = True
             self.is_initialized = True
-            print(f"Databricks MLflow初期化成功: {DATABRICKS_HOST}")
+            print(f"Databricks MLflow初期化成功: {db_config.DATABRICKS_HOST}")
             return True
 
         except Exception as e:
@@ -177,7 +181,7 @@ class MLflowManager:
         missing_dirs = set()
 
         for model_type, experiment_name in self.EXPERIMENT_NAMES.items():
-            experiment_path = f"{DATABRICKS_EXPERIMENT_PREFIX}/{experiment_name}"
+            experiment_path = f"{db_config.DATABRICKS_EXPERIMENT_PREFIX}/{experiment_name}"
             try:
                 experiment = mlflow.get_experiment_by_name(experiment_path)
                 if experiment is None:
@@ -190,11 +194,11 @@ class MLflowManager:
                         error_msg = str(create_error)
                         if "RESOURCE_DOES_NOT_EXIST" in error_msg and "Parent directory" in error_msg:
                             # 親ディレクトリが存在しない
-                            missing_dirs.add(DATABRICKS_EXPERIMENT_PREFIX)
+                            missing_dirs.add(db_config.DATABRICKS_EXPERIMENT_PREFIX)
             except Exception as e:
                 error_msg = str(e)
                 if "RESOURCE_DOES_NOT_EXIST" in error_msg:
-                    missing_dirs.add(DATABRICKS_EXPERIMENT_PREFIX)
+                    missing_dirs.add(db_config.DATABRICKS_EXPERIMENT_PREFIX)
 
         return list(missing_dirs)
 
@@ -232,8 +236,8 @@ class MLflowManager:
 
             # WorkspaceClientを初期化（環境変数から認証情報を取得）
             w = WorkspaceClient(
-                host=DATABRICKS_HOST,
-                token=DATABRICKS_TOKEN
+                host=db_config.DATABRICKS_HOST,
+                token=db_config.DATABRICKS_TOKEN
             )
 
             for dir_path in directories:
@@ -408,7 +412,7 @@ class MLflowManager:
 
         if target == "databricks" and self.use_databricks and self._databricks_connected:
             # Databricks用
-            experiment_path = f"{DATABRICKS_EXPERIMENT_PREFIX}/{experiment_name}"
+            experiment_path = f"{db_config.DATABRICKS_EXPERIMENT_PREFIX}/{experiment_name}"
             mlflow.set_tracking_uri("databricks")
         else:
             # ローカル用
@@ -628,11 +632,11 @@ class MLflowManager:
 
         try:
             # DatabricksワークスペースのMLflow実験URLを構築
-            base_url = DATABRICKS_HOST.rstrip('/')
+            base_url = db_config.DATABRICKS_HOST.rstrip('/')
 
             if model_type:
                 experiment_name = self.EXPERIMENT_NAMES[model_type]
-                experiment_path = f"{DATABRICKS_EXPERIMENT_PREFIX}/{experiment_name}"
+                experiment_path = f"{db_config.DATABRICKS_EXPERIMENT_PREFIX}/{experiment_name}"
                 # 実験IDを取得してURLを構築
                 experiment = mlflow.get_experiment_by_name(experiment_path)
                 if experiment:
@@ -1280,6 +1284,102 @@ class MLflowManager:
         else:
             return {"status": "error", "message": "記録に失敗しました"}
 
+    def log_togivad_model(self, model_path, training_params, metrics,
+                          dataset_info, extra_artifacts: list = None):
+        """TogiVAD（軌道語彙分類 E2E）の学習結果を記録
+
+        Args:
+            extra_artifacts: 追加で記録するファイル（学習曲線PNG等）のリスト
+        """
+        def _as_param(v):
+            if v is None:
+                return None
+            if isinstance(v, (list, tuple)):
+                return ",".join(map(str, v))
+            return v
+
+        params = {
+            "framework": "pytorch",
+            "model_type": "togivad",
+            "model_arch": "togivad",
+            "data_folder": training_params.get("data_folder", "unknown"),
+            "task_type": "trajectory_vocabulary_classification",
+            # 軌道ラベルの情報源（pose: デッドレコニング / slam: LiDAR SLAM）
+            "pose_source": training_params.get("pose_source", "pose"),
+            "vocab_k": training_params.get("vocab_k", 128),
+            "vocab_from_logs": training_params.get("vocab_from_logs", True),
+            "horizon": training_params.get("horizon", 20),
+            "dt": training_params.get("dt", 0.05),
+            "ego_dropout": training_params.get("ego_dropout", 0.3),
+            "epochs": training_params.get("num_epochs", 0),
+            "learning_rate": training_params.get("learning_rate", 3e-4),
+            "batch_size": training_params.get("batch_size", 16),
+            "num_image_sources": training_params.get("num_image_sources", 1),
+            "selected_sources": training_params.get("selected_sources", ""),
+            "img_size": _as_param(training_params.get("img_size")),
+            "val_split": training_params.get("val_split"),
+            "weight_decay": training_params.get("weight_decay"),
+            "quality_excluded_frames": training_params.get("quality_excluded_frames"),
+            "early_stopping": ("enabled" if training_params.get("use_early_stopping")
+                               else "disabled"),
+            "patience": training_params.get("patience"),
+            "model_params_total": training_params.get("model_params_total"),
+            "device": training_params.get("device"),
+            "torch_version": training_params.get("torch_version"),
+            "cuda_version": training_params.get("cuda_version"),
+        }
+        if training_params.get("comment"):
+            params["comment"] = training_params["comment"]
+
+        run_metrics = {
+            "best_val_loss": metrics.get("best_val_loss", 0.0),
+            "final_train_loss": metrics.get("final_train_loss", 0.0),
+            "final_val_loss": metrics.get("final_val_loss", 0.0),
+            "best_epoch": metrics.get("best_epoch", 0),
+            "best_val_top1": metrics.get("best_val_top1", 0.0),
+            "best_val_top5": metrics.get("best_val_top5", 0.0),
+            "best_val_ade_m": metrics.get("best_val_ade_m", 0.0),
+            "total_training_time": metrics.get("total_training_time", 0.0),
+            "avg_epoch_time": metrics.get("avg_epoch_time", 0.0),
+            "completed_epochs": metrics.get("completed_epochs", 0)
+        }
+
+        tags = {
+            "model_category": "togivad",
+            "model_arch": "togivad",
+            "task_type": "trajectory_vocabulary_classification",
+            "framework": "pytorch",
+            "status": metrics.get("status", "completed"),
+            "image_sources": training_params.get("selected_sources", ""),
+            "pose_source": training_params.get("pose_source", "pose"),
+            "training_environment": training_params.get("training_environment", "local")
+        }
+
+        if dataset_info:
+            params.update({
+                "train_samples": dataset_info.get("train_samples", 0),
+                "val_samples": dataset_info.get("val_samples", 0),
+                "total_sequences": dataset_info.get("total_sequences", 0)
+            })
+
+        custom_name = training_params.get('model_name', '')
+        if custom_name:
+            run_name = custom_name
+        else:
+            source = training_params.get("pose_source", "pose")
+            run_name = f"togivad_{source}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        success = self._log_with_local_fallback(
+            ModelType.TOGIVAD, run_name, params, run_metrics, tags,
+            dataset_info if dataset_info else {}, metrics, model_path,
+            extra_artifacts=extra_artifacts
+        )
+
+        if success:
+            return {"status": "success", "run_name": run_name}
+        else:
+            return {"status": "error", "message": "記録に失敗しました"}
+
     def _get_default_mlflow_uri(self):
         """デフォルトのmlrunsディレクトリURI(sqlite)を取得"""
         try:
@@ -1396,6 +1496,187 @@ class MLflowManager:
             if self.local_tracking_uri:
                 mlflow.set_tracking_uri(self.local_tracking_uri)
 
+    def sync_databricks_to_local(self, parent_widget=None, progress_callback=None,
+                                 cancel_check=None):
+        """Databricks上の学習記録（MLflow Run）をすべてローカルに取り込む（逆方向同期）
+
+        クラウド学習（ノートブック）の記録は実験パスのプレフィックスが
+        アプリ設定と異なる場合があるため、実験名の末尾一致で対象を広く収集する。
+
+        Returns:
+            dict: {"synced": int, "skipped": int, "failed": int,
+                   "errors": list, "cancelled": bool, "message": str?}
+        """
+        result = {"synced": 0, "skipped": 0, "failed": 0,
+                  "errors": [], "cancelled": False}
+
+        if not self.use_databricks:
+            result["errors"].append("Databricksモードが無効です")
+            return result
+        if not self._databricks_connected:
+            if not self._initialize_databricks(parent_widget):
+                result["errors"].append("Databricksに接続できません")
+                return result
+
+        from mlflow.tracking import MlflowClient
+
+        local_uri = self._get_default_mlflow_uri()
+        try:
+            db_client = MlflowClient(tracking_uri="databricks")
+            local_client = MlflowClient(tracking_uri=local_uri)
+        except Exception as e:
+            result["errors"].append(f"MLflowクライアント初期化エラー: {e}")
+            return result
+
+        try:
+            # 1. Databric's上の実験を名前の末尾一致で収集
+            name_set = set(self.EXPERIMENT_NAMES.values())
+            try:
+                all_db_exps = db_client.search_experiments()
+            except Exception as e:
+                result["errors"].append(f"Databricks実験一覧取得エラー: {e}")
+                return result
+
+            matched_exps = []  # [(local_experiment_name, db_experiment)]
+            for exp in all_db_exps:
+                base = exp.name.rstrip('/').split('/')[-1]
+                if base in name_set:
+                    matched_exps.append((base, exp))
+
+            # 2. 各実験のRunを収集
+            runs_to_sync = []  # [(local_experiment_name, Run)]
+            for exp_name, db_exp in matched_exps:
+                try:
+                    runs = db_client.search_runs(
+                        [db_exp.experiment_id],
+                        order_by=["start_time DESC"], max_results=1000)
+                    for r in runs:
+                        runs_to_sync.append((exp_name, r))
+                except Exception as e:
+                    result["errors"].append(f"{db_exp.name}: {e}")
+
+            total = len(runs_to_sync)
+            if total == 0:
+                result["message"] = "取得するクラウド記録がありません"
+                return result
+
+            # 3. 各Runをローカルに取り込む
+            for i, (exp_name, run) in enumerate(runs_to_sync):
+                if cancel_check and cancel_check():
+                    result["cancelled"] = True
+                    break
+                if progress_callback:
+                    label = (run.data.tags or {}).get(
+                        'mlflow.runName', run.info.run_id)
+                    progress_callback(i + 1, total, f"取得中: {label}")
+
+                r = self._sync_run_to_local(
+                    exp_name, run, db_client, local_client)
+                if r == "synced":
+                    result["synced"] += 1
+                elif r == "skipped":
+                    result["skipped"] += 1
+                else:
+                    result["failed"] += 1
+                    result["errors"].append(f"{run.info.run_id}: {r}")
+
+            return result
+
+        except Exception as e:
+            result["errors"].append(str(e))
+            return result
+
+    def _sync_run_to_local(self, experiment_name, db_run, db_client, local_client):
+        """Databricksの1RunをローカルMLflowに複製（params/metrics履歴/tags/artifacts）"""
+        try:
+            run_id = db_run.info.run_id
+            tags = dict(db_run.data.tags or {})
+            run_name = tags.get('mlflow.runName', '')
+
+            # ローカル実験（無ければ作成）
+            local_exp = local_client.get_experiment_by_name(experiment_name)
+            if local_exp is None:
+                exp_id = local_client.create_experiment(experiment_name)
+            else:
+                exp_id = local_exp.experiment_id
+
+            # 重複チェック（取り込み済みなら skip）
+            try:
+                existing = local_client.search_runs(
+                    [exp_id],
+                    filter_string=f"tags.original_databricks_run_id = '{run_id}'",
+                    max_results=1)
+                if existing:
+                    return "skipped"
+            except Exception:
+                pass
+
+            # ローカルRunを作成
+            create_tags = {'mlflow.runName': run_name} if run_name else None
+            new_run = local_client.create_run(
+                exp_id, start_time=db_run.info.start_time, tags=create_tags)
+            nrid = new_run.info.run_id
+
+            # パラメータ
+            for k, v in (db_run.data.params or {}).items():
+                try:
+                    local_client.log_param(nrid, k, v)
+                except Exception:
+                    pass
+
+            # メトリクス（履歴つき。取れなければ最終値のみ）
+            from mlflow.entities import Metric
+            for mkey in (db_run.data.metrics or {}).keys():
+                try:
+                    hist = db_client.get_metric_history(run_id, mkey)
+                    batch = [Metric(m.key, m.value, m.timestamp, m.step)
+                             for m in hist]
+                    for j in range(0, len(batch), 1000):
+                        local_client.log_batch(nrid, metrics=batch[j:j + 1000])
+                except Exception:
+                    try:
+                        local_client.log_metric(
+                            nrid, mkey, float(db_run.data.metrics[mkey]))
+                    except Exception:
+                        pass
+
+            # タグ（システムタグ以外）
+            for k, v in tags.items():
+                if k.startswith("mlflow."):
+                    continue
+                try:
+                    local_client.set_tag(nrid, k, v)
+                except Exception:
+                    pass
+            local_client.set_tag(nrid, "synced_from_databricks", "true")
+            local_client.set_tag(nrid, "original_databricks_run_id", run_id)
+            local_client.set_tag(nrid, "sync_timestamp",
+                                 datetime.now().isoformat())
+
+            # アーティファクト（best-effort）
+            try:
+                import tempfile
+                for a in db_client.list_artifacts(run_id):
+                    dst = tempfile.mkdtemp(prefix="db_art_")
+                    dl = db_client.download_artifacts(run_id, a.path, dst)
+                    if os.path.isdir(dl):
+                        local_client.log_artifacts(nrid, dl, a.path)
+                    else:
+                        local_client.log_artifact(
+                            nrid, dl, os.path.dirname(a.path) or None)
+            except Exception as ae:
+                print(f"アーティファクト取り込み警告 ({run_name}): {ae}")
+
+            # 終了状態を反映
+            local_client.set_terminated(
+                nrid, status=db_run.info.status or "FINISHED",
+                end_time=db_run.info.end_time)
+            return "synced"
+
+        except Exception as e:
+            print(f"ローカル取り込みエラー: {e}")
+            return str(e)
+
     def _delete_orphaned_databricks_runs(self, local_run_names, cancel_check=None):
         """ローカルに存在しないDatabricks上のRunを削除
 
@@ -1416,7 +1697,7 @@ class MLflowManager:
                 if cancel_check and cancel_check():
                     break
 
-                experiment_path = f"{DATABRICKS_EXPERIMENT_PREFIX}/{experiment_name}"
+                experiment_path = f"{db_config.DATABRICKS_EXPERIMENT_PREFIX}/{experiment_name}"
                 try:
                     experiment = mlflow.get_experiment_by_name(experiment_path)
                     if not experiment:
@@ -1481,7 +1762,7 @@ class MLflowManager:
             mlflow.set_tracking_uri("databricks")
 
             for experiment_name, local_names in local_run_names.items():
-                experiment_path = f"{DATABRICKS_EXPERIMENT_PREFIX}/{experiment_name}"
+                experiment_path = f"{db_config.DATABRICKS_EXPERIMENT_PREFIX}/{experiment_name}"
                 try:
                     experiment = mlflow.get_experiment_by_name(experiment_path)
                     if experiment:
@@ -1514,7 +1795,7 @@ class MLflowManager:
 
             # Databricksに切り替え
             mlflow.set_tracking_uri("databricks")
-            experiment_path = f"{DATABRICKS_EXPERIMENT_PREFIX}/{experiment_name}"
+            experiment_path = f"{db_config.DATABRICKS_EXPERIMENT_PREFIX}/{experiment_name}"
 
             try:
                 mlflow.set_experiment(experiment_path)
@@ -1630,7 +1911,7 @@ class MLflowManager:
             if self.use_databricks and self._databricks_connected:
                 mlflow.set_tracking_uri("databricks")
                 for model_type, experiment_name in self.EXPERIMENT_NAMES.items():
-                    experiment_path = f"{DATABRICKS_EXPERIMENT_PREFIX}/{experiment_name}"
+                    experiment_path = f"{db_config.DATABRICKS_EXPERIMENT_PREFIX}/{experiment_name}"
                     try:
                         experiment = mlflow.get_experiment_by_name(experiment_path)
                         if experiment:

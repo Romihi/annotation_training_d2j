@@ -79,7 +79,7 @@ from model_training import generate_augmentation_samples
 from styles import get_location_color, apply_style, set_theme, get_current_theme, PRIMARY_STYLE, MODEL_STYLE, TRAINING_STYLE, EXPORT_STYLE, SPECIAL_STYLE, DESTRUCTIVE_STYLE, NAV_STYLE
 
 
-from managers import AnnotationDataManager, MLflowManager, ModelType, SequenceTrainingManager, PoseSourceManager
+from managers import AnnotationDataManager, MLflowManager, ModelType, SequenceTrainingManager, PoseSourceManager, TogivadTrainingManager
 from map_view import MapViewDialog
 from utils.yolo_utils import train_yolo_with_ui, TrainingOutputDialog
 from data_analysis import DataAnalysisDialog
@@ -393,6 +393,7 @@ class ImageLabel(QLabel):
         self.extra_inference_points = []  # 追加モデルの推論ポイントリスト [(QPoint, QColor, show_flag), ...]
         self.sequence_prediction_points = []  # 時系列予測軌道 [(QPoint, ...)]
         self.show_gru_prediction = False  # 時系列予測表示フラグ
+        self.bev_mode = False  # BEV(真上から見た図)表示モード（画像ソース='__bev__'）
         self.zoom_factor = DEFAULT_ZOOM_FACTOR
         self.resolution_scale = 1.0          # 1.0=フル解像度, 0.1=10%
         self.crop_overlay_config = None      # 仮想ソース表示用
@@ -811,6 +812,16 @@ class ImageLabel(QLabel):
         painter = QPainter(self)
 
         self.draw_initial_frame(painter)
+
+        # BEV(真上から見た図)モード: カメラ画像の代わりに、操舵/走行/予測軌道を
+        # ego座標(x前方/y左)のまま真上から見た図として描く。表示切替は各軌道の
+        # 既存チェックボックスに連動（下の draw_bev 内で個別に判定）。
+        if getattr(self, 'bev_mode', False):
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            self.draw_bev(painter, self.target_rect)
+            painter.end()
+            return
+
         self.draw_virtual_overlay(painter, self.target_rect)
 
         # CAMオーバーレイを描画（ベース画像の上、他のアノテーションの下）
@@ -832,11 +843,21 @@ class ImageLabel(QLabel):
         # セグメンテーション走行方向矢印を描画
         self.draw_seg_driving_direction(self.pix_width, self.pix_height, painter, self.target_rect)
 
-        # 自動運転アノテーション操舵軌道（angle値からの予測円弧）を描画
-        self.draw_auto_driving_direction(_ann_pw, _ann_ph, painter, _ann_rect)
-
-        # 記録された自己位置からの実測走行軌道を描画
-        self.draw_recorded_trajectory(_ann_pw, _ann_ph, painter, _ann_rect)
+        # 操舵軌道(赤)・走行軌道(緑)は魚眼カメラ画像への投影。結合表示で
+        # _ann_rect が全キャンバス（推論対象セル未指定）のときだけ、軌道が
+        # セル境界をまたいで複数画像にかかるので描画しない。特定カメラセルに
+        # 割り当て済みならそのセル内に限定して描く（俯瞰は BEV セルが担う）。
+        _is_combined = getattr(self.main_window, 'current_variant', None) == '__combined__' \
+            if self.main_window else False
+        _cell_specific = (_ann_rect != self.target_rect)   # 特定セルに割当済みか
+        if (not _is_combined) or _cell_specific:
+            # 自動運転アノテーション操舵軌道（angle値からの予測円弧）を描画
+            self.draw_auto_driving_direction(_ann_pw, _ann_ph, painter, _ann_rect)
+            # 記録された自己位置からの実測走行軌道（緑）を描画
+            self.draw_recorded_trajectory(_ann_pw, _ann_ph, painter, _ann_rect)
+            # TogiVAD 予測軌道（シアン）を同じ魚眼投影で描画（走行軌道と原点・
+            # スケールを揃える。トップダウン overlay は使わない）
+            self.draw_prediction_trajectory(_ann_pw, _ann_ph, painter, _ann_rect)
 
         # SpeedGaugeWidget（画像外の独立ウィジェット）を更新
         if self.main_window and hasattr(self.main_window, 'speed_gauge'):
@@ -1462,8 +1483,15 @@ class ImageLabel(QLabel):
         else:
             infer_src = getattr(mw, '_combined_inference_source', None)
             if not infer_src or infer_src not in combined_sources:
-                return target_rect, self.pix_width, self.pix_height
-            slot_idx = combined_sources.index(infer_src)
+                # 推論対象未指定なら最初のカメラソース（BEV以外）のセルを既定に
+                # する。全キャンバスを返すと軌道がセル境界をまたいで描画されたり、
+                # _cell_specific 判定で走行/予測軌道がスキップされてしまう。
+                cam_srcs = [s for s in combined_sources if s != 'BEV']
+                if not cam_srcs:
+                    return target_rect, self.pix_width, self.pix_height
+                slot_idx = combined_sources.index(cam_srcs[0])
+            else:
+                slot_idx = combined_sources.index(infer_src)
 
         # _create_combined_image と同じグリッド縮小計算
         n_slots = len(combined_sources)
@@ -1611,10 +1639,12 @@ class ImageLabel(QLabel):
                 painter.drawEllipse(scaled_x - 15, scaled_y - 15, 30, 30)
 
         # 時系列予測軌道を描画（中実三角＋矢印接続、t+1が最大で段階的に縮小）
+        # 推論軌跡は暗めのシアン（ティール）。将来アノテーション表示（緑）と
+        # 明確に区別するため（両方緑だと重なって見分けられなかった）
         if getattr(self, 'show_gru_prediction', False) and getattr(self, 'sequence_prediction_points', []):
-            traj_color = QColor(0, 200, 0)  # 緑
-            traj_border = QColor(0, 128, 0)  # 濃い緑
-            tp1_border = QColor(0, 90, 0)    # t+1強調用の深緑
+            traj_color = QColor(0, 150, 160)  # 暗めシアン（塗り）
+            traj_border = QColor(0, 90, 100)  # 濃いティール（枠）
+            tp1_border = QColor(0, 55, 70)    # t+1強調用の深いティール
             n_pts = len(self.sequence_prediction_points)
             base_r = ANNOTATION_CIRCLE_SIZE - 1  # t+1のサイズ（アノテーション円より1pt小さい）
             min_r = 3
@@ -2103,34 +2133,20 @@ class ImageLabel(QLabel):
         painter.setPen(QPen(QColor(255, 255, 255)))
         painter.drawText(tx, ty, info_text)
 
-    def draw_recorded_trajectory(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
-        """記録された自己位置データから計算した実際の走行軌道を描画（等距離射影魚眼モデル）
+    def _draw_ego_trajectory_fisheye(self, traj, pix_width, pix_height, painter,
+                                     target_rect, color, draw_dots=True, arrow=False):
+        """ego座標(+X前方/+Y左, m)の軌道を等距離射影魚眼でカメラ画像へ投影して描く。
 
-        draw_auto_driving_direction（操舵軌道 = angle値からの予測円弧）と同じ投影モデルを
-        使うが、こちらは pose_manager.compute_future_trajectory の実測ego軌道
-        （+X前方/+Y左, メートル単位）を描く。地面座標はカメラ高さで正規化(h=1)されて
-        いるため、メートル値を auto_cam_height_m で割ってスケールを合わせる。
+        走行軌道(緑)・予測軌道(シアン)で共通に使う。始点=車体直下(ego原点)を必ず
+        起点にし、原点・スケール（メートル→地面→魚眼画素）を両軌道で揃える。
+        地面座標はカメラ高さで正規化(h=1)するため、メートル値を cam_height_m で割る。
         """
-        if not getattr(self.main_window, 'show_recorded_trajectory', False):
-            return
+        mw = self.main_window
+        cam_pitch_rad = math.radians(getattr(mw, 'auto_cam_pitch_deg', 20.0))
+        fov_deg       = getattr(mw, 'auto_fov_deg', 160.0)
+        cam_height_m  = max(1e-3, getattr(mw, 'auto_cam_height_m', 0.15))
 
-        current_index = self.main_window.current_index
-        if current_index is None:
-            return
-        pose_manager = getattr(self.main_window, 'pose_manager', None)
-        if pose_manager is None or not pose_manager.has_any_pose():
-            return
-
-        horizon = max(1, int(getattr(self.main_window, 'recorded_traj_points', 20)))
-        traj = pose_manager.compute_future_trajectory(current_index, horizon=horizon, dt=0.05)
-        if traj is None or len(traj) == 0:
-            return
-
-        cam_pitch_rad = math.radians(getattr(self.main_window, 'auto_cam_pitch_deg', 20.0))
-        fov_deg       = getattr(self.main_window, 'auto_fov_deg', 160.0)
-        cam_height_m  = max(1e-3, getattr(self.main_window, 'auto_cam_height_m', 0.15))
-
-        cx = pix_width  / 2.0
+        cx = pix_width / 2.0
         cy = pix_height / 2.0
         half_diag_px  = math.sqrt((pix_width / 2.0) ** 2 + (pix_height / 2.0) ** 2)
         fov_half_rad  = math.radians(fov_deg / 2.0)
@@ -2156,35 +2172,278 @@ class ImageLabel(QLabel):
             sy = target_rect.y() + (iy / pix_height) * target_rect.height()
             return sx, sy
 
-        # ego座標(+X前方/+Y左, m) → 地面座標(gx=右正, gy=前方, h=1正規化)
         screen_pts = []
+        origin_pt = ground_to_screen(0.0, 0.0)   # 車体直下=線の起点
+        if origin_pt is not None:
+            screen_pts.append(origin_pt)
+        pts_ego = []
         for x_ego, y_ego in traj:
-            if x_ego <= 0.0:
-                continue  # 後退・停止区間は描画しない（投影が破綻するため）
+            if float(x_ego) <= 0.0:
+                continue                          # 後退・停止区間は投影が破綻
             gx = -float(y_ego) / cam_height_m
             gy = float(x_ego) / cam_height_m
             pt = ground_to_screen(gx, gy)
             if pt is not None:
                 screen_pts.append(pt)
+                pts_ego.append(pt)
 
         if len(screen_pts) < 2:
             return
 
         painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
         painter.setOpacity(1.0)
-        traj_color = QColor(0, 200, 0, 220)  # 緑（操舵軌道の赤と区別）
-
         painter.setClipRect(target_rect)
-        painter.setPen(QPen(traj_color, 3))
+        painter.setPen(QPen(color, 3))
         painter.setBrush(Qt.NoBrush)
         for i in range(len(screen_pts) - 1):
             x1, y1 = screen_pts[i]
             x2, y2 = screen_pts[i + 1]
             painter.drawLine(int(x1), int(y1), int(x2), int(y2))
-        # 軌道点にも小さな丸を描いて実測点であることを示す
-        painter.setBrush(traj_color)
-        for x, y in screen_pts:
-            painter.drawEllipse(int(x) - 2, int(y) - 2, 4, 4)
+        if arrow and len(screen_pts) >= 2:
+            x2, y2 = screen_pts[-1]
+            x1, y1 = screen_pts[-2]
+            ang = math.atan2(y2 - y1, x2 - x1)
+            al = 10
+            painter.setBrush(QBrush(color))
+            painter.drawPolygon(QPolygon([
+                QPoint(int(x2), int(y2)),
+                QPoint(int(x2 - al * math.cos(ang - math.pi / 6)),
+                       int(y2 - al * math.sin(ang - math.pi / 6))),
+                QPoint(int(x2 - al * math.cos(ang + math.pi / 6)),
+                       int(y2 - al * math.sin(ang + math.pi / 6)))]))
+        if draw_dots:
+            painter.setBrush(color)
+            for x, y in pts_ego:
+                painter.drawEllipse(int(x) - 2, int(y) - 2, 4, 4)
+        painter.setClipping(False)
+
+    def draw_recorded_trajectory(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
+        """記録された自己位置からの実測走行軌道(緑)を魚眼投影で描画する。"""
+        if not getattr(self.main_window, 'show_recorded_trajectory', False):
+            return
+        current_index = self.main_window.current_index
+        if current_index is None:
+            return
+        pose_manager = getattr(self.main_window, 'pose_manager', None)
+        if pose_manager is None or not pose_manager.has_any_pose():
+            return
+        horizon = max(1, int(getattr(self.main_window, 'recorded_traj_points', 20)))
+        traj_dt = float(getattr(self.main_window, 'recorded_traj_dt', 0.05))
+        traj_src = getattr(self.main_window, 'recorded_traj_source', None)
+        traj = pose_manager.compute_future_trajectory(
+            current_index, horizon=horizon, dt=traj_dt, prefer=traj_src)
+        if traj is None or len(traj) == 0:
+            return
+        self._draw_ego_trajectory_fisheye(
+            traj, pix_width, pix_height, painter, target_rect,
+            QColor(0, 200, 0, 220), draw_dots=True)
+
+    def draw_prediction_trajectory(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
+        """TogiVAD 予測軌道(シアン)を、走行軌道と同じ魚眼投影でカメラ画像へ描く。
+
+        従来はトップダウンの自動スケール overlay だったため原点・スケールが
+        走行軌道(緑)と揃わなかった。ここで同一投影に統一する。
+        """
+        mw = self.main_window
+        if mw is None:
+            return
+        if not getattr(mw, 'show_gru_predictions', False):
+            return
+        if not getattr(mw, '_gru_is_togivad', False):
+            return
+        idx = getattr(mw, 'current_index', None)
+        pred = getattr(mw, 'gru_predictions', {}).get(idx)
+        if not pred:
+            return
+        self._draw_ego_trajectory_fisheye(
+            pred, pix_width, pix_height, painter, target_rect,
+            QColor(0, 170, 180, 235), draw_dots=False, arrow=True)
+
+    def _bev_steering_arc(self, idx, max_fwd, n=24):
+        """操舵角(annotation angle)から定曲率アークを ego座標 (n,2)[m] で作る。
+
+        angle∈[-1,1] × 最大舵角 → 舵角δ → 曲率κ=tan(δ)/wheelbase。
+        +angle=右旋回(donkeycar規約) → ego +Y左では y<0 になる符号にする。
+        max_fwd[m] まで前進する円弧をサンプルする（他軌道と前方到達を揃える）。
+        """
+        mw = self.main_window
+        ann = mw.annotations.get(idx, {}) if getattr(mw, 'annotations', None) else {}
+        if 'angle' not in ann:
+            return None
+        angle_val = float(ann['angle'])
+        max_steer = math.radians(getattr(mw, 'auto_max_steering_angle', 25.0))
+        wheelbase = 0.25  # RC カーの代表値[m]（BEVの向き指標なので厳密さは不要）
+        delta = angle_val * max_steer
+        kappa = -math.tan(delta) / wheelbase   # +angle(右) → κ<0 → y<0(右)
+        # 弧長は「前方に進む範囲」まで（方位変化≤~90°）で打ち切る。
+        # 全舵角だと旋回半径が小さく、弧長を伸ばすと前方成分が減って
+        # ループしてしまう（x=sin(κs)/κ は κs=π/2 で前方最大）ため。
+        s_max = max(0.1, max_fwd)
+        if abs(kappa) > 1e-6:
+            s_max = min(s_max, 0.95 * (math.pi / 2.0) / abs(kappa))
+        s = np.linspace(0.0, s_max, n)
+        if abs(kappa) < 1e-6:
+            x = s
+            y = np.zeros_like(s)
+        else:
+            x = np.sin(kappa * s) / kappa
+            y = (1.0 - np.cos(kappa * s)) / kappa
+        return np.stack([x, y], axis=1)
+
+    def draw_bev(self, painter, rect):
+        """真上から見た図(BEV)を描画する。
+
+        操舵軌道(赤)・走行軌道(緑)・予測軌道(シアン)を ego座標(+X前方/+Y左, m)の
+        まま俯瞰投影する。表示ON/OFFは各軌道の既存フラグに連動:
+          - 操舵: show_auto_driving_direction（操舵軌道を表示(赤)）
+          - 走行: show_recorded_trajectory（走行軌道を表示(緑)）
+          - 予測: show_gru_prediction かつ TogiVAD（時系列予測軌道を表示）
+        """
+        mw = self.main_window
+        if mw is None:
+            return
+        idx = getattr(mw, 'current_index', None)
+        if idx is None:
+            return
+        pm = getattr(mw, 'pose_manager', None)
+
+        is_dark = getattr(mw, 'is_dark_mode', False)
+        bg = QColor(30, 33, 38) if is_dark else QColor(238, 240, 243)
+        grid_col = QColor(70, 76, 84) if is_dark else QColor(205, 210, 216)
+        axis_col = QColor(110, 118, 128) if is_dark else QColor(170, 176, 184)
+        txt_col = QColor(180, 186, 194) if is_dark else QColor(90, 96, 104)
+
+        painter.setClipRect(rect)
+        painter.fillRect(rect, bg)
+
+        # --- 表示する軌道を収集（ego (N,2)[m]） ---
+        trajs = []  # (points_np, QColor, label)
+        if getattr(mw, 'show_recorded_trajectory', False) and pm and pm.has_any_pose():
+            g = pm.compute_future_trajectory(
+                idx, horizon=max(1, int(getattr(mw, 'recorded_traj_points', 20))),
+                dt=float(getattr(mw, 'recorded_traj_dt', 0.05)),
+                prefer=getattr(mw, 'recorded_traj_source', None))
+            if g is not None and len(g) >= 1:
+                trajs.append((np.asarray(g, dtype=float), QColor(0, 200, 0), 'rec'))
+        pred = None
+        # 予測(cyan)はチェックボックス状態(show_gru_predictions)で判定する。
+        # ビューフラグ show_gru_prediction は _update_gru_prediction_display で
+        # 設定されるが、結合表示では BEV セルを焼くのがそれより前になり得るため
+        # 依存しない。未キャッシュならその場で推論してから描く。
+        if getattr(mw, 'show_gru_predictions', False) and getattr(mw, '_gru_is_togivad', False):
+            preds = getattr(mw, 'gru_predictions', {})
+            if idx not in preds and hasattr(mw, '_ensure_gru_current_prediction'):
+                mw._ensure_gru_current_prediction(idx)
+                preds = getattr(mw, 'gru_predictions', {})
+            pred_raw = preds.get(idx)
+            if pred_raw:
+                pred = np.asarray(pred_raw, dtype=float)
+                trajs.append((pred, QColor(0, 170, 180), 'pred'))
+
+        # --- 表示レンジ（前方・横）を決める。前方は軌道の最大到達か既定3m ---
+        fwd_vals = [float(a[:, 0].max()) for a, _, _ in trajs if len(a)]
+        lat_vals = [float(np.abs(a[:, 1]).max()) for a, _, _ in trajs if len(a)]
+        max_fwd = max([3.0] + fwd_vals)
+        max_lat = max([1.0] + lat_vals)
+
+        # 操舵アークは他軌道と前方到達を揃えてから追加（レンジ確定後）
+        if getattr(mw, 'show_auto_driving_direction', False):
+            arc = self._bev_steering_arc(idx, max_fwd)
+            if arc is not None:
+                trajs.insert(0, (arc, QColor(230, 40, 40), 'steer'))
+                max_lat = max(max_lat, float(np.abs(arc[:, 1]).max()))
+
+        # --- 俯瞰投影: 車体=下部中央、前方=上、左=左。縦横等比 ---
+        margin = 14
+        avail_w = rect.width() - 2 * margin
+        avail_h = rect.height() - 2 * margin
+        scale = min(avail_w / (2.0 * max_lat * 1.1),
+                    avail_h / (max_fwd * 1.12))     # px/m（等比）
+        ox = rect.x() + rect.width() / 2.0
+        oy = rect.y() + rect.height() - margin       # 車体位置（下端）
+
+        def to_screen(x_fwd, y_left):
+            return (ox - y_left * scale, oy - x_fwd * scale)
+
+        # 目盛・凡例の共通フォント（描画解像度に比例した小さめの px サイズ）
+        fs = max(6, int(round(rect.height() * 0.045)))
+        label_font = QFont("Arial")
+        label_font.setPixelSize(fs)
+        painter.setFont(label_font)
+
+        # --- グリッド（1m間隔）＋距離ラベル（右端に右寄せ表示） ---
+        f_max_line = int(math.floor(max_fwd))
+        lbl_w = fs * 3
+        for m in range(0, f_max_line + 1):
+            sx, sy = to_screen(m, 0)
+            painter.setPen(QPen(axis_col if m == 0 else grid_col, 1))
+            painter.drawLine(int(rect.x()), int(sy), int(rect.x() + rect.width()), int(sy))
+            if m > 0:
+                painter.setPen(QPen(txt_col, 1))
+                painter.drawText(
+                    QRect(int(rect.x() + rect.width() - lbl_w - 3),
+                          int(sy) - fs - 2, lbl_w, fs + 2),
+                    Qt.AlignRight | Qt.AlignBottom, f"{m}m")
+        l_max_line = int(math.floor(max_lat))
+        for m in range(-l_max_line, l_max_line + 1):
+            sx, _ = to_screen(0, m)
+            painter.setPen(QPen(axis_col if m == 0 else grid_col, 1))
+            painter.drawLine(int(sx), int(rect.y()), int(sx), int(rect.y() + rect.height()))
+
+        # --- 車体マーカー（上向き三角） ---
+        painter.setPen(QPen(QColor(60, 66, 74) if not is_dark else QColor(200, 206, 214), 1))
+        painter.setBrush(QBrush(QColor(120, 128, 138)))
+        vx, vy = ox, oy
+        painter.drawPolygon(QPolygon([
+            QPoint(int(vx), int(vy - 9)),
+            QPoint(int(vx - 6), int(vy + 4)),
+            QPoint(int(vx + 6), int(vy + 4))]))
+
+        # --- 各軌道: 折れ線＋終端矢印＋終端ドット ---
+        for pts, color, label in trajs:
+            sp = [to_screen(float(x), float(y)) for x, y in pts]
+            # 車体（下部中央 = (ox, oy)）から連結。以前は (0.0, oy)=画面左端から
+            # 伸びる誤った線が出ていた（操舵は原点始点なので連結しない）
+            sp = [(ox, oy)] + sp if label != 'steer' else sp
+            painter.setPen(QPen(color, 2))
+            painter.setBrush(Qt.NoBrush)
+            for i in range(len(sp) - 1):
+                x1, y1 = sp[i]
+                x2, y2 = sp[i + 1]
+                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+            # 終端矢印
+            if len(sp) >= 2:
+                x2, y2 = sp[-1]
+                x1, y1 = sp[-2]
+                ang = math.atan2(y2 - y1, x2 - x1)
+                al = 9
+                painter.setBrush(QBrush(color))
+                painter.drawPolygon(QPolygon([
+                    QPoint(int(x2), int(y2)),
+                    QPoint(int(x2 - al * math.cos(ang - math.pi / 6)),
+                           int(y2 - al * math.sin(ang - math.pi / 6))),
+                    QPoint(int(x2 - al * math.cos(ang + math.pi / 6)),
+                           int(y2 - al * math.sin(ang + math.pi / 6)))]))
+
+        # --- 凡例 ---
+        legend = []
+        if getattr(mw, 'show_auto_driving_direction', False):
+            legend.append((QColor(230, 40, 40), get_text('bev_legend_steering')))
+        if getattr(mw, 'show_recorded_trajectory', False) and pm and pm.has_any_pose():
+            legend.append((QColor(0, 200, 0), get_text('bev_legend_recorded')))
+        if pred is not None:
+            legend.append((QColor(0, 170, 180), get_text('bev_legend_prediction')))
+        painter.setFont(label_font)
+        sw = max(6, fs)               # 凡例の色見本の幅
+        row_h = fs + 3
+        ly = rect.y() + 3
+        for col, name in legend:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(col))
+            painter.drawRect(int(rect.x() + 4), int(ly + fs // 2), sw, 2)
+            painter.setPen(QPen(txt_col, 1))
+            painter.drawText(int(rect.x() + 4 + sw + 4), int(ly + fs), name)
+            ly += row_h
         painter.setClipping(False)
 
     def draw_segmentation_inference_results(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
@@ -5029,7 +5288,16 @@ class ImageAnnotationTool(QMainWindow):
         self.seg_display_mode = 'trajectory'  # 表示モード: 'trajectory' or 'waypoint'
         self.show_auto_driving_direction = False  # 自動運転アノテーション操舵軌道表示フラグ
         self.show_recorded_trajectory = False  # 記録された自己位置からの走行軌道表示フラグ
-        self.recorded_traj_points = 20  # 走行軌道の表示点数（1点=0.05秒先。プレースホルダー空欄時のデフォルト）
+        # 走行軌道は「秒数(表示する時間窓) × 点数(標本数)」で指定する。
+        # dt = 秒数 / 点数 を派生値として持ち、描画はこの dt を使う。
+        # TogiVAD モデル読込時は秒数・点数・dt・pose_source をそのモデルへ同期し、
+        # 緑の実測軌道（学習データGT）と推論軌道が同じ時間窓・同じ標本点になる。
+        self.recorded_traj_points = 20        # 標本点数（空欄時のデフォルト）
+        self.recorded_traj_seconds = 1.0      # 表示する時間窓 [s]（20点×0.05s）
+        self.recorded_traj_dt = 0.05          # 派生: 秒数 / 点数
+        # 既定 pose（slam は再ローカライズのテレポートで補完不可フレームが多く
+        # 走行軌道が途切れやすい。優先順位 None だと slam が先に選ばれてしまう）
+        self.recorded_traj_source = "pose"
         self.auto_cam_height_m = 0.15  # 走行軌道の投影スケールに使うカメラ地上高（m）※spinbox初期値と一致させること
         self.auto_max_steering_angle = 25.0  # 自動運転操舵軌道の最大舵角（度）
         self.auto_cam_pitch_deg = 20.0        # カメラ俯角（度）※spinbox初期値と一致させること
@@ -5212,6 +5480,8 @@ class ImageAnnotationTool(QMainWindow):
             if var == self.current_variant:
                 rb.setChecked(True)
             rb.toggled.connect(lambda checked, v=var: self.on_variant_changed(v) if checked else None)
+        # pose/slam があるとき BEV(真上から見た図) ソースを追加
+        self._add_bev_variant_button(variant_layout)
         # 複数ソースがある場合は結合表示ボタンを追加
         if len(self.available_variants) >= 2:
             combined_button = QPushButton(get_text('label_combined_view'))
@@ -5571,8 +5841,17 @@ class ImageAnnotationTool(QMainWindow):
             db_sync = menu.addAction(f"🔄 {get_text('sync')}")
             db_sync.triggered.connect(self._sync_to_databricks)
 
+        db_pull = menu.addAction(f"⬇ {get_text('db_menu_pull_records')}")
+        db_pull.triggered.connect(self._sync_databricks_to_local)
+
         db_transfer = menu.addAction(f"📤 {get_text('transfer')}")
         db_transfer.triggered.connect(self._transfer_to_databricks)
+
+        db_import = menu.addAction(f"📥 {get_text('db_menu_import_model')}")
+        db_import.triggered.connect(self._import_databricks_model)
+
+        db_logs = menu.addAction(f"📄 {get_text('db_menu_logs')}")
+        db_logs.triggered.connect(lambda: self._show_databricks_run_logs())
 
         db_settings = menu.addAction(f"⚙ {get_text('settings')}")
         db_settings.triggered.connect(self._show_databricks_settings)
@@ -6099,7 +6378,10 @@ class ImageAnnotationTool(QMainWindow):
         self.inference_info_label.setWordWrap(True)
         self.inference_info_label.setStyleSheet("color: #009999;")
         self.inference_info_label.setMinimumHeight(45)
-        self.inference_info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        # 垂直は Minimum（内容に応じて伸びる）。Fixed だと sizeHint 分しか高さが
+        # 確保されず、TogiVAD 予測表（見出し+複数行）の最終行（=pred_seconds の
+        # 3.0s 行など）がクリップされて表示されない不具合があった。
+        self.inference_info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         info_layout.addWidget(self.inference_info_label)
 
         # 追加モデル用推論結果表示ラベルのコンテナ
@@ -6609,35 +6891,72 @@ class ImageAnnotationTool(QMainWindow):
         _label_h = self.fontMetrics().height() + 4
 
         # 行1: [✓ 操舵軌道を表示] [✓ 走行軌道を表示]（チェックボックスは単独行にしてラベルの見切れを防ぐ）
-        traj_row = QHBoxLayout()
-        traj_row.setSpacing(4)
+        # 行1a: 操舵軌道を表示(赤) — 単独行
+        steer_row = QHBoxLayout()
+        steer_row.setSpacing(4)
         self.show_auto_driving_direction_checkbox = QCheckBox(get_text('chk_show_auto_driving_direction'))
         self.show_auto_driving_direction_checkbox.setChecked(False)
         self.show_auto_driving_direction_checkbox.setToolTip(get_text('tip_auto_driving_direction'))
         self.show_auto_driving_direction_checkbox.stateChanged.connect(self.toggle_auto_driving_direction)
         self.show_auto_driving_direction_checkbox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.show_auto_driving_direction_checkbox.setMinimumHeight(_label_h)
-        traj_row.addWidget(self.show_auto_driving_direction_checkbox)
+        steer_row.addWidget(self.show_auto_driving_direction_checkbox)
+        steer_row.addStretch()
+        auto_driving_control_layout.addLayout(steer_row)
 
-        # 走行軌道（記録された自己位置からの実測軌道）表示
+        # 行1b: 走行軌道を表示(緑) + 自己位置ソース + 秒数 + 点数 — 単独行
+        rec_row = QHBoxLayout()
+        rec_row.setSpacing(4)
         self.show_recorded_trajectory_checkbox = QCheckBox(get_text('chk_show_recorded_trajectory'))
         self.show_recorded_trajectory_checkbox.setChecked(False)
         self.show_recorded_trajectory_checkbox.setToolTip(get_text('tip_recorded_trajectory'))
         self.show_recorded_trajectory_checkbox.stateChanged.connect(self.toggle_recorded_trajectory)
         self.show_recorded_trajectory_checkbox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.show_recorded_trajectory_checkbox.setMinimumHeight(_label_h)
-        traj_row.addWidget(self.show_recorded_trajectory_checkbox)
+        rec_row.addWidget(self.show_recorded_trajectory_checkbox)
 
-        # 走行軌道の表示点数（プレースホルダーで調整。空欄はデフォルト20点=1秒先）
+        # 走行軌道の自己位置ソース（既定 pose。slam はテレポートで補完不可に
+        # なるフレームが多く、軌道が途切れやすいため既定にしない）
+        self.recorded_traj_source_combo = QComboBox()
+        self.recorded_traj_source_combo.addItem("pose", "pose")
+        self.recorded_traj_source_combo.addItem("slam", "slam")
+        self.recorded_traj_source_combo.setToolTip(get_text('tip_recorded_traj_source'))
+        self.recorded_traj_source_combo.setCurrentIndex(0)   # 既定 pose
+        self.recorded_traj_source_combo.currentIndexChanged.connect(self.update_recorded_traj_source)
+        rec_row.addWidget(self.recorded_traj_source_combo)
+
+        # 走行軌道の表示時間窓 [秒]（0.5秒刻み・小数第1位。TogiVADモデル読込時は
+        # モデルの秒数へ同期）。単位「秒」は入力欄の外に別ラベルで表示する
+        # （suffix にすると値と同じ枠内に入り込むため）。
+        self.recorded_traj_seconds_input = QDoubleSpinBox()
+        self.recorded_traj_seconds_input.setRange(0.1, 10.0)
+        self.recorded_traj_seconds_input.setSingleStep(0.5)
+        self.recorded_traj_seconds_input.setDecimals(1)
+        self.recorded_traj_seconds_input.setFixedWidth(52)
+        self.recorded_traj_seconds_input.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.recorded_traj_seconds_input.setToolTip(get_text('tip_recorded_traj_seconds'))
+        self.recorded_traj_seconds_input.setValue(self.recorded_traj_seconds)
+        self.recorded_traj_seconds_input.valueChanged.connect(self.update_recorded_traj_seconds)
+        rec_row.addWidget(self.recorded_traj_seconds_input)
+        # 秒数入力の右に単位「秒」ラベル（点数の「点」と同じ扱い）
+        self.recorded_traj_seconds_unit = QLabel(get_text('unit_seconds_label'))
+        self.recorded_traj_seconds_unit.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        rec_row.addWidget(self.recorded_traj_seconds_unit)
+
+        # 走行軌道の標本点数（プレースホルダーで調整。空欄はデフォルト20点）
         self.recorded_traj_points_input = QLineEdit()
         self.recorded_traj_points_input.setPlaceholderText(get_text('placeholder_recorded_traj_points'))
         self.recorded_traj_points_input.setToolTip(get_text('tip_recorded_traj_points'))
         self.recorded_traj_points_input.setFixedWidth(44)
         self.recorded_traj_points_input.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.recorded_traj_points_input.textChanged.connect(self.update_recorded_traj_points)
-        traj_row.addWidget(self.recorded_traj_points_input)
-        traj_row.addStretch()
-        auto_driving_control_layout.addLayout(traj_row)
+        rec_row.addWidget(self.recorded_traj_points_input)
+        # 点数入力の右に単位「点」ラベル
+        self.recorded_traj_points_unit = QLabel(get_text('unit_points_label'))
+        self.recorded_traj_points_unit.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        rec_row.addWidget(self.recorded_traj_points_unit)
+        rec_row.addStretch()
+        auto_driving_control_layout.addLayout(rec_row)
 
         # 行2: 最大舵角 / 俯角 / FOV を横に並べる（各列：ラベルを値の上に配置）
         #   狭いパネル幅でもラベルが全部見えるよう、1項目=1列(ラベル＋入力欄)とする
@@ -8093,8 +8412,16 @@ class ImageAnnotationTool(QMainWindow):
         if hasattr(self, 'main_image_view'):
             self.main_image_view.update()
 
+    def _sync_recorded_traj_dt(self):
+        """走行軌道の dt を 秒数/点数 から再計算し、表示中なら再描画する。"""
+        pts = max(1, int(getattr(self, 'recorded_traj_points', 20)))
+        secs = max(1e-3, float(getattr(self, 'recorded_traj_seconds', 1.0)))
+        self.recorded_traj_dt = secs / pts
+        if hasattr(self, 'main_image_view') and self.show_recorded_trajectory:
+            self.main_image_view.update()
+
     def update_recorded_traj_points(self, text):
-        """走行軌道の表示点数を更新（空欄はデフォルト20点=1秒先）"""
+        """走行軌道の標本点数を更新（空欄はデフォルト20点）。dt=秒数/点数を再計算。"""
         text = text.strip()
         if not text:
             self.recorded_traj_points = 20
@@ -8106,6 +8433,18 @@ class ImageAnnotationTool(QMainWindow):
             if value < 1:
                 return
             self.recorded_traj_points = min(value, 200)
+        self._sync_recorded_traj_dt()
+
+    def update_recorded_traj_seconds(self, value):
+        """走行軌道の表示時間窓[秒]を更新。dt=秒数/点数を再計算。"""
+        self.recorded_traj_seconds = float(value)
+        self._sync_recorded_traj_dt()
+
+    def update_recorded_traj_source(self, _idx=None):
+        """走行軌道(緑)の自己位置ソース(pose/slam)を更新して再描画する。"""
+        combo = getattr(self, 'recorded_traj_source_combo', None)
+        if combo is not None:
+            self.recorded_traj_source = combo.currentData()
         if hasattr(self, 'main_image_view') and self.show_recorded_trajectory:
             self.main_image_view.update()
 
@@ -9471,6 +9810,29 @@ class ImageAnnotationTool(QMainWindow):
             self.play_button.setText(get_text('btn_play'))
             self.reverse_play_button.setText(get_text('btn_reverse_play'))
 
+    def _has_pose_data(self):
+        """pose/slam 等の自己位置データがセッションにあるか。"""
+        pm = getattr(self, 'pose_manager', None)
+        return bool(pm is not None and pm.has_any_pose())
+
+    def _add_bev_variant_button(self, variant_layout):
+        """pose/slam があるとき BEV(真上から見た図) ラジオを画像ソース欄に追加する。
+
+        値は '__bev__'。選択すると on_variant_changed が bev_mode を立て、
+        操舵/走行/予測軌道を真上から見た図として描く（表示切替は各チェック
+        ボックスに連動）。自己位置が無いセッションでは追加しない。
+        """
+        if not self._has_pose_data():
+            return
+        rb = QRadioButton(get_text('image_source_bev'))
+        rb.setToolTip(get_text('tip_image_source_bev'))
+        if getattr(self, 'current_variant', None) == '__bev__':
+            rb.setChecked(True)
+        rb.toggled.connect(
+            lambda checked: self.on_variant_changed('__bev__') if checked else None)
+        variant_layout.addWidget(rb)
+        self.variant_button_group.addButton(rb)
+
     def on_variant_changed(self, variant):
         """
         ラジオボタンで選択された画像ソースキーが変更された時に呼ばれるメソッド
@@ -9492,6 +9854,16 @@ class ImageAnnotationTool(QMainWindow):
         self.current_variant = variant
         print(f"キーを '{variant}' に変更しました")
 
+        # BEV(真上から見た図)モードの切替。カメラ画像リスト(self.images)は
+        # そのまま保持し、paintEvent が BEV を描く（軌道は ego座標で自己完結）。
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.bev_mode = (variant == '__bev__')
+        if variant == '__bev__':
+            # 現在フレームの pixmap を保持したまま再描画（BEVはその上に描く）
+            self.display_current_image()
+            self.update_variant_buttons()
+            return
+
         # 結合表示モードの場合
         if variant == '__combined__':
             # 最初のバリアントの画像数をベースにする
@@ -9505,11 +9877,19 @@ class ImageAnnotationTool(QMainWindow):
                 canvas_w = self.main_image_view.width()
                 orig_w = getattr(self, 'original_image_width', None)
                 if orig_w and orig_w > 0 and canvas_w > 0:
-                    # combined画像幅 = orig_w * cols なので収まるズームを計算
-                    fit_zoom = canvas_w / (orig_w * cols)
+                    # combined画像幅 = orig_w * cols。表示に必要な拡大率ぶん
+                    # 高解像度(スーパーサンプル)で焼き、ズームを1/SSに補正する。
+                    # これで BEV セルの文字・線が拡大でぼやけず鮮明になる。
+                    fit_zoom_raw = canvas_w / (orig_w * cols)
+                    # 切り捨て（int）で SS を決めると fit_zoom=raw/SS>=1 が保証され、
+                    # ズーム下限クランプ(1.0)による表示はみ出しを避けられる。
+                    ss = max(1, min(3, int(fit_zoom_raw)))  # 1〜3倍
+                    self._combined_supersample = ss
+                    fit_zoom = fit_zoom_raw / ss
                     slider_val = max(10, min(50, round(fit_zoom * 10)))
                 else:
                     # フォールバック: 列数で割るだけ
+                    self._combined_supersample = 1
                     slider_val = max(10, self.canvas_zoom_slider.value() // cols)
                 # 結合表示→結合表示のグリッド変更時は上書きしない
                 if not hasattr(self, '_pre_combined_zoom'):
@@ -9637,6 +10017,9 @@ class ImageAnnotationTool(QMainWindow):
             if var == self.current_variant:
                 rb.setChecked(True)
             rb.toggled.connect(lambda checked, v=var: self.on_variant_changed(v) if checked else None)
+
+        # pose/slam があるとき BEV(真上から見た図) ソースを追加
+        self._add_bev_variant_button(variant_layout)
 
         # 複数ソースがある場合は結合表示ボタンを追加
         if len(self.available_variants) >= 2:
@@ -9780,6 +10163,10 @@ class ImageAnnotationTool(QMainWindow):
         all_vars_ordered = list(current_order) + [
             v for v in self.available_variants if v not in current_order
         ]
+        # pose/slam があるとき BEV(真上から見た図) を結合表示のセル候補に加える
+        # （軌道を俯瞰した合成画像を1セルとして焼き込む。キー名は 'BEV'）
+        if self._has_pose_data() and 'BEV' not in all_vars_ordered:
+            all_vars_ordered.append('BEV')
 
         # ---- ヘッダー行 ----
         _COL1_W = 60
@@ -15780,8 +16167,12 @@ class ImageAnnotationTool(QMainWindow):
             )
             return
 
-        # カスタム転送確認ダイアログ（自動学習チェックボックス付き）
-        from databricks.config_databricks import DATABRICKS_CLUSTER_ID, DATABRICKS_NOTEBOOK_PATH
+        # カスタム転送確認ダイアログ（自動学習・モデル種別・ハイパラ・ノートブック配置付き）
+        from databricks import config_databricks as db_config
+        db_config.reload()
+        cluster_id_cur = db_config.DATABRICKS_CLUSTER_ID
+        notebook_path_cur = db_config.DATABRICKS_NOTEBOOK_PATH
+
         confirm_dialog = QDialog(self)
         confirm_dialog.setWindowTitle(get_text('dlg_transfer_confirm'))
         confirm_layout = QVBoxLayout(confirm_dialog)
@@ -15791,10 +16182,65 @@ class ImageAnnotationTool(QMainWindow):
         confirm_layout.addWidget(confirm_label)
 
         auto_train_checkbox = QCheckBox(get_text('chk_auto_train_after_transfer'))
-        if not DATABRICKS_CLUSTER_ID:
-            auto_train_checkbox.setEnabled(False)
-            auto_train_checkbox.setToolTip(get_text('tip_auto_train_cluster_required'))
         confirm_layout.addWidget(auto_train_checkbox)
+
+        # 学習設定グループ（自動学習ON時のみ有効）
+        train_group = QGroupBox(get_text('db_train_settings'))
+        train_form = QFormLayout()
+
+        # コンピュート選択（サーバーレス＝フリープラン対応 / クラスター）
+        compute_combo = QComboBox()
+        compute_combo.addItem(get_text('db_compute_serverless'), 'serverless')
+        compute_combo.addItem(get_text('db_compute_cluster'), 'cluster')
+        # クラスターIDが設定済みなら既定でクラスター、無ければサーバーレス
+        compute_combo.setCurrentIndex(1 if cluster_id_cur else 0)
+        train_form.addRow(get_text('db_field_compute'), compute_combo)
+
+        deploy_checkbox = QCheckBox(get_text('db_chk_deploy_notebooks'))
+        deploy_checkbox.setChecked(True)
+        deploy_checkbox.setToolTip(get_text('db_tip_deploy'))
+        train_form.addRow(deploy_checkbox)
+
+        model_combo = QComboBox()
+        model_combo.addItem(get_text('db_model_basic'), "basic")
+        model_combo.addItem(get_text('db_model_togivad'), "togivad")
+        train_form.addRow(get_text('db_field_model_type'), model_combo)
+
+        epochs_spin = QSpinBox()
+        epochs_spin.setRange(1, 500)
+        epochs_spin.setValue(10)
+        train_form.addRow(get_text('db_field_epochs'), epochs_spin)
+
+        batch_spin = QSpinBox()
+        batch_spin.setRange(1, 512)
+        batch_spin.setValue(32)
+        train_form.addRow(get_text('db_field_batch'), batch_spin)
+
+        lr_spin = QDoubleSpinBox()
+        lr_spin.setDecimals(5)
+        lr_spin.setRange(0.00001, 1.0)
+        lr_spin.setSingleStep(0.0001)
+        lr_spin.setValue(0.001)
+        train_form.addRow(get_text('db_field_lr'), lr_spin)
+
+        vocab_spin = QSpinBox()
+        vocab_spin.setRange(8, 1024)
+        vocab_spin.setValue(128)
+        vocab_row_label = QLabel(get_text('db_field_vocab_k'))
+        train_form.addRow(vocab_row_label, vocab_spin)
+
+        # togivad選択時のみ語彙Kを表示、basic時は隠す
+        def _on_model_changed():
+            is_togivad = model_combo.currentData() == "togivad"
+            vocab_spin.setVisible(is_togivad)
+            vocab_row_label.setVisible(is_togivad)
+        model_combo.currentIndexChanged.connect(_on_model_changed)
+        _on_model_changed()
+
+        train_group.setLayout(train_form)
+        train_group.setEnabled(False)
+        confirm_layout.addWidget(train_group)
+        auto_train_checkbox.toggled.connect(train_group.setEnabled)
 
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(confirm_dialog.accept)
@@ -15805,6 +16251,23 @@ class ImageAnnotationTool(QMainWindow):
             return
 
         do_auto_train = auto_train_checkbox.isChecked()
+        do_deploy_notebooks = do_auto_train and deploy_checkbox.isChecked()
+        use_serverless = compute_combo.currentData() == 'serverless'
+        # クラスター実行を選んだのにクラスター未指定なら中止
+        if do_auto_train and not use_serverless and not cluster_id_cur:
+            QMessageBox.warning(self, get_text('dlg_transfer_confirm'),
+                                get_text('tip_auto_train_cluster_required'))
+            return
+        train_model_type = model_combo.currentData()
+        train_params = {
+            "epochs": epochs_spin.value(),
+            "batch_size": batch_spin.value(),
+            "learning_rate": lr_spin.value(),
+        }
+        if train_model_type == "togivad":
+            train_params["vocab_k"] = vocab_spin.value()
+        else:
+            train_params["image_column"] = "cam/image_array"
 
         # 進捗ダイアログを作成
         progress = QProgressDialog(get_text('msg_preparing_transfer'), get_text('btn_cancel'), 0, 100, self)
@@ -15920,16 +16383,25 @@ class ImageAnnotationTool(QMainWindow):
 
                 if do_auto_train:
                     try:
+                        # ノートブックを自動配置（選択時）
+                        if do_deploy_notebooks:
+                            deploy_res = transfer_manager.deploy_notebooks(notebook_path_cur)
+                            if not deploy_res.get('success'):
+                                raise RuntimeError(
+                                    get_text('db_msg_deploy_failed',
+                                             deploy_res.get('error', '')))
                         run_result = transfer_manager.submit_training_workflow(
                             zip_remote_path=result['remote_path'],
-                            notebook_base_path=DATABRICKS_NOTEBOOK_PATH,
-                            cluster_id=DATABRICKS_CLUSTER_ID
+                            notebook_base_path=notebook_path_cur,
+                            cluster_id=cluster_id_cur,
+                            model_type=train_model_type,
+                            train_params=train_params,
+                            use_serverless=use_serverless,
                         )
-                        QMessageBox.information(
-                            self,
-                            get_text('dlg_transfer_complete'),
-                            get_text('msg_transfer_and_train_complete', result['annotation_count'], size_mb, result['remote_path'], run_result['run_id'])
-                        )
+                        # ジョブ監視ダイアログを起動（完了時にモデル取込を案内）
+                        self._monitor_databricks_run(
+                            run_result['run_id'], run_result['run_url'],
+                            train_model_type)
                     except Exception as e:
                         QMessageBox.warning(
                             self,
@@ -15961,103 +16433,623 @@ class ImageAnnotationTool(QMainWindow):
                 get_text('msg_transfer_error', f"{str(e)}\n\n{traceback.format_exc()}")
             )
 
-    def _show_databricks_settings(self):
-        """Databricks設定ダイアログを表示"""
+    def _monitor_databricks_run(self, run_id, run_url, model_type):
+        """Databricks学習ジョブの進捗をポーリング表示し、成功時にモデル取込を案内"""
+        import webbrowser
+
+        # 非モーダル：開いたままアプリを操作できる。閉じてもジョブはDatabricks側で継続する
+        dialog = QDialog(self)
+        dialog.setWindowTitle(get_text('db_monitor_title'))
+        dialog.setMinimumWidth(500)
+        dialog.setModal(False)
+        v = QVBoxLayout(dialog)
+
+        status_label = QLabel(get_text('db_monitor_starting'))
+        status_label.setWordWrap(True)
+        v.addWidget(status_label)
+
+        task_label = QLabel("")
+        task_label.setWordWrap(True)
+        task_label.setStyleSheet("font-family: monospace; font-size: 11px;")
+        v.addWidget(task_label)
+
+        hint_label = QLabel(get_text('db_monitor_hint'))
+        hint_label.setWordWrap(True)
+        hint_label.setStyleSheet("color: gray; font-size: 11px;")
+        v.addWidget(hint_label)
+
+        btn_row = QHBoxLayout()
+        open_btn = QPushButton(get_text('db_monitor_open_browser'))
+        open_btn.clicked.connect(lambda: webbrowser.open(run_url))
+        logs_btn = QPushButton(get_text('db_logs_fetch'))
+        logs_btn.clicked.connect(lambda: self._show_databricks_run_logs(run_id))
+        close_btn = QPushButton(get_text('btn_close'))
+        close_btn.clicked.connect(dialog.close)
+        btn_row.addWidget(open_btn)
+        btn_row.addWidget(logs_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        v.addLayout(btn_row)
+
         try:
-            from databricks.config_databricks import (
-                DATABRICKS_ENABLED, DATABRICKS_HOST, DATABRICKS_TOKEN,
-                DATABRICKS_EXPERIMENT_PREFIX, get_databricks_status, get_env_template
-            )
+            monitor_manager = DatabricksTransferManager()
+        except Exception as e:
+            status_label.setText(get_text('db_msg_test_failed', str(e)))
+            dialog.show()
+            return
+
+        timer = QTimer(dialog)
+        state = {"done": False}
+
+        def poll():
+            if state["done"]:
+                return
+            try:
+                st = monitor_manager.get_run_status(run_id)
+            except Exception as e:
+                status_label.setText(get_text('db_monitor_poll_error', str(e)))
+                return
+            life = st['life_cycle_state']
+            res = st.get('result_state') or ""
+            status_label.setText(get_text('db_monitor_status', run_id, life, res))
+            task_label.setText("\n".join(
+                f"  {t['key']}: {t['life_cycle_state']} "
+                f"{t.get('result_state') or ''}".rstrip()
+                for t in st['tasks']))
+            if st['is_terminal']:
+                state["done"] = True
+                timer.stop()
+                if res == "SUCCESS":
+                    status_label.setText(get_text('db_monitor_success', run_id))
+                    self._offer_model_download(model_type, dialog)
+                else:
+                    status_label.setText(get_text(
+                        'db_monitor_failed', run_id, res,
+                        st.get('state_message', '')))
+
+        def on_finished(_result):
+            # ダイアログを閉じたらポーリング停止（ジョブ自体はサーバー側で継続）
+            timer.stop()
+            if hasattr(self, "_db_monitors") and dialog in self._db_monitors:
+                self._db_monitors.remove(dialog)
+
+        timer.timeout.connect(poll)
+        dialog.finished.connect(on_finished)
+        timer.start(5000)
+        QTimer.singleShot(300, poll)   # 初回は即時
+
+        # GC防止・参照保持（非モーダルなので即returnしても破棄されないように）
+        if not hasattr(self, "_db_monitors"):
+            self._db_monitors = []
+        self._db_monitors.append(dialog)
+        dialog.show()
+
+    def _offer_model_download(self, model_type, parent_dialog):
+        """学習済みモデルをVolumesのmodels/からローカルへ取り込む"""
+        reply = QMessageBox.question(
+            parent_dialog, get_text('db_dl_title'), get_text('db_dl_confirm'),
+            QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            dl_manager = DatabricksTransferManager()
+            files = dl_manager.list_remote_files("models")
+            candidates = [f for f in files
+                          if not f['is_dir']
+                          and f['name'].endswith(('.pt', '.pth'))]
+            if model_type == "togivad":
+                togivad_files = [f for f in candidates
+                                 if f['name'].startswith('togivad')]
+                if togivad_files:
+                    candidates = togivad_files
+            if not candidates:
+                QMessageBox.information(parent_dialog, get_text('db_dl_title'),
+                                        get_text('db_dl_none'))
+                return
+            # 名前（タイムスタンプ）でソートし最新を選択
+            candidates.sort(key=lambda f: f['name'])
+            newest = candidates[-1]
+
+            models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+            os.makedirs(models_dir, exist_ok=True)
+            local_path = os.path.join(models_dir, newest['name'])
+
+            progress = QProgressDialog(get_text('db_dl_progress'),
+                                       get_text('btn_cancel'), 0, 100,
+                                       parent_dialog)
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+            progress.show()
+
+            def cb(done, total):
+                QApplication.processEvents()
+                if total:
+                    progress.setValue(min(100, int(done / total * 100)))
+
+            dl_manager.download_file(newest['path'], local_path,
+                                     progress_callback=cb)
+            progress.close()
+            QMessageBox.information(parent_dialog, get_text('db_dl_title'),
+                                    get_text('db_dl_done', local_path))
+        except Exception as e:
+            QMessageBox.warning(parent_dialog, get_text('db_dl_title'),
+                                get_text('db_dl_failed', str(e)))
+
+    def _sync_databricks_to_local(self):
+        """Databricks上のクラウド学習記録（MLflow Run）をすべてローカルへ取得"""
+        if not self._ensure_databricks_enabled():
+            return
+
+        progress = QProgressDialog(get_text('db_pull_progress'),
+                                   get_text('btn_cancel'), 0, 100, self)
+        progress.setWindowTitle(get_text('db_menu_pull_records'))
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        cancelled = [False]
+
+        def pcb(cur, total, msg):
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                cancelled[0] = True
+                return
+            if total:
+                progress.setValue(min(100, int(cur / total * 100)))
+            progress.setLabelText(msg)
+            QApplication.processEvents()
+
+        def ccheck():
+            QApplication.processEvents()
+            return progress.wasCanceled() or cancelled[0]
+
+        try:
+            res = self.mlflow_manager.sync_databricks_to_local(
+                parent_widget=self, progress_callback=pcb, cancel_check=ccheck)
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(self, get_text('db_menu_pull_records'),
+                                 get_text('db_pull_failed', str(e)))
+            return
+        progress.close()
+
+        if res.get('cancelled'):
+            QMessageBox.information(self, get_text('db_menu_pull_records'),
+                                    get_text('db_pull_cancelled'))
+            return
+        if (res.get('synced', 0) == 0 and res.get('skipped', 0) == 0
+                and res.get('errors')):
+            QMessageBox.warning(self, get_text('db_menu_pull_records'),
+                                get_text('db_pull_failed',
+                                         "\n".join(res['errors'][:5])))
+            return
+        msg = res.get('message') or get_text(
+            'db_pull_done', res.get('synced', 0),
+            res.get('skipped', 0), res.get('failed', 0))
+        QMessageBox.information(self, get_text('db_menu_pull_records'), msg)
+        try:
+            self._update_databricks_status_label()
+        except Exception:
+            pass
+
+    def _show_databricks_run_logs(self, run_id=None):
+        """学習パイプライン（ジョブRun）のログをまとめて取得・表示・保存する
+
+        Args:
+            run_id: 対象RunのID。Noneなら最近のRun一覧から選択する。
+        """
+        if not self._ensure_databricks_enabled():
+            return
+        try:
+            logs_manager = DatabricksTransferManager()
+        except Exception as e:
+            QMessageBox.warning(self, get_text('db_logs_title'),
+                                get_text('db_msg_test_failed', str(e)))
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(get_text('db_logs_title'))
+        dialog.setMinimumSize(780, 560)
+        v = QVBoxLayout(dialog)
+
+        # Run選択
+        top = QHBoxLayout()
+        top.addWidget(QLabel(get_text('db_logs_select_run')))
+        run_combo = QComboBox()
+        top.addWidget(run_combo, 1)
+        reload_runs_btn = QPushButton(get_text('db_import_refresh'))
+        top.addWidget(reload_runs_btn)
+        v.addLayout(top)
+
+        text = QPlainTextEdit()
+        text.setReadOnly(True)
+        text.setStyleSheet("font-family: monospace; font-size: 11px;")
+        text.setLineWrapMode(QPlainTextEdit.NoWrap)
+        v.addWidget(text, 1)
+
+        def load_runs():
+            run_combo.clear()
+            runs = logs_manager.list_recent_runs(limit=30)
+            if run_id and not any(r['run_id'] == run_id for r in runs):
+                run_combo.addItem(f"Run {run_id}", run_id)
+            for r in runs:
+                label = (f"{r['run_name']} — {r['life_cycle_state']} "
+                         f"{r.get('result_state') or ''} (id={r['run_id']})")
+                run_combo.addItem(" ".join(label.split()), r['run_id'])
+            if run_id:
+                for i in range(run_combo.count()):
+                    if run_combo.itemData(i) == run_id:
+                        run_combo.setCurrentIndex(i)
+                        break
+
+        reload_runs_btn.clicked.connect(load_runs)
+        load_runs()
+
+        def fetch_logs():
+            rid = run_combo.currentData()
+            if rid is None:
+                return
+            text.setPlainText(get_text('db_logs_fetching'))
+            QApplication.processEvents()
+            try:
+                logs = logs_manager.get_run_logs(int(rid))
+                text.setPlainText(logs_manager.format_run_logs(logs))
+            except Exception as e:
+                text.setPlainText(get_text('db_logs_fetch_failed', str(e)))
+
+        def save_logs():
+            content = text.toPlainText()
+            if not content.strip():
+                return
+            rid = run_combo.currentData()
+            logs_dir = os.path.join(APP_DIR_PATH, "databricks_logs")
+            os.makedirs(logs_dir, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(logs_dir, f"run_{rid}_{ts}.txt")
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                QMessageBox.information(dialog, get_text('db_logs_title'),
+                                        get_text('db_logs_saved', path))
+            except Exception as e:
+                QMessageBox.warning(dialog, get_text('db_logs_title'),
+                                    get_text('db_logs_save_failed', str(e)))
+
+        def open_browser():
+            import webbrowser
+            from databricks import config_databricks as db_config
+            rid = run_combo.currentData()
+            if rid is not None:
+                webbrowser.open(
+                    f"{db_config.DATABRICKS_HOST.rstrip('/')}/#job/{rid}")
+
+        btn_row = QHBoxLayout()
+        fetch_btn = QPushButton(get_text('db_logs_fetch'))
+        fetch_btn.clicked.connect(fetch_logs)
+        save_btn = QPushButton(get_text('db_logs_save'))
+        save_btn.clicked.connect(save_logs)
+        open_btn = QPushButton(get_text('db_monitor_open_browser'))
+        open_btn.clicked.connect(open_browser)
+        close_btn = QPushButton(get_text('btn_close'))
+        close_btn.clicked.connect(dialog.accept)
+        btn_row.addWidget(fetch_btn)
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(open_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        v.addLayout(btn_row)
+
+        # 初回自動取得
+        if run_combo.count() > 0:
+            fetch_logs()
+
+        dialog.exec_()
+
+    def _import_databricks_model(self):
+        """DatabricksのVolumes models/ から学習済みモデルを選んでローカルへ取り込む"""
+        # Databricksモードが有効か確認（無効なら有効化を提案）
+        if not self._ensure_databricks_enabled():
+            return
+
+        try:
+            mgr = DatabricksTransferManager()
+        except Exception as e:
+            QMessageBox.warning(self, get_text('db_dl_title'),
+                                get_text('db_msg_test_failed', str(e)))
+            return
+
+        def list_models():
+            try:
+                files = mgr.list_remote_files("models")
+            except Exception as e:
+                QMessageBox.warning(self, get_text('db_dl_title'),
+                                    get_text('db_import_list_failed', str(e)))
+                return None
+            candidates = [f for f in files
+                          if not f['is_dir']
+                          and f['name'].endswith(('.pt', '.pth'))]
+            candidates.sort(key=lambda f: f['name'], reverse=True)  # 新しい順
+            return candidates
+
+        candidates = list_models()
+        if candidates is None:
+            return
+        if not candidates:
+            QMessageBox.information(self, get_text('db_dl_title'),
+                                    get_text('db_dl_none'))
+            return
+
+        # 選択ダイアログ
+        dialog = QDialog(self)
+        dialog.setWindowTitle(get_text('db_import_title'))
+        dialog.setMinimumWidth(540)
+        v = QVBoxLayout(dialog)
+        v.addWidget(QLabel(get_text('db_import_desc')))
+
+        combo = QComboBox()
+
+        def fill_combo(items):
+            combo.clear()
+            for f in items:
+                size_mb = (f.get('size') or 0) / (1024 * 1024)
+                combo.addItem(f"{f['name']}  ({size_mb:.1f} MB)", f)
+        fill_combo(candidates)
+        v.addWidget(combo)
+
+        refresh_btn = QPushButton(get_text('db_import_refresh'))
+
+        def do_refresh():
+            items = list_models()
+            if items:
+                fill_combo(items)
+        refresh_btn.clicked.connect(do_refresh)
+        v.addWidget(refresh_btn)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        v.addWidget(button_box)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        selected = combo.currentData()
+        if not selected:
+            return
+
+        models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
+        os.makedirs(models_dir, exist_ok=True)
+        local_path = os.path.join(models_dir, selected['name'])
+
+        # 既存ファイルは上書き確認
+        if os.path.exists(local_path):
+            if QMessageBox.question(
+                    self, get_text('db_dl_title'),
+                    get_text('db_import_overwrite', selected['name']),
+                    QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+                return
+
+        progress = QProgressDialog(get_text('db_dl_progress'),
+                                   get_text('btn_cancel'), 0, 100, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+
+        def cb(done, total):
+            QApplication.processEvents()
+            if total:
+                progress.setValue(min(100, int(done / total * 100)))
+
+        try:
+            mgr.download_file(selected['path'], local_path, progress_callback=cb)
+            progress.close()
+            QMessageBox.information(self, get_text('db_dl_title'),
+                                    get_text('db_dl_done', local_path))
+        except Exception as e:
+            progress.close()
+            QMessageBox.warning(self, get_text('db_dl_title'),
+                                get_text('db_dl_failed', str(e)))
+
+    def _show_databricks_settings(self):
+        """Databricks設定ダイアログを表示（アプリ内で編集・保存・接続テスト可能）"""
+        try:
+            from databricks import config_databricks as db_config
+            db_config.reload()
+            current = db_config.get_all_settings()
             config_available = True
         except ImportError:
             config_available = False
+            current = {}
 
         dialog = QDialog(self)
         dialog.setWindowTitle(get_text('dlg_databricks_settings'))
-        dialog.setMinimumWidth(550)
+        dialog.setMinimumWidth(620)
         layout = QVBoxLayout(dialog)
 
-        # 現在の状態を表示
-        status_group = QGroupBox(get_text('section_connection_status'))
-        status_layout = QVBoxLayout()
+        if not config_available:
+            layout.addWidget(QLabel(get_text('msg_config_databricks_not_found')))
+            close_button = QPushButton(get_text('btn_close'))
+            close_button.clicked.connect(dialog.accept)
+            layout.addWidget(close_button)
+            dialog.exec_()
+            return
 
-        if config_available:
-            status = get_databricks_status()
-            status_text = get_text('label_status_message', status['status'], status['message'])
-        else:
-            status_text = get_text('msg_config_databricks_not_found')
+        # --- 接続設定（編集可能） ---
+        conn_group = QGroupBox(get_text('db_group_connection'))
+        form = QFormLayout()
 
-        status_label = QLabel(status_text)
-        status_label.setWordWrap(True)
-        status_layout.addWidget(status_label)
-        status_group.setLayout(status_layout)
-        layout.addWidget(status_group)
+        enabled_check = QCheckBox()
+        enabled_check.setChecked(current.get("DATABRICKS_ENABLED") == "true")
+        form.addRow(get_text('db_field_enabled'), enabled_check)
 
-        # 環境変数の状態を表示
-        env_group = QGroupBox(get_text('label_env_status'))
-        env_layout = QFormLayout()
+        host_edit = QLineEdit(current.get("DATABRICKS_HOST", ""))
+        host_edit.setPlaceholderText("https://xxx.cloud.databricks.com")
+        form.addRow("Host:", host_edit)
 
-        env_enabled = os.environ.get("DATABRICKS_ENABLED", "")
-        env_host = os.environ.get("DATABRICKS_HOST", "")
-        env_token = os.environ.get("DATABRICKS_TOKEN", "")
-        env_prefix = os.environ.get("DATABRICKS_EXPERIMENT_PREFIX", "")
+        token_edit = QLineEdit(current.get("DATABRICKS_TOKEN", ""))
+        token_edit.setEchoMode(QLineEdit.Password)
+        token_edit.setPlaceholderText("dapi...")
+        form.addRow("Token:", token_edit)
 
-        env_layout.addRow("DATABRICKS_ENABLED:", QLabel(env_enabled or get_text('label_not_set')))
-        env_layout.addRow("DATABRICKS_HOST:", QLabel(env_host[:40] + "..." if len(env_host) > 40 else env_host or get_text('label_not_set')))
-        env_layout.addRow("DATABRICKS_TOKEN:", QLabel("****" + env_token[-4:] if env_token else get_text('label_not_set')))
-        env_layout.addRow("EXPERIMENT_PREFIX:", QLabel(env_prefix or get_text('label_using_default')))
+        prefix_edit = QLineEdit(current.get("DATABRICKS_EXPERIMENT_PREFIX", ""))
+        form.addRow(get_text('db_field_experiment'), prefix_edit)
 
-        env_group.setLayout(env_layout)
-        layout.addWidget(env_group)
+        volumes_edit = QLineEdit(current.get("DATABRICKS_VOLUMES_PATH", ""))
+        form.addRow(get_text('db_field_volumes'), volumes_edit)
 
-        # 自動学習パイプライン設定
-        train_group = QGroupBox(get_text('label_auto_train_settings'))
-        train_layout = QFormLayout()
+        notebook_edit = QLineEdit(current.get("DATABRICKS_NOTEBOOK_PATH", ""))
+        form.addRow(get_text('db_field_notebook'), notebook_edit)
 
-        env_cluster_id = os.environ.get("DATABRICKS_CLUSTER_ID", "")
-        env_notebook_path = os.environ.get("DATABRICKS_NOTEBOOK_PATH", "")
+        catalog_edit = QLineEdit(current.get("DATABRICKS_CATALOG", ""))
+        form.addRow("Catalog:", catalog_edit)
+        schema_edit = QLineEdit(current.get("DATABRICKS_SCHEMA", ""))
+        form.addRow("Schema:", schema_edit)
 
-        cluster_label = QLabel(env_cluster_id or get_text('label_not_set'))
-        cluster_label.setToolTip(get_text('label_set_via_env'))
-        train_layout.addRow(get_text('label_cluster_id') + ":", cluster_label)
+        conn_group.setLayout(form)
+        layout.addWidget(conn_group)
 
-        notebook_label = QLabel(env_notebook_path or get_text('label_using_default'))
-        notebook_label.setToolTip(get_text('label_set_via_env'))
-        train_layout.addRow(get_text('label_notebook_path') + ":", notebook_label)
+        # --- クラスター選択（ドロップダウン + 更新） ---
+        cluster_group = QGroupBox(get_text('db_group_cluster'))
+        cluster_layout = QHBoxLayout()
+        cluster_combo = QComboBox()
+        cluster_combo.setEditable(True)   # 手入力も許可
+        cur_cluster = current.get("DATABRICKS_CLUSTER_ID", "")
+        if cur_cluster:
+            cluster_combo.addItem(cur_cluster, cur_cluster)
+        refresh_cluster_btn = QPushButton(get_text('db_btn_refresh_clusters'))
+        cluster_layout.addWidget(cluster_combo, 1)
+        cluster_layout.addWidget(refresh_cluster_btn)
+        cluster_group.setLayout(cluster_layout)
+        layout.addWidget(cluster_group)
 
-        train_group.setLayout(train_layout)
-        layout.addWidget(train_group)
+        # メッセージ表示
+        msg_label = QLabel("")
+        msg_label.setWordWrap(True)
+        layout.addWidget(msg_label)
 
-        # 設定方法の説明
-        help_group = QGroupBox(get_text('section_env_setup'))
-        help_layout = QVBoxLayout()
-        help_text = QLabel(get_text('msg_env_setup_help'))
-        help_text.setWordWrap(True)
-        help_text.setStyleSheet("font-family: monospace;")
-        help_layout.addWidget(help_text)
-        help_group.setLayout(help_layout)
-        layout.addWidget(help_group)
+        def set_msg(text, color="gray"):
+            msg_label.setText(text)
+            msg_label.setStyleSheet(f"color: {color};")
+            QApplication.processEvents()
 
-        # ボタンレイアウト
-        button_layout = QHBoxLayout()
+        def gather():
+            cid = (cluster_combo.currentData()
+                   or cluster_combo.currentText() or "").strip()
+            return {
+                "DATABRICKS_ENABLED": "true" if enabled_check.isChecked() else "false",
+                "DATABRICKS_HOST": host_edit.text().strip().rstrip('/'),
+                "DATABRICKS_TOKEN": token_edit.text().strip(),
+                "DATABRICKS_EXPERIMENT_PREFIX": prefix_edit.text().strip(),
+                "DATABRICKS_VOLUMES_PATH": volumes_edit.text().strip(),
+                "DATABRICKS_NOTEBOOK_PATH": notebook_edit.text().strip(),
+                "DATABRICKS_CLUSTER_ID": cid,
+                "DATABRICKS_CATALOG": catalog_edit.text().strip(),
+                "DATABRICKS_SCHEMA": schema_edit.text().strip(),
+            }
 
-        # テンプレートをコピーボタン
-        if config_available:
+        def persist():
+            """入力値をストアへ保存し、config/環境変数へ即時反映"""
+            db_config.save_settings(gather())
+
+        def do_save():
+            persist()
+            # MLflow連携モードもチェック状態に同期
+            try:
+                self.mlflow_manager.set_databricks_mode(enabled_check.isChecked())
+                self.databricks_checkbox.blockSignals(True)
+                self.databricks_checkbox.setChecked(enabled_check.isChecked())
+                self.databricks_checkbox.blockSignals(False)
+                self._update_databricks_status_label()
+            except Exception:
+                pass
+            set_msg(get_text('db_msg_saved'), "green")
+
+        def do_test():
+            persist()
+            set_msg(get_text('db_msg_testing'))
+            try:
+                mgr = DatabricksTransferManager()
+                ok, message = mgr.test_connection()
+                set_msg(message, "green" if ok else "red")
+            except Exception as e:
+                set_msg(get_text('db_msg_test_failed', str(e)), "red")
+
+        def do_refresh_clusters():
+            persist()
+            set_msg(get_text('db_msg_loading_clusters'))
+            try:
+                mgr = DatabricksTransferManager()
+                clusters = mgr.list_clusters()
+                keep = (cluster_combo.currentData()
+                        or cluster_combo.currentText() or "").strip()
+                cluster_combo.clear()
+                for c in clusters:
+                    cluster_combo.addItem(
+                        f"{c['name']} ({c['state']}) — {c['id']}", c['id'])
+                if keep:
+                    matched = False
+                    for i in range(cluster_combo.count()):
+                        if cluster_combo.itemData(i) == keep:
+                            cluster_combo.setCurrentIndex(i)
+                            matched = True
+                            break
+                    if not matched:
+                        cluster_combo.setEditText(keep)
+                set_msg(get_text('db_msg_clusters_loaded', len(clusters)), "green")
+            except Exception as e:
+                set_msg(get_text('db_msg_clusters_failed', str(e)), "red")
+
+        def do_deploy():
+            persist()
+            set_msg(get_text('db_msg_deploying'))
+            try:
+                mgr = DatabricksTransferManager()
+                res = mgr.deploy_notebooks(notebook_edit.text().strip())
+                if res.get('success'):
+                    set_msg(get_text('db_msg_deployed',
+                                     len(res['deployed']), res['base_path']), "green")
+                else:
+                    set_msg(get_text('db_msg_deploy_failed',
+                                     res.get('error', '')), "red")
+            except Exception as e:
+                set_msg(get_text('db_msg_deploy_failed', str(e)), "red")
+
+        refresh_cluster_btn.clicked.connect(do_refresh_clusters)
+
+        # --- 操作ボタン（保存・接続テスト・ノートブック配置） ---
+        btn_row = QHBoxLayout()
+        save_btn = QPushButton(get_text('db_btn_save'))
+        save_btn.clicked.connect(do_save)
+        test_btn = QPushButton(get_text('db_btn_test'))
+        test_btn.clicked.connect(do_test)
+        deploy_btn = QPushButton(get_text('db_btn_deploy'))
+        deploy_btn.setToolTip(get_text('db_tip_deploy'))
+        deploy_btn.clicked.connect(do_deploy)
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(test_btn)
+        btn_row.addWidget(deploy_btn)
+        layout.addLayout(btn_row)
+
+        # --- 補助ボタン（テンプレ・README・閉じる） ---
+        btn_row2 = QHBoxLayout()
+        try:
+            from databricks.config_databricks import get_env_template
             copy_template_button = QPushButton(get_text('btn_copy_template'))
-            copy_template_button.clicked.connect(lambda: self._copy_env_template(get_env_template()))
-            button_layout.addWidget(copy_template_button)
-
-        # READMEを開くボタン
+            copy_template_button.clicked.connect(
+                lambda: self._copy_env_template(get_env_template()))
+            btn_row2.addWidget(copy_template_button)
+        except Exception:
+            pass
         open_readme_button = QPushButton(get_text('btn_open_readme'))
         open_readme_button.clicked.connect(self._open_databricks_readme)
-        button_layout.addWidget(open_readme_button)
-
-        layout.addLayout(button_layout)
-
-        # 閉じるボタン
+        btn_row2.addWidget(open_readme_button)
         close_button = QPushButton(get_text('btn_close'))
         close_button.clicked.connect(dialog.accept)
-        layout.addWidget(close_button)
+        btn_row2.addWidget(close_button)
+        layout.addLayout(btn_row2)
 
         dialog.exec_()
 
@@ -20865,6 +21857,31 @@ class ImageAnnotationTool(QMainWindow):
             if hasattr(self, 'map_view_dialog') and self.map_view_dialog is not None and self.map_view_dialog.isVisible():
                 self.map_view_dialog.set_pose_manager(self.pose_manager)
 
+            # 画像ソース欄を再構築（pose/slam 取込後に BEV ソースを反映する）。
+            # ツールバーは起動時=pose未取込で作られるため、ここで初めて
+            # _has_pose_data()=True になり BEV ラジオが追加される。
+            self.update_variant_buttons()
+
+            # 走行軌道(緑)の自己位置ソースを自動選択する。pose を優先しつつ、
+            # このセッションの pose がヨー凍結（theta 不変）なら slam 等へ
+            # フォールバックする（凍結 pose だと軌道が常に真っ直ぐになるため）。
+            if self.pose_manager.has_any_pose():
+                best = self.pose_manager.best_trajectory_source()
+                if best:
+                    self.recorded_traj_source = best
+                    if hasattr(self, 'recorded_traj_source_combo'):
+                        combo = self.recorded_traj_source_combo
+                        j = combo.findData(best)
+                        if j >= 0:
+                            combo.blockSignals(True)
+                            combo.setCurrentIndex(j)
+                            combo.blockSignals(False)
+                    # pose が使えず別ソースになった場合は理由を通知
+                    if best != "pose" and not self.pose_manager.heading_varies("pose"):
+                        self.statusBar().showMessage(
+                            f"走行軌道: pose のヨーが凍結（方位不変）のため "
+                            f"{best} を使用します", 6000)
+
             return self.annotated_count > 0
                 
         except Exception as e:
@@ -20969,6 +21986,38 @@ class ImageAnnotationTool(QMainWindow):
 
         return bbox_info
 
+    def _render_bev_to_pil(self, w, h):
+        """BEV(真上から見た図)を (w,h) の PIL.Image として描画する（結合表示セル用）。
+
+        メインビューの draw_bev（QPainter 版）を QImage にオフスクリーン描画し、
+        PIL へ変換する。軌道の表示ON/OFFは各チェックボックスに連動（draw_bev 内で
+        判定）。描画できない場合は None。
+        """
+        view = getattr(self, 'main_image_view', None)
+        if view is None or not hasattr(view, 'draw_bev'):
+            return None
+        try:
+            w, h = int(w), int(h)
+            qimg = QImage(w, h, QImage.Format_RGB888)
+            qimg.fill(QColor(238, 240, 243))
+            painter = QPainter(qimg)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            try:
+                view.draw_bev(painter, QRect(0, 0, w, h))
+            finally:
+                painter.end()
+            # QImage(RGB888) → PIL.Image（bytesPerLine のパディングを考慮）
+            qimg = qimg.convertToFormat(QImage.Format_RGB888)
+            bpl = qimg.bytesPerLine()
+            ptr = qimg.constBits()
+            ptr.setsize(qimg.height() * bpl)
+            arr = np.frombuffer(ptr, np.uint8)[:qimg.height() * bpl].reshape(qimg.height(), bpl)
+            arr = arr[:, :w * 3].reshape(h, w, 3)
+            return Image.fromarray(arr.copy(), 'RGB')
+        except Exception as e:
+            print(f"BEV 合成画像の描画に失敗: {e}")
+            return None
+
     def _create_combined_image(self):
         """選択されたソースをグリッド配置した結合画像を作成（元キャンバスサイズに収める）"""
         if not hasattr(self, 'image_groups') or not self.image_groups:
@@ -20996,9 +22045,16 @@ class ImageAnnotationTool(QMainWindow):
 
         # ソース順序に沿って (name, image_or_None) のリストを作成
         # 画像が取得できないスロットも位置を保持してプレースホルダーを表示する
+        ss = max(1, int(getattr(self, '_combined_supersample', 1)))
+        base_w = getattr(self, 'original_image_width', 320) or 320
+        base_h = getattr(self, 'original_image_height', 240) or 240
         cell_slots = []  # [(source_name, PIL.Image or None), ...]
         for var in source_order:
-            if var in group:
+            if var == 'BEV':
+                # 真上から見た図を PIL 画像として焼き込む（1セル）。セルの実解像度
+                # (base × SS) で直接描くことで、paste 時の再拡大を避け鮮明に保つ。
+                cell_slots.append((var, self._render_bev_to_pil(base_w * ss, base_h * ss)))
+            elif var in group:
                 img = load_image_safely(group[var])
                 if img is not None:
                     if img.mode != 'RGB':
@@ -21046,11 +22102,15 @@ class ImageAnnotationTool(QMainWindow):
             cols = min(cols, n_slots)
             rows = max(1, (n_slots + cols - 1) // cols)
 
-        # キャンバスサイズ（元の画像サイズ × グリッド数で横幅を確保）
+        # キャンバスサイズ（元の画像サイズ × グリッド数で横幅を確保）。
+        # スーパーサンプル倍率 SS ぶん高解像度で焼き、表示時は on_variant_changed
+        # がズームを 1/SS に補正するので表示サイズは変わらず、拡大による BEV の
+        # 文字・線のぼやけだけが軽減される（カメラ写真は LANCZOS で拡大）。
+        ss = max(1, int(getattr(self, '_combined_supersample', 1)))
         base_w = getattr(self, 'original_image_width', 320)
         base_h = getattr(self, 'original_image_height', 240)
-        cell_w = base_w
-        cell_h = base_h
+        cell_w = base_w * ss
+        cell_h = base_h * ss
         canvas_w = cell_w * cols
         canvas_h = cell_h * rows
 
@@ -24664,22 +25724,52 @@ class ImageAnnotationTool(QMainWindow):
             return
 
         trajectory = predictions[current_index]
+        is_togivad = getattr(self, '_gru_is_togivad', False)
 
-        # テキスト構築
-        gru_text = f"<b style='color:#00C800;'>{get_text('label_traj_inference_result')}</b>"
+        # テキスト構築（推論軌跡の色に合わせて見出しも暗めシアン）
+        if is_togivad:
+            header = get_text('label_togivad_inference_result')
+        else:
+            header = get_text('label_traj_inference_result')
+        header_color = '#00A0A0' if is_togivad else '#00C800'
+        gru_text = f"<b style='color:{header_color};'>{header}</b>"
         gru_text += "<table style='margin:0; padding:0; border-spacing:0;'>"
-        for step, (s, t) in enumerate(trajectory):
-            gru_text += (
-                f"<tr><td>t+{step+1}:&nbsp;</td>"
-                f"<td style='color:#00C800;'>{s:+.3f},&nbsp;</td>"
-                f"<td style='color:#008000;'>{t:+.3f}</td></tr>"
-            )
+        if is_togivad:
+            # 各行は値のみ（凡例と単位は見出し「t+Δt, x, y (s, m, m)」に集約）。
+            # 時刻は実秒 = (step+1)*dt。末尾(=pred_seconds)を必ず含む等間隔で
+            # 数点だけ間引く（最終行がちょうど horizon*dt 秒になる）。
+            dt = float(getattr(self._gru_cfg, 'dt', 0.05))
+            n = len(trajectory)
+            K = min(6, n)
+            if n > 1:
+                steps = sorted(set(round(i * (n - 1) / (K - 1)) for i in range(K)))
+            else:
+                steps = [0]
+            for step in steps:
+                x, y = trajectory[step]
+                gru_text += (
+                    f"<tr><td style='color:#00A0A0;'>{(step+1)*dt:.2f}&nbsp;</td>"
+                    f"<td style='color:#008C8C;'>{x:+.2f}&nbsp;</td>"
+                    f"<td style='color:#006A6A;'>{y:+.2f}</td></tr>"
+                )
+        else:
+            for step, (s, t) in enumerate(trajectory):
+                gru_text += (
+                    f"<tr><td>t+{step+1}:&nbsp;</td>"
+                    f"<td style='color:#00C800;'>{s:+.3f},&nbsp;</td>"
+                    f"<td style='color:#008000;'>{t:+.3f}</td></tr>"
+                )
         gru_text += "</table>"
 
         if hasattr(self, 'inference_info_label'):
-            current_text = self.inference_info_label.text()
-            if current_text.strip():
-                self.inference_info_label.setText(current_text + gru_text)
+            # 予測ブロックは区切りマーカー以降に置き、追記のたびに既存ブロックを
+            # 除去してから付け直す（複数回呼ばれても二重表示にならない冪等化）。
+            # 従来は current_text + gru_text の無条件追記で、読込時に本メソッドが
+            # 2回呼ばれると推論結果が2つ並んでいた。
+            GRU_DELIM = "<!--togivad-pred-->"
+            base_text = self.inference_info_label.text().split(GRU_DELIM)[0]
+            if base_text.strip():
+                self.inference_info_label.setText(base_text + GRU_DELIM + gru_text)
             else:
                 self.inference_info_label.setText(gru_text)
             self.inference_info_label.setTextFormat(Qt.RichText)
@@ -24696,7 +25786,15 @@ class ImageAnnotationTool(QMainWindow):
         if not img_w or not img_h:
             img_w = view.pixmap().width() if view.pixmap() else 0
             img_h = view.pixmap().height() if view.pixmap() else 0
-        if img_w > 0 and img_h > 0 and trajectory:
+        if is_togivad:
+            # TogiVAD の予測はカメラ画像へ魚眼投影で描く（draw_prediction_trajectory、
+            # 走行軌道と同じ原点・スケール）。ここではトップダウンの点列 overlay は
+            # 使わないので空にし、フラグだけ立てる（BEV セルは draw_bev が描く）。
+            self.main_image_view.sequence_prediction_points = []
+            self.main_image_view.show_gru_prediction = bool(trajectory)
+        elif img_w > 0 and img_h > 0 and trajectory:
+            # GRU/TCN（制御量 (steering, throttle)）は従来どおり angle-throttle
+            # プロット座標へ写して点列 overlay で描く。
             points = []
             for s, t in trajectory:
                 x = int((s + 1) / 2 * img_w)
@@ -24742,6 +25840,7 @@ class ImageAnnotationTool(QMainWindow):
         arch_combo.addItem("GRU", "gru")
         arch_combo.addItem("TCN", "tcn")
         arch_combo.addItem("CausalCNN", "causal_cnn")
+        arch_combo.addItem("TogiVAD", "togivad")
 
         # パネルで選択中のモデルタイプを初期値に連動
         if hasattr(self, 'traj_arch_combo'):
@@ -24850,6 +25949,85 @@ class ImageAnnotationTool(QMainWindow):
         fusion_layout.addStretch()
         arch_layout.addLayout(fusion_layout)
 
+        # --- TogiVAD 固有パラメータ（arch=togivad のときのみ表示） ---
+        togivad_group = QGroupBox(get_text('label_togivad_params'))
+        togivad_layout = QVBoxLayout()
+
+        pose_source_layout = QHBoxLayout()
+        pose_source_layout.addWidget(QLabel(get_text('label_pose_source')))
+        pose_source_combo = QComboBox()
+        # 既定は pose（デッドレコニング）。slam は生値のまま選択可
+        # （平滑化slamは実験結果を見て検討）
+        pose_source_combo.addItem(get_text('opt_pose_source_pose'), 'pose')
+        pose_source_combo.addItem(get_text('opt_pose_source_slam'), 'slam')
+        pose_source_layout.addWidget(pose_source_combo)
+        pose_source_layout.addStretch()
+        togivad_layout.addLayout(pose_source_layout)
+
+        # 予測ホライズン: x秒先(pred_seconds)を pred_points 点で等時間間隔サンプル。
+        # 間の点はタイムスタンプ補間で生成される（compute_future_trajectory）。
+        horizon_layout = QHBoxLayout()
+        horizon_layout.addWidget(QLabel(get_text('label_togivad_pred_seconds')))
+        togivad_seconds_spin = QDoubleSpinBox()
+        togivad_seconds_spin.setRange(0.1, 5.0)
+        togivad_seconds_spin.setSingleStep(0.1)
+        togivad_seconds_spin.setDecimals(2)
+        togivad_seconds_spin.setValue(1.0)
+        horizon_layout.addWidget(togivad_seconds_spin)
+
+        horizon_layout.addWidget(QLabel(get_text('label_togivad_pred_points')))
+        togivad_points_spin = QSpinBox()
+        togivad_points_spin.setRange(1, 100)
+        togivad_points_spin.setValue(20)
+        horizon_layout.addWidget(togivad_points_spin)
+
+        # dt と MPPI互換の目安を動的表示
+        togivad_dt_label = QLabel("")
+        togivad_dt_label.setStyleSheet("color: #666;")
+        horizon_layout.addWidget(togivad_dt_label)
+        horizon_layout.addStretch()
+        togivad_layout.addLayout(horizon_layout)
+
+        def update_togivad_dt():
+            pts = togivad_points_spin.value()
+            secs = togivad_seconds_spin.value()
+            dt_ms = (secs / pts * 1000.0) if pts else 0.0
+            compat = " = MPPI互換" if (pts == 20 and abs(secs - 1.0) < 1e-6) else ""
+            togivad_dt_label.setText(f"→ dt={dt_ms:.1f}ms/点{compat}")
+
+        togivad_seconds_spin.valueChanged.connect(update_togivad_dt)
+        togivad_points_spin.valueChanged.connect(update_togivad_dt)
+        update_togivad_dt()
+
+        vocab_layout = QHBoxLayout()
+        vocab_layout.addWidget(QLabel(get_text('label_vocab_size')))
+        vocab_k_combo = QComboBox()
+        for k in ['64', '128', '256', '512']:
+            vocab_k_combo.addItem(k)
+        vocab_k_combo.setCurrentText('128')
+        vocab_layout.addWidget(vocab_k_combo)
+
+        vocab_from_logs_check = QCheckBox(get_text('chk_vocab_from_logs'))
+        vocab_from_logs_check.setChecked(True)
+        vocab_layout.addWidget(vocab_from_logs_check)
+
+        vocab_layout.addWidget(QLabel(get_text('label_ego_dropout')))
+        ego_dropout_spin = QDoubleSpinBox()
+        ego_dropout_spin.setRange(0.0, 0.9)
+        ego_dropout_spin.setSingleStep(0.05)
+        ego_dropout_spin.setValue(0.3)
+        vocab_layout.addWidget(ego_dropout_spin)
+        vocab_layout.addStretch()
+        togivad_layout.addLayout(vocab_layout)
+
+        togivad_info_label = QLabel(get_text('label_togivad_info'))
+        togivad_info_label.setStyleSheet("color: #666;")
+        togivad_info_label.setWordWrap(True)
+        togivad_layout.addWidget(togivad_info_label)
+
+        togivad_group.setLayout(togivad_layout)
+        arch_layout.addWidget(togivad_group)
+
         def update_arch_widgets():
             arch = arch_combo.currentData()
             gru_layers_spin.setVisible(arch == "gru")
@@ -24858,9 +26036,16 @@ class ImageAnnotationTool(QMainWindow):
             tcn_kernel_label.setVisible(arch == "tcn")
             cnn_kernel_spin.setVisible(arch == "causal_cnn")
             cnn_kernel_label.setVisible(arch == "causal_cnn")
+            # TogiVAD: 単一フレーム入力・軌道語彙分類のため
+            # シーケンス/隠れ層/融合の設定は使わない（無効化して明示）
+            is_togivad = (arch == "togivad")
+            togivad_group.setVisible(is_togivad)
+            for w in (seq_len_spin, pred_horizon_spin, stride_spin,
+                      hidden_dim_combo, dropout_spin, fusion_combo,
+                      attn_heads_spin, aug_check):
+                w.setEnabled(not is_togivad)
 
         arch_combo.currentIndexChanged.connect(update_arch_widgets)
-        update_arch_widgets()
 
         # シーケンス情報ラベル
         seq_info_label = QLabel(get_text('label_traj_seq_info', SEQ_DEFAULT_SEQ_LEN, SEQ_DEFAULT_PRED_HORIZON))
@@ -24992,6 +26177,9 @@ class ImageAnnotationTool(QMainWindow):
 
         training_group.setLayout(training_layout)
         right_column.addWidget(training_group)
+
+        # 初期表示を設定（aug_check など右カラムのウィジェット定義後に呼ぶ）
+        update_arch_widgets()
 
         # --- 学習対象データ選択グループ ---
         data_selection_group = QGroupBox(get_text('label_training_data_selection'))
@@ -25153,6 +26341,22 @@ class ImageAnnotationTool(QMainWindow):
         elif selected_arch == 'causal_cnn':
             config['kernel_size'] = cnn_kernel_spin.value()
             config['cnn_channels'] = SEQ_CAUSAL_CNN_DEFAULT_CHANNELS
+        elif selected_arch == 'togivad':
+            config['pose_source'] = pose_source_combo.currentData()
+            config['pred_seconds'] = togivad_seconds_spin.value()
+            config['pred_points'] = togivad_points_spin.value()
+            config['vocab_k'] = int(vocab_k_combo.currentText())
+            config['vocab_from_logs'] = vocab_from_logs_check.isChecked()
+            config['ego_dropout'] = ego_dropout_spin.value()
+            # 事前バリデーション: カメラ台数プリセットと自己位置の有無
+            if len(selected_sources) not in TogivadTrainingManager.SUPPORTED_CAMERA_COUNTS:
+                QMessageBox.warning(self, get_text('dlg_warning'),
+                                    get_text('msg_togivad_bad_source_count'))
+                return
+            if not self.pose_manager.has_any_pose():
+                QMessageBox.warning(self, get_text('dlg_warning'),
+                                    get_text('msg_togivad_no_pose'))
+                return
 
         # マルチカメラ融合パラメータ
         config['fusion_method'] = fusion_combo.currentData()
@@ -25180,24 +26384,41 @@ class ImageAnnotationTool(QMainWindow):
             if hasattr(self, 'mlflow_manager'):
                 mlflow_mgr = self.mlflow_manager
 
-            manager = SequenceTrainingManager(models_dir, mlflow_manager=mlflow_mgr)
-            result = manager.train(
-                valid_indexes=valid_indexes,
-                annotations=self.annotations,
-                images=self.images,
-                source_images_map=getattr(self, 'source_images_map', None),
-                selected_sources=selected_sources,
-                config=config,
-                progress_callback=update_progress
-            )
+            if selected_arch == 'togivad':
+                manager = TogivadTrainingManager(models_dir, mlflow_manager=mlflow_mgr)
+                result = manager.train(
+                    valid_indexes=valid_indexes,
+                    annotations=self.annotations,
+                    images=self.images,
+                    source_images_map=getattr(self, 'source_images_map', None),
+                    selected_sources=selected_sources,
+                    pose_manager=self.pose_manager,
+                    config=config,
+                    progress_callback=update_progress
+                )
+            else:
+                manager = SequenceTrainingManager(models_dir, mlflow_manager=mlflow_mgr)
+                result = manager.train(
+                    valid_indexes=valid_indexes,
+                    annotations=self.annotations,
+                    images=self.images,
+                    source_images_map=getattr(self, 'source_images_map', None),
+                    selected_sources=selected_sources,
+                    config=config,
+                    progress_callback=update_progress
+                )
 
             progress.close()
 
             if result.get('status') == 'error':
-                if result.get('message') == 'no_sequences':
+                err = result.get('message')
+                if err == 'no_sequences':
                     QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_traj_no_sequences'))
+                elif err in ('togivad_bad_source_count', 'togivad_no_pose',
+                             'togivad_bad_horizon'):
+                    QMessageBox.warning(self, get_text('dlg_warning'), get_text(f'msg_{err}'))
                 else:
-                    QMessageBox.warning(self, get_text('dlg_warning'), result.get('message', 'Unknown error'))
+                    QMessageBox.warning(self, get_text('dlg_warning'), err or 'Unknown error')
                 return
 
             if result.get('status') == 'cancelled':
@@ -25205,7 +26426,9 @@ class ImageAnnotationTool(QMainWindow):
                 return
 
             # 学習曲線グラフを保存
-            if result.get('model_path') and result.get('train_losses') and result.get('val_losses'):
+            # （togivad はマネージャ側で ADE 付き曲線を保存済みのためスキップ）
+            if selected_arch != 'togivad' and result.get('model_path') \
+                    and result.get('train_losses') and result.get('val_losses'):
                 self._save_traj_training_curve(
                     result['model_path'],
                     result['train_losses'],
@@ -25214,9 +26437,17 @@ class ImageAnnotationTool(QMainWindow):
                 )
 
             arch_label = selected_arch.upper()
+            togivad_line = ""
+            if selected_arch == 'togivad':
+                togivad_line = (
+                    f"Pose Source: {config.get('pose_source', 'pose')}\n"
+                    f"Val top1: {result.get('val_top1', 0):.1%} | "
+                    f"Val ADE: {result.get('val_ade_m', 0):.3f} m\n"
+                )
             msg = (
                 f"{get_text('msg_traj_training_complete')}\n\n"
                 f"Architecture: {arch_label}\n"
+                f"{togivad_line}"
                 f"Best Val Loss: {result.get('best_val_loss', 0):.6f}\n"
                 f"Epochs: {result.get('epochs_trained', 0)}\n"
                 f"Sequences: {result.get('total_sequences', 0)} "
@@ -25300,14 +26531,58 @@ class ImageAnnotationTool(QMainWindow):
 
         try:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            model, cfg, sources = SequenceTrainingManager.load_model(selected_model_path, device)
+            # togivad モデルは別マネージャ・別チェックポイント形式
+            # （state_dict/config(TogiVADConfig)/vocab、単一フレーム軌道分類）
+            is_togivad = os.path.basename(selected_model_path).startswith("togivad_")
+            if is_togivad:
+                model, cfg, vocab, meta = TogivadTrainingManager.load_model(
+                    selected_model_path, device)
+                self._gru_vocab = vocab
+                self._gru_pose_source = meta.get('pose_source', 'pose')
+                self._gru_sources = meta.get('selected_sources', ['cam'])
+                self._gru_manager = TogivadTrainingManager(models_dir)
+                # 緑の実測走行軌道（学習データGT）を読込モデルの時間窓へ同期する。
+                # 秒数・点数・dt・pose_source を合わせることで、推論軌道（シアン）と
+                # 実測軌道（緑）が同じ秒数・同じ標本点になり直接比較できる
+                # （既定は 20点×0.05s=1.0秒固定で、3秒モデルと不一致だった）。
+                total_seconds = float(cfg.horizon) * float(cfg.dt)
+                self.recorded_traj_points = int(cfg.horizon)
+                self.recorded_traj_seconds = total_seconds
+                self.recorded_traj_dt = float(cfg.dt)
+                self.recorded_traj_source = self._gru_pose_source
+                # UI 入力欄も同期値へ更新（再帰的な再計算を避けるため signals を止める）
+                if hasattr(self, 'recorded_traj_seconds_input'):
+                    self.recorded_traj_seconds_input.blockSignals(True)
+                    self.recorded_traj_seconds_input.setValue(total_seconds)
+                    self.recorded_traj_seconds_input.blockSignals(False)
+                if hasattr(self, 'recorded_traj_points_input'):
+                    self.recorded_traj_points_input.blockSignals(True)
+                    self.recorded_traj_points_input.setText(str(int(cfg.horizon)))
+                    self.recorded_traj_points_input.blockSignals(False)
+                if hasattr(self, 'recorded_traj_source_combo'):
+                    combo = self.recorded_traj_source_combo
+                    combo.blockSignals(True)
+                    j = combo.findData(self._gru_pose_source)
+                    if j >= 0:
+                        combo.setCurrentIndex(j)
+                    combo.blockSignals(False)
+                self.statusBar().showMessage(
+                    f"走行軌道(緑)を読込モデルに同期: {int(cfg.horizon)}点 × "
+                    f"{cfg.dt:.2f}s = {total_seconds:.1f}s "
+                    f"(source={self._gru_pose_source})", 6000)
+            else:
+                model, cfg, sources = SequenceTrainingManager.load_model(
+                    selected_model_path, device)
+                self._gru_sources = sources
+                self._gru_vocab = None
+                self._gru_pose_source = None
+                self._gru_manager = SequenceTrainingManager(models_dir)
             model.eval()
+            self._gru_is_togivad = is_togivad
             self._gru_model = model
             self._gru_cfg = cfg
-            self._gru_sources = sources
             self._gru_device = device
             self._gru_model_path = selected_model_path
-            self._gru_manager = SequenceTrainingManager(models_dir)
             # モデルが変わったので予測キャッシュをクリア
             self.gru_predictions = {}
             self.gru_prediction_config = cfg
@@ -25328,15 +26603,26 @@ class ImageAnnotationTool(QMainWindow):
         if current_index in self.gru_predictions:
             return
         try:
-            deleted = getattr(self, 'deleted_indexes', set())
-            traj = self._gru_manager.predict_current(
-                self._gru_model, self._gru_cfg, self._gru_sources,
-                current_index, self.annotations, self.images,
-                getattr(self, 'source_images_map', None),
-                self._gru_device, deleted
-            )
-            if traj is not None:
-                self.gru_predictions[current_index] = traj
+            if getattr(self, '_gru_is_togivad', False):
+                # togivad: ego座標系(x前方/y左)[m]の予測軌道 (H,2)
+                out = self._gru_manager.predict_current(
+                    self._gru_model, self._gru_cfg, self._gru_vocab,
+                    self._gru_sources, current_index, self.images,
+                    getattr(self, 'source_images_map', None), self.annotations,
+                    pose_manager=getattr(self, 'pose_manager', None),
+                    pose_source=self._gru_pose_source, device=self._gru_device)
+                if out is not None:
+                    self.gru_predictions[current_index] = out["best"].tolist()
+            else:
+                deleted = getattr(self, 'deleted_indexes', set())
+                traj = self._gru_manager.predict_current(
+                    self._gru_model, self._gru_cfg, self._gru_sources,
+                    current_index, self.annotations, self.images,
+                    getattr(self, 'source_images_map', None),
+                    self._gru_device, deleted
+                )
+                if traj is not None:
+                    self.gru_predictions[current_index] = traj
         except Exception as e:
             print(f"時系列逐次推論エラー: {e}")
 
@@ -25397,14 +26683,38 @@ class ImageAnnotationTool(QMainWindow):
                 QApplication.processEvents()
                 return not progress.wasCanceled()
 
-            result = self._gru_manager.predict(
-                model_path=self._gru_model_path,
-                valid_indexes=valid_indexes,
-                annotations=self.annotations,
-                images=self.images,
-                source_images_map=getattr(self, 'source_images_map', None),
-                progress_callback=update_progress
-            )
+            if getattr(self, '_gru_is_togivad', False):
+                # togivad: バッチ predict() が無いため predict_current を全フレーム反復
+                predictions = {}
+                src_map = getattr(self, 'source_images_map', None)
+                total = len(valid_indexes)
+                cancelled = False
+                for i, idx in enumerate(valid_indexes):
+                    if i % 20 == 0:
+                        if not update_progress(i, total,
+                                               get_text('msg_traj_predicting')):
+                            cancelled = True
+                            break
+                    out = self._gru_manager.predict_current(
+                        self._gru_model, self._gru_cfg, self._gru_vocab,
+                        self._gru_sources, idx, self.images, src_map,
+                        self.annotations,
+                        pose_manager=getattr(self, 'pose_manager', None),
+                        pose_source=self._gru_pose_source,
+                        device=self._gru_device)
+                    if out is not None:
+                        predictions[idx] = out["best"].tolist()
+                result = {"status": "cancelled" if cancelled else "completed",
+                          "predictions": predictions, "config": self._gru_cfg}
+            else:
+                result = self._gru_manager.predict(
+                    model_path=self._gru_model_path,
+                    valid_indexes=valid_indexes,
+                    annotations=self.annotations,
+                    images=self.images,
+                    source_images_map=getattr(self, 'source_images_map', None),
+                    progress_callback=update_progress
+                )
 
             progress.close()
 
@@ -25417,6 +26727,11 @@ class ImageAnnotationTool(QMainWindow):
 
             if result.get('status') == 'cancelled':
                 self.statusBar().showMessage(get_text('status_training_cancelled'), 5000)
+                # togivad はキャンセルでも途中までの予測を活かす
+                if result.get('predictions'):
+                    self.gru_predictions.update(result['predictions'])
+                    self.show_gru_predictions = True
+                    self._gru_infer_enabled = True
                 return
 
             # 全画像分の予測をキャッシュにマージ
@@ -27008,7 +28323,7 @@ class ImageAnnotationTool(QMainWindow):
         traj_method_layout = QHBoxLayout()
         traj_method_layout.addWidget(QLabel(get_text('label_model_arch')))
         self.traj_arch_combo = QComboBox()
-        self.traj_arch_combo.addItems(["GRU", "TCN", "CausalCNN"])
+        self.traj_arch_combo.addItems(["GRU", "TCN", "CausalCNN", "TogiVAD"])
         self.traj_arch_combo.setCurrentIndex(0)  # デフォルト: GRU
         self.traj_arch_combo.currentIndexChanged.connect(self.refresh_traj_model_list)
         traj_method_layout.addWidget(self.traj_arch_combo)
@@ -27067,6 +28382,10 @@ class ImageAnnotationTool(QMainWindow):
         self._gru_model_path = None
         self._gru_device = None
         self._gru_infer_enabled = False  # 逐次推論(現在画像)が有効か
+        # togivad 用の追加状態（軌道語彙分類・ego座標系軌道）
+        self._gru_is_togivad = False
+        self._gru_vocab = None
+        self._gru_pose_source = None
 
         # モデルリストを初期化
         self.refresh_traj_model_list()
@@ -27087,6 +28406,7 @@ class ImageAnnotationTool(QMainWindow):
             "gru": "gru_",
             "tcn": "tcn_",
             "causalcnn": "causal_cnn_",
+            "togivad": "togivad_",
         }
         filter_prefix = arch_to_prefix.get(arch_filter, "")
 

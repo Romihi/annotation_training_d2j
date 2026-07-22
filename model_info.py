@@ -205,6 +205,15 @@ SEQUENCE_MODEL_INFO = {
         'param_count': 3.0,
         'gflops': 0.10,
     },
+    'togivad': {
+        'name': 'TogiVAD-Nano',
+        'description': ('BEV+軌道語彙分類のE2E運転モデル (VADv2式)。'
+                        'ラベルは実測自己位置 (pose既定/slam選択可) の将来軌道'),
+        'backbone': 'TinyBackbone + IPM + BEVEncoder',
+        'temporal': 'なし (単一フレーム + ego status)',
+        'param_count': 1.5,
+        'gflops': 0.9,
+    },
 }
 
 SEQUENCE_PAPER_INFO = {
@@ -227,6 +236,12 @@ SEQUENCE_PAPER_INFO = {
         'year': 2024,
         'url': 'https://arxiv.org/abs/2405.04436',
         'repo': 'https://github.com/CPR-D/TinyLidarNet',
+    },
+    'togivad': {
+        'title': 'VADv2: End-to-End Vectorized Autonomous Driving via Probabilistic Planning',
+        'authors': 'Shaoyu Chen, Bo Jiang, Hao Gao, Bencheng Liao, Qing Xu, Qian Zhang, Chang Huang, Wenyu Liu, Xinggang Wang',
+        'year': 2024,
+        'url': 'https://arxiv.org/abs/2402.13243',
     },
     'mobilenetv3_backbone': {
         'title': 'Searching for MobileNetV3',

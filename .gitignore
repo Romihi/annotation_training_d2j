@@ -202,3 +202,7 @@ NUL
 client_secrets.json
 .google_credentials.json
 pydrive_settings.yaml
+
+# Databricks in-app settings (contains access token)
+databricks_settings.local.json
+databricks_logs/

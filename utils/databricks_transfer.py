@@ -371,14 +371,126 @@ class DatabricksTransferManager:
             except Exception as e:
                 debug_print(f"一時ディレクトリの削除に失敗: {e}")
 
-    def submit_training_workflow(self, zip_remote_path: str, notebook_base_path: str, cluster_id: str) -> dict:
+    # 学習ノートブックの選択肢（model_type -> train ノートブック名）
+    TRAIN_NOTEBOOKS = {
+        "basic": "03_train_model",        # resnet18 angle/throttle 回帰
+        "togivad": "04_train_togivad",    # TogiVAD-Nano 軌道語彙分類
+    }
+
+    # 自動配置対象のノートブック（アプリ内 databricks/ からワークスペースへ）
+    NOTEBOOK_FILES = [
+        "01_extract_annotations",
+        "02_load_annotations",
+        "03_train_model",
+        "04_train_togivad",
+    ]
+
+    def _resolve_notebook_path(self, notebook_base_path: str) -> str:
+        """ノートブックパス中の {user} を現在ユーザーのメールに置換"""
+        if "{user}" in notebook_base_path:
+            try:
+                user = self.client.current_user.me().user_name
+                notebook_base_path = notebook_base_path.replace("{user}", user)
+            except Exception as e:
+                debug_print(f"ユーザー名の取得に失敗（{{user}}未解決）: {e}")
+        return notebook_base_path.rstrip("/")
+
+    def list_clusters(self) -> List[dict]:
+        """ノートブックを実行できる全目的クラスターの一覧を取得
+
+        Returns:
+            [{'id': str, 'name': str, 'state': str}, ...]（新しい順）
         """
-        Databricks Runs Submit APIで3ノートブックをチェーン実行
+        try:
+            from databricks.sdk.service.compute import ClusterSource
+        except Exception:
+            ClusterSource = None
+
+        result = []
+        try:
+            for c in self.client.clusters.list():
+                # ジョブ専用クラスター（JOB由来）は除外し、対話/UI作成のものだけ
+                source = getattr(c, "cluster_source", None)
+                if ClusterSource is not None and source == ClusterSource.JOB:
+                    continue
+                state = getattr(c, "state", None)
+                result.append({
+                    "id": c.cluster_id,
+                    "name": c.cluster_name or c.cluster_id,
+                    "state": state.value if hasattr(state, "value") else str(state),
+                })
+        except Exception as e:
+            debug_print(f"クラスター一覧取得エラー: {e}")
+        return result
+
+    def deploy_notebooks(self, notebook_base_path: str,
+                         local_dir: Optional[str] = None) -> dict:
+        """アプリ同梱のノートブックをワークスペースへ配置（上書き）
+
+        Args:
+            notebook_base_path: 配置先のワークスペースベースパス（{user}可）
+            local_dir: ローカルの databricks ノートブックディレクトリ
+                       （Noneならこのファイルからの相対で自動解決）
+
+        Returns:
+            {'success': bool, 'deployed': [name...], 'base_path': str, 'error': str?}
+        """
+        import base64
+        from databricks.sdk.service.workspace import ImportFormat, Language
+
+        base_path = self._resolve_notebook_path(notebook_base_path)
+        if local_dir is None:
+            app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            local_dir = os.path.join(app_dir, "databricks")
+
+        debug_print(f"ノートブック配置開始: {local_dir} -> {base_path}")
+        try:
+            self.client.workspace.mkdirs(base_path)
+        except Exception as e:
+            debug_print(f"ディレクトリ作成（既存なら無視）: {e}")
+
+        deployed = []
+        try:
+            for name in self.NOTEBOOK_FILES:
+                local_path = os.path.join(local_dir, f"{name}.py")
+                if not os.path.exists(local_path):
+                    debug_print(f"スキップ（ファイル無し）: {local_path}")
+                    continue
+                with open(local_path, "rb") as f:
+                    content_b64 = base64.b64encode(f.read()).decode("utf-8")
+                self.client.workspace.import_(
+                    path=f"{base_path}/{name}",
+                    content=content_b64,
+                    format=ImportFormat.SOURCE,
+                    language=Language.PYTHON,
+                    overwrite=True,
+                )
+                deployed.append(name)
+                debug_print(f"配置完了: {base_path}/{name}")
+            return {"success": True, "deployed": deployed, "base_path": base_path}
+        except Exception as e:
+            debug_print(f"ノートブック配置エラー: {e}")
+            return {"success": False, "deployed": deployed,
+                    "base_path": base_path, "error": str(e)}
+
+    def submit_training_workflow(self, zip_remote_path: str, notebook_base_path: str,
+                                 cluster_id: str = "", model_type: str = "basic",
+                                 train_params: Optional[Dict[str, Any]] = None,
+                                 use_serverless: bool = False) -> dict:
+        """
+        Databricks Runs Submit APIで extract→load→train の3タスクをチェーン実行
 
         Args:
             zip_remote_path: アップロード済みZIPファイルのリモートパス
-            notebook_base_path: ノートブックのワークスペースベースパス
-            cluster_id: 既存クラスターID
+            notebook_base_path: ノートブックのワークスペースベースパス（{user}可）
+            cluster_id: 既存クラスターID（サーバーレス実行時は空でよい）
+            model_type: 学習モデル種別 "basic"（既定）| "togivad"
+            train_params: 学習ハイパラ。trainノートブックのwidgetsへ渡す
+                          （例: {"epochs": 10, "batch_size": 32, "learning_rate": 0.001,
+                                 "image_column": "cam/image_array"}）
+            use_serverless: True または cluster_id が空の場合、クラスターを指定せず
+                            サーバーレスコンピュートで実行する（フリープラン対応）。
+                            各ノートブックは冒頭の %pip install で依存を導入する。
 
         Returns:
             {"run_id": int, "run_url": str}
@@ -388,46 +500,264 @@ class DatabricksTransferManager:
         """
         from databricks.sdk.service.jobs import SubmitTask, NotebookTask, TaskDependency
 
+        base_path = self._resolve_notebook_path(notebook_base_path)
         extract_path = zip_remote_path.replace(".zip", "")
+        train_notebook = self.TRAIN_NOTEBOOKS.get(model_type,
+                                                  self.TRAIN_NOTEBOOKS["basic"])
 
-        debug_print(f"ワークフロー送信: zip={zip_remote_path}, notebooks={notebook_base_path}, cluster={cluster_id}")
+        serverless = bool(use_serverless or not cluster_id)
+        # クラスター実行時のみ existing_cluster_id を付与（サーバーレスは無指定）
+        compute_kwargs = {} if serverless else {"existing_cluster_id": cluster_id}
+
+        # widgetsへ渡すパラメータは文字列化する（data_pathは必ず付与）
+        train_base_params = {"data_path": extract_path}
+        for k, v in (train_params or {}).items():
+            if v is not None:
+                train_base_params[str(k)] = str(v)
+
+        debug_print(f"ワークフロー送信: zip={zip_remote_path}, notebooks={base_path}, "
+                    f"compute={'serverless' if serverless else cluster_id}, "
+                    f"model_type={model_type}, train={train_notebook}, "
+                    f"params={train_base_params}")
 
         wait = self.client.jobs.submit(
-            run_name=f"auto_train_{os.path.basename(zip_remote_path)}",
+            run_name=f"auto_train_{model_type}_{os.path.basename(zip_remote_path)}",
             tasks=[
                 SubmitTask(
                     task_key="extract",
-                    existing_cluster_id=cluster_id,
                     notebook_task=NotebookTask(
-                        notebook_path=f"{notebook_base_path}/01_extract_annotations",
+                        notebook_path=f"{base_path}/01_extract_annotations",
                         base_parameters={"zip_path": zip_remote_path}
-                    )
+                    ),
+                    **compute_kwargs
                 ),
                 SubmitTask(
                     task_key="load",
                     depends_on=[TaskDependency(task_key="extract")],
-                    existing_cluster_id=cluster_id,
                     notebook_task=NotebookTask(
-                        notebook_path=f"{notebook_base_path}/02_load_annotations",
+                        notebook_path=f"{base_path}/02_load_annotations",
                         base_parameters={"data_path": extract_path}
-                    )
+                    ),
+                    **compute_kwargs
                 ),
                 SubmitTask(
                     task_key="train",
                     depends_on=[TaskDependency(task_key="load")],
-                    existing_cluster_id=cluster_id,
                     notebook_task=NotebookTask(
-                        notebook_path=f"{notebook_base_path}/03_train_model",
-                        base_parameters={"data_path": extract_path}
-                    )
+                        notebook_path=f"{base_path}/{train_notebook}",
+                        base_parameters=train_base_params
+                    ),
+                    **compute_kwargs
                 ),
             ]
         )
 
         run_id = wait.response.run_id
-        run_url = f"{config_databricks.DATABRICKS_HOST}#job/{run_id}"
+        run_url = f"{config_databricks.DATABRICKS_HOST.rstrip('/')}/#job/{run_id}"
         debug_print(f"ワークフロー送信完了: run_id={run_id}, url={run_url}")
         return {"run_id": run_id, "run_url": run_url}
+
+    def get_run_status(self, run_id: int) -> dict:
+        """ジョブRunの状態を取得（ポーリング用）
+
+        Returns:
+            {
+              'run_id': int,
+              'life_cycle_state': str,   # PENDING/RUNNING/TERMINATED/...
+              'result_state': str|None,  # SUCCESS/FAILED/CANCELED/...（完了時）
+              'is_terminal': bool,
+              'state_message': str,
+              'run_url': str,
+              'tasks': [{'key': str, 'life_cycle_state': str, 'result_state': str|None}]
+            }
+        """
+        run = self.client.jobs.get_run(run_id)
+        state = run.state
+        life = getattr(state, "life_cycle_state", None)
+        result = getattr(state, "result_state", None)
+        life_str = life.value if hasattr(life, "value") else str(life) if life else ""
+        result_str = result.value if hasattr(result, "value") else (
+            str(result) if result else None)
+
+        terminal_states = {"TERMINATED", "SKIPPED", "INTERNAL_ERROR"}
+        is_terminal = life_str in terminal_states
+
+        tasks = []
+        for t in (run.tasks or []):
+            t_state = getattr(t, "state", None)
+            t_life = getattr(t_state, "life_cycle_state", None)
+            t_result = getattr(t_state, "result_state", None)
+            tasks.append({
+                "key": t.task_key,
+                "life_cycle_state": (t_life.value if hasattr(t_life, "value")
+                                     else str(t_life) if t_life else ""),
+                "result_state": (t_result.value if hasattr(t_result, "value")
+                                 else str(t_result) if t_result else None),
+            })
+
+        return {
+            "run_id": run_id,
+            "life_cycle_state": life_str,
+            "result_state": result_str,
+            "is_terminal": is_terminal,
+            "state_message": getattr(state, "state_message", "") or "",
+            "run_url": run.run_page_url or
+                       f"{config_databricks.DATABRICKS_HOST.rstrip('/')}/#job/{run_id}",
+            "tasks": tasks,
+        }
+
+    def list_recent_runs(self, limit: int = 20) -> List[dict]:
+        """最近のジョブRun一覧を取得（ログ取得の選択用）
+
+        Returns:
+            [{'run_id': int, 'run_name': str, 'life_cycle_state': str,
+              'result_state': str|None, 'start_time': int}, ...]（新しい順）
+        """
+        runs = []
+        # jobs.list_runs は1リクエストのlimit上限が25。SDKのイテレータが
+        # page_token で自動ページングするため、ページサイズは25に固定し、
+        # 目的件数(limit)に達したら打ち切る。
+        page_size = 25
+        try:
+            for r in self.client.jobs.list_runs(limit=page_size,
+                                                completed_only=False):
+                state = getattr(r, "state", None)
+                life = getattr(state, "life_cycle_state", None)
+                res = getattr(state, "result_state", None)
+                runs.append({
+                    "run_id": r.run_id,
+                    "run_name": r.run_name or str(r.run_id),
+                    "life_cycle_state": (life.value if hasattr(life, "value")
+                                         else str(life) if life else ""),
+                    "result_state": (res.value if hasattr(res, "value")
+                                     else str(res) if res else None),
+                    "start_time": getattr(r, "start_time", 0) or 0,
+                })
+                if len(runs) >= limit:
+                    break
+        except Exception as e:
+            debug_print(f"Run一覧取得エラー: {e}")
+        return runs
+
+    def get_run_logs(self, run_id: int) -> dict:
+        """ジョブRunの全タスクのログ・エラー・ノートブック出力をまとめて取得
+
+        Returns:
+            {
+              'run_id': int, 'run_name': str, 'run_url': str,
+              'tasks': [{'key','task_run_id','life_cycle_state','result_state',
+                         'logs','error','error_trace','notebook_result'}]
+            }
+        """
+        run = self.client.jobs.get_run(run_id)
+        tasks_out = []
+        for t in (run.tasks or []):
+            state = getattr(t, "state", None)
+            life = getattr(state, "life_cycle_state", None)
+            res = getattr(state, "result_state", None)
+            entry = {
+                "key": t.task_key,
+                "task_run_id": t.run_id,
+                "life_cycle_state": (life.value if hasattr(life, "value")
+                                     else str(life) if life else ""),
+                "result_state": (res.value if hasattr(res, "value")
+                                 else str(res) if res else None),
+                "logs": "", "error": "", "error_trace": "",
+                "notebook_result": None,
+            }
+            try:
+                out = self.client.jobs.get_run_output(t.run_id)
+                nb = getattr(out, "notebook_output", None)
+                entry["notebook_result"] = getattr(nb, "result", None) if nb else None
+                entry["logs"] = out.logs or ""
+                entry["error"] = out.error or ""
+                entry["error_trace"] = out.error_trace or ""
+            except Exception as e:
+                entry["error"] = f"(ログ取得エラー: {e})"
+            tasks_out.append(entry)
+
+        return {
+            "run_id": run_id,
+            "run_name": run.run_name or "",
+            "run_url": run.run_page_url or
+                       f"{config_databricks.DATABRICKS_HOST.rstrip('/')}/#job/{run_id}",
+            "tasks": tasks_out,
+        }
+
+    @staticmethod
+    def format_run_logs(logs: dict) -> str:
+        """get_run_logs の結果を1つのテキストに整形（表示・保存用）"""
+        lines = [
+            "=" * 70,
+            f"Run ID   : {logs.get('run_id')}",
+            f"Run name : {logs.get('run_name', '')}",
+            f"URL      : {logs.get('run_url', '')}",
+            "=" * 70,
+        ]
+        for t in logs.get("tasks", []):
+            lines.append("")
+            lines.append("-" * 70)
+            lines.append(f"[TASK] {t['key']}  (task_run_id={t['task_run_id']})")
+            lines.append(f"  state : {t['life_cycle_state']} "
+                         f"{t.get('result_state') or ''}".rstrip())
+            lines.append("-" * 70)
+            if t.get("error"):
+                lines.append("■ ERROR:")
+                lines.append(t["error"])
+            if t.get("error_trace"):
+                lines.append("■ ERROR TRACE:")
+                lines.append(t["error_trace"])
+            if t.get("notebook_result"):
+                lines.append("■ NOTEBOOK RESULT:")
+                lines.append(str(t["notebook_result"]))
+            if t.get("logs"):
+                lines.append("■ LOGS (stdout/stderr):")
+                lines.append(t["logs"])
+            if not any(t.get(k) for k in
+                       ("error", "error_trace", "notebook_result", "logs")):
+                lines.append("(出力・ログはありません。実行中/未開始の可能性があります)")
+        return "\n".join(lines)
+
+    def download_file(self, remote_path: str, local_path: str,
+                      progress_callback: Optional[Callable[[int, int], None]] = None
+                      ) -> bool:
+        """Volumes上のファイルをローカルへダウンロード
+
+        Args:
+            remote_path: Volumes内の相対パスまたは /Volumes フルパス
+            local_path: 保存先ローカルパス
+            progress_callback: (downloaded_bytes, total_bytes) 進捗
+
+        Returns:
+            成功した場合True
+        """
+        if not remote_path.startswith("/Volumes"):
+            full_path = f"{self.volumes_path}/{remote_path}"
+        else:
+            full_path = remote_path
+
+        debug_print(f"ダウンロード開始: {full_path} -> {local_path}")
+        os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
+        try:
+            resp = self.client.files.download(full_path)
+            # DownloadResponse.contents はストリーム（read可能）
+            stream = getattr(resp, "contents", resp)
+            total = int(getattr(resp, "content_length", 0) or 0)
+            written = 0
+            with open(local_path, "wb") as out:
+                while True:
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    written += len(chunk)
+                    if progress_callback:
+                        progress_callback(written, total or written)
+            debug_print(f"ダウンロード完了: {written / (1024*1024):.2f} MB")
+            return True
+        except Exception as e:
+            debug_print(f"ダウンロードエラー: {e}")
+            raise
 
     def list_remote_files(self, remote_path: str = "") -> List[dict]:
         """リモートのファイル一覧を取得

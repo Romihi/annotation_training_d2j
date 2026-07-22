@@ -161,6 +161,32 @@ class PoseSourceManager:
             ]
         return self._available_sources_cache
 
+    def heading_varies(self, source: str, min_range_rad: float = 0.087) -> bool:
+        """source の方位(theta)が実際に変化するか（凍結ヨーの検出）。
+
+        pose の BNO055 が未校正等でヨーが凍結すると theta が全フレーム一定になり、
+        デッドレコニング位置も凍結方位に沿って直進する。その結果 ego 座標系の
+        将来軌道が常に真っ直ぐ（横方向=0）になってしまう。theta の範囲が
+        min_range_rad(既定 ~5°)未満なら凍結とみなし False を返す。
+        """
+        thetas = [s[source].theta for s in self._raw.values() if source in s]
+        if len(thetas) < 2:
+            return False
+        return (max(thetas) - min(thetas)) > min_range_rad
+
+    def best_trajectory_source(self, priority=("pose", "slam", "vslam")) -> Optional[str]:
+        """走行軌道に使える（方位が凍結していない）ソースを優先順で返す。
+
+        pose を優先しつつ、pose のヨーが凍結しているセッションでは slam 等へ
+        フォールバックする。どれも使えなければ available_sources の先頭。
+        """
+        available = set(self.available_sources())
+        for src in priority:
+            if src in available and self.heading_varies(src):
+                return src
+        avail = self.available_sources()
+        return avail[0] if avail else None
+
     def _is_degenerate(self, source: str) -> bool:
         """値が全く変化しない（＝未稼働・センサー未接続）ソースを検出"""
         xs: List[float] = []
@@ -361,15 +387,20 @@ class PoseSourceManager:
 
     def compute_future_trajectory(self, index: int, horizon: int = 20, dt: float = 0.05,
                                    max_dt_gap_s: float = 0.5,
-                                   exclude: Optional[Set[int]] = None) -> Optional[np.ndarray]:
+                                   exclude: Optional[Set[int]] = None,
+                                   prefer: Optional[str] = None) -> Optional[np.ndarray]:
         """フレームindexから horizon*dt 秒先までの ego座標系将来軌道 (horizon, 2)。
 
         togivad/dataset.py::future_trajectory と同じ出力仕様（+X前方/+Y左、
         t=dt..horizon*dtの等間隔点）だが、speed+yawレートの積分ではなく
         実測pose系列（get_pose、上書き/補間を反映）から直接ego座標変換する。
         作成できなければNoneを返す。
+
+        prefer でソースを指定できる（例: togivad学習の "pose"（既定）/"slam"。
+        get_pose と同じ意味論で、指定ソースが無いフレームは優先順位に
+        フォールバックする）。
         """
-        origin = self.get_pose(index)
+        origin = self.get_pose(index, prefer=prefer)
         if origin is None:
             return None
         t0 = self._timestamps_ms.get(index)
@@ -396,7 +427,7 @@ class PoseSourceManager:
                 break
 
             if idx_b not in exclude:
-                pose_b = self.get_pose(idx_b)
+                pose_b = self.get_pose(idx_b, prefer=prefer)
                 if pose_b is not None:
                     ts.append((tb - t0) / 1000.0)
                     xs.append(pose_b.x)
@@ -419,6 +450,33 @@ class PoseSourceManager:
         x_ego = dx * cos_t + dy * sin_t
         y_ego = -dx * sin_t + dy * cos_t
         return np.stack([x_ego, y_ego], axis=1)
+
+
+    def yaw_rate(self, index: int, prefer: Optional[str] = None,
+                 max_dt_gap_s: float = 0.5) -> float:
+        """フレームindexのヨーレート [rad/s]（次の既知フレームとのtheta差分）。
+
+        togivad学習の ego 入力用。学習ラベル（compute_future_trajectory）と
+        同じソース選択(prefer)・同じ実測系列から作ることで情報源を揃える。
+        次フレームが無い/時間ギャップが大きい場合は 0.0。
+        """
+        t0 = self._timestamps_ms.get(index)
+        p0 = self.get_pose(index, prefer=prefer)
+        if t0 is None or p0 is None:
+            return 0.0
+        later = [k for k in self._timestamps_ms.keys() if k > index]
+        if not later:
+            return 0.0
+        idx_b = min(later)
+        t1 = self._timestamps_ms[idx_b]
+        dtau = (t1 - t0) / 1000.0
+        if dtau <= 1e-6 or dtau > max_dt_gap_s:
+            return 0.0
+        p1 = self.get_pose(idx_b, prefer=prefer)
+        if p1 is None:
+            return 0.0
+        d = (p1.theta - p0.theta + math.pi) % (2 * math.pi) - math.pi
+        return d / dtau
 
 
 def _interpolate_angle(a: float, b: float, ratio: float) -> float:

@@ -6,6 +6,7 @@ PoseSourceManagerが読み取ったpose/slam/vslam/arucoの軌跡を2Dプロッ�
 ソース切替・色分け・現在フレームのハイライト・軌跡クリックによるフレームジャンプを提供する。
 背景にはROS map_server形式（.yaml + .pgm/.png）のSLAM地図を重畳できる。
 """
+import math
 import os
 import yaml
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
@@ -14,8 +15,10 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBo
 from PyQt5.QtCore import Qt, pyqtSignal
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
+from matplotlib.patches import RegularPolygon
 
 from translations import get_text
 
@@ -136,9 +139,16 @@ class MapViewWidget(QWidget):
         self.figure = Figure(figsize=(5, 5))
         self.canvas = FigureCanvas(self.figure)
         self.ax = self.figure.add_subplot(111)
+
+        # matplotlib 標準のナビゲーションツールバー（ホーム/平行移動(pan)/
+        # ズーム矩形/保存）。pan・zoom はボタンで切替、Home で全体表示に戻る。
+        self.nav_toolbar = NavigationToolbar(self.canvas, self)
+        layout.addWidget(self.nav_toolbar)
         layout.addWidget(self.canvas)
 
         self.canvas.mpl_connect('pick_event', self._on_pick)
+        # マウスホイールでカーソル位置を中心にズーム（pan/zoomモード不要）
+        self.canvas.mpl_connect('scroll_event', self._on_scroll)
 
     # --- 外部インターフェース -------------------------------------------------
 
@@ -207,10 +217,35 @@ class MapViewWidget(QWidget):
                 pass
             self._current_marker = None
         if pose is not None:
-            self._current_marker, = self.ax.plot(
-                [pose.x], [pose.y], marker='o', markersize=12,
-                markerfacecolor='none', markeredgecolor='red', markeredgewidth=2, zorder=3
-            )
+            # 現在位置は進行方向を向いた赤い三角で表示する。三角の大きさは
+            # 現在の表示範囲に対する一定割合にして、ズームしても見やすく保つ。
+            xlim = self.ax.get_xlim()
+            ylim = self.ax.get_ylim()
+            span = max(abs(xlim[1] - xlim[0]), abs(ylim[1] - ylim[0]), 1e-6)
+            radius = span * 0.02
+            # RegularPolygon の orientation は +Y を 0 とするため theta-π/2 で
+            # マップ方位（+X 基準）に合わせる。theta が無ければ上向き。
+            theta = getattr(pose, 'theta', 0.0) or 0.0
+            self._current_marker = RegularPolygon(
+                (pose.x, pose.y), numVertices=3, radius=radius,
+                orientation=theta - math.pi / 2.0,
+                facecolor='red', edgecolor='darkred', linewidth=1.0, zorder=5)
+            self.ax.add_patch(self._current_marker)
+        self.canvas.draw_idle()
+
+    def _on_scroll(self, event):
+        """マウスホイールでカーソル位置を中心にズームする。"""
+        if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
+            return
+        scale = 0.8 if event.button == 'up' else 1.25   # up=拡大 / down=縮小
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        cx, cy = event.xdata, event.ydata
+        # カーソル位置を固定点にして各軸を scale 倍に伸縮
+        new_xlim = (cx + (xlim[0] - cx) * scale, cx + (xlim[1] - cx) * scale)
+        new_ylim = (cy + (ylim[0] - cy) * scale, cy + (ylim[1] - cy) * scale)
+        self.ax.set_xlim(new_xlim)
+        self.ax.set_ylim(new_ylim)
         self.canvas.draw_idle()
 
     def refresh(self) -> None:

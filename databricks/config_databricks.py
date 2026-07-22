@@ -18,6 +18,17 @@ import os
 from translations import get_text
 
 # ===========================================
+# アプリ内保存の設定ストアを os.environ に反映
+# （環境変数を読む前に呼ぶ。ストアの非空値が環境変数を上書きする）
+# ===========================================
+try:
+    from databricks import settings_store as _settings_store
+    _settings_store.load_and_apply()
+except Exception as _e:  # ストアが無い/壊れていても環境変数だけで動作可能
+    _settings_store = None
+    print(f"[config_databricks] 設定ストアの読み込みをスキップ: {_e}")
+
+# ===========================================
 # 環境変数から設定を読み込み
 # ===========================================
 
@@ -138,3 +149,77 @@ def print_config_status():
 def get_env_template():
     """環境変数設定のテンプレートを返す"""
     return get_text('msg_databricks_env_template')
+
+# ===========================================
+# 設定の再読込・保存（アプリ内編集用・再起動不要）
+# ===========================================
+
+def reload():
+    """設定ストア→os.environ を再適用し、モジュール変数を再読込する。
+
+    アプリ内で設定を変更・保存した直後に呼ぶことで、アプリを再起動せずに
+    新しい設定（HOST/TOKEN/VOLUMES/CLUSTER等）を反映できる。
+    モジュール属性として参照している側（config_databricks.DATABRICKS_HOST 等）
+    は最新値を得られる（トップレベルで from ... import した名前は更新されない
+    点に注意。接続処理は config_databricks.X の形で参照すること）。
+    """
+    global DATABRICKS_ENABLED, DATABRICKS_HOST, DATABRICKS_TOKEN
+    global DATABRICKS_EXPERIMENT_PREFIX, DATABRICKS_MODEL_REGISTRY_CATALOG
+    global DATABRICKS_MODEL_REGISTRY_SCHEMA, DATABRICKS_CLUSTER_ID
+    global DATABRICKS_NOTEBOOK_PATH, DATABRICKS_VOLUMES_PATH
+
+    if _settings_store is not None:
+        try:
+            _settings_store.load_and_apply()
+        except Exception as e:
+            print(f"[config_databricks] reload時のストア適用に失敗: {e}")
+
+    DATABRICKS_ENABLED = _get_bool_env("DATABRICKS_ENABLED", False)
+    DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST", "")
+    DATABRICKS_TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
+    DATABRICKS_EXPERIMENT_PREFIX = os.environ.get(
+        "DATABRICKS_EXPERIMENT_PREFIX", "/Shared/annotation_tool_experiments")
+    DATABRICKS_MODEL_REGISTRY_CATALOG = os.environ.get("DATABRICKS_CATALOG", "main")
+    DATABRICKS_MODEL_REGISTRY_SCHEMA = os.environ.get("DATABRICKS_SCHEMA", "default")
+    DATABRICKS_CLUSTER_ID = os.environ.get("DATABRICKS_CLUSTER_ID", "")
+    DATABRICKS_NOTEBOOK_PATH = os.environ.get(
+        "DATABRICKS_NOTEBOOK_PATH",
+        "/Workspace/Users/{user}/annotation_training_d2j/databricks")
+    DATABRICKS_VOLUMES_PATH = os.environ.get(
+        "DATABRICKS_VOLUMES_PATH", "/Volumes/workspace/default/annotation_data")
+
+
+def save_settings(new_values: dict) -> str:
+    """アプリ内で編集した設定を永続化し、即時反映する。
+
+    Args:
+        new_values: {環境変数名: 値} の辞書（settings_store.SETTINGS_KEYS のキー）
+
+    Returns:
+        保存先ファイルパス（ストアが無い場合は空文字）
+    """
+    path = ""
+    if _settings_store is not None:
+        path = _settings_store.save(new_values)
+    else:
+        # ストアが使えない場合でも当該セッションには反映する
+        for k, v in new_values.items():
+            if v is not None and str(v) != "":
+                os.environ[k] = str(v)
+    reload()
+    return path
+
+
+def get_all_settings() -> dict:
+    """現在の全設定値を辞書で返す（設定ダイアログの初期表示用）"""
+    return {
+        "DATABRICKS_ENABLED": "true" if DATABRICKS_ENABLED else "false",
+        "DATABRICKS_HOST": DATABRICKS_HOST,
+        "DATABRICKS_TOKEN": DATABRICKS_TOKEN,
+        "DATABRICKS_EXPERIMENT_PREFIX": DATABRICKS_EXPERIMENT_PREFIX,
+        "DATABRICKS_VOLUMES_PATH": DATABRICKS_VOLUMES_PATH,
+        "DATABRICKS_CLUSTER_ID": DATABRICKS_CLUSTER_ID,
+        "DATABRICKS_NOTEBOOK_PATH": DATABRICKS_NOTEBOOK_PATH,
+        "DATABRICKS_CATALOG": DATABRICKS_MODEL_REGISTRY_CATALOG,
+        "DATABRICKS_SCHEMA": DATABRICKS_MODEL_REGISTRY_SCHEMA,
+    }
