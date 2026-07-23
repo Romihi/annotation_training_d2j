@@ -44,6 +44,9 @@ def _get_bool_env(key: str, default: bool = False) -> bool:
 # Databricks連携の有効/無効
 DATABRICKS_ENABLED = _get_bool_env("DATABRICKS_ENABLED", False)
 
+# 認証方式: "pat"（Personal Access Token・既定）| "oauth-u2m"（ブラウザOAuth）
+DATABRICKS_AUTH_METHOD = os.environ.get("DATABRICKS_AUTH_METHOD", "pat")
+
 # Databricks認証設定（環境変数から取得）
 DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST", "")
 DATABRICKS_TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
@@ -93,7 +96,8 @@ def validate_databricks_config():
         elif not DATABRICKS_HOST.startswith("https://"):
             errors.append(get_text('msg_env_host_https_required'))
 
-        if not DATABRICKS_TOKEN:
+        # PAT方式のみトークン必須。OAuth(U2M)はブラウザ認証のためトークン不要
+        if DATABRICKS_AUTH_METHOD != "oauth-u2m" and not DATABRICKS_TOKEN:
             errors.append(get_text('msg_env_token_not_set'))
 
     return errors
@@ -164,6 +168,7 @@ def reload():
     点に注意。接続処理は config_databricks.X の形で参照すること）。
     """
     global DATABRICKS_ENABLED, DATABRICKS_HOST, DATABRICKS_TOKEN
+    global DATABRICKS_AUTH_METHOD
     global DATABRICKS_EXPERIMENT_PREFIX, DATABRICKS_MODEL_REGISTRY_CATALOG
     global DATABRICKS_MODEL_REGISTRY_SCHEMA, DATABRICKS_CLUSTER_ID
     global DATABRICKS_NOTEBOOK_PATH, DATABRICKS_VOLUMES_PATH
@@ -175,6 +180,7 @@ def reload():
             print(f"[config_databricks] reload時のストア適用に失敗: {e}")
 
     DATABRICKS_ENABLED = _get_bool_env("DATABRICKS_ENABLED", False)
+    DATABRICKS_AUTH_METHOD = os.environ.get("DATABRICKS_AUTH_METHOD", "pat")
     DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST", "")
     DATABRICKS_TOKEN = os.environ.get("DATABRICKS_TOKEN", "")
     DATABRICKS_EXPERIMENT_PREFIX = os.environ.get(
@@ -214,6 +220,7 @@ def get_all_settings() -> dict:
     """現在の全設定値を辞書で返す（設定ダイアログの初期表示用）"""
     return {
         "DATABRICKS_ENABLED": "true" if DATABRICKS_ENABLED else "false",
+        "DATABRICKS_AUTH_METHOD": DATABRICKS_AUTH_METHOD,
         "DATABRICKS_HOST": DATABRICKS_HOST,
         "DATABRICKS_TOKEN": DATABRICKS_TOKEN,
         "DATABRICKS_EXPERIMENT_PREFIX": DATABRICKS_EXPERIMENT_PREFIX,

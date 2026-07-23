@@ -26,6 +26,7 @@ SETTINGS_PATH = os.path.join(_APP_DIR, "databricks_settings.local.json")
 # 永続化するキー（すべて DATABRICKS_ プレフィックスの環境変数名と一致させる）
 SETTINGS_KEYS = [
     "DATABRICKS_ENABLED",
+    "DATABRICKS_AUTH_METHOD",
     "DATABRICKS_HOST",
     "DATABRICKS_TOKEN",
     "DATABRICKS_EXPERIMENT_PREFIX",

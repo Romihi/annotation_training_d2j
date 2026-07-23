@@ -115,18 +115,27 @@ class MLflowManager:
             print(f"Databricks設定エラー: {errors}")
             return False
 
-        # HOST/TOKENが空の場合はエラー（環境変数未設定でUIから有効化した場合）
+        # HOSTは必須
         if not db_config.DATABRICKS_HOST:
             print("Databricks設定エラー: DATABRICKS_HOST が設定されていません")
             return False
-        if not db_config.DATABRICKS_TOKEN:
+
+        auth_method = getattr(db_config, "DATABRICKS_AUTH_METHOD", "pat")
+        # PAT方式のみトークン必須（OAuth U2Mはブラウザ認証のため不要）
+        if auth_method != "oauth-u2m" and not db_config.DATABRICKS_TOKEN:
             print("Databricks設定エラー: DATABRICKS_TOKEN が設定されていません")
             return False
 
         try:
-            # Databricks認証情報を環境変数に設定
+            # MLflow（databricks-sdk経由）の認証情報を環境変数で指定
             os.environ["DATABRICKS_HOST"] = db_config.DATABRICKS_HOST
-            os.environ["DATABRICKS_TOKEN"] = db_config.DATABRICKS_TOKEN
+            if auth_method == "oauth-u2m":
+                # OAuth U2M: トークンは使わず、SDKのブラウザ認証＋キャッシュに委ねる
+                os.environ["DATABRICKS_AUTH_TYPE"] = "external-browser"
+                os.environ.pop("DATABRICKS_TOKEN", None)
+            else:
+                os.environ["DATABRICKS_TOKEN"] = db_config.DATABRICKS_TOKEN
+                os.environ.pop("DATABRICKS_AUTH_TYPE", None)
 
             # MLflowのトラッキングURIをDatabricksに設定
             self.tracking_uri = "databricks"

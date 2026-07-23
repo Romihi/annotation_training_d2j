@@ -16885,6 +16885,14 @@ class ImageAnnotationTool(QMainWindow):
         enabled_check.setChecked(current.get("DATABRICKS_ENABLED") == "true")
         form.addRow(get_text('db_field_enabled'), enabled_check)
 
+        # 認証方式（PAT / OAuth U2M ブラウザ認証）
+        auth_combo = QComboBox()
+        auth_combo.addItem(get_text('db_auth_pat'), "pat")
+        auth_combo.addItem(get_text('db_auth_oauth'), "oauth-u2m")
+        auth_combo.setCurrentIndex(
+            1 if current.get("DATABRICKS_AUTH_METHOD", "pat") == "oauth-u2m" else 0)
+        form.addRow(get_text('db_field_auth_method'), auth_combo)
+
         host_edit = QLineEdit(current.get("DATABRICKS_HOST", ""))
         host_edit.setPlaceholderText("https://xxx.cloud.databricks.com")
         form.addRow("Host:", host_edit)
@@ -16892,7 +16900,21 @@ class ImageAnnotationTool(QMainWindow):
         token_edit = QLineEdit(current.get("DATABRICKS_TOKEN", ""))
         token_edit.setEchoMode(QLineEdit.Password)
         token_edit.setPlaceholderText("dapi...")
-        form.addRow("Token:", token_edit)
+        token_label = QLabel("Token:")
+        form.addRow(token_label, token_edit)
+
+        oauth_hint = QLabel(get_text('db_auth_oauth_hint'))
+        oauth_hint.setWordWrap(True)
+        oauth_hint.setStyleSheet("color: gray; font-size: 11px;")
+        form.addRow("", oauth_hint)
+
+        def _on_auth_changed():
+            is_oauth = auth_combo.currentData() == "oauth-u2m"
+            token_label.setVisible(not is_oauth)
+            token_edit.setVisible(not is_oauth)
+            oauth_hint.setVisible(is_oauth)
+        auth_combo.currentIndexChanged.connect(_on_auth_changed)
+        _on_auth_changed()
 
         prefix_edit = QLineEdit(current.get("DATABRICKS_EXPERIMENT_PREFIX", ""))
         form.addRow(get_text('db_field_experiment'), prefix_edit)
@@ -16940,6 +16962,7 @@ class ImageAnnotationTool(QMainWindow):
                    or cluster_combo.currentText() or "").strip()
             return {
                 "DATABRICKS_ENABLED": "true" if enabled_check.isChecked() else "false",
+                "DATABRICKS_AUTH_METHOD": auth_combo.currentData(),
                 "DATABRICKS_HOST": host_edit.text().strip().rstrip('/'),
                 "DATABRICKS_TOKEN": token_edit.text().strip(),
                 "DATABRICKS_EXPERIMENT_PREFIX": prefix_edit.text().strip(),

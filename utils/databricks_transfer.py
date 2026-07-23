@@ -40,12 +40,24 @@ class DatabricksTransferManager:
 
     @property
     def client(self) -> WorkspaceClient:
-        """WorkspaceClientを取得（遅延初期化）"""
+        """WorkspaceClientを取得（遅延初期化・認証方式で分岐）
+
+        - pat（既定）: Personal Access Token
+        - oauth-u2m: ブラウザOAuth（初回にブラウザが開き、以後はSDKが
+          ~/.databricks/token-cache.json のトークンを自動更新して再利用）
+        """
         if self._client is None:
-            self._client = WorkspaceClient(
-                host=config_databricks.DATABRICKS_HOST,
-                token=config_databricks.DATABRICKS_TOKEN
-            )
+            method = getattr(config_databricks, "DATABRICKS_AUTH_METHOD", "pat")
+            if method == "oauth-u2m":
+                self._client = WorkspaceClient(
+                    host=config_databricks.DATABRICKS_HOST,
+                    auth_type="external-browser",
+                )
+            else:
+                self._client = WorkspaceClient(
+                    host=config_databricks.DATABRICKS_HOST,
+                    token=config_databricks.DATABRICKS_TOKEN,
+                )
         return self._client
 
     def test_connection(self) -> tuple:

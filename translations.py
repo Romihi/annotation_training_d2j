@@ -1763,6 +1763,10 @@ Google Cloud Console での OAuth設定手順
         # --- Databricks連携（アプリ内設定・転送・学習・監視） ---
         'db_group_connection': '接続設定',
         'db_field_enabled': 'Databricks連携を有効化',
+        'db_field_auth_method': '認証方式:',
+        'db_auth_pat': 'PAT（アクセストークン）',
+        'db_auth_oauth': 'OAuth（ブラウザ認証）',
+        'db_auth_oauth_hint': 'OAuth: 初回の接続時にブラウザが開きログインします。トークンは自動でキャッシュ・更新され、平文保存されません（~/.databricks/token-cache.json）。ヘッドレス実行では使えないためPATをご利用ください。',
         'db_field_experiment': '実験パス:',
         'db_field_volumes': 'Volumesパス:',
         'db_field_notebook': 'ノートブックパス:',
@@ -3497,6 +3501,10 @@ Notes
         # --- Databricks integration (in-app settings / transfer / train / monitor) ---
         'db_group_connection': 'Connection settings',
         'db_field_enabled': 'Enable Databricks integration',
+        'db_field_auth_method': 'Auth method:',
+        'db_auth_pat': 'PAT (access token)',
+        'db_auth_oauth': 'OAuth (browser login)',
+        'db_auth_oauth_hint': 'OAuth: a browser opens on first connection to log in. The token is cached and refreshed automatically and is not stored in plaintext (~/.databricks/token-cache.json). Not usable headless; use PAT for that.',
         'db_field_experiment': 'Experiment path:',
         'db_field_volumes': 'Volumes path:',
         'db_field_notebook': 'Notebook path:',
