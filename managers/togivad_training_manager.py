@@ -56,13 +56,26 @@ class TogivadDataset(Dataset):
 
     def __init__(self, valid_indexes, annotations, images, source_images_map,
                  selected_sources, pose_manager, pose_source, cfg,
-                 exclude=None):
+                 exclude=None, return_prev=False, return_lidar=False,
+                 return_control=False):
         self.cfg = cfg
         self.selected_sources = selected_sources
         self.images = images
         self.source_images_map = source_images_map or {}
         self.vocab = None                     # train() が語彙構築後に設定する
         self._nearest = None                  # nearest_vocab_index（同上）
+        # T1-a: True のとき __getitem__ が前フレーム画像 prev_images と
+        # ego 相対運動 ego_dpose を追加で返す（時系列 2 フレーム展開学習用）。
+        self.return_prev = return_prev
+        # Fusion: True のとき item["lidar_bev"] (1,bev,bev) を追加で返す
+        # （セッションの lidar/{idx}_lidar_distance_array_.npy を
+        # occupancy_from_scan でラスタ化。欠損はゼロ=無情報）。
+        self.return_lidar = return_lidar
+        # Pilot: True のとき item["ctrl"] (2,)=[angle,throttle]（現フレーム t の
+        # 運転アノテーション）を追加で返す。cfg.use_control のとき ego 末尾には
+        # 直前フレーム (t−1) の指令が付く（リーク回避の入出力分離）。
+        self.return_control = return_control
+        self._lidar_meta_cache = {}           # session_dir -> meta dict
 
         self.transform = transforms.Compose([
             transforms.Resize((cfg.image_h, cfg.image_w)),
@@ -73,6 +86,11 @@ class TogivadDataset(Dataset):
 
         exclude = exclude or set()
         self.samples = []                     # [(index, traj(H,2), ego(ego_dim,))]
+        # T1-a: サンプルと同順の前フレーム情報。prev_idx=None は先頭/欠落
+        # （現フレームを複製し dpose=0 で warp 恒等にフォールバック）。
+        self.prev_indexes = []                # [int | None]
+        self.dposes = []                      # [np.ndarray(3,)]
+        self.ctrls = []                       # Pilot: [np.ndarray(2,)] (t の指令)
         for idx in sorted(valid_indexes):
             if not all(self._image_path(idx, s) for s in selected_sources):
                 continue
@@ -88,7 +106,40 @@ class TogivadDataset(Dataset):
             ego = np.concatenate([
                 [speed, yaw_rate],
                 np.zeros(2 * cfg.raceline_points)]).astype(np.float32)
+            if getattr(cfg, "use_control", False):
+                # Pilot: 直前フレーム (t−1) の指令を ego 末尾に追記
+                pa = annotations.get(idx - 1, {})
+                ctrl_prev = np.array(
+                    [float(pa.get("angle", 0.0) or 0.0),
+                     float(pa.get("throttle", 0.0) or 0.0)], np.float32)
+                ego = np.concatenate([ego, ctrl_prev]).astype(np.float32)
             self.samples.append((idx, traj.astype(np.float32), ego))
+            if return_prev:
+                prev_idx, dpose = self._prev_info(
+                    idx, selected_sources, pose_manager, pose_source, exclude)
+                self.prev_indexes.append(prev_idx)
+                self.dposes.append(dpose)
+            if return_control:
+                self.ctrls.append(np.array(
+                    [float(ann.get("angle", 0.0) or 0.0),
+                     float(ann.get("throttle", 0.0) or 0.0)], np.float32))
+
+    def _prev_info(self, idx, selected_sources, pose_manager, pose_source,
+                   exclude):
+        """前フレーム（直前の記録フレーム idx-1）と ego 相対運動 dpose を返す。
+
+        dpose は pose_manager.relative_dpose（実測 pose 差分・_timestamp_ms 由来の
+        実 dt）で計算し、走行軌道表示・学習ラベルと同一情報源に揃える。前フレーム
+        画像が無い / dt ギャップ超過 / pose 欠落なら (None, zeros) で warp 恒等。
+        """
+        prev_idx = idx - 1
+        ok = (prev_idx not in exclude
+              and all(self._image_path(prev_idx, s) for s in selected_sources))
+        dpose = pose_manager.relative_dpose(
+            prev_idx, idx, prefer=pose_source) if ok else None
+        if dpose is None:
+            return None, np.zeros(3, np.float32)
+        return prev_idx, dpose.astype(np.float32)
 
     def _image_path(self, index, source_name):
         if source_name in self.source_images_map:
@@ -110,8 +161,7 @@ class TogivadDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, i):
-        index, traj, ego = self.samples[i]
+    def _load_images(self, index):
         imgs = []
         for source in self.selected_sources:
             path = self._image_path(index, source)
@@ -121,14 +171,55 @@ class TogivadDataset(Dataset):
             except Exception:
                 imgs.append(torch.zeros(
                     3, self.cfg.image_h, self.cfg.image_w))
+        return torch.stack(imgs)                               # (S, 3, H, W)
+
+    def _lidar_occ(self, index):
+        """Fusion: セッションの LiDAR npy → BEV 占有 (1,bev,bev)。欠損はゼロ。
+
+        画像パス（<session>/images/{idx}_..jpg）からセッションを引き、togivad と
+        同一コード（occupancy_from_scan / manifest の角度規約）でラスタ化する。
+        """
+        cfg = self.cfg
+        try:
+            from togivad.dataset import _load_lidar_meta, occupancy_from_scan
+            img = (self.images[index]
+                   if self.images and index < len(self.images)
+                   else self._image_path(index, self.selected_sources[0]))
+            session = os.path.dirname(os.path.dirname(img))
+            prefix = os.path.basename(img).split('_')[0]
+            npy = os.path.join(session, 'lidar',
+                               f'{prefix}_lidar_distance_array_.npy')
+            if not os.path.exists(npy):
+                return np.zeros((1, cfg.bev_size, cfg.bev_size), np.float32)
+            meta = self._lidar_meta_cache.get(session)
+            if meta is None:
+                meta = _load_lidar_meta(session)
+                self._lidar_meta_cache[session] = meta
+            occ, _ = occupancy_from_scan(np.load(npy), meta, cfg)
+            return occ
+        except Exception:
+            return np.zeros((1, cfg.bev_size, cfg.bev_size), np.float32)
+
+    def __getitem__(self, i):
+        index, traj, ego = self.samples[i]
         label = self._nearest(self.vocab, traj)
-        return {
-            "images": torch.stack(imgs),                       # (S, 3, H, W)
+        item = {
+            "images": self._load_images(index),                # (S, 3, H, W)
             "ego": torch.from_numpy(ego),
             "label": torch.tensor(label, dtype=torch.long),
             "traj": torch.from_numpy(traj),                    # (H, 2) 実測GT
             "index": torch.tensor(index),
         }
+        if self.return_prev:                                   # T1-a: 前フレーム
+            prev_idx = self.prev_indexes[i]
+            src = prev_idx if prev_idx is not None else index  # 無ければ現を複製
+            item["prev_images"] = self._load_images(src)
+            item["ego_dpose"] = torch.from_numpy(self.dposes[i])
+        if self.return_lidar:                                  # Fusion: LiDAR占有
+            item["lidar_bev"] = torch.from_numpy(self._lidar_occ(index))
+        if self.return_control:                                # Pilot: 制御教師(t)
+            item["ctrl"] = torch.from_numpy(self.ctrls[i])
+        return item
 
 
 class TogivadTrainingManager:
@@ -181,6 +272,18 @@ class TogivadTrainingManager:
         vocab_k = int(config.get('vocab_k', 128))
         vocab_from_logs = bool(config.get('vocab_from_logs', True))
         ego_dropout = float(config.get('ego_dropout', 0.3))
+        # T1-b: 語彙残差回帰（脱量子化）。既定 False で従来の分類のみ挙動。
+        use_residual = bool(config.get('use_residual', False))
+        lambda_residual = float(config.get('lambda_residual', 1.0))
+        # T1-a: pose-warp 時系列 BEV 融合。前フレーム＋実測 dpose で 2 フレーム展開。
+        use_temporal = bool(config.get('use_temporal', False))
+        # Fusion: LiDAR 占有 BEV を追加入力し 1×1 conv で融合。
+        use_lidar = bool(config.get('use_lidar', False))
+        # Pilot: 制御入出力（模倣 L1 + pure-pursuit 整合 + 平滑の 3 損失）。
+        use_control = bool(config.get('use_control', False))
+        lambda_control = float(config.get('lambda_control', 1.0))
+        lambda_consist = float(config.get('lambda_consist', 0.2))
+        lambda_smooth = float(config.get('lambda_smooth', 0.05))
         epochs = int(config.get('epochs', 20))
         batch_size = int(config.get('batch_size', 16))
         learning_rate = float(config.get('learning_rate', 3e-4))
@@ -196,7 +299,9 @@ class TogivadTrainingManager:
         if pred_points < 1 or pred_seconds <= 0:
             return {"status": "error", "message": "togivad_bad_horizon"}
         dt = pred_seconds / pred_points
-        cfg = make_config(n_cams, vocab_k=vocab_k, horizon=pred_points, dt=dt)
+        cfg = make_config(n_cams, vocab_k=vocab_k, horizon=pred_points, dt=dt,
+                          use_residual=use_residual, use_temporal=use_temporal,
+                          use_lidar=use_lidar, use_control=use_control)
 
         # 1. Dataset構築（品質不良フレームは書き戻しと同様に除外）
         if progress_callback:
@@ -211,7 +316,9 @@ class TogivadTrainingManager:
             valid_indexes=valid_indexes, annotations=annotations,
             images=images, source_images_map=source_images_map,
             selected_sources=selected_sources, pose_manager=pose_manager,
-            pose_source=pose_source, cfg=cfg, exclude=quality_excluded)
+            pose_source=pose_source, cfg=cfg, exclude=quality_excluded,
+            return_prev=use_temporal, return_lidar=use_lidar,
+            return_control=use_control)
 
         if len(dataset) == 0:
             return {"status": "error", "message": "no_sequences"}
@@ -246,6 +353,14 @@ class TogivadTrainingManager:
 
         model_params_total = sum(p.numel() for p in model.parameters())
         vocab_t = torch.as_tensor(vocab, dtype=torch.float32, device=device)
+        # Pilot: 整合正則化の教師（語彙ごとの pure-pursuit 舵。静的）と
+        # control 出力のインデックス（output_spec 単一情報源）
+        steer_vocab = ctl_idx = None
+        if use_control:
+            from togivad.config import output_spec
+            from togivad.train import vocab_pursuit_steering
+            steer_vocab = vocab_pursuit_steering(vocab, cfg).to(device)
+            ctl_idx = output_spec(cfg).index("control")
 
         # 5. Training loop
         train_losses, val_losses = [], []
@@ -268,15 +383,50 @@ class TogivadTrainingManager:
                 ego = batch['ego'].to(device)
                 labels = batch['label'].to(device)
 
+                # Pilot 平滑損失用の直前舵（ego 末尾 2 次元。dropout 前に保持）
+                ang_prev = ego[:, -2].clone() if use_control else None
                 # ego status ショートカット対策（togivad/train.py と同じ）
                 if ego_dropout > 0:
                     drop = (torch.rand(ego.shape[0], 1, device=device)
                             < ego_dropout).float()
                     ego = ego * (1.0 - drop)
 
+                # Fusion: LiDAR 占有ラスタを追加入力（欠損フレームはゼロ）
+                kw = ({"lidar_bev": batch['lidar_bev'].to(device)}
+                      if use_lidar else {})
                 optimizer.zero_grad()
-                _occ, _agents, traj_logits = model(imgs, ego)
+                if use_temporal:
+                    # 前フレームを先に通して生 BEV 状態を得る（勾配は切る）。
+                    # bev_state は常に最終出力。ego は生 BEV に影響しない。
+                    prev_imgs = batch['prev_images'].to(device)
+                    dpose = batch['ego_dpose'].to(device)
+                    with torch.no_grad():
+                        prev_bev = model(prev_imgs, ego)[-1]
+                    out = model(imgs, ego, prev_bev=prev_bev, ego_dpose=dpose,
+                                **kw)
+                else:
+                    out = model(imgs, ego, **kw)
+                traj_logits = out[2]
                 loss = F.cross_entropy(traj_logits, labels)
+                # T1-b: 選択語彙(GT近傍 anchor)＋残差 を実測GTへ回帰
+                if use_residual:
+                    traj_gt = batch['traj'].to(device)          # (B, T, 2)
+                    anchor = vocab_t[labels]                    # (B, T, 2)
+                    pred_traj = anchor + out[3]                 # anchor + residual
+                    loss = loss + lambda_residual * F.smooth_l1_loss(
+                        pred_traj, traj_gt)
+                # Pilot: 模倣 L1 + 選択語彙軌道の pure-pursuit 舵整合 + 平滑
+                if use_control:
+                    ctrl_pred = out[ctl_idx]                    # (B, 2)
+                    ctrl_gt = batch['ctrl'].to(device)
+                    with torch.no_grad():                       # 選択は勾配停止
+                        tgt_steer = steer_vocab[traj_logits.argmax(dim=1)]
+                    loss = loss \
+                        + lambda_control * F.l1_loss(ctrl_pred, ctrl_gt) \
+                        + lambda_consist * F.l1_loss(ctrl_pred[:, 0],
+                                                     tgt_steer) \
+                        + lambda_smooth * (ctrl_pred[:, 0]
+                                           - ang_prev).abs().mean()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
                 optimizer.step()
@@ -299,6 +449,7 @@ class TogivadTrainingManager:
             val_running, val_batches = 0.0, 0
             top1 = top5 = cnt = 0
             ade_sum = 0.0
+            ctl_mae_sum = 0.0
             with torch.no_grad():
                 for batch in val_loader:
                     imgs = batch['images'].to(device)
@@ -306,9 +457,23 @@ class TogivadTrainingManager:
                     labels = batch['label'].to(device)
                     traj_gt = batch['traj'].to(device)
 
-                    _occ, _agents, traj_logits = model(imgs, ego)
+                    kw = ({"lidar_bev": batch['lidar_bev'].to(device)}
+                          if use_lidar else {})
+                    if use_temporal:
+                        prev_imgs = batch['prev_images'].to(device)
+                        dpose = batch['ego_dpose'].to(device)
+                        prev_bev = model(prev_imgs, ego)[-1]
+                        out = model(imgs, ego, prev_bev=prev_bev,
+                                    ego_dpose=dpose, **kw)
+                    else:
+                        out = model(imgs, ego, **kw)
+                    traj_logits = out[2]
                     val_running += F.cross_entropy(traj_logits, labels).item()
                     val_batches += 1
+                    if use_control:                        # Pilot: angle MAE
+                        ctl_mae_sum += (out[ctl_idx][:, 0]
+                                        - batch['ctrl'].to(device)[:, 0]) \
+                            .abs().sum().item()
 
                     pred_idx = traj_logits.argmax(1)
                     top1 += (pred_idx == labels).sum().item()
@@ -316,6 +481,8 @@ class TogivadTrainingManager:
                     top5 += (traj_logits.topk(k, dim=1).indices
                              == labels[:, None]).any(1).sum().item()
                     pred_traj = vocab_t[pred_idx]                  # (B, H, 2)
+                    if use_residual:                               # 実出力=語彙+残差
+                        pred_traj = pred_traj + out[3]
                     ade_sum += torch.linalg.norm(
                         pred_traj - traj_gt, dim=2).mean(1).sum().item()
                     cnt += labels.shape[0]
@@ -336,6 +503,9 @@ class TogivadTrainingManager:
                 best_metrics = {"val_top1": val_top1,
                                 "val_top5": top5 / max(cnt, 1),
                                 "val_ade_m": val_ade}
+                if use_control:
+                    best_metrics["val_ctl_angle_mae"] = \
+                        ctl_mae_sum / max(cnt, 1)
                 epochs_no_improve = 0
             else:
                 epochs_no_improve += 1
@@ -434,6 +604,14 @@ class TogivadTrainingManager:
                     "pred_seconds": pred_seconds,
                     "pred_points": pred_points,
                     "ego_dropout": ego_dropout,
+                    "use_residual": use_residual,
+                    "lambda_residual": lambda_residual if use_residual else 0.0,
+                    "use_temporal": use_temporal,
+                    "use_lidar": use_lidar,
+                    "use_control": use_control,
+                    "lambda_control": lambda_control if use_control else 0.0,
+                    "lambda_consist": lambda_consist if use_control else 0.0,
+                    "lambda_smooth": lambda_smooth if use_control else 0.0,
                     "num_epochs": epochs,
                     "learning_rate": learning_rate,
                     "batch_size": batch_size,
@@ -628,16 +806,61 @@ class TogivadTrainingManager:
         ego = np.concatenate([[speed, yaw_rate],
                               np.zeros(2 * cfg.raceline_points)]
                              ).astype(np.float32)
+        if getattr(cfg, "use_control", False):
+            # Pilot: 直前フレームの運転アノテーションを直前指令として与える
+            pa = annotations.get(target_index - 1, {}) if annotations else {}
+            ego = np.concatenate([ego, np.array(
+                [float(pa.get("angle", 0.0) or 0.0),
+                 float(pa.get("throttle", 0.0) or 0.0)],
+                np.float32)]).astype(np.float32)
 
         with torch.no_grad():
-            _occ, _agents, logits = model(
+            kw = {}
+            if getattr(cfg, "use_lidar", False):
+                # Fusion: セッションの LiDAR をラスタ化して入力（欠損はゼロ）
+                ds.selected_sources = selected_sources
+                ds._lidar_meta_cache = {}
+                kw["lidar_bev"] = torch.from_numpy(
+                    TogivadDataset._lidar_occ(ds, target_index)
+                ).unsqueeze(0).to(device)
+            out = model(
                 torch.stack(imgs).unsqueeze(0).to(device),
-                torch.from_numpy(ego).unsqueeze(0).to(device))
+                torch.from_numpy(ego).unsqueeze(0).to(device), **kw)
+            logits = out[2]
             probs = torch.softmax(logits[0], dim=0).cpu().numpy()
+            # T1-b: 残差があれば表示軌道にも反映（脱量子化後の実軌道）
+            residual = (out[3][0].cpu().numpy()
+                        if getattr(cfg, "use_residual", False) and len(out) > 3
+                        else None)
+            control = None
+            if getattr(cfg, "use_control", False):
+                from togivad.config import output_spec
+                c = out[output_spec(cfg).index("control")][0].cpu().numpy()
+                control = (float(c[0]), float(c[1]))       # Pilot 生出力
         top = np.argsort(probs)[::-1][:topk]
         vocab = np.asarray(vocab, dtype=np.float32)
+        trajs = [vocab[k] + residual if residual is not None else vocab[k]
+                 for k in top]
+        # pure pursuit（togivad.infer.track と同一幾何）: 非 Pilot モデルでも
+        # 運転推論表示（angle/throttle）を出せるようにする
+        import math
+        bt = trajs[0]
+        dist = np.linalg.norm(bt, axis=1)
+        k = int(np.searchsorted(dist, cfg.lookahead_m))
+        k = min(max(k, 1), len(bt) - 1)
+        tx, ty = float(bt[k, 0]), float(bt[k, 1])
+        ld = max(math.hypot(tx, ty), 1e-3)
+        steer = math.atan2(2.0 * cfg.wheelbase_m
+                           * math.sin(math.atan2(ty, tx)), ld)
+        tv = float(np.linalg.norm(np.diff(
+            np.vstack([[0, 0], bt]), axis=0), axis=1).sum()) / \
+            (len(bt) * cfg.dt)
+        pursuit = (float(np.clip(steer / cfg.max_steer_rad, -1.0, 1.0)),
+                   float(np.clip(tv / cfg.v_max_mps, -1.0, 1.0)))
         return {
-            "trajectories": [vocab[k] for k in top],
+            "trajectories": trajs,
             "probs": [float(probs[k]) for k in top],
-            "best": vocab[top[0]],
+            "best": trajs[0],
+            "control": control,        # Pilot: (angle, throttle) / 無効時 None
+            "pursuit": pursuit,        # 選択軌道の pure pursuit (angle, throttle)
         }

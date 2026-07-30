@@ -478,6 +478,37 @@ class PoseSourceManager:
         d = (p1.theta - p0.theta + math.pi) % (2 * math.pi) - math.pi
         return d / dtau
 
+    def relative_dpose(self, prev_index: int, index: int,
+                       prefer: Optional[str] = None,
+                       max_dt_gap_s: float = 0.5) -> Optional[np.ndarray]:
+        """前フレーム prev_index → フレーム index の ego 相対運動 [dx, dy, dθ]。
+
+        TogiVAD 時系列融合（T1-a）の warp 入力。**実測 pose 差分**から作るので
+        走行軌道表示・学習ラベル（compute_future_trajectory）と同一情報源・同一
+        座標規約になる（速度×dt の近似は使わない）。世界→ego 変換は
+        compute_future_trajectory と同じ式。
+
+        座標: 返り値は **prev フレーム系**（+X 前方 / +Y 左）での並進 (dx, dy) と
+        方位差 dθ（(-π, π]）。dt ギャップ超過・pose 欠落・時刻欠落では None。
+        """
+        t0 = self._timestamps_ms.get(prev_index)
+        t1 = self._timestamps_ms.get(index)
+        if t0 is None or t1 is None:
+            return None
+        dtau = (t1 - t0) / 1000.0
+        if dtau <= 1e-6 or dtau > max_dt_gap_s:
+            return None
+        p0 = self.get_pose(prev_index, prefer=prefer)
+        p1 = self.get_pose(index, prefer=prefer)
+        if p0 is None or p1 is None:
+            return None
+        dx_w, dy_w = p1.x - p0.x, p1.y - p0.y
+        cos_t, sin_t = math.cos(p0.theta), math.sin(p0.theta)
+        dx = dx_w * cos_t + dy_w * sin_t            # 前 ego 系 前方
+        dy = -dx_w * sin_t + dy_w * cos_t           # 前 ego 系 左
+        dth = (p1.theta - p0.theta + math.pi) % (2 * math.pi) - math.pi
+        return np.array([dx, dy, dth], dtype=np.float32)
+
 
 def _interpolate_angle(a: float, b: float, ratio: float) -> float:
     """最短経路での角度補間（radian, 折り返し対応）"""

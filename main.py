@@ -81,7 +81,9 @@ from styles import get_location_color, apply_style, set_theme, get_current_theme
 
 from managers import AnnotationDataManager, MLflowManager, ModelType, SequenceTrainingManager, PoseSourceManager, TogivadTrainingManager
 from map_view import MapViewDialog
-from utils.yolo_utils import train_yolo_with_ui, TrainingOutputDialog
+from utils.yolo_utils import (train_yolo_with_ui, TrainingOutputDialog,
+                              dets_to_bboxes, masks_to_segments,
+                              DEFAULT_VEHICLE_CLASSES, DEFAULT_EGO_REGION)
 from data_analysis import DataAnalysisDialog
 from utils.databricks_transfer import DatabricksTransferManager
 
@@ -830,12 +832,14 @@ class ImageLabel(QLabel):
         # 各機能毎に描画（描画順序を調整）
         self.draw_grid(painter, self.target_rect)
         self.draw_background_frame(painter, self.target_rect)
-        # バウンディングボックス（YOLO推論結果含む）を先に描画
-        self.draw_bbox(self.pix_width, self.pix_height, painter, self.target_rect)
-        self.draw_segmentation(self.pix_width, self.pix_height, painter, self.target_rect)
-        self.draw_waypoints(self.pix_width, self.pix_height, painter, self.target_rect)
-        # 結合表示時は推論対象セルのサブ矩形・ピクセル寸法を使う
+        # 結合表示時は推論対象セルのサブ矩形・ピクセル寸法を使う。
+        # 矩形/セグ（検出・推論）も全体でなくこのセル矩形に合わせる（結合表示で
+        # ボックスが対象カメラセルからはみ出てずれるのを防ぐ）。
         _ann_rect, _ann_pw, _ann_ph = self._get_annotation_draw_params(self.target_rect)
+        # バウンディングボックス（YOLO推論結果含む）を先に描画（対象カメラセル矩形へ）
+        self.draw_bbox(_ann_pw, _ann_ph, painter, _ann_rect)
+        self.draw_segmentation(_ann_pw, _ann_ph, painter, _ann_rect)
+        self.draw_waypoints(self.pix_width, self.pix_height, painter, self.target_rect)
 
         # アノテーション点、推論点、差分ベクトルを最後に描画（上に表示）
         self.draw_control_points(painter, _ann_rect, _ann_pw, _ann_ph)
@@ -2365,6 +2369,9 @@ class ImageLabel(QLabel):
         def to_screen(x_fwd, y_left):
             return (ox - y_left * scale, oy - x_fwd * scale)
 
+        # CAM画像をIPMで地面へ投影して背景に敷く（グリッド/軌道の下）
+        self._draw_bev_camera(painter, mw, idx, to_screen)
+
         # 目盛・凡例の共通フォント（描画解像度に比例した小さめの px サイズ）
         fs = max(6, int(round(rect.height() * 0.045)))
         label_font = QFont("Arial")
@@ -2389,6 +2396,10 @@ class ImageLabel(QLabel):
             sx, _ = to_screen(0, m)
             painter.setPen(QPen(axis_col if m == 0 else grid_col, 1))
             painter.drawLine(int(sx), int(rect.y()), int(sx), int(rect.y() + rect.height()))
+
+        # --- 学習GTプレビュー: LiDAR占有(障害物マップ)・コース境界①・他車② ---
+        # モデルが学習する教師ラベルそのものを俯瞰に重畳し、目視検証できるようにする。
+        self._draw_bev_gt(painter, mw, idx, to_screen, ox, oy, scale, is_dark)
 
         # --- 車体マーカー（上向き三角） ---
         painter.setPen(QPen(QColor(60, 66, 74) if not is_dark else QColor(200, 206, 214), 1))
@@ -2433,6 +2444,15 @@ class ImageLabel(QLabel):
             legend.append((QColor(0, 200, 0), get_text('bev_legend_recorded')))
         if pred is not None:
             legend.append((QColor(0, 170, 180), get_text('bev_legend_prediction')))
+        # 学習GT レイヤの凡例（占有・境界・他車）
+        if getattr(mw, 'show_bev_occupancy', True):
+            legend.append((QColor(230, 90, 60), get_text('bev_legend_occupancy')))
+        if getattr(mw, 'show_bev_boundary', True):
+            legend.append((QColor(20, 90, 225), get_text('bev_legend_boundary')))
+            legend.append((QColor(225, 105, 0), get_text('bev_legend_boundary_r')))
+        if getattr(mw, 'show_bev_agents', True) and \
+                getattr(mw, 'bbox_annotations', {}).get(idx):
+            legend.append((QColor(210, 60, 200), get_text('bev_legend_agent')))
         painter.setFont(label_font)
         sw = max(6, fs)               # 凡例の色見本の幅
         row_h = fs + 3
@@ -2445,6 +2465,268 @@ class ImageLabel(QLabel):
             painter.drawText(int(rect.x() + 4 + sw + 4), int(ly + fs), name)
             ly += row_h
         painter.setClipping(False)
+
+    def _bev_gt_data(self, mw, idx):
+        """現フレームの LiDAR 占有・境界①を計算（idx キャッシュ）。
+
+        画像パスから同セッションの LiDAR npy（{番号}_lidar_distance_array_.npy）を
+        引き、togivad と同一コード（occupancy_from_scan / boundary_from_occupancy）で
+        BEV 占有と左右境界を作る。失敗時は (None, None, None)。
+        """
+        if getattr(mw, '_bev_gt_idx', None) == idx:
+            return mw._bev_gt_occ, mw._bev_gt_bnd, mw._bev_gt_cfg
+        occ_cells = bnd = ucfg = None
+        try:
+            import sys as _sys
+            import numpy as _np
+            _rr = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if _rr not in _sys.path:
+                _sys.path.insert(0, _rr)
+            from togivad.config import make_config
+            from togivad.dataset import (occupancy_from_scan,
+                                         boundary_from_occupancy, _load_lidar_meta)
+            img_path = mw.images[idx]
+            session = os.path.dirname(os.path.dirname(img_path))
+            prefix = os.path.basename(img_path).split('_')[0]
+            npy = os.path.join(session, 'lidar',
+                               f'{prefix}_lidar_distance_array_.npy')
+            ucfg = getattr(mw, '_bev_gt_cfg', None) or make_config(1)
+            if os.path.exists(npy):
+                scan = _np.load(npy)
+                meta = _load_lidar_meta(session)
+                occ, has = occupancy_from_scan(scan, meta, ucfg)
+                if has > 0.5:
+                    ii, jj = _np.where(occ[0] > 0.5)
+                    X = ucfg.x_min_m + (ii + 0.5) * ucfg.cell_m
+                    Y = ucfg.y_max_m - (jj + 0.5) * ucfg.cell_m
+                    occ_cells = _np.stack([X, Y], axis=1)          # (N,2) ego[m]
+                    # 左右分離の中心線に走行経路を使う（カーブでの跨ぎを防ぐ）
+                    pm = getattr(mw, 'pose_manager', None)
+                    prefer = getattr(mw, 'recorded_traj_source', None)
+                    path = None
+                    if pm is not None and pm.has_any_pose():
+                        try:
+                            path = pm.compute_future_trajectory(
+                                idx, horizon=20, dt=0.1, prefer=prefer)
+                        except Exception:
+                            path = None
+                        # セッション末尾・停車で将来経路が無い/退化 → **過去の
+                        # 走行軌跡**（現 ego 系・原点で終端）にフォールバック。
+                        # 分離線の外挿（_extend_path）が直近の曲率で前方へ弧を
+                        # 伸ばすので、停止フレームでも左右判定が安定する。
+                        if path is None or len(path) < 2 or \
+                                float(_np.hypot(*(
+                                    _np.asarray(path[-1], float)
+                                    - _np.asarray(path[0], float)))) < 0.3:
+                            pts = []
+                            for j in range(max(0, idx - 25), idx):
+                                try:
+                                    dp = pm.relative_dpose(j, idx,
+                                                           prefer=prefer)
+                                except Exception:
+                                    dp = None
+                                if dp is None:
+                                    continue
+                                dx, dy, dth = (float(dp[0]), float(dp[1]),
+                                               float(dp[2]))
+                                c, s = _np.cos(dth), _np.sin(dth)
+                                # j の位置を現フレーム系へ（SE2 逆変換）
+                                pts.append((-(c * dx + s * dy),
+                                            -(-s * dx + c * dy)))
+                            pts.append((0.0, 0.0))
+                            path = _np.asarray(pts) if len(pts) >= 2 else None
+                    bnd = boundary_from_occupancy(occ, ucfg, has, path_xy=path)
+        except Exception:
+            occ_cells = bnd = None
+        mw._bev_gt_idx = idx
+        mw._bev_gt_occ = occ_cells
+        mw._bev_gt_bnd = bnd
+        mw._bev_gt_cfg = ucfg
+        return occ_cells, bnd, ucfg
+
+    def _bev_agent_points(self, mw, idx):
+        """現フレームの opponent 矩形を ego 地面点へ（②のライブ確認）。
+
+        カメラ単眼の**距離は不正確**（魚眼合成モデル・未較正）だが**方位は正確**。
+        そこで矩形底辺中心の逆投影で方位を得たら、その方位近傍の **LiDAR 占有
+        （壁から手前へ凸に出た＝他車）** に距離をスナップして位置を補正する
+        （LiDAR は直接測距なので正確）。占有が無ければカメラ推定のまま。
+        """
+        import numpy as _np
+        # 他車ボックス = opponent アノテ + 車両クラスの**推論結果**（car等）。
+        # 自動アノテ未実行でも推論表示だけで他車が出るようにする（自車領域は
+        # 推論側で DEFAULT_EGO_REGION 除外済み）。
+        veh = set(DEFAULT_VEHICLE_CLASSES) | {'opponent'}
+        opp = [b for b in getattr(mw, 'bbox_annotations', {}).get(idx, [])
+               if b.get('class') == 'opponent']
+        opp += [b for b in getattr(mw, 'detection_inference_results', {}).get(idx, [])
+                if b.get('class') in veh]
+        if not opp:
+            return []
+        W = int(getattr(mw, 'original_image_width', 0) or 160)
+        H = int(getattr(mw, 'original_image_height', 0) or 120)
+        unp = getattr(mw, '_bev_unprojector', None)
+        if unp is None or getattr(mw, '_bev_unproj_wh', None) != (W, H):
+            try:
+                import sys as _sys
+                _rr = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                if _rr not in _sys.path:
+                    _sys.path.insert(0, _rr)
+                from togivad.config import make_config
+                from togivad.tools.agent_labeler import GroundUnprojector
+                tv = make_config(5)
+                spec = next((c for c in tv.cameras if c.name == 'cam3'), None) \
+                    or min(tv.cameras, key=lambda s: abs(s.yaw_deg))
+                unp = GroundUnprojector(spec, (W, H))
+                mw._bev_unprojector = unp
+                mw._bev_unproj_wh = (W, H)
+            except Exception:
+                mw._bev_unprojector = False
+                return []
+        if unp is False:
+            return []
+        occ_cells = self._bev_gt_data(mw, idx)[0]        # LiDAR 占有点 (N,2)[m]
+        has_occ = occ_cells is not None and len(occ_cells)
+        pts = []
+        for b in opp:
+            try:
+                u = (b['x1'] + b['x2']) * 0.5 * W
+                v = max(b['y1'], b['y2']) * H
+                p = unp.unproject(u, v)
+                if p is None:
+                    continue
+                bearing = float(_np.arctan2(p[1], p[0]))
+                # マーカーの**サイズはボックスの画素比に比例**させる。cam3 は正式な
+                # 魚眼較正が無く（合成モデル）、近接地面の逆投影は距離も開き角も
+                # 大きく歪むため、計量的な実寸投影は信頼できない。位置は投影＋LiDAR
+                # スナップで補正し、大きさはボックスの見かけ(大→大)を反映する方針。
+                fw = abs(float(b['x2'] - b['x1']))        # 画像幅に対する比 0..1
+                fh = abs(float(b['y2'] - b['y1']))        # 画像高に対する比 0..1
+                if has_occ:
+                    # カメラ方位（正確）のレイ近傍の LiDAR 占有のうち、**カメラ距離
+                    # 推定に最も近い点**へスナップ（=その方位の実測他車位置）。
+                    # 遠方他車を手前の壁へ寄せない/大きく離れた点には飛ばない。
+                    perp = _np.abs(occ_cells[:, 0] * _np.sin(bearing)
+                                   - occ_cells[:, 1] * _np.cos(bearing))
+                    on_ray = perp < 0.2
+                    if on_ray.any():
+                        cand = occ_cells[on_ray]
+                        d = _np.linalg.norm(cand - _np.asarray(p), axis=1)
+                        k = int(_np.argmin(d))
+                        if d[k] < 1.0:                # 適度に近ければ LiDAR へ補正
+                            p = cand[k]
+                # 画素比 → 実寸[m]。1/10RC 相当(幅~0.2, 車長~0.4)に収める。
+                w_m = float(min(max(fw * 1.2, 0.12), 0.55))   # 横(=Y方向)
+                d_m = float(min(max(fh * 1.2, 0.15), 0.70))   # 前後(=X方向)
+                pts.append((float(p[0]), float(p[1]), w_m, d_m))
+            except Exception:
+                pass
+        return pts
+
+    def _draw_bev_camera(self, painter, mw, idx, to_screen):
+        """現フレームのカメラ画像を IPM で地面へ投影し BEV 背景に描く。
+
+        toggle: mw.show_bev_camera（既定 False）。対応表（ego→カメラ画素）は
+        カメラ較正のみで決まる静的量なので画像サイズごとにキャッシュし、毎フレームは
+        cv2.remap のみ。半透明でグリッド・軌道・境界が上に見えるようにする。
+        """
+        if not getattr(mw, 'show_bev_camera', False):
+            return
+        try:
+            import sys as _sys
+            import cv2
+            import numpy as _np
+            from PyQt5.QtGui import QImage
+            from PyQt5.QtCore import QRect
+            img = cv2.imread(mw.images[idx])              # BGR
+            if img is None:
+                return
+            Himg, Wimg = img.shape[:2]
+            key = (Wimg, Himg)
+            cache = getattr(mw, '_bev_cam_maps', None)
+            if cache is None or cache[0] != key:
+                rr = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                if rr not in _sys.path:
+                    _sys.path.insert(0, rr)
+                from togivad.config import make_config
+                from togivad.calib import bev_camera_maps
+                tv = make_config(5)
+                spec = next((c for c in tv.cameras if c.name == 'cam3'), None) \
+                    or min(tv.cameras, key=lambda s: abs(s.yaw_deg))
+                xr, yr, out = (0.2, 5.0), (-2.5, 2.5), (240, 250)
+                mx, my, valid = bev_camera_maps(spec, xr, yr, out, (Wimg, Himg))
+                cache = (key, mx, my, valid, xr, yr, out)
+                mw._bev_cam_maps = cache
+            _k, mx, my, valid, xr, yr, out = cache
+            warped = cv2.remap(img, mx, my, cv2.INTER_LINEAR)   # (H,W,3) BGR
+            H, W = out
+            rgba = _np.zeros((H, W, 4), _np.uint8)
+            rgba[..., :3] = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
+            rgba[..., 3] = (valid * 210).astype(_np.uint8)     # 半透明・無効は透明
+            qimg = QImage(rgba.data, W, H, 4 * W,
+                          QImage.Format_RGBA8888).copy()
+            tlx, tly = to_screen(xr[1], yr[1])                 # (X_MAX,Y_MAX)=左上
+            brx, bry = to_screen(xr[0], yr[0])                 # (X_MIN,Y_MIN)=右下
+            painter.drawImage(QRect(int(tlx), int(tly),
+                                    int(brx - tlx), int(bry - tly)), qimg)
+        except Exception as e:
+            print(f"bev camera projection: {e}")
+
+    def _draw_bev_gt(self, painter, mw, idx, to_screen, ox, oy, scale, is_dark):
+        """BEV に学習GT（占有・境界・他車）を重畳する。各トグルは既定ON。"""
+        # 1) LiDAR 占有（障害物マップ）: 淡いマスで背景に
+        if getattr(mw, 'show_bev_occupancy', True):
+            occ_cells, bnd, _ = self._bev_gt_data(mw, idx)
+            if occ_cells is not None and len(occ_cells):
+                col = QColor(230, 90, 60, 90) if not is_dark else QColor(250, 120, 90, 90)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(col))
+                sz = max(2, int(0.0625 * scale))          # セル1つぶんの見かけ幅
+                for X, Y in occ_cells:
+                    sx, sy = to_screen(float(X), float(Y))
+                    painter.drawRect(int(sx - sz / 2), int(sy - sz / 2), sz, sz)
+        else:
+            _, bnd, _ = self._bev_gt_data(mw, idx)
+        # 2) コース境界①: 左(青)・右(橙)のポリライン
+        if getattr(mw, 'show_bev_boundary', True) and bnd is not None:
+            pts_all, valid = bnd
+            cols = [QColor(20, 90, 225), QColor(225, 105, 0)]     # 左(濃青), 右(濃橙)
+            for inst in range(pts_all.shape[0]):
+                sp = [to_screen(float(x), float(y))
+                      for (x, y), ok in zip(pts_all[inst], valid[inst]) if ok > 0.5]
+                if len(sp) >= 2:
+                    painter.setPen(QPen(cols[inst % 2], 4, Qt.SolidLine))  # 濃く太く
+                    for k in range(len(sp) - 1):
+                        painter.drawLine(int(sp[k][0]), int(sp[k][1]),
+                                         int(sp[k + 1][0]), int(sp[k + 1][1]))
+                    # 点も打って視認性を上げる
+                    painter.setBrush(QBrush(cols[inst % 2]))
+                    painter.setPen(Qt.NoPen)
+                    for x, y in sp:
+                        painter.drawEllipse(int(x) - 2, int(y) - 2, 4, 4)
+        # 2.5) 自車周辺の除外範囲: 車両搭載物の反射ノイズを境界処理で無視する
+        #     半径（togivad.dataset.SELF_EXCLUDE_RADIUS_M と同値）をグレー点線円
+        #     で可視化する（この円内の LiDAR 点は境界に使われない）。
+        try:
+            from togivad.dataset import SELF_EXCLUDE_RADIUS_M as _exr
+        except Exception:
+            _exr = 0.7
+        cx, cy = to_screen(0.0, 0.0)
+        rr = int(_exr * scale)
+        pen = QPen(QColor(128, 128, 128, 180), 2, Qt.DashLine)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(int(cx - rr), int(cy - rr), 2 * rr, 2 * rr)
+        # 3) 他車②: opponent 矩形を ego 投影し、**実寸(幅×車長)に比例**した
+        #    楕円で描く（w_m=横=Y方向, d_m=前後=X方向。最小4pxで遠方も視認可）。
+        if getattr(mw, 'show_bev_agents', True):
+            painter.setPen(QPen(QColor(210, 60, 200), 2))
+            painter.setBrush(QBrush(QColor(210, 60, 200, 120)))
+            for X, Y, w_m, d_m in self._bev_agent_points(mw, idx):
+                sx, sy = to_screen(X, Y)
+                rx = max(4, int(0.5 * w_m * scale))       # 横半径(px)
+                ry = max(4, int(0.5 * d_m * scale))       # 前後半径(px)
+                painter.drawEllipse(int(sx - rx), int(sy - ry), 2 * rx, 2 * ry)
 
     def draw_segmentation_inference_results(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
         """セグメンテーション推論結果の描画"""
@@ -5810,6 +6092,136 @@ class ImageAnnotationTool(QMainWindow):
             )
             print(f"future_traj保存エラー: {e}")
 
+    def write_back_agent_tracks(self, horizon=10, camera_name='cam3',
+                                classes=('opponent',), parent_widget=None):
+        """② 相手車の矩形アノテーション → togivad/agents（他車 ego 位置＋将来軌道）。
+
+        検出矩形（bbox_annotations の opponent クラス）を GroundUnprojector で
+        ego 地面点に逆投影し、pose_manager の実測 dpose でフレーム間追跡して
+        将来 T_a 点を各フレームの ego 系で構築し、catalog に書き戻す
+        （togivad/tools/agent_labeler の再利用。ego 版 write_back_future_trajectories
+        と同じ manifest/catalog・_index 照合・.bak 方式）。②の学習
+        （train_sequence_model で「TogiVAD他車(E2E)」有効）はこのキーを読む。
+        """
+        parent = parent_widget if parent_widget is not None else self
+        title = get_text('map_view_agent_writeback_btn')
+        manifest_path = getattr(self, 'last_manifest_path', None)
+        if not manifest_path or not os.path.exists(manifest_path):
+            QMessageBox.warning(parent, title,
+                                get_text('map_view_writeback_no_manifest'))
+            return
+        try:
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            catalog_files = json.loads(lines[4]).get('paths', []) \
+                if len(lines) >= 5 else []
+        except Exception as e:
+            QMessageBox.critical(parent, title,
+                                 get_text('map_view_writeback_error', str(e)))
+            return
+        if not catalog_files:
+            QMessageBox.warning(parent, title,
+                                get_text('map_view_writeback_no_manifest'))
+            return
+
+        # togivad の相手カメラ CameraSpec と逆投影器を用意
+        try:
+            import sys as _sys
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if repo_root not in _sys.path:
+                _sys.path.insert(0, repo_root)
+            from togivad.config import make_config
+            from togivad.tools.agent_labeler import (GroundUnprojector,
+                                                     build_agent_labels)
+            tvcfg = make_config(5, agent_horizon=int(horizon),
+                                use_agent_motion=True)
+            spec = next((c for c in tvcfg.cameras if c.name == camera_name), None) \
+                or min(tvcfg.cameras, key=lambda s: abs(s.yaw_deg))
+            image_wh = (640, 480)
+            unp = GroundUnprojector(spec, image_wh)
+        except Exception as e:
+            QMessageBox.critical(parent, title,
+                                 get_text('map_view_writeback_error', str(e)))
+            return
+
+        image_to_entry = getattr(self, '_manifest_image_to_entry', {})
+        excluded = set(self.deleted_indexes)
+        cls_set = set(classes)
+        W, H = image_wh
+
+        # 有効フレームを順序どおり並べ、各フレームの opponent 検出を ego へ逆投影
+        order, entry_of = [], {}
+        for img_idx in range(len(self.images)):
+            if img_idx in excluded:
+                continue
+            ei = image_to_entry.get(img_idx)
+            if ei is None:
+                continue
+            order.append(img_idx)
+            entry_of[img_idx] = ei
+        dets, n_boxes = [], 0
+        for img_idx in order:
+            ego_pts = []
+            for bb in self.bbox_annotations.get(img_idx, []):
+                if bb.get('class') not in cls_set:
+                    continue
+                px = ((bb['x1'] + bb['x2']) * 0.5 * W, max(bb['y1'], bb['y2']) * H)
+                p = unp.unproject(px[0], px[1])
+                if p is not None:
+                    ego_pts.append((float(p[0]), float(p[1])))
+                    n_boxes += 1
+            dets.append(ego_pts)
+        if n_boxes == 0:
+            QMessageBox.information(parent, title,
+                                    get_text('map_view_agent_writeback_none'))
+            return
+        dposes = [self.pose_manager.relative_dpose(order[k], order[k + 1])
+                  for k in range(len(order) - 1)]
+        agents = build_agent_labels(dets, dposes, int(horizon),
+                                    max_agents=tvcfg.num_agent_queries)
+        agents_by_entry = {entry_of[order[k]]: agents[k]
+                           for k in range(len(order))}
+
+        base_dir = os.path.dirname(manifest_path)
+        written = 0
+        try:
+            for catalog_file in catalog_files:
+                catalog_path = os.path.join(base_dir, catalog_file)
+                if not os.path.exists(catalog_path):
+                    continue
+                with open(catalog_path, 'r', encoding='utf-8') as f:
+                    catalog_lines = f.readlines()
+                modified, new_lines = False, []
+                for line in catalog_lines:
+                    s = line.strip()
+                    if not s:
+                        new_lines.append(line)
+                        continue
+                    row = json.loads(s)
+                    ag = agents_by_entry.get(row.get('_index'))
+                    if ag is not None:
+                        row['togivad/agents'] = [
+                            [round(float(v), 4) for v in a] for a in ag]
+                        new_lines.append(json.dumps(row, ensure_ascii=False) + '\n')
+                        modified = True
+                        if ag:
+                            written += 1
+                    else:
+                        new_lines.append(line)
+                if modified:
+                    shutil.copy2(catalog_path, catalog_path + '.bak')
+                    with open(catalog_path, 'w', encoding='utf-8') as f:
+                        f.writelines(new_lines)
+            QMessageBox.information(
+                parent, title,
+                get_text('map_view_agent_writeback_result', written, n_boxes))
+            print(f"togivad/agents保存完了: frames_with_agents={written}, "
+                  f"boxes={n_boxes}")
+        except Exception as e:
+            QMessageBox.critical(parent, title,
+                                 get_text('map_view_writeback_error', str(e)))
+            print(f"togivad/agents保存エラー: {e}")
+
     def _show_mlflow_menu(self):
         """MLflowメニューを表示"""
         from PyQt5.QtWidgets import QMenu
@@ -5894,6 +6306,10 @@ class ImageAnnotationTool(QMainWindow):
 
         yolo_action = menu.addAction(f"📦 {get_text('load_yolo_annotation')}")
         yolo_action.triggered.connect(self.load_yolo_annotations)
+
+        # 学習済みYOLOで他車(opponent)/セグを自動アノテーション（②の他車GTを自動化）
+        auto_action = menu.addAction(f"🤖 {get_text('yolo_auto_annot_menu')}")
+        auto_action.triggered.connect(self.show_yolo_auto_annotate_dialog)
 
         # ボタンの下にメニューを表示
         button = self.load_annotation_button
@@ -6281,10 +6697,12 @@ class ImageAnnotationTool(QMainWindow):
 
         obj_detection_layout.addLayout(yolo_model_buttons_layout)
 
-        # YOLOオートアノテーション実行ボタン
+        # YOLOオートアノテーション実行ボタン → モデル選択(未取得ならDL)付きダイアログ。
+        # モデル未読込でもダイアログ内でDL/選択できるため常時有効。
         self.yolo_auto_annotate_btn = QPushButton(get_text('yolo_auto_annotate'))
-        self.yolo_auto_annotate_btn.clicked.connect(self.yolo_auto_annotate)
-        self.yolo_auto_annotate_btn.setEnabled(False)
+        self.yolo_auto_annotate_btn.clicked.connect(self.show_yolo_auto_annotate_dialog)
+        self.yolo_auto_annotate_btn.setEnabled(True)
+        self.yolo_auto_annotate_btn.setToolTip(get_text('yolo_auto_annot_hint'))
         apply_style(self.yolo_auto_annotate_btn, 'special')
         obj_detection_layout.addWidget(self.yolo_auto_annotate_btn)
 
@@ -6957,6 +7375,23 @@ class ImageAnnotationTool(QMainWindow):
         rec_row.addWidget(self.recorded_traj_points_unit)
         rec_row.addStretch()
         auto_driving_control_layout.addLayout(rec_row)
+
+        # 行1c: BEV(真上図)レイヤのトグル — CAM投影/障害物/境界/他車
+        bev_layer_row = QHBoxLayout()
+        bev_layer_row.setSpacing(6)
+        for attr, key, default in (
+                ('show_bev_camera', 'chk_bev_camera', False),
+                ('show_bev_occupancy', 'chk_bev_occupancy', True),
+                ('show_bev_boundary', 'chk_bev_boundary', True),
+                ('show_bev_agents', 'chk_bev_agents', True)):
+            setattr(self, attr, default)
+            cb = QCheckBox(get_text(key))
+            cb.setChecked(default)
+            cb.setMinimumHeight(_label_h)
+            cb.stateChanged.connect(self._make_bev_layer_toggle(attr))
+            bev_layer_row.addWidget(cb)
+        bev_layer_row.addStretch()
+        auto_driving_control_layout.addLayout(bev_layer_row)
 
         # 行2: 最大舵角 / 俯角 / FOV を横に並べる（各列：ラベルを値の上に配置）
         #   狭いパネル幅でもラベルが全部見えるよう、1項目=1列(ラベル＋入力欄)とする
@@ -8411,6 +8846,14 @@ class ImageAnnotationTool(QMainWindow):
         self.show_recorded_trajectory = (state == Qt.Checked)
         if hasattr(self, 'main_image_view'):
             self.main_image_view.update()
+
+    def _make_bev_layer_toggle(self, attr):
+        """BEVレイヤ表示フラグ attr を切り替えるスロットを返す（CAM投影/障害物/境界/他車）。"""
+        def _slot(state):
+            setattr(self, attr, state == Qt.Checked)
+            if hasattr(self, 'main_image_view'):
+                self.main_image_view.update()
+        return _slot
 
     def _sync_recorded_traj_dt(self):
         """走行軌道の dt を 秒数/点数 から再計算し、表示中なら再描画する。"""
@@ -10713,8 +11156,13 @@ class ImageAnnotationTool(QMainWindow):
     
     def update_inference_checkboxes_status(self):
         """各モデルの読み込み状態に応じてチェックボックスの有効/無効を更新"""
-        # 自動運転モデル
-        if hasattr(self, 'model') and self.model is not None:
+        # 自動運転モデル。TogiVAD（時系列側で読込・angle/throttle を
+        # inference_results へ供給）も運転推論ソースとして扱う — これを見ずに
+        # 無効化すると YOLO 読込のたびに TogiVAD の推論表示が消える。
+        has_driving = (hasattr(self, 'model') and self.model is not None) or \
+            (getattr(self, '_gru_is_togivad', False)
+             and getattr(self, '_gru_model', None) is not None)
+        if has_driving:
             self.inference_checkbox.setEnabled(True)
             self.inference_checkbox.setToolTip(get_text('tip_driving_model_loaded'))
         else:
@@ -12461,6 +12909,7 @@ class ImageAnnotationTool(QMainWindow):
         
         if not unified_model_files:
             self.yolo_unified_model_combo.addItem(get_text('combo_model_not_found'))
+            self._add_yolo_dl_items_unified(selected_model_type)   # DL項目を追加
             self.statusBar().showMessage(get_text('status_yolo_model_not_found', selected_model_type), 3000)
             return
         
@@ -12499,6 +12948,7 @@ class ImageAnnotationTool(QMainWindow):
 
             self.yolo_unified_model_combo.addItem(display_name, model_info['path'])
 
+        self._add_yolo_dl_items_unified(selected_model_type)   # 末尾にDL項目も併記
 
         # 更新完了メッセージ
         detection_count = sum(1 for m in unified_model_files if m['task'] == get_text('label_detection_short'))
@@ -12518,21 +12968,26 @@ class ImageAnnotationTool(QMainWindow):
         current_index = self.yolo_unified_model_combo.currentIndex()
         selected_model_display = self.yolo_unified_model_combo.currentText()
         relative_path = self.yolo_unified_model_combo.itemData(current_index)
-        
-        if not relative_path or get_text('msg_combo_model_not_found') in selected_model_display or "not found" in selected_model_display.lower():
-            QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_no_valid_model'))
-            return
 
-        # タスクタイプを判定
-        is_segmentation = get_text('label_seg_tag_short') in selected_model_display or "[Seg]" in selected_model_display
+        # DL項目（⬇ ダウンロード）が選ばれたら事前学習モデルを取得して models へ保存
+        if isinstance(relative_path, str) and relative_path.startswith('__DL__:'):
+            dl_type = relative_path[len('__DL__:'):]
+            model_path = self.download_pretrained_yolo_model(dl_type)
+            if not model_path or not os.path.exists(model_path):
+                QMessageBox.warning(self, get_text('dlg_warning'),
+                                    get_text('yolo_model_dl_failed'))
+                return
+            is_segmentation = 'seg' in dl_type.lower()
+        else:
+            if not relative_path or get_text('msg_combo_model_not_found') in selected_model_display or "not found" in selected_model_display.lower():
+                QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_no_valid_model'))
+                return
+            is_segmentation = get_text('label_seg_tag_short') in selected_model_display or "[Seg]" in selected_model_display
+            model_path = os.path.join(models_dir, relative_path)
+            if not os.path.exists(model_path):
+                QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_selected_model_not_found', model_path))
+                return
         task_type = get_text('label_segmentation_short') if is_segmentation else get_text('label_detection_short')
-        
-        # モデルパスを構築
-        model_path = os.path.join(models_dir, relative_path)
-        
-        if not os.path.exists(model_path):
-            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_selected_model_not_found', model_path))
-            return
         
         # 信頼度閾値の設定
         confidence, ok = QInputDialog.getDouble(
@@ -13750,6 +14205,7 @@ class ImageAnnotationTool(QMainWindow):
         
         if not yolo_model_files:
             self.yolo_saved_model_combo.addItem(get_text('combo_model_not_found'))
+            self._add_yolo_dl_items(selected_model_type)   # DL項目を選択肢に追加
             self.statusBar().showMessage(get_text('status_yolo_model_not_found', selected_model_type), 3000)
             return
         
@@ -13785,9 +14241,46 @@ class ImageAnnotationTool(QMainWindow):
             
             # コンボボックスにアイテムを追加し、ユーザーデータとして相対パスを設定
             self.yolo_saved_model_combo.addItem(model_name, model_info['path'])
-        
+
+        self._add_yolo_dl_items(selected_model_type)       # 末尾にDL項目も併記
+
         # 更新完了メッセージ
         self.statusBar().showMessage(get_text('status_models_loaded', len(yolo_model_files), selected_model_type), 3000)
+
+    def _add_yolo_dl_items(self, model_type):
+        """保存済みモデルコンボに「⬇ ダウンロード」項目を追加する。
+
+        選択して「モデル読込」を押すと download_pretrained_yolo_model が事前学習
+        モデルを取得して models/ に保存しロードする。手元にモデルが無くても
+        プルダウンから選んで導入できる（COCO事前学習は car 等を検出）。
+        """
+        mt = (model_type or '').strip().lower()
+        names = []
+        if mt.startswith('yolo'):
+            names.append(mt)
+        for n in ('yolov8n', 'yolo11n', 'yolov8n-seg'):
+            if n not in names:
+                names.append(n)
+        for n in names:
+            self.yolo_saved_model_combo.addItem(
+                f"⬇ {n}.pt ({get_text('yolo_model_dl_tag')})", f"__DL__:{n}")
+
+    def _add_yolo_dl_items_unified(self, model_type):
+        """統合モデルコンボ（yolo_unified_model_combo）に「⬇ ダウンロード」項目を追加。
+
+        選んで「モデル読込」を押すと事前学習モデルを DL→models 保存→ロードする。
+        検出(yolov8n/yolo11n)とセグ(yolov8n-seg)の定番を併記。
+        """
+        mt = (model_type or '').strip().lower()
+        names = []
+        if mt.startswith('yolo'):
+            names.append(mt)
+        for n in ('yolov8n', 'yolo11n', 'yolov8n-seg'):
+            if n not in names:
+                names.append(n)
+        for n in names:
+            self.yolo_unified_model_combo.addItem(
+                f"⬇ {n}.pt ({get_text('yolo_model_dl_tag')})", f"__DL__:{n}")
 
     def download_pretrained_yolo_model(self, model_type):
         """事前学習済みのYOLOモデルをダウンロードしてmodelsフォルダに保存する"""
@@ -13866,19 +14359,25 @@ class ImageAnnotationTool(QMainWindow):
         
         # ユーザーデータからパスを取得（相対パス）
         relative_path = self.yolo_saved_model_combo.itemData(current_index)
-        
-        if not relative_path or selected_model_display == "YOLOget_text('combo_model_not_found')" :
-            QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_no_valid_model'))
-            return
-        
-        # モデルのパスを取得 - 相対パスからフルパスに変換
-        # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
-        model_path = os.path.join(models_dir, relative_path)
-        
-        # モデルが存在するか確認
-        if not os.path.exists(model_path):
-            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_selected_model_not_found', model_path))
-            return
+
+        # DL項目（⬇ ダウンロード）が選ばれたら事前学習モデルを取得して models へ保存
+        if isinstance(relative_path, str) and relative_path.startswith('__DL__:'):
+            dl_type = relative_path[len('__DL__:'):]
+            model_path = self.download_pretrained_yolo_model(dl_type)
+            if not model_path or not os.path.exists(model_path):
+                QMessageBox.warning(self, get_text('dlg_warning'),
+                                    get_text('yolo_model_dl_failed'))
+                return
+            self.refresh_yolo_model_list()             # 保存済み一覧を更新
+        else:
+            if not relative_path or selected_model_display == "YOLOget_text('combo_model_not_found')":
+                QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_no_valid_model'))
+                return
+            # モデルのパスを取得 - 相対パスからフルパスに変換
+            model_path = os.path.join(models_dir, relative_path)
+            if not os.path.exists(model_path):
+                QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_selected_model_not_found', model_path))
+                return
             
         # 進捗ダイアログを表示
         progress = QProgressDialog(
@@ -14762,6 +15261,207 @@ class ImageAnnotationTool(QMainWindow):
         
         return sorted(list(classes))
 
+    def show_yolo_auto_annotate_dialog(self):
+        """学習済みYOLOで他車(opponent)/セグメンテーションを自動アノテーションする設定ダイアログ。
+
+        検出モデル(self.yolo_model) or セグモデル(self.yolo_seg_model)を全/現フレームに
+        走らせ、元クラス(例 car,truck,bus,motorcycle)を target クラス(既定 opponent)へ
+        写像して bbox_annotations / segmentation_annotations に書き込む。
+        opponent 矩形はそのまま②の「他車ラベルを計算して保存」→ togivad/agents に繋がる。
+        """
+        if not self.images:
+            QMessageBox.warning(self, get_text('dlg_warning'),
+                                get_text('msg_load_images_first'))
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle(get_text('yolo_auto_annot_title'))
+        lay = QVBoxLayout(dlg)
+
+        # モデル選択（既存 .pt ＋ DL 可能な事前学習プリセット）
+        model_row = QHBoxLayout()
+        model_row.addWidget(QLabel(get_text('yolo_auto_annot_model')))
+        model_combo = QComboBox()
+        for label, data in self._yolo_model_options():
+            model_combo.addItem(label, data)
+        model_row.addWidget(model_combo)
+        lay.addLayout(model_row)
+
+        src_row = QHBoxLayout()
+        src_row.addWidget(QLabel(get_text('yolo_auto_annot_src')))
+        src_edit = QLineEdit(",".join(DEFAULT_VEHICLE_CLASSES))
+        src_row.addWidget(src_edit)
+        lay.addLayout(src_row)
+
+        tgt_row = QHBoxLayout()
+        tgt_row.addWidget(QLabel(get_text('yolo_auto_annot_tgt')))
+        tgt_edit = QLineEdit("opponent")
+        tgt_row.addWidget(tgt_edit)
+        lay.addLayout(tgt_row)
+
+        conf_row = QHBoxLayout()
+        conf_row.addWidget(QLabel(get_text('yolo_auto_annot_conf')))
+        conf_spin = QDoubleSpinBox()
+        conf_spin.setRange(0.01, 1.0)
+        conf_spin.setSingleStep(0.05)
+        conf_spin.setValue(float(getattr(self, 'yolo_confidence_threshold', 0.5)))
+        conf_row.addWidget(conf_spin)
+        lay.addLayout(conf_row)
+
+        all_check = QCheckBox(get_text('yolo_auto_annot_all'))
+        all_check.setChecked(True)
+        lay.addWidget(all_check)
+        replace_check = QCheckBox(get_text('yolo_auto_annot_replace'))
+        replace_check.setChecked(True)
+        lay.addWidget(replace_check)
+
+        lay.addWidget(QLabel(get_text('yolo_auto_annot_hint')))
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+        if not dlg.exec_():
+            return
+
+        model, task = self._resolve_yolo_model(model_combo.currentData())
+        if model is None:
+            return
+        src = [c.strip() for c in src_edit.text().split(',') if c.strip()]
+        target = tgt_edit.text().strip() or 'opponent'
+        class_map = {c: target for c in src} if src else None
+        conf = float(conf_spin.value())
+        scope_all = all_check.isChecked()
+        replace = replace_check.isChecked()
+        self.auto_annotate_with_yolo(task, class_map, conf, scope_all, replace)
+
+    def _yolo_model_options(self):
+        """自動アノテのモデル選択肢: (表示名, データ) のリスト。
+
+        データ: 'loaded_det'/'loaded_seg'（読込済み）/ .pt のフルパス（既存ファイル）/
+        'dl:<name>'（未取得の事前学習プリセット。選択時に DL して models へ保存）。
+        事前学習(COCO)は car/truck/bus/motorcycle を検出でき、他車→opponent に使える。
+        """
+        opts = []
+        if getattr(self, 'yolo_model', None) is not None:
+            opts.append((get_text('yolo_model_loaded_det'), 'loaded_det'))
+        if getattr(self, 'yolo_seg_model', None) is not None:
+            opts.append((get_text('yolo_model_loaded_seg'), 'loaded_seg'))
+        try:
+            for f in sorted(os.listdir(models_dir)):
+                if f.endswith('.pt'):
+                    opts.append((f, os.path.join(models_dir, f)))
+        except Exception:
+            pass
+        for name in ('yolov8n', 'yolov8s', 'yolo11n'):
+            opts.append((f"{name}.pt ({get_text('yolo_model_dl_tag')})", f"dl:{name}"))
+        opts.append((f"yolov8n-seg.pt ({get_text('yolo_model_dl_tag')})",
+                     "dl:yolov8n-seg"))
+        if not opts:
+            opts.append((get_text('yolo_model_dl_tag') + " yolov8n", "dl:yolov8n"))
+        return opts
+
+    def _resolve_yolo_model(self, spec):
+        """モデル選択データ → (model, task)。必要なら DL/ロードして self にキャッシュ。
+
+        task: 'segment'（モデル名に seg を含む）| 'detect'。失敗時 (None, None)。
+        """
+        try:
+            if spec == 'loaded_det':
+                return self.yolo_model, 'detect'
+            if spec == 'loaded_seg':
+                return self.yolo_seg_model, 'segment'
+            if isinstance(spec, str) and spec.startswith('dl:'):
+                path = self.download_pretrained_yolo_model(spec[3:])
+                if not path:
+                    QMessageBox.warning(self, get_text('yolo_auto_annot_title'),
+                                        get_text('yolo_model_dl_failed'))
+                    return None, None
+            else:
+                path = spec
+            task = 'segment' if 'seg' in os.path.basename(path).lower() else 'detect'
+            model = YOLO(path)
+            if task == 'segment':
+                self.yolo_seg_model = model
+            else:
+                self.yolo_model = model
+            return model, task
+        except Exception as e:
+            QMessageBox.critical(self, get_text('yolo_auto_annot_title'),
+                                 get_text('yolo_model_dl_failed') + f"\n{e}")
+            return None, None
+
+    def auto_annotate_with_yolo(self, task, class_map, conf, scope_all, replace):
+        """学習済みYOLOをフレームに走らせ、検出/セグをアノテーションへ変換する。"""
+        model = getattr(self, 'yolo_model', None) if task == 'detect' \
+            else getattr(self, 'yolo_seg_model', None)
+        if model is None:
+            QMessageBox.information(self, get_text('yolo_auto_annot_title'),
+                                    get_text('yolo_auto_annot_no_model'))
+            return
+        indices = list(range(len(self.images))) if scope_all else [self.current_index]
+        progress = QProgressDialog(get_text('yolo_auto_annot_running'),
+                                   get_text('btn_cancel'), 0, len(indices), self)
+        progress.setWindowTitle(get_text('yolo_auto_annot_title'))
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        n_items, n_frames = 0, 0
+        for k, idx in enumerate(indices):
+            if k % 5 == 0:
+                progress.setValue(k)
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    break
+            try:
+                img_path = self.images[idx]
+                results = model(img_path, conf=conf, verbose=False)
+                img = Image.open(img_path)
+                wh = img.size
+                added = 0
+                if task == 'detect':
+                    if replace:
+                        self.bbox_annotations[idx] = [
+                            b for b in self.bbox_annotations.get(idx, [])
+                            if 'confidence' not in b]      # 手動分は残しAI分のみ置換
+                    for result in results:
+                        boxes = getattr(result, 'boxes', None)
+                        if boxes is None:
+                            continue
+                        bbs = dets_to_bboxes(boxes.data.cpu().numpy(),
+                                             result.names, wh, class_map, conf,
+                                             ego_region=DEFAULT_EGO_REGION)  # 自車除外
+                        for bb in bbs:
+                            self.bbox_annotations.setdefault(idx, []).append(bb)
+                            added += 1
+                else:  # segment
+                    if replace and idx in self.segmentation_annotations:
+                        self.segmentation_annotations[idx] = [
+                            s for s in self.segmentation_annotations.get(idx, [])
+                            if 'confidence' not in s]
+                    for result in results:
+                        masks = getattr(result, 'masks', None)
+                        boxes = getattr(result, 'boxes', None)
+                        if masks is None or boxes is None:
+                            continue
+                        bd = boxes.data.cpu().numpy()
+                        classes = [result.names[int(d[5])] if int(d[5]) in result.names
+                                   else f"class_{int(d[5])}" for d in bd]
+                        confs = [float(d[4]) for d in bd]
+                        segs = masks_to_segments(masks.data.cpu().numpy(),
+                                                 classes, confs, class_map, conf,
+                                                 ego_region=DEFAULT_EGO_REGION)
+                        for s in segs:
+                            self.segmentation_annotations.setdefault(idx, []).append(s)
+                            added += 1
+                if added:
+                    n_frames += 1
+                    n_items += added
+            except Exception as e:
+                print(f"auto_annotate idx={idx}: {e}")
+        progress.setValue(len(indices))
+        self.main_image_view.update()
+        QMessageBox.information(
+            self, get_text('yolo_auto_annot_title'),
+            get_text('yolo_auto_annot_result', n_items, n_frames))
+
     def run_single_yolo_inference(self):
         """現在表示中の画像に対してYOLO推論を実行"""
         if not self.images or not hasattr(self, 'yolo_model'):
@@ -14778,40 +15478,19 @@ class ImageAnnotationTool(QMainWindow):
             if current_index in self.detection_inference_results:
                 del self.detection_inference_results[current_index]
             
-            # 検出結果を保存
-            bboxes = []
-            
-            # 画像サイズを取得
+            # 検出結果を保存（dets_to_bboxes を共有。自車領域は除外）
             img = Image.open(current_img_path)
             img_width, img_height = img.size
-            
+            bboxes = []
             for result in results:
-                for det in result.boxes.data.cpu().numpy():
-                    if len(det) >= 6:  # x1, y1, x2, y2, confidence, class_id
-                        x1, y1, x2, y2, conf, class_id = det[:6]
-                        
-                        # 画像サイズで正規化（0-1の範囲に）
-                        x1_norm = x1 / img_width
-                        y1_norm = y1 / img_height
-                        x2_norm = x2 / img_width
-                        y2_norm = y2 / img_height
-                        
-                        # クラス名を取得
-                        class_id = int(class_id)
-                        class_name = result.names[class_id] if class_id in result.names else f"class_{class_id}"
-                        
-                        # バウンディングボックスを追加
-                        bbox = {
-                            'x1': x1_norm,
-                            'y1': y1_norm,
-                            'x2': x2_norm,
-                            'y2': y2_norm,
-                            'class': class_name,
-                            'confidence': float(conf)
-                        }
-                        
-                        bboxes.append(bbox)
-            
+                boxes = getattr(result, 'boxes', None)
+                if boxes is None:
+                    continue
+                bboxes.extend(dets_to_bboxes(
+                    boxes.data.cpu().numpy(), result.names,
+                    (img_width, img_height), class_map=None, conf_min=0.0,
+                    ego_region=DEFAULT_EGO_REGION))
+
             # 推論結果を保存（インデックスベース）
             if bboxes:
                 self.detection_inference_results[current_index] = bboxes
@@ -15294,6 +15973,10 @@ class ImageAnnotationTool(QMainWindow):
             "COCO基本": "person,bicycle,car,motorcycle,airplane,bus,train,truck",
             "自動運転基本": "car,person,bicycle,motorcycle,truck,bus,traffic_light,stop_sign,cone",
             "ミニカー用": "car,person,sign,cone,obstacle,barrier",
+            # ② TogiVAD 他車動き予測(agent motion)の GT 用。相手車を opponent で、
+            # 静的障害物を obstacle で矩形アノテーションする。box→ego 投影＋追跡で
+            # togivad/agents（他車の ego 位置＋将来軌道）に変換して②の学習に使う。
+            "TogiVAD他車(E2E)": "opponent,obstacle",
             "屋内ロボット": "person,chair,table,laptop,cell_phone,book,bottle,cup",
             "建設現場": "person,truck,excavator,cone,barrier,hard_hat,safety_vest",
         }
@@ -15878,25 +16561,55 @@ class ImageAnnotationTool(QMainWindow):
             )
 
     def _ensure_databricks_enabled(self):
-        """Databricks連携が無効なら有効化を提案し、有効化する。成功でTrue、キャンセルでFalse"""
-        if self.mlflow_manager.use_databricks:
+        """Databricks連携を有効化し、SDK接続を確立する。成功でTrue、失敗/キャンセルでFalse
+
+        初回の転送・学習からでも接続できるよう、MLflow接続の前にまずSDK接続
+        （接続テスト相当）を確立してトークンをキャッシュする。OAuthの場合は
+        ここでブラウザ認証が走る。
+        """
+        # 既に有効かつ接続済みなら何もしない
+        if self.mlflow_manager.use_databricks and \
+                self.mlflow_manager._databricks_connected:
             return True
 
-        reply = QMessageBox.question(
-            self,
-            get_text('dlg_databricks_not_enabled'),
-            get_text('msg_databricks_enable_confirm'),
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes
-        )
-        if reply != QMessageBox.Yes:
+        # 未有効なら有効化を確認
+        if not self.mlflow_manager.use_databricks:
+            reply = QMessageBox.question(
+                self,
+                get_text('dlg_databricks_not_enabled'),
+                get_text('msg_databricks_enable_confirm'),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+            if reply != QMessageBox.Yes:
+                return False
+
+        # 1. SDK接続を先に確立（OAuthはブラウザ認証→トークンキャッシュ、PATは検証）
+        self.statusBar().showMessage(get_text('db_connecting'), 0)
+        QApplication.processEvents()
+        try:
+            ok, message = DatabricksTransferManager().test_connection()
+        except Exception as e:
+            ok, message = False, str(e)
+        self.statusBar().clearMessage()
+        if not ok:
+            QMessageBox.warning(
+                self,
+                get_text('dlg_databricks_connection_failed'),
+                get_text('db_connect_failed', message))
             return False
 
-        # Databricks連携を有効化
-        self.databricks_checkbox.setChecked(True)
-        # _on_databricks_toggle が接続を試みる。失敗時はチェックが外される
+        # 2. MLflowモードを有効化（トークンキャッシュ済みなので接続成功する）
         if not self.mlflow_manager.use_databricks:
-            return False
+            # _on_databricks_toggle が MLflow 接続を行う（失敗時はチェックが外れる）
+            self.databricks_checkbox.setChecked(True)
+            if not self.mlflow_manager.use_databricks:
+                return False
+        elif not self.mlflow_manager._databricks_connected:
+            self.mlflow_manager.is_initialized = False
+            self.mlflow_manager.initialize(
+                self.mlflow_manager.folder_path, parent_widget=self)
+            self._update_databricks_status_label()
         return True
 
     def _open_databricks_ui(self):
@@ -16196,6 +16909,39 @@ class ImageAnnotationTool(QMainWindow):
         compute_combo.setCurrentIndex(1 if cluster_id_cur else 0)
         train_form.addRow(get_text('db_field_compute'), compute_combo)
 
+        # サーバーレス環境（アクセラレータ/環境バージョン/GPUベース環境）
+        # ノートブックに紐づく環境を上書きし、GPU/CPU不整合を回避する
+        accel_combo = QComboBox()
+        accel_combo.addItem(get_text('db_accel_cpu'), 'cpu')
+        accel_combo.addItem(get_text('db_accel_gpu'), 'gpu')
+        accel_label = QLabel(get_text('db_field_accelerator'))
+        train_form.addRow(accel_label, accel_combo)
+
+        env_version_edit = QLineEdit("2")
+        env_version_edit.setToolTip(get_text('db_tip_env_version'))
+        env_version_label = QLabel(get_text('db_field_env_version'))
+        train_form.addRow(env_version_label, env_version_edit)
+
+        base_env_edit = QLineEdit()
+        base_env_edit.setPlaceholderText(get_text('db_base_env_placeholder'))
+        base_env_edit.setToolTip(get_text('db_tip_base_env'))
+        base_env_label = QLabel(get_text('db_field_base_env'))
+        train_form.addRow(base_env_label, base_env_edit)
+
+        def _on_compute_or_accel_changed():
+            is_serverless = compute_combo.currentData() == 'serverless'
+            is_gpu = accel_combo.currentData() == 'gpu'
+            # サーバーレス時のみ環境指定を表示
+            for w in (accel_label, accel_combo,
+                      env_version_label, env_version_edit):
+                w.setVisible(is_serverless)
+            # GPUベース環境名はサーバーレス＋GPU時のみ
+            base_env_label.setVisible(is_serverless and is_gpu)
+            base_env_edit.setVisible(is_serverless and is_gpu)
+        compute_combo.currentIndexChanged.connect(_on_compute_or_accel_changed)
+        accel_combo.currentIndexChanged.connect(_on_compute_or_accel_changed)
+        _on_compute_or_accel_changed()
+
         deploy_checkbox = QCheckBox(get_text('db_chk_deploy_notebooks'))
         deploy_checkbox.setChecked(True)
         deploy_checkbox.setToolTip(get_text('db_tip_deploy'))
@@ -16258,6 +17004,11 @@ class ImageAnnotationTool(QMainWindow):
             QMessageBox.warning(self, get_text('dlg_transfer_confirm'),
                                 get_text('tip_auto_train_cluster_required'))
             return
+        # サーバーレス環境の指定（GPU/CPU不整合の回避）
+        serverless_env_version = env_version_edit.text().strip() if use_serverless else ""
+        serverless_base_environment = (
+            base_env_edit.text().strip()
+            if use_serverless and accel_combo.currentData() == 'gpu' else "")
         train_model_type = model_combo.currentData()
         train_params = {
             "epochs": epochs_spin.value(),
@@ -16397,6 +17148,8 @@ class ImageAnnotationTool(QMainWindow):
                             model_type=train_model_type,
                             train_params=train_params,
                             use_serverless=use_serverless,
+                            serverless_env_version=serverless_env_version,
+                            serverless_base_environment=serverless_base_environment,
                         )
                         # ジョブ監視ダイアログを起動（完了時にモデル取込を案内）
                         self._monitor_databricks_run(
@@ -19237,10 +19990,31 @@ class ImageAnnotationTool(QMainWindow):
             traceback.print_exc()
             self.statusBar().showMessage(get_text('status_cam_error', e), 5000)
 
+    def _toggle_togivad_control_infer_display(self, state):
+        """時系列(TogiVAD)側の自動運転推論表示チェック → 既存の推論表示へ同期。
+
+        実表示は inference_checkbox（toggle_inference_display）が担う。状態が
+        既に一致している場合は表示だけ更新する。
+        """
+        if not hasattr(self, 'inference_checkbox'):
+            return
+        checked = (state == Qt.Checked)
+        if self.inference_checkbox.isChecked() != checked:
+            self.inference_checkbox.setChecked(checked)   # 既存トグルが更新を実施
+        else:
+            self.update_inference_display()
+
     def toggle_inference_display(self, state):
         """自動運転推論表示の切り替え"""
         show_inference = (state == Qt.Checked)
         self.main_image_view.show_inference = show_inference
+        # 時系列(TogiVAD)側の同項目チェックへ逆同期（ループ防止に signals 停止）
+        if hasattr(self, 'togivad_control_infer_checkbox'):
+            cb = self.togivad_control_infer_checkbox
+            if cb.isChecked() != show_inference:
+                cb.blockSignals(True)
+                cb.setChecked(show_inference)
+                cb.blockSignals(False)
         
         # 画面更新
         #if hasattr(self, 'main_image_view'):
@@ -26043,6 +26817,30 @@ class ImageAnnotationTool(QMainWindow):
         vocab_layout.addStretch()
         togivad_layout.addLayout(vocab_layout)
 
+        # T1-b: 残差回帰（脱量子化）。既定 OFF で従来の語彙分類のみ。
+        residual_check = QCheckBox(get_text('chk_togivad_residual'))
+        residual_check.setChecked(False)
+        residual_check.setToolTip(get_text('tip_togivad_residual'))
+        togivad_layout.addWidget(residual_check)
+
+        # T1-a: 時系列BEV融合（pose-warp）。既定 OFF で単一フレーム。
+        temporal_check = QCheckBox(get_text('chk_togivad_temporal'))
+        temporal_check.setChecked(False)
+        temporal_check.setToolTip(get_text('tip_togivad_temporal'))
+        togivad_layout.addWidget(temporal_check)
+
+        # Fusion: LiDAR占有をBEV融合。既定 OFF（LiDAR記録セッションで有効化）。
+        lidar_check = QCheckBox(get_text('chk_togivad_lidar'))
+        lidar_check.setChecked(False)
+        lidar_check.setToolTip(get_text('tip_togivad_lidar'))
+        togivad_layout.addWidget(lidar_check)
+
+        # Pilot: 制御入出力（angle/throttle 直接出力）。既定 OFF。
+        control_check = QCheckBox(get_text('chk_togivad_control'))
+        control_check.setChecked(False)
+        control_check.setToolTip(get_text('tip_togivad_control'))
+        togivad_layout.addWidget(control_check)
+
         togivad_info_label = QLabel(get_text('label_togivad_info'))
         togivad_info_label.setStyleSheet("color: #666;")
         togivad_info_label.setWordWrap(True)
@@ -26371,6 +27169,10 @@ class ImageAnnotationTool(QMainWindow):
             config['vocab_k'] = int(vocab_k_combo.currentText())
             config['vocab_from_logs'] = vocab_from_logs_check.isChecked()
             config['ego_dropout'] = ego_dropout_spin.value()
+            config['use_residual'] = residual_check.isChecked()  # T1-b
+            config['use_temporal'] = temporal_check.isChecked()  # T1-a
+            config['use_lidar'] = lidar_check.isChecked()        # Fusion
+            config['use_control'] = control_check.isChecked()    # Pilot
             # 事前バリデーション: カメラ台数プリセットと自己位置の有無
             if len(selected_sources) not in TogivadTrainingManager.SUPPORTED_CAMERA_COUNTS:
                 QMessageBox.warning(self, get_text('dlg_warning'),
@@ -26608,7 +27410,11 @@ class ImageAnnotationTool(QMainWindow):
             self._gru_model_path = selected_model_path
             # モデルが変わったので予測キャッシュをクリア
             self.gru_predictions = {}
-            self.gru_prediction_config = cfg
+            # togivad の cfg は dataclass（.get 無し）— 消費側は dict 前提の
+            # ため表示用 dict に変換して保持する
+            self.gru_prediction_config = (
+                {"seq_len": 1, "pred_horizon": int(getattr(cfg, 'horizon', 0))}
+                if is_togivad else cfg)
             return True
         except Exception as e:
             QMessageBox.critical(
@@ -26636,6 +27442,7 @@ class ImageAnnotationTool(QMainWindow):
                     pose_source=self._gru_pose_source, device=self._gru_device)
                 if out is not None:
                     self.gru_predictions[current_index] = out["best"].tolist()
+                    self._store_togivad_control_result(current_index, out)
             else:
                 deleted = getattr(self, 'deleted_indexes', set())
                 traj = self._gru_manager.predict_current(
@@ -26649,6 +27456,32 @@ class ImageAnnotationTool(QMainWindow):
         except Exception as e:
             print(f"時系列逐次推論エラー: {e}")
 
+    def _store_togivad_control_result(self, idx, out):
+        """TogiVAD の制御量を**通常の運転推論表示と同じ契約**で格納する。
+
+        Pilot(use_control) は ControlHead の (angle, throttle) を直接、非 Pilot
+        は選択軌道の pure pursuit を使う。inference_results へ angle/throttle と
+        推論点座標（x=(angle+1)/2·W, y=(1−throttle)/2·H — batch_inference と同じ
+        写像）を書き、既存の情報パネル・シアン推論点・差分ベクトルに乗せる。
+        """
+        ctrl = out.get("control") or out.get("pursuit")
+        if ctrl is None:
+            return
+        a, t = float(ctrl[0]), float(ctrl[1])
+        W = int(getattr(self, 'original_image_width', 0) or 160)
+        H = int(getattr(self, 'original_image_height', 0) or 120)
+        x = max(0, min(int((a + 1) / 2 * W), W - 1))
+        y = max(0, min(int((1 - t) / 2 * H), H - 1))
+        self.inference_results[idx] = {
+            "angle": a, "throttle": t,
+            "pilot/angle": a, "pilot/throttle": t,
+            "x": x, "y": y,
+        }
+        try:
+            self.calculate_and_store_diff_vector(idx)
+        except Exception:
+            pass
+
     def run_gru_prediction(self):
         """時系列モデルを読み込み、読み込み直後に現在フレームの推論結果を表示する。
         以降はナビゲーション時に現在画像へ逐次推論する（自動運転モデルと同じ挙動）。"""
@@ -26656,6 +27489,12 @@ class ImageAnnotationTool(QMainWindow):
             return
 
         self._gru_infer_enabled = True
+        # togivad(Pilot 含む): angle/throttle を通常の運転推論表示に載せるため
+        # 推論表示チェックを有効化＋自動 ON にする（batch 推論後と同じ挙動）
+        if getattr(self, '_gru_is_togivad', False) \
+                and hasattr(self, 'inference_checkbox'):
+            self.inference_checkbox.setEnabled(True)
+            self.inference_checkbox.setChecked(True)
         self.show_gru_predictions = True
         if hasattr(self, 'gru_prediction_checkbox'):
             self.gru_prediction_checkbox.setChecked(True)
@@ -26727,8 +27566,15 @@ class ImageAnnotationTool(QMainWindow):
                         device=self._gru_device)
                     if out is not None:
                         predictions[idx] = out["best"].tolist()
+                        self._store_togivad_control_result(idx, out)
+                # config は完了メッセージ側が dict(.get) 前提のため表示用 dict に
+                # 変換して渡す（TogiVADConfig を生で入れると .get が無く例外）
                 result = {"status": "cancelled" if cancelled else "completed",
-                          "predictions": predictions, "config": self._gru_cfg}
+                          "predictions": predictions,
+                          "total_predictions": len(predictions),
+                          "config": {"seq_len": 1,
+                                     "pred_horizon":
+                                         int(self._gru_cfg.horizon)}}
             else:
                 result = self._gru_manager.predict(
                     model_path=self._gru_model_path,
@@ -28385,6 +29231,19 @@ class ImageAnnotationTool(QMainWindow):
         self.gru_prediction_checkbox.setChecked(False)
         self.gru_prediction_checkbox.stateChanged.connect(self._toggle_gru_prediction_display)
         gru_content_layout.addWidget(self.gru_prediction_checkbox)
+
+        # TogiVAD の自動運転推論結果（angle/throttle・Pilot/pure pursuit）表示。
+        # 表示自体は自動運転モデルの推論表示（inference_checkbox → 情報パネル＋
+        # シアン推論点）と同じ経路を使うため、状態を双方向に同期する。
+        gru_infer_label = QLabel(get_text('label_togivad_control_infer'))
+        gru_infer_label.setStyleSheet("color: #666;")
+        gru_content_layout.addWidget(gru_infer_label)
+        self.togivad_control_infer_checkbox = QCheckBox(
+            get_text('chk_show_togivad_control_infer'))
+        self.togivad_control_infer_checkbox.setChecked(False)
+        self.togivad_control_infer_checkbox.stateChanged.connect(
+            self._toggle_togivad_control_infer_display)
+        gru_content_layout.addWidget(self.togivad_control_infer_checkbox)
 
         gru_model_layout.addWidget(self.gru_content_widget)
 

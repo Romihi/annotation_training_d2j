@@ -191,6 +191,40 @@ TRANSLATIONS = {
         'bev_legend_steering': '操舵軌道',
         'bev_legend_recorded': '走行軌道(実測)',
         'bev_legend_prediction': '予測軌道',
+        'chk_bev_camera': 'CAM投影',
+        'chk_bev_occupancy': '障害物',
+        'chk_bev_boundary': '境界',
+        'chk_bev_agents': '他車',
+        'bev_legend_occupancy': '障害物(LiDAR)',
+        'bev_legend_boundary': 'コース境界(左)',
+        'bev_legend_boundary_r': 'コース境界(右)',
+        'bev_legend_agent': '他車②',
+        'yolo_auto_annot_menu': 'YOLO自動アノテーション(他車/セグ)',
+        'yolo_auto_annot_title': 'YOLO自動アノテーション',
+        'yolo_auto_annot_model': 'モデル',
+        'yolo_model_loaded_det': '読込済みモデル(検出)',
+        'yolo_model_loaded_seg': '読込済みモデル(セグ)',
+        'yolo_model_dl_tag': 'DL',
+        'yolo_model_dl_failed': 'モデルのダウンロード/読み込みに失敗しました。ネット接続を確認してください。',
+        'yolo_auto_annot_task': 'タスク',
+        'yolo_auto_annot_detect': '物体検出(矩形)',
+        'yolo_auto_annot_segment': 'セグメンテーション',
+        'yolo_auto_annot_src': '元クラス(カンマ区切り)',
+        'yolo_auto_annot_tgt': '変換先クラス',
+        'yolo_auto_annot_conf': '信頼度しきい値',
+        'yolo_auto_annot_all': '全フレームに実行（OFFで現フレームのみ）',
+        'yolo_auto_annot_replace': '既存のAI自動アノテーションを置換（手動分は保持）',
+        'yolo_auto_annot_hint': ('学習済みYOLOで他車を自動検出し、元クラスを「変換先クラス」'
+                                 '(既定 opponent)へ写像してアノテーションします。\n'
+                                 'モデルは上の「モデル」から選択。手元に無ければ末尾(DL)の'
+                                 'yolov8n.pt 等を選ぶと自動ダウンロードして models に保存します'
+                                 '（COCO事前学習で car/truck/bus/motorcycle を検出）。\n'
+                                 'opponent 矩形はマップビューの「他車ラベルを計算して保存(②)」'
+                                 'で togivad/agents に変換され②の学習に使えます。'),
+        'yolo_auto_annot_no_model': ('YOLOモデルが読み込まれていません。先に「YOLOモデル読込」'
+                                     'で検出/セグモデルを読み込んでください。'),
+        'yolo_auto_annot_running': 'YOLO推論でアノテーション中...',
+        'yolo_auto_annot_result': '自動アノテーション完了: {0}個 / {1}フレーム',
 
         # --- 自動運転モデル ---
         'label_pilot_model_select': 'モデルタイプ:',
@@ -1620,6 +1654,26 @@ Google Cloud Console での OAuth設定手順
         'label_vocab_size': '軌道語彙数 K',
         'chk_vocab_from_logs': '語彙をログから構築（k-means）',
         'label_ego_dropout': 'ego ドロップアウト',
+        'chk_togivad_residual': '残差回帰で脱量子化（T1-b・ADE改善）',
+        'tip_togivad_residual': ('選択語彙に残差(オフセット)を回帰して 6.25cm '
+                                 '量子化を脱する。分類の頑健さを保ったまま軌道の'
+                                 '連続精度が上がる。ONNXに traj_residual 出力が付く'),
+        'chk_togivad_temporal': '時系列BEV融合（T1-a・pose-warp）',
+        'tip_togivad_temporal': ('前フレームBEVを実測pose差分でwarpして融合する。'
+                                 '記録の連続フレームと _timestamp_ms 由来の実dtで'
+                                 '2フレーム展開学習する（走行軌道表示と同一情報源）。'
+                                 'ONNXに prev_bev/ego_dpose 入力と bev_state 出力が付く'),
+        'chk_togivad_lidar': 'LiDAR占有をBEV融合（Fusion）',
+        'tip_togivad_lidar': ('LiDAR占有ラスタ (1ch) をカメラBEVと1×1convで融合する'
+                              '（TogiVAD-Fusion）。遮蔽・白飛び時も直接測距で壁/他車'
+                              'の位置が裏付けられる。LiDAR記録のあるセッションが必要'
+                              '（欠損フレームはゼロ=無情報）。ONNXに lidar_bev 入力が付く'),
+        'chk_togivad_control': '制御入出力（Pilot・angle/throttle直接出力）',
+        'tip_togivad_control': ('直前指令を ego 入力に加え、走行軌道を考慮した '
+                                '(angle, throttle) を直接出力する（TogiVAD-Pilot）。'
+                                '損失=模倣L1＋pure-pursuit整合＋平滑。運転アノテーション'
+                                '（angle/throttle）が必要。実行時は traj/pilot/blend '
+                                'の3モードで切替（pure pursuit は安全フォールバック）'),
         'label_togivad_info': ('軌道: 1.0秒 / 20点（MPPI互換）。画像ソース数は '
                                '1/2/4/5 台に対応。品質不良フレーム'
                                '（テレポート等）は自動除外されます'),
@@ -1660,6 +1714,8 @@ Google Cloud Console での OAuth設定手順
         'label_select_traj_model': '時系列モデル選択',
         'label_traj_model_info': '{0} | seq={1}, horizon={2}, sources={3}',
         'chk_show_traj_prediction': '時系列予測軌道を表示',
+        'label_togivad_control_infer': '自動運転推論結果（TogiVAD）:',
+        'chk_show_togivad_control_infer': '推論 angle/throttle を表示',
         'label_traj_pred_steering': '予測(steering)',
         'label_traj_pred_throttle': '予測(throttle)',
         'label_traj_inference_result': '時系列推論結果(a,t)s:',
@@ -1747,6 +1803,10 @@ Google Cloud Console での OAuth設定手順
         'map_view_writeback_horizon_label': '予測点数:',
         'map_view_writeback_dt_label': '間隔[s]:',
         'map_view_writeback_btn': '軌道ラベルを計算して保存',
+        'map_view_agent_writeback_btn': '他車ラベルを計算して保存(②)',
+        'map_view_agent_writeback_tooltip': '相手車の矩形アノテーション（opponentクラス）を ego 地面へ逆投影し、\n実測poseで追跡して他車の将来軌道（togivad/agents）を計算・保存します。\nTogiVAD②マルチモーダル他車動き予測の教師ラベルになります。\n元のファイルは .bak にバックアップされます。',
+        'map_view_agent_writeback_none': '相手車（opponent）の矩形アノテーションが見つかりません。\nクラスプリセット「TogiVAD他車(E2E)」で相手車を矩形アノテーションしてから実行してください。',
+        'map_view_agent_writeback_result': '他車ラベル(togivad/agents)を保存しました。\n他車ありフレーム: {0} / 逆投影した矩形: {1}',
         'map_view_writeback_tooltip': '現在の自己位置データ（品質フィルタ・区間編集・補間を反映）から、\n各フレームの将来軌道（togivad学習用の教師ラベル togivad/future_traj）を計算し、\n記録データ（catalogファイル）に保存します。\n元のファイルは .bak としてバックアップされます。',
         'map_view_writeback_hint': '※ 各フレームから「予測点数×間隔」秒先までの走行軌跡を教師ラベルとして計算し、記録データに保存します（togivadの学習で使用）。保存前に元ファイルは .bak にバックアップされます。',
         'map_view_writeback_horizon_tooltip': '将来軌道の点数（デフォルト20点 = togivadの設定と同じ）',
@@ -1761,6 +1821,8 @@ Google Cloud Console での OAuth設定手順
         'map_view_writeback_no_manifest': 'manifest.jsonが読み込まれていません。先にデータを読み込んでください。',
 
         # --- Databricks連携（アプリ内設定・転送・学習・監視） ---
+        'db_connecting': 'Databricksに接続中...（OAuthの場合はブラウザで認証）',
+        'db_connect_failed': 'Databricksに接続できませんでした:\n{0}',
         'db_group_connection': '接続設定',
         'db_field_enabled': 'Databricks連携を有効化',
         'db_field_auth_method': '認証方式:',
@@ -1789,6 +1851,14 @@ Google Cloud Console での OAuth設定手順
         'db_field_compute': 'コンピュート:',
         'db_compute_serverless': 'サーバーレス（フリープラン対応）',
         'db_compute_cluster': 'クラスター（設定のクラスターIDを使用）',
+        'db_field_accelerator': 'アクセラレータ:',
+        'db_accel_cpu': 'CPU',
+        'db_accel_gpu': 'GPU',
+        'db_field_env_version': '環境バージョン:',
+        'db_tip_env_version': 'サーバーレス環境のバージョン（例: 2, 3）。ノートブックに紐づく環境を上書きし、GPU/CPUの不整合を回避します。ワークスペースで有効な値を指定してください。',
+        'db_field_base_env': 'GPUベース環境名:',
+        'db_base_env_placeholder': '例: databricks-gpu（ワークスペースの表示に合わせる）',
+        'db_tip_base_env': 'GPUアクセラレータで実行する場合のベース環境名。ワークスペースの「環境」パネルに表示される名称を指定します。CPUの場合は空でOKです。',
         'db_chk_deploy_notebooks': '学習前にノートブックを自動配置する',
         'db_model_basic': '基本モデル（ステア/スロットル回帰・resnet18）',
         'db_model_togivad': 'TogiVAD（軌道語彙分類・要 togivad/future_traj ラベル）',
@@ -1925,6 +1995,40 @@ Google Cloud Console での OAuth設定手順
         'bev_legend_steering': 'Steering',
         'bev_legend_recorded': 'Driven (GT)',
         'bev_legend_prediction': 'Prediction',
+        'chk_bev_camera': 'CAM proj.',
+        'chk_bev_occupancy': 'Obstacles',
+        'chk_bev_boundary': 'Boundary',
+        'chk_bev_agents': 'Agents',
+        'bev_legend_occupancy': 'Obstacles (LiDAR)',
+        'bev_legend_boundary': 'Boundary (left)',
+        'bev_legend_boundary_r': 'Boundary (right)',
+        'bev_legend_agent': 'Agent ②',
+        'yolo_auto_annot_menu': 'YOLO auto-annotate (agents/seg)',
+        'yolo_auto_annot_title': 'YOLO auto-annotation',
+        'yolo_auto_annot_model': 'Model',
+        'yolo_model_loaded_det': 'Loaded model (detect)',
+        'yolo_model_loaded_seg': 'Loaded model (segment)',
+        'yolo_model_dl_tag': 'download',
+        'yolo_model_dl_failed': 'Failed to download/load the model. Check your internet connection.',
+        'yolo_auto_annot_task': 'Task',
+        'yolo_auto_annot_detect': 'Detection (boxes)',
+        'yolo_auto_annot_segment': 'Segmentation',
+        'yolo_auto_annot_src': 'Source classes (comma-separated)',
+        'yolo_auto_annot_tgt': 'Target class',
+        'yolo_auto_annot_conf': 'Confidence threshold',
+        'yolo_auto_annot_all': 'Run on all frames (off = current only)',
+        'yolo_auto_annot_replace': 'Replace previous AI annotations (keep manual)',
+        'yolo_auto_annot_hint': ('Auto-detect other vehicles with a trained YOLO and map the '
+                                 'source classes to the target class (default: opponent).\n'
+                                 'Pick a model above; if you have none, choose a "(download)" '
+                                 'preset like yolov8n.pt to auto-download it into models '
+                                 '(COCO-pretrained detects car/truck/bus/motorcycle).\n'
+                                 'Opponent boxes convert to togivad/agents via the map view '
+                                 '"Compute & save agent labels (②)" for ② training.'),
+        'yolo_auto_annot_no_model': ('No YOLO model loaded. Load a detection/segmentation '
+                                     'model first via "Load YOLO model".'),
+        'yolo_auto_annot_running': 'Annotating via YOLO inference...',
+        'yolo_auto_annot_result': 'Auto-annotation done: {0} items / {1} frames',
 
         # --- Pilot Model ---
         'label_pilot_model_select': 'Model Type:',
@@ -3356,6 +3460,33 @@ Notes
         'label_vocab_size': 'Trajectory vocabulary K',
         'chk_vocab_from_logs': 'Build vocabulary from logs (k-means)',
         'label_ego_dropout': 'Ego dropout',
+        'chk_togivad_residual': 'Residual regression (T1-b, de-quantize/ADE)',
+        'tip_togivad_residual': ('Regress an offset on the chosen vocabulary '
+                                 'to escape the 6.25cm quantization; keeps '
+                                 'classification robustness while adding '
+                                 'continuous precision. Adds traj_residual to ONNX.'),
+        'chk_togivad_temporal': 'Temporal BEV fusion (T1-a, pose-warp)',
+        'tip_togivad_temporal': ('Warp the previous-frame BEV by the measured '
+                                 'pose delta and fuse it. Trains as a 2-frame '
+                                 'unroll using real dt from _timestamp_ms (same '
+                                 'source as the driving-trajectory display). '
+                                 'Adds prev_bev/ego_dpose inputs and bev_state '
+                                 'output to ONNX.'),
+        'chk_togivad_lidar': 'Fuse LiDAR occupancy into BEV (Fusion)',
+        'tip_togivad_lidar': ('Fuse the LiDAR occupancy raster (1ch) with the '
+                              'camera BEV via a 1x1 conv (TogiVAD-Fusion). '
+                              'Direct ranging backs up walls/agents under '
+                              'occlusion or glare. Requires sessions with LiDAR '
+                              'records (missing frames become zeros). Adds a '
+                              'lidar_bev input to ONNX.'),
+        'chk_togivad_control': 'Control I/O (Pilot, direct angle/throttle)',
+        'tip_togivad_control': ('Feed the previous command into ego and output '
+                                'trajectory-aware (angle, throttle) directly '
+                                '(TogiVAD-Pilot). Loss = imitation L1 + '
+                                'pure-pursuit consistency + smoothness. Needs '
+                                'driving annotations (angle/throttle). Runtime '
+                                'modes: traj / pilot / blend (pure pursuit '
+                                'remains the safety fallback).'),
         'label_togivad_info': ('Trajectory: 1.0s / 20 points (MPPI compatible). '
                                'Supports 1/2/4/5 image sources. Low-quality '
                                'frames (teleports etc.) are excluded '
@@ -3398,6 +3529,8 @@ Notes
         'label_select_traj_model': 'Select Sequence Model',
         'label_traj_model_info': '{0} | seq={1}, horizon={2}, sources={3}',
         'chk_show_traj_prediction': 'Show Sequence Prediction',
+        'label_togivad_control_infer': 'Driving inference (TogiVAD):',
+        'chk_show_togivad_control_infer': 'Show inferred angle/throttle',
         'label_traj_pred_steering': 'Pred (steering)',
         'label_traj_pred_throttle': 'Pred (throttle)',
         'label_traj_inference_result': 'Sequence Inference:',
@@ -3485,6 +3618,10 @@ Notes
         'map_view_writeback_horizon_label': 'Points:',
         'map_view_writeback_dt_label': 'Interval [s]:',
         'map_view_writeback_btn': 'Compute & save trajectory labels',
+        'map_view_agent_writeback_btn': 'Compute & save agent labels (②)',
+        'map_view_agent_writeback_tooltip': 'Unproject opponent bounding boxes to the ego ground, track them with measured pose,\nand compute other-vehicle future trajectories (togivad/agents).\nThese become the GT for TogiVAD ② multimodal agent motion.\nThe original files are backed up as .bak.',
+        'map_view_agent_writeback_none': 'No opponent bounding boxes found.\nAnnotate opponents with the class preset "TogiVAD他車(E2E)" first, then run this.',
+        'map_view_agent_writeback_result': 'Saved agent labels (togivad/agents).\nFrames with agents: {0} / unprojected boxes: {1}',
         'map_view_writeback_tooltip': 'Computes each frame\'s future trajectory (togivad training label\ntogivad/future_traj) from the current pose data (with quality filter,\nsegment overrides and interpolation applied) and saves it into the\nrecorded catalog files. Original files are backed up as .bak.',
         'map_view_writeback_hint': 'Computes the driving trajectory up to "points × interval" seconds ahead of each frame as a training label and saves it into the recorded data (used by togivad training). Original files are backed up as .bak before saving.',
         'map_view_writeback_horizon_tooltip': 'Number of future trajectory points (default 20 = togivad default)',
@@ -3499,6 +3636,8 @@ Notes
         'map_view_writeback_no_manifest': 'manifest.json is not loaded. Load a session first.',
 
         # --- Databricks integration (in-app settings / transfer / train / monitor) ---
+        'db_connecting': 'Connecting to Databricks... (a browser opens for OAuth)',
+        'db_connect_failed': 'Could not connect to Databricks:\n{0}',
         'db_group_connection': 'Connection settings',
         'db_field_enabled': 'Enable Databricks integration',
         'db_field_auth_method': 'Auth method:',
@@ -3527,6 +3666,14 @@ Notes
         'db_field_compute': 'Compute:',
         'db_compute_serverless': 'Serverless (works on free plan)',
         'db_compute_cluster': 'Cluster (use configured cluster ID)',
+        'db_field_accelerator': 'Accelerator:',
+        'db_accel_cpu': 'CPU',
+        'db_accel_gpu': 'GPU',
+        'db_field_env_version': 'Environment version:',
+        'db_tip_env_version': 'Serverless environment version (e.g. 2, 3). Overrides the environment bound to the notebook to avoid GPU/CPU mismatch. Use a value valid in your workspace.',
+        'db_field_base_env': 'GPU base environment:',
+        'db_base_env_placeholder': 'e.g. databricks-gpu (match your workspace)',
+        'db_tip_base_env': 'Base environment name when running on a GPU accelerator. Use the name shown in the workspace Environment panel. Leave empty for CPU.',
         'db_chk_deploy_notebooks': 'Deploy notebooks before training',
         'db_model_basic': 'Basic model (steer/throttle regression, resnet18)',
         'db_model_togivad': 'TogiVAD (trajectory-vocab classification, needs togivad/future_traj labels)',

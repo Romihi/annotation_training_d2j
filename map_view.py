@@ -513,6 +513,14 @@ class MapViewDialog(QDialog):
         self.writeback_button.setToolTip(get_text('map_view_writeback_tooltip'))
         self.writeback_button.clicked.connect(self._on_writeback_clicked)
         writeback_row.addWidget(self.writeback_button)
+        # ②: 相手車矩形（opponent）→ togivad/agents 書き戻し
+        self.agent_writeback_button = QPushButton(
+            get_text('map_view_agent_writeback_btn'))
+        self.agent_writeback_button.setToolTip(
+            get_text('map_view_agent_writeback_tooltip'))
+        self.agent_writeback_button.clicked.connect(
+            self._on_agent_writeback_clicked)
+        writeback_row.addWidget(self.agent_writeback_button)
         writeback_row.addStretch()
         parent_layout.addLayout(writeback_row)
 
@@ -638,3 +646,14 @@ class MapViewDialog(QDialog):
                 parent_widget=self)
         finally:
             self.writeback_button.setEnabled(True)
+
+    def _on_agent_writeback_clicked(self):
+        """② 相手車矩形 → togivad/agents（他車の ego 位置＋将来軌道）書き戻し。"""
+        if self.main_window is None:
+            return
+        self.agent_writeback_button.setEnabled(False)
+        try:
+            self.main_window.write_back_agent_tracks(
+                horizon=self.writeback_horizon_spin.value(), parent_widget=self)
+        finally:
+            self.agent_writeback_button.setEnabled(True)
