@@ -1126,7 +1126,7 @@ TRANSLATIONS = {
         'unit_seconds_suffix': ' 秒',
         'unit_seconds_label': '秒',
         'unit_points_label': '点',
-        'tip_recorded_traj_source': '走行軌道(緑)の自己位置ソース。既定 pose（デッドレコニングで滑らか）。slam は絶対位置だが再ローカライズのテレポートで補完できず軌道が途切れるフレームが多い。TogiVADモデル読込時はそのモデルの学習ソースへ同期',
+        'tip_recorded_traj_source': '走行軌道(緑)の自己位置ソース。既定 pose（デッドレコニングで滑らか）。slam は絶対位置だが再ローカライズのテレポートで軌道が途切れるフレームが多い。vslam は Visual SLAM（連続的だがドリフトしうる。未記録セッションでは原点に潰れる）。TogiVADモデル読込時はそのモデルの学習ソースへ同期',
         'tip_recorded_traj_seconds': '走行軌道を表示する時間窓[秒]（dt=秒数/点数）。TogiVADモデル読込時はそのモデルの秒数(horizon×dt)へ自動同期し、推論軌道と同じ時間窓で比較できる',
         'tip_recorded_traj_points': '走行軌道の標本点数（空欄で20点。dt=秒数/点数）。TogiVADモデル読込時はそのモデルのhorizon/dt/pose_sourceに自動同期し推論軌道と同じ標本点になる',
         'tip_auto_max_steering': '操舵軌道表示に使用する最大舵角（度）',
@@ -1669,11 +1669,35 @@ Google Cloud Console での OAuth設定手順
                               'の位置が裏付けられる。LiDAR記録のあるセッションが必要'
                               '（欠損フレームはゼロ=無情報）。ONNXに lidar_bev 入力が付く'),
         'chk_togivad_control': '制御入出力（Pilot・angle/throttle直接出力）',
+        'chk_togivad_control_trj': '軌道入力制御（Pilot-Trj・学習トラッカー）',
+        'tip_togivad_control_trj': ('推論された**最終軌道**（マスク・スコア適用後）を'
+                                    '入力に (angle, throttle) を出す学習トラッカー'
+                                    '（TogiVAD-Pilot-Trj）。教師は「GT走行軌道↔当時の'
+                                    '運転アノテーション」で全フレームに完備。Pilot とは'
+                                    '排他。実行時は軌道選択と制御が常に一致し、'
+                                    'ONNXグラフは不変（numpy評価＋sidecar）'),
         'tip_togivad_control': ('直前指令を ego 入力に加え、走行軌道を考慮した '
                                 '(angle, throttle) を直接出力する（TogiVAD-Pilot）。'
                                 '損失=模倣L1＋pure-pursuit整合＋平滑。運転アノテーション'
                                 '（angle/throttle）が必要。実行時は traj/pilot/blend '
                                 'の3モードで切替（pure pursuit は安全フォールバック）'),
+        'chk_togivad_world': '世界モデル自己教師（T2-a・少データ汎化）',
+        'tip_togivad_world': ('「現在のBEVトークン＋選択軌道→次フレームのBEV'
+                              'トークン」を予測する補助損失（LAW/DriveWorld-lite）。'
+                              '教師は次フレーム画像そのもの＝アノテーション不要。'
+                              '表現学習でデータ効率が上がる。学習専用ヘッドのため'
+                              'ONNX・推論コストは不変（推論コスト0）'),
+        'chk_togivad_agent_motion': '他車動き予測（②・要 他車ラベル）',
+        'tip_togivad_agent_motion': ('マルチモーダル他車動き予測（K\'モード×T_a点）'
+                                     'を学習する。GT はマップビューの「他車ラベルを'
+                                     '計算して保存」で書き戻した togivad/agents。'
+                                     'ONNXに agent_motion/agent_mode_logits 出力が付く'),
+        'chk_togivad_track': 'agent追跡強化（T2-b・track embedding）',
+        'tip_togivad_track': ('AgentHead クエリの track embedding を前後フレームの'
+                              '対照学習で対応付け、同一他車に一貫した表現を与える'
+                              '（UniAD-lite）。他車動き予測（②）と時系列BEV融合'
+                              '（T1-a）が前提。GT は他車ラベル書き戻し時の'
+                              ' togivad/agent_ids。学習専用のため ONNX は不変'),
         'label_togivad_info': ('軌道: 1.0秒 / 20点（MPPI互換）。画像ソース数は '
                                '1/2/4/5 台に対応。品質不良フレーム'
                                '（テレポート等）は自動除外されます'),
@@ -1683,6 +1707,12 @@ Google Cloud Console での OAuth設定手順
                                 'TogiVADの学習には自己位置付き記録が必要です'),
         'msg_togivad_bad_horizon': ('予測秒数は正の値、予測点数は1以上を'
                                     '指定してください'),
+        'msg_togivad_track_prereq': ('agent追跡強化（T2-b）には「他車動き予測（②）」'
+                                     'と「時系列BEV融合（T1-a）」の両方を有効に'
+                                     'してください'),
+        'msg_togivad_no_agents': ('他車ラベル（togivad/agents）が見つかりません。'
+                                  'マップビューの「他車ラベルを計算して保存」で'
+                                  '書き戻してから学習してください'),
         'label_stride': 'ストライド',
         'label_hidden_dim': 'Hidden Size',
         'label_dropout': 'Dropout',
@@ -1714,12 +1744,12 @@ Google Cloud Console での OAuth設定手順
         'label_select_traj_model': '時系列モデル選択',
         'label_traj_model_info': '{0} | seq={1}, horizon={2}, sources={3}',
         'chk_show_traj_prediction': '時系列予測軌道を表示',
-        'label_togivad_control_infer': '自動運転推論結果（TogiVAD）:',
+        'label_togivad_control_infer': '推論結果（TogiVAD）:',
         'chk_show_togivad_control_infer': '推論 angle/throttle を表示',
         'label_traj_pred_steering': '予測(steering)',
         'label_traj_pred_throttle': '予測(throttle)',
         'label_traj_inference_result': '時系列推論結果(a,t)s:',
-        'label_togivad_inference_result': 'TogiVAD推論軌道 t+Δt, x, y (s, m, m):',
+        'label_togivad_inference_result': '推論軌道 t+Δt, x, y (s, m, m):',
         'label_traj_section_title': '時系列モデル',
         'label_all': 'すべて',
         'label_combined_view': '結合表示',
@@ -1761,6 +1791,25 @@ Google Cloud Console での OAuth設定手順
         'map_view_source_auto': '自動選択（優先順）',
         'map_view_colorby_label': '色分け:',
         'map_view_colorby_time': '時間',
+        'map_view_colorby_lap': 'ラップ',
+        'map_view_lap_all_short': '全',
+        'map_view_show_line': '線表示',
+        'map_view_laptime_current': 'ラップ{0}: {1}s｜ラップ内 {2}s',
+        'map_view_laptime_best': 'ベスト: ラップ{0} {1}s｜経過 {2}s',
+        'map_view_laptime_total': '経過 {0}s',
+        'map_view_lap_table_btn': 'ラップ一覧',
+        'map_view_lap_table_title': 'ラップタイム一覧',
+        'map_view_lap_table_col_lap': 'ラップ',
+        'map_view_lap_table_col_time': 'タイム[s]',
+        'map_view_lap_table_col_start': '開始フレーム',
+        'map_view_lap_table_col_note': '備考',
+        'map_view_lap_table_best': '★ベスト',
+        'map_view_lap_table_running': '走行中',
+        'map_view_lap_table_close': '閉じる',
+        'map_view_lap_label': 'ラップ:',
+        'map_view_lap_all': '全ラップ',
+        'map_view_lap_item': 'ラップ {0}',
+        'map_view_lap_status': '周回数: {0}',
         'map_view_colorby_speed': '速度',
         'map_view_colorby_source': 'ソース',
         'map_view_colorby_status': 'ステータス',
@@ -1768,7 +1817,7 @@ Google Cloud Console での OAuth設定手順
         'map_view_clear_background': '地図をクリア',
         'map_view_no_pose_data': 'このセッションには自己位置データ（pose/slam/vslam/aruco）がありません',
         'map_view_available_sources': '利用可能なソース: {0}',
-        'map_view_status_extras': '軌道ラベル（黒枠）: {0}件 / ジャンプ（赤×）: {1}件',
+        'map_view_status_extras': '軌道ラベル保存済み: {0}件 / ジャンプ（赤×）: {1}件',
         'map_view_legend_jump': 'ジャンプ',
         'map_view_legend_slip': 'スリップ',
         'map_view_legend_rough': '悪路',
@@ -1819,6 +1868,41 @@ Google Cloud Console での OAuth設定手順
         'map_view_writeback_result': '保存が完了しました。\n\n・軌道ラベルを保存: {0}件\n・スキップ（軌道を計算できないフレーム）: {1}件\n・除外（削除済みフレーム）: {2}件',
         'map_view_writeback_error': '保存中にエラーが発生しました: {0}',
         'map_view_writeback_no_manifest': 'manifest.jsonが読み込まれていません。先にデータを読み込んでください。',
+
+        # map_view_region_ / map_view_autoloc_ : 位置領域（閉ポリゴン）と位置自動アノテーション（Phase 1）
+        'map_view_colorby_loc': '位置',
+        'map_view_region_label': '位置領域:',
+        'map_view_region_edit_btn': '領域編集',
+        'map_view_region_edit_tooltip': 'ONの間、マップ上でポリゴン領域を編集できます（セグメンテーションと同じ操作感）。\n・空き地クリックで新規ポリゴン開始→頂点を順にクリック→最初の頂点クリックまたは右クリックで閉じて確定\n・既存領域: クリックで選択＋ドラッグで移動、頂点ドラッグで変形、右クリックで点を挿入、\n　Shift+右クリックでクラス変更、Delete/Backspaceで頂点/領域を削除（未選択でもホバー中の領域を削除可）、\n　Shift+クリックで選択解除\n・既存領域の頂点の近くをクリックするとその頂点を共有します（隣接領域の境界合わせ）\n・Ctrl+クリックで既存領域の上からでも新規ポリゴンを開始できます（重ね塗り修正用）',
+        'map_view_region_class_label': 'クラス:',
+        'map_view_region_undo_btn': '最後を削除',
+        'map_view_region_clear_btn': '全クリア',
+        'map_view_region_save_btn': '領域を保存',
+        'map_view_region_save_tooltip': '領域定義を location_regions.json として地図フォルダへ保存します。\n同じ地図を使う別セッションでも自動で読み込まれ再利用できます。',
+        'map_view_region_saved': '位置領域を保存しました: {0}',
+        'map_view_region_save_error': '位置領域の保存に失敗しました: {0}',
+        'map_view_region_no_save_dir': '保存先が決められません（地図もデータフォルダも未読込です）',
+        'map_view_region_loaded': '保存済みの位置領域を読み込みました: {0}件（{1}）',
+        'map_view_region_count': '定義済み領域: {0}件',
+        'map_view_region_hint_start': '空き地クリックで新規ポリゴン開始（クラス {0}）。既存領域はクリックで選択して編集できます（Ctrl+クリックで領域上からも新規開始）',
+        'map_view_region_hint_progress': '頂点 {0}個（クラス {1}）。クリックで頂点追加（3点以上で閉じられます）',
+        'map_view_region_hint_close': '頂点 {0}個（クラス {1}）。最初の頂点（白丸）クリックまたは右クリックで閉じて確定します',
+        'map_view_region_hint_selected': '領域 {0}（クラス {1}）を選択中。頂点ドラッグで変形、内部ドラッグで移動、右クリックで点を挿入、Shift+右クリックでクラス変更、Delete で削除、Shift+クリックで解除',
+        'map_view_region_added': '領域を追加: クラス {0}（頂点 {1}個）',
+        'map_view_region_deleted': '領域を削除しました（クラス {0}）',
+        'map_view_region_point_added': 'ポリゴンに新しい点を追加しました (位置: {0})',
+        'map_view_region_menu_change_class': '位置クラスを変更...',
+        'map_view_region_none': '位置領域が定義されていません。「領域編集」をONにしてマップ上でポリゴンを描いてください。',
+        'map_view_region_hint': '※ 「領域編集」ONで空き地をクリックしてポリゴンを描き、最初の頂点クリックまたは右クリックで閉じると位置クラスの領域になります。既存領域はクリックで選択し、頂点ドラッグ・移動・点追加・クラス変更・Delete削除ができます（操作はセグメンテーションアノテーションと同じ）。「領域から位置を自動付与」で各フレームのpose（自己位置）を内包する領域の位置ラベルを一括付与します（重なりは後から定義した領域を優先。色分け「位置」で確認できます）。',
+        'map_view_autoloc_btn': '領域から位置を自動付与',
+        'map_view_autoloc_tooltip': '各フレームの自己位置（pose）を内包するポリゴン領域を探し、\nその領域の位置クラスを自動付与します（重なりは後から定義した領域を優先）。\n付与結果は位置ボタンのカウント・ギャラリー・色分け「位置」に反映されます。',
+        'map_view_autoloc_keep_manual': '手動アノテを保持',
+        'map_view_autoloc_keep_manual_tooltip': 'ON: 手動で付けた位置ラベルは上書きしません（自動付与分は更新されます）\nOFF: すべての位置ラベルを領域定義で上書きします',
+        'map_view_autoloc_confirm_title': '位置自動アノテーション',
+        'map_view_autoloc_confirm_msg': '{0}件のポリゴン領域を使って、poseのある全フレームへ位置ラベルを\n自動付与します（重なりは後から定義した領域を優先）。\n\n・手動アノテを保持: {1}\n\n実行しますか？',
+        'map_view_autoloc_progress': '位置ラベルを付与中... {0}/{1}',
+        'map_view_autoloc_cancelled': 'キャンセルしました（キャンセルまでに{0}件付与済み）。',
+        'map_view_autoloc_result': '位置自動アノテーションが完了しました。\n\n・付与: {0}件\n・手動アノテ保持のためスキップ: {1}件\n・pose無しのためスキップ: {2}件\n・領域外のためスキップ: {3}件\n・削除済みのため除外: {4}件',
 
         # --- Databricks連携（アプリ内設定・転送・学習・監視） ---
         'db_connecting': 'Databricksに接続中...（OAuthの場合はブラウザで認証）',
@@ -2930,7 +3014,7 @@ Google Cloud Console での OAuth設定手順
         'unit_seconds_suffix': ' s',
         'unit_seconds_label': 's',
         'unit_points_label': 'pts',
-        'tip_recorded_traj_source': 'Localization source for the driven trajectory (green). Default pose (smooth dead reckoning). slam is absolute but has many frames that cannot be interpolated due to relocalization teleports, breaking the trajectory. Syncs to the model source when a TogiVAD model is loaded.',
+        'tip_recorded_traj_source': 'Localization source for the driven trajectory (green). Default pose (smooth dead reckoning). slam is absolute but breaks on relocalization teleports. vslam is Visual SLAM (continuous but may drift; collapses to the origin in sessions without records). Syncs to the model source when a TogiVAD model is loaded.',
         'tip_recorded_traj_seconds': 'Time window [s] of the driven trajectory (dt = seconds / points). When a TogiVAD model is loaded, auto-syncs to its seconds (horizon×dt) to compare against the prediction over the same window.',
         'tip_recorded_traj_points': 'Number of driven-trajectory sample points (empty = 20; dt = seconds / points). When a TogiVAD model is loaded, auto-syncs to its horizon/dt/pose_source to match the prediction sample points.',
         'tip_auto_max_steering': 'Maximum steering angle used for steering trajectory display (degrees)',
@@ -3480,6 +3564,14 @@ Notes
                               'records (missing frames become zeros). Adds a '
                               'lidar_bev input to ONNX.'),
         'chk_togivad_control': 'Control I/O (Pilot, direct angle/throttle)',
+        'chk_togivad_control_trj': 'Trajectory-input control (Pilot-Trj)',
+        'tip_togivad_control_trj': ('A learned tracker that outputs (angle, throttle) '
+                                    'from the **final inferred trajectory** (after '
+                                    'masking/scoring). Supervised by GT-trajectory vs '
+                                    'driving annotations, available on every frame. '
+                                    'Mutually exclusive with Pilot. Control always '
+                                    'matches the executed trajectory; ONNX graph '
+                                    'unchanged (numpy head + sidecar).'),
         'tip_togivad_control': ('Feed the previous command into ego and output '
                                 'trajectory-aware (angle, throttle) directly '
                                 '(TogiVAD-Pilot). Loss = imitation L1 + '
@@ -3487,6 +3579,28 @@ Notes
                                 'driving annotations (angle/throttle). Runtime '
                                 'modes: traj / pilot / blend (pure pursuit '
                                 'remains the safety fallback).'),
+        'chk_togivad_world': 'World-model self-supervision (T2-a)',
+        'tip_togivad_world': ('Auxiliary loss predicting next-frame BEV tokens '
+                              'from current tokens + selected trajectory '
+                              '(LAW/DriveWorld-lite). The teacher is the next '
+                              'camera frame itself — no annotation needed. '
+                              'Improves data efficiency via representation '
+                              'learning. Train-only head: ONNX and inference '
+                              'cost are unchanged (zero inference cost).'),
+        'chk_togivad_agent_motion': 'Agent motion prediction (2, needs agent labels)',
+        'tip_togivad_agent_motion': ('Learn multi-modal agent motion (K\' modes '
+                                     'x T_a points). GT is togivad/agents written '
+                                     'back via "Compute & save agent labels" in '
+                                     'the map view. Adds agent_motion / '
+                                     'agent_mode_logits outputs to ONNX.'),
+        'chk_togivad_track': 'Agent tracking (T2-b, track embedding)',
+        'tip_togivad_track': ('Associate AgentHead queries across consecutive '
+                              'frames via contrastive track embeddings '
+                              '(UniAD-lite), giving each opponent a consistent '
+                              'representation. Requires agent motion (2) and '
+                              'temporal BEV fusion (T1-a). GT is '
+                              'togivad/agent_ids from the agent-label '
+                              'write-back. Train-only: ONNX unchanged.'),
         'label_togivad_info': ('Trajectory: 1.0s / 20 points (MPPI compatible). '
                                'Supports 1/2/4/5 image sources. Low-quality '
                                'frames (teleports etc.) are excluded '
@@ -3498,6 +3612,12 @@ Notes
                                 'localization'),
         'msg_togivad_bad_horizon': ('Predict seconds must be positive and '
                                     'predict points >= 1'),
+        'msg_togivad_track_prereq': ('Agent tracking (T2-b) requires both '
+                                     '"Agent motion prediction (2)" and '
+                                     '"Temporal BEV fusion (T1-a)" enabled'),
+        'msg_togivad_no_agents': ('No agent labels (togivad/agents) found. '
+                                  'Write them back via "Compute & save agent '
+                                  'labels" in the map view before training'),
         'label_stride': 'Stride',
         'label_hidden_dim': 'Hidden Size',
         'label_dropout': 'Dropout',
@@ -3576,6 +3696,25 @@ Notes
         'map_view_source_auto': 'Auto (by priority)',
         'map_view_colorby_label': 'Color by:',
         'map_view_colorby_time': 'Time',
+        'map_view_colorby_lap': 'Lap',
+        'map_view_lap_all_short': 'All',
+        'map_view_show_line': 'Line',
+        'map_view_laptime_current': 'Lap {0}: {1}s | in-lap {2}s',
+        'map_view_laptime_best': 'Best: Lap {0} {1}s | elapsed {2}s',
+        'map_view_laptime_total': 'Elapsed {0}s',
+        'map_view_lap_table_btn': 'Lap list',
+        'map_view_lap_table_title': 'Lap times',
+        'map_view_lap_table_col_lap': 'Lap',
+        'map_view_lap_table_col_time': 'Time [s]',
+        'map_view_lap_table_col_start': 'Start frame',
+        'map_view_lap_table_col_note': 'Note',
+        'map_view_lap_table_best': '★ Best',
+        'map_view_lap_table_running': 'running',
+        'map_view_lap_table_close': 'Close',
+        'map_view_lap_label': 'Lap:',
+        'map_view_lap_all': 'All laps',
+        'map_view_lap_item': 'Lap {0}',
+        'map_view_lap_status': 'Laps: {0}',
         'map_view_colorby_speed': 'Speed',
         'map_view_colorby_source': 'Source',
         'map_view_colorby_status': 'Status',
@@ -3583,7 +3722,7 @@ Notes
         'map_view_clear_background': 'Clear Map',
         'map_view_no_pose_data': 'This session has no pose data (pose/slam/vslam/aruco)',
         'map_view_available_sources': 'Available sources: {0}',
-        'map_view_status_extras': 'traj labels (black edge): {0} / jumps (red x): {1}',
+        'map_view_status_extras': 'traj labels saved: {0} / jumps (red x): {1}',
         'map_view_legend_jump': 'Jump',
         'map_view_legend_slip': 'Slip',
         'map_view_legend_rough': 'Rough road',
@@ -3634,6 +3773,41 @@ Notes
         'map_view_writeback_result': 'Save complete.\n\n- Trajectory labels saved: {0}\n- Skipped (trajectory unavailable): {1}\n- Excluded (deleted frames): {2}',
         'map_view_writeback_error': 'Error while saving: {0}',
         'map_view_writeback_no_manifest': 'manifest.json is not loaded. Load a session first.',
+
+        # map_view_region_ / map_view_autoloc_ : location regions (closed polygons) & auto location annotation (Phase 1)
+        'map_view_colorby_loc': 'Location',
+        'map_view_region_label': 'Location regions:',
+        'map_view_region_edit_btn': 'Edit regions',
+        'map_view_region_edit_tooltip': 'While ON, polygon regions can be edited on the map (same feel as segmentation annotation).\n- Click empty space to start a new polygon, click vertices in order, then click the first vertex or right-click to close\n- Existing regions: click to select + drag to move, drag vertices to reshape, right-click inserts a point,\n  Shift+right-click changes the class, Delete/Backspace removes the vertex/region (a hovered region can be\n  deleted without selecting), Shift+click deselects\n- Clicking near a vertex of an existing region reuses that vertex (shared boundaries)\n- Ctrl+click starts a new polygon even on top of an existing region (for overlay patches)',
+        'map_view_region_class_label': 'Class:',
+        'map_view_region_undo_btn': 'Undo last',
+        'map_view_region_clear_btn': 'Clear all',
+        'map_view_region_save_btn': 'Save regions',
+        'map_view_region_save_tooltip': 'Saves the region definitions as location_regions.json into the map folder.\nSessions using the same map auto-load and reuse them.',
+        'map_view_region_saved': 'Saved location regions: {0}',
+        'map_view_region_save_error': 'Failed to save location regions: {0}',
+        'map_view_region_no_save_dir': 'No save location available (neither a map nor a data folder is loaded)',
+        'map_view_region_loaded': 'Loaded saved location regions: {0} region(s) ({1})',
+        'map_view_region_count': 'Defined regions: {0}',
+        'map_view_region_hint_start': 'Click empty space to start a new polygon (class {0}). Click an existing region to select and edit it (Ctrl+click starts a new polygon even on a region)',
+        'map_view_region_hint_progress': '{0} vertex(es) (class {1}). Click to add vertices (3+ vertices to close)',
+        'map_view_region_hint_close': '{0} vertex(es) (class {1}). Click the first vertex (white dot) or right-click to close and confirm',
+        'map_view_region_hint_selected': 'Region {0} (class {1}) selected. Drag vertices to reshape, drag inside to move, right-click inserts a point, Shift+right-click changes the class, Delete removes, Shift+click deselects',
+        'map_view_region_added': 'Region added: class {0} ({1} vertices)',
+        'map_view_region_deleted': 'Region deleted (class {0})',
+        'map_view_region_point_added': 'Added a new point to the polygon (position: {0})',
+        'map_view_region_menu_change_class': 'Change location class...',
+        'map_view_region_none': 'No location regions defined. Turn on "Edit regions" and draw polygons on the map first.',
+        'map_view_region_hint': 'With "Edit regions" ON, click empty space to draw a polygon and close it via its first vertex or right-click to make a location-class region. Click an existing region to select it, then drag vertices, move it, add points, change its class, or Delete it (same interactions as segmentation annotation). "Auto-label from regions" assigns each frame the location label of the polygon containing its pose (overlaps: the later-defined region wins; check results with color-by "Location").',
+        'map_view_autoloc_btn': 'Auto-label from regions',
+        'map_view_autoloc_tooltip': 'Finds the polygon region containing each frame\'s pose and assigns that\nregion\'s location class (overlaps: the later-defined region wins).\nResults are reflected in the location buttons, gallery, and color-by "Location".',
+        'map_view_autoloc_keep_manual': 'Keep manual labels',
+        'map_view_autoloc_keep_manual_tooltip': 'ON: manually set location labels are never overwritten (auto labels are refreshed)\nOFF: all location labels are overwritten from the region definitions',
+        'map_view_autoloc_confirm_title': 'Auto location annotation',
+        'map_view_autoloc_confirm_msg': 'Auto-assign location labels to all frames with pose data using\n{0} polygon region(s) (overlaps: the later-defined region wins).\n\n- Keep manual labels: {1}\n\nProceed?',
+        'map_view_autoloc_progress': 'Assigning location labels... {0}/{1}',
+        'map_view_autoloc_cancelled': 'Cancelled ({0} label(s) had already been assigned).',
+        'map_view_autoloc_result': 'Auto location annotation finished.\n\n- Assigned: {0}\n- Skipped (manual kept): {1}\n- Skipped (no pose): {2}\n- Skipped (outside all regions): {3}\n- Excluded (deleted frames): {4}',
 
         # --- Databricks integration (in-app settings / transfer / train / monitor) ---
         'db_connecting': 'Connecting to Databricks... (a browser opens for OAuth)',

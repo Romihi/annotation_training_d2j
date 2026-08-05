@@ -12,6 +12,12 @@ TensorRT のインストール:
   または NVIDIA TensorRT SDK から whl を直接インストール
 
 MultiSourceModel (マルチカメラ・attention 融合) にも対応。
+
+TogiVAD 系（togivad_*.pth。Tier1/ベクトル化/Fusion/Pilot の全フラグ構成）にも対応:
+  - ONNX 化は togivad/export_onnx.py に委譲（入出力名 = config.output_spec）
+  - trt サブコマンドの出力は TogiVADRuntime の規約に合わせ **.engine** 拡張子で、
+    語彙 sidecar <name>_vocab.npy も同ディレクトリに生成される
+  例: python tools/torch2trt_converter.py trt models/togivad_xxx.pth
 """
 
 import os
@@ -37,6 +43,88 @@ _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_TOOLS_DIR)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
+# togivad パッケージはリポジトリ直下
+_REPO_ROOT = os.path.dirname(_PROJECT_ROOT)
+
+
+# ---------------------------------------------------------------------------
+# TogiVAD 対応
+# ---------------------------------------------------------------------------
+
+def _is_togivad_ckpt(model_path: str, quick: bool = False) -> bool:
+    """TogiVAD 系チェックポイントかを判定する。
+
+    ファイル名 `togivad` プレフィックス（アノテーションツールの保存規約）を優先。
+    quick=False ならチェックポイントのキー構成（state_dict + config + vocab =
+    togivad/train.py 互換形式）でも判定する（list 等の一括処理は quick=True）。
+    """
+    if os.path.basename(model_path).lower().startswith('togivad'):
+        return True
+    if quick:
+        return False
+    try:
+        ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
+        return isinstance(ckpt, dict) and \
+            {'state_dict', 'config', 'vocab'} <= set(ckpt.keys())
+    except Exception:
+        return False
+
+
+def _load_togivad(model_path: str):
+    """TogiVAD チェックポイント → (model(eval,cpu), TogiVADConfig)。"""
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
+    from togivad.config import TogiVADConfig
+    from togivad.model.net import TogiVADNano
+    ckpt = torch.load(model_path, map_location='cpu', weights_only=False)
+    cfg = TogiVADConfig.from_dict(ckpt['config'])
+    model = TogiVADNano(cfg, vocab=ckpt['vocab'])
+    model.load_state_dict(ckpt['state_dict'])
+    model.eval()
+    return model, cfg
+
+
+def _togivad_flags(cfg) -> str:
+    flags = [n for n in ('use_residual', 'use_temporal', 'use_map',
+                         'use_agent_motion', 'use_lidar', 'use_control')
+             if getattr(cfg, n, False)]
+    return ', '.join(flags) if flags else 'なし（基本構成）'
+
+
+def export_togivad_to_onnx(model_path: str, output_path: str = None) -> str:
+    """TogiVAD を ONNX に変換する（togivad.export_onnx に委譲）。
+
+    入出力名・順序は config.output_spec が単一情報源（use_lidar/use_temporal の
+    追加入力、residual/map/agent/control/bev_state の追加出力を自動で含む）。
+    語彙 sidecar <base>_vocab.npy も同時に生成される（.engine 読込規約と同名）。
+    """
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
+    from togivad.export_onnx import export as togivad_export
+
+    if output_path is None:
+        output_path = os.path.splitext(model_path)[0] + '.onnx'
+
+    model, cfg = _load_togivad(model_path)
+    print(f"\n[ONNX 変換 (TogiVAD)]")
+    print(f"  入力モデル : {model_path}")
+    print(f"  出力ONNX   : {output_path}")
+    print(f"  構成       : {cfg.num_cameras}cam × {cfg.image_h}x{cfg.image_w}, "
+          f"ego_dim={cfg.ego_dim}, vocab_k={cfg.vocab_k}, horizon={cfg.horizon}")
+    print(f"  拡張フラグ : {_togivad_flags(cfg)}")
+
+    # nn.MultiheadAttention fast-path を OFF（一般 ops への展開用）
+    try:
+        torch.backends.mha.set_fastpath_enabled(False)
+    except Exception:
+        pass
+    with torch.no_grad():
+        togivad_export(model, cfg, output_path)
+
+    size_mb = os.path.getsize(output_path) / 1024 / 1024
+    print(f"  ONNX 変換成功: {size_mb:.2f} MB")
+    print(f"  語彙 sidecar : {output_path.replace('.onnx', '_vocab.npy')}")
+    return output_path
 
 
 # ---------------------------------------------------------------------------
@@ -410,18 +498,37 @@ def benchmark_inference(model_path: str = None,
 
     # --- PyTorch ベンチマーク ---
     if model_path or model is not None:
-        if model is None:
+        fn = None
+        if model is None and model_path and _is_togivad_ckpt(model_path):
+            # TogiVAD: cfg のフラグ構成に応じた複数入力（images/ego + 追加入力）
+            model, tv_cfg = _load_togivad(model_path)
+            model = model.to(dev)
+            imgs = torch.randn(1, tv_cfg.num_cameras, 3, tv_cfg.image_h,
+                               tv_cfg.image_w, device=dev)
+            ego = torch.zeros(1, tv_cfg.ego_dim, device=dev)
+            kw = {}
+            if getattr(tv_cfg, 'use_lidar', False):
+                kw['lidar_bev'] = torch.zeros(
+                    1, 1, tv_cfg.bev_size, tv_cfg.bev_size, device=dev)
+            if getattr(tv_cfg, 'use_temporal', False):
+                kw['prev_bev'] = torch.zeros(
+                    1, tv_cfg.bev_dim, tv_cfg.bev_size, tv_cfg.bev_size,
+                    device=dev)
+                kw['ego_dpose'] = torch.zeros(1, 3, device=dev)
+            fn = lambda: model(imgs, ego, **kw)
+        elif model is None:
             meta = load_model_weights(model_path, dev)
             mt, ns, fm = infer_model_type_from_filename(model_path)
             model = _build_model(meta, mt or 'mobilenetv3_small_100', dev)
             num_sources = meta['num_sources']
 
-        if num_sources > 1:
-            dummy = [torch.randn(1, 3, H, W, device=dev) for _ in range(num_sources)]
-            fn = lambda: model(dummy)
-        else:
-            dummy = torch.randn(1, 3, H, W, device=dev)
-            fn = lambda: model(dummy)
+        if fn is None:
+            if num_sources > 1:
+                dummy = [torch.randn(1, 3, H, W, device=dev) for _ in range(num_sources)]
+                fn = lambda: model(dummy)
+            else:
+                dummy = torch.randn(1, 3, H, W, device=dev)
+                fn = lambda: model(dummy)
 
         with torch.no_grad():
             for _ in range(num_warmup):
@@ -563,11 +670,17 @@ def main():
             return
         print(f"\n{len(models)} 件のモデルファイル:")
         for p in models:
-            mt, ns, fm = infer_model_type_from_filename(p)
-            tag = f"multi{ns}_{fm}" if ns > 1 else "single"
+            if _is_togivad_ckpt(p, quick=True):
+                tag = "togivad"
+            else:
+                mt, ns, fm = infer_model_type_from_filename(p)
+                tag = f"multi{ns}_{fm}" if ns > 1 else "single"
             print(f"  [{tag:20s}] {os.path.relpath(p)}")
 
     elif args.cmd == 'onnx':
+        if _is_togivad_ckpt(args.model_path):
+            export_togivad_to_onnx(args.model_path, output_path=args.output)
+            return
         mt = args.model_type
         if mt is None:
             mt, ns, fm = infer_model_type_from_filename(args.model_path)
@@ -578,6 +691,26 @@ def main():
                        dynamic_batch=args.dynamic_batch)
 
     elif args.cmd == 'trt':
+        if _is_togivad_ckpt(args.model_path):
+            # TogiVAD: ONNX → engine（TogiVADRuntime の .engine 規約で出力。
+            # 語彙 sidecar <base>_vocab.npy は export が生成済み＝engine と同名）
+            onnx_path = (os.path.splitext(args.output)[0] + '.onnx'
+                         if args.output else
+                         os.path.splitext(args.model_path)[0] + '.onnx')
+            onnx_result = export_togivad_to_onnx(args.model_path, onnx_path)
+            if not onnx_result:
+                return
+            engine_out = os.path.splitext(onnx_result)[0] + '.engine'
+            trt_result = convert_onnx_to_trt(
+                onnx_result, output_path=engine_out,
+                precision=args.precision, workspace_gb=args.workspace)
+            if trt_result and not args.keep_onnx:
+                os.remove(onnx_result)
+                print(f"  中間 ONNX を削除: {onnx_result}")
+            if trt_result:
+                print(f"\nTogiVADRuntime でそのまま読めます: "
+                      f"TogiVADRuntime('{trt_result}')")
+            return
         mt = args.model_type
         if mt is None:
             mt, ns, fm = infer_model_type_from_filename(args.model_path)

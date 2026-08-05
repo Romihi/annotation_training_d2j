@@ -57,7 +57,8 @@ class TogivadDataset(Dataset):
     def __init__(self, valid_indexes, annotations, images, source_images_map,
                  selected_sources, pose_manager, pose_source, cfg,
                  exclude=None, return_prev=False, return_lidar=False,
-                 return_control=False):
+                 return_control=False, return_control_prev=False,
+                 return_next=False, return_agents=False, return_track=False):
         self.cfg = cfg
         self.selected_sources = selected_sources
         self.images = images
@@ -75,7 +76,19 @@ class TogivadDataset(Dataset):
         # 運転アノテーション）を追加で返す。cfg.use_control のとき ego 末尾には
         # 直前フレーム (t−1) の指令が付く（リーク回避の入出力分離）。
         self.return_control = return_control
+        # Pilot-Trj: True のとき item["ctrl_prev"] (2,) = t−1 の指令を追加で返す
+        # （TrjControlHead の ego_ctrl 用。main ego は不変 = ego_dim 不変）。
+        self.return_control_prev = return_control_prev
+        # T2-a: True のとき item["next_images"]/["dpose_next"]（次フレーム画像と
+        # 現→次の ego 相対運動）を追加で返す（世界モデル自己教師の教師側。
+        # 末尾/欠落は現フレーム複製＋dpose=0 で恒等教師にフォールバック）。
+        self.return_next = return_next
+        # ②/T2-b: True のとき catalog 行の togivad/agents（＋agent_ids）から
+        # 他車 GT を追加で返す（togivad.dataset と同一の解釈コードを再利用）。
+        self.return_agents = return_agents
+        self.return_track = return_track
         self._lidar_meta_cache = {}           # session_dir -> meta dict
+        self._catalog_cache = {}              # session_dir -> {_index: row}
 
         self.transform = transforms.Compose([
             transforms.Resize((cfg.image_h, cfg.image_w)),
@@ -91,6 +104,9 @@ class TogivadDataset(Dataset):
         self.prev_indexes = []                # [int | None]
         self.dposes = []                      # [np.ndarray(3,)]
         self.ctrls = []                       # Pilot: [np.ndarray(2,)] (t の指令)
+        self.ctrl_prevs = []                  # Pilot-Trj: [np.ndarray(2,)] (t−1)
+        self.next_indexes = []                # T2-a: [int | None]（次フレーム）
+        self.dposes_next = []                 # T2-a: [np.ndarray(3,)] 現→次
         for idx in sorted(valid_indexes):
             if not all(self._image_path(idx, s) for s in selected_sources):
                 continue
@@ -123,6 +139,16 @@ class TogivadDataset(Dataset):
                 self.ctrls.append(np.array(
                     [float(ann.get("angle", 0.0) or 0.0),
                      float(ann.get("throttle", 0.0) or 0.0)], np.float32))
+            if return_control_prev:
+                pa = annotations.get(idx - 1, {})
+                self.ctrl_prevs.append(np.array(
+                    [float(pa.get("angle", 0.0) or 0.0),
+                     float(pa.get("throttle", 0.0) or 0.0)], np.float32))
+            if return_next:
+                next_idx, dpose_n = self._next_info(
+                    idx, selected_sources, pose_manager, pose_source, exclude)
+                self.next_indexes.append(next_idx)
+                self.dposes_next.append(dpose_n)
 
     def _prev_info(self, idx, selected_sources, pose_manager, pose_source,
                    exclude):
@@ -140,6 +166,22 @@ class TogivadDataset(Dataset):
         if dpose is None:
             return None, np.zeros(3, np.float32)
         return prev_idx, dpose.astype(np.float32)
+
+    def _next_info(self, idx, selected_sources, pose_manager, pose_source,
+                   exclude):
+        """次フレーム（idx+1）と現→次の ego 相対運動 dpose_next（T2-a 教師側）。
+
+        _prev_info と対称。次フレーム画像が無い / pose 欠落なら (None, zeros)
+        で「変化なし」の恒等教師にフォールバックする。
+        """
+        next_idx = idx + 1
+        ok = (next_idx not in exclude
+              and all(self._image_path(next_idx, s) for s in selected_sources))
+        dpose = pose_manager.relative_dpose(
+            idx, next_idx, prefer=pose_source) if ok else None
+        if dpose is None:
+            return None, np.zeros(3, np.float32)
+        return next_idx, dpose.astype(np.float32)
 
     def _image_path(self, index, source_name):
         if source_name in self.source_images_map:
@@ -200,6 +242,65 @@ class TogivadDataset(Dataset):
         except Exception:
             return np.zeros((1, cfg.bev_size, cfg.bev_size), np.float32)
 
+    def _catalog_row(self, index):
+        """②/T2-b: 画像パスからセッションの catalog 行を _index 照合で引く。
+
+        画像は <session>/images/{_index}_..jpg 規約（_lidar_occ と同じ導出）。
+        セッションの catalog_*.catalog を一括読みして {_index: row} でキャッシュ
+        する。見つからなければ {}（GT なし = mask 0 で損失スキップ）。
+        """
+        if index < 0:
+            return {}
+        try:
+            img = (self.images[index]
+                   if self.images and index < len(self.images)
+                   else self._image_path(index, self.selected_sources[0]))
+            if not img:
+                return {}
+            session = os.path.dirname(os.path.dirname(img))
+            prefix = int(os.path.basename(img).split('_')[0])
+        except (TypeError, ValueError, IndexError):
+            return {}
+        rows = self._catalog_cache.get(session)
+        if rows is None:
+            import glob as _glob
+            import json as _json
+            rows = {}
+            try:
+                for cf in sorted(_glob.glob(
+                        os.path.join(session, 'catalog_*.catalog'))):
+                    with open(cf, encoding='utf-8') as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            r = _json.loads(line)
+                            if '_index' in r:
+                                rows[int(r['_index'])] = r
+            except Exception:
+                pass
+            self._catalog_cache[session] = rows
+        return rows.get(prefix, {})
+
+    def _agents_gt(self, index):
+        """catalog 行の togivad/agents → (pos, fut, mask)。togivad.dataset の
+        解釈コードを再利用（同一規約: M パディング・将来点は最終点補完）。"""
+        from togivad.dataset import TogiVADDataset as _TVD
+        return _TVD._agents_gt(self, self._catalog_row(index))
+
+    def _agent_ids(self, index):
+        """catalog 行の togivad/agent_ids → (M,) int64（無効 -1）。同上の再利用。"""
+        from togivad.dataset import TogiVADDataset as _TVD
+        return _TVD._agent_ids(self, self._catalog_row(index))
+
+    def has_agents(self, max_check=200):
+        """②/T2-b の事前検証: サンプル中に他車 GT が 1 件でもあるか。"""
+        step = max(1, len(self.samples) // max_check)
+        for index, _t, _e in self.samples[::step]:
+            if self._catalog_row(index).get("togivad/agents"):
+                return True
+        return False
+
     def __getitem__(self, i):
         index, traj, ego = self.samples[i]
         label = self._nearest(self.vocab, traj)
@@ -219,6 +320,24 @@ class TogivadDataset(Dataset):
             item["lidar_bev"] = torch.from_numpy(self._lidar_occ(index))
         if self.return_control:                                # Pilot: 制御教師(t)
             item["ctrl"] = torch.from_numpy(self.ctrls[i])
+        if self.return_control_prev:                           # Pilot-Trj: t−1 指令
+            item["ctrl_prev"] = torch.from_numpy(self.ctrl_prevs[i])
+        if self.return_next:                                   # T2-a: 次フレーム
+            next_idx = self.next_indexes[i]
+            src = next_idx if next_idx is not None else index  # 無ければ現を複製
+            item["next_images"] = self._load_images(src)
+            item["dpose_next"] = torch.from_numpy(self.dposes_next[i])
+        if self.return_agents:                                 # ②: 他車 GT
+            pos, fut, amask = self._agents_gt(index)
+            item["ag_pos"] = torch.from_numpy(pos)             # (M, 2)
+            item["ag_fut"] = torch.from_numpy(fut)             # (M, T_a, 2)
+            item["ag_mask"] = torch.from_numpy(amask)          # (M,)
+        if self.return_track:                                  # T2-b: 追跡 GT
+            prev_pos, _pf, prev_mask = self._agents_gt(index - 1)
+            item["ids_cur"] = torch.from_numpy(self._agent_ids(index))
+            item["prev_ag_pos"] = torch.from_numpy(prev_pos)
+            item["prev_ag_ids"] = torch.from_numpy(self._agent_ids(index - 1))
+            item["prev_ag_mask"] = torch.from_numpy(prev_mask)
         return item
 
 
@@ -284,6 +403,24 @@ class TogivadTrainingManager:
         lambda_control = float(config.get('lambda_control', 1.0))
         lambda_consist = float(config.get('lambda_consist', 0.2))
         lambda_smooth = float(config.get('lambda_smooth', 0.05))
+        # Pilot-Trj: 最終軌道入力の学習トラッカー（教師強制 + trj_mix 混合）。
+        use_control_trj = bool(config.get('use_control_trj', False))
+        trj_mix = float(config.get('trj_mix', 0.2))
+        if use_control and use_control_trj:
+            return {"status": "error",
+                    "message": "Pilot と Pilot-Trj は排他です（どちらか一方のみ）"}
+        # T2-a: 世界モデル自己教師（学習専用ヘッド = ONNX/推論コスト不変）。
+        use_world_model = bool(config.get('use_world_model', False))
+        lambda_wm = float(config.get('lambda_wm', 0.5))
+        # ②: マルチモーダル他車動き予測（catalog の togivad/agents GT が必要）。
+        use_agent_motion = bool(config.get('use_agent_motion', False))
+        lambda_agent = float(config.get('lambda_agent', 1.0))
+        # T2-b: agent 追跡強化（track embedding の前後フレーム対照学習。
+        # ②の GT と T1-a の前フレーム供給が前提 = net でも検証される）。
+        use_track = bool(config.get('use_track', False))
+        lambda_track = float(config.get('lambda_track', 0.5))
+        if use_track and not (use_agent_motion and use_temporal):
+            return {"status": "error", "message": "togivad_track_prereq"}
         epochs = int(config.get('epochs', 20))
         batch_size = int(config.get('batch_size', 16))
         learning_rate = float(config.get('learning_rate', 3e-4))
@@ -301,7 +438,11 @@ class TogivadTrainingManager:
         dt = pred_seconds / pred_points
         cfg = make_config(n_cams, vocab_k=vocab_k, horizon=pred_points, dt=dt,
                           use_residual=use_residual, use_temporal=use_temporal,
-                          use_lidar=use_lidar, use_control=use_control)
+                          use_lidar=use_lidar, use_control=use_control,
+                          use_control_trj=use_control_trj,
+                          use_world_model=use_world_model,
+                          use_agent_motion=use_agent_motion,
+                          use_track=use_track)
 
         # 1. Dataset構築（品質不良フレームは書き戻しと同様に除外）
         if progress_callback:
@@ -318,10 +459,16 @@ class TogivadTrainingManager:
             selected_sources=selected_sources, pose_manager=pose_manager,
             pose_source=pose_source, cfg=cfg, exclude=quality_excluded,
             return_prev=use_temporal, return_lidar=use_lidar,
-            return_control=use_control)
+            return_control=use_control or use_control_trj,
+            return_control_prev=use_control_trj,
+            return_next=use_world_model, return_agents=use_agent_motion,
+            return_track=use_track)
 
         if len(dataset) == 0:
             return {"status": "error", "message": "no_sequences"}
+        if use_agent_motion and not dataset.has_agents():
+            # ②/T2-b: 他車 GT（togivad/agents）未書き戻しのセッション
+            return {"status": "error", "message": "togivad_no_agents"}
 
         # 2. 語彙構築（既定: 実走行ログの k-means。不足時は合成）
         vocab = synthetic_vocabulary(cfg)
@@ -361,6 +508,15 @@ class TogivadTrainingManager:
             from togivad.train import vocab_pursuit_steering
             steer_vocab = vocab_pursuit_steering(vocab, cfg).to(device)
             ctl_idx = output_spec(cfg).index("control")
+        # ②/T2-b: 出力インデックスと損失関数（togivad/train.py と同一実装）
+        agent_loss = track_loss = agt_idx = mode_idx = None
+        if use_agent_motion:
+            from togivad.config import output_spec
+            from togivad.train import agent_loss
+            agt_idx = output_spec(cfg).index("agent_motion")
+            mode_idx = output_spec(cfg).index("agent_mode_logits")
+        if use_track:
+            from togivad.train import track_loss
 
         # 5. Training loop
         train_losses, val_losses = [], []
@@ -385,6 +541,8 @@ class TogivadTrainingManager:
 
                 # Pilot 平滑損失用の直前舵（ego 末尾 2 次元。dropout 前に保持）
                 ang_prev = ego[:, -2].clone() if use_control else None
+                # Pilot-Trj の ego_ctrl 用 [speed, yaw_rate]（dropout 前の生値）
+                ego_sr = ego[:, :2].clone() if use_control_trj else None
                 # ego status ショートカット対策（togivad/train.py と同じ）
                 if ego_dropout > 0:
                     drop = (torch.rand(ego.shape[0], 1, device=device)
@@ -395,15 +553,30 @@ class TogivadTrainingManager:
                 kw = ({"lidar_bev": batch['lidar_bev'].to(device)}
                       if use_lidar else {})
                 optimizer.zero_grad()
+                need_aux = use_world_model or use_track
+                prev_out = prev_aux = None
                 if use_temporal:
                     # 前フレームを先に通して生 BEV 状態を得る（勾配は切る）。
                     # bev_state は常に最終出力。ego は生 BEV に影響しない。
                     prev_imgs = batch['prev_images'].to(device)
                     dpose = batch['ego_dpose'].to(device)
-                    with torch.no_grad():
-                        prev_bev = model(prev_imgs, ego)[-1]
-                    out = model(imgs, ego, prev_bev=prev_bev, ego_dpose=dpose,
-                                **kw)
+                    if use_track:
+                        # T2-b: 前フレームは勾配ありで通し track embedding を
+                        # 得る。temporal へ渡す bev_state は従来通り勾配を切る
+                        prev_out, prev_aux = model.forward_with_aux(
+                            prev_imgs, ego)
+                        prev_bev = prev_out[-1].detach()
+                    else:
+                        with torch.no_grad():
+                            prev_bev = model(prev_imgs, ego)[-1]
+                    if need_aux:
+                        out, aux = model.forward_with_aux(
+                            imgs, ego, prev_bev=prev_bev, ego_dpose=dpose, **kw)
+                    else:
+                        out = model(imgs, ego, prev_bev=prev_bev,
+                                    ego_dpose=dpose, **kw)
+                elif need_aux:
+                    out, aux = model.forward_with_aux(imgs, ego, **kw)
                 else:
                     out = model(imgs, ego, **kw)
                 traj_logits = out[2]
@@ -427,6 +600,52 @@ class TogivadTrainingManager:
                                                      tgt_steer) \
                         + lambda_smooth * (ctrl_pred[:, 0]
                                            - ang_prev).abs().mean()
+                # Pilot-Trj: 教師強制（GT軌道→当時の指令）が主。確率 trj_mix で
+                # モデル選択軌道（stop-grad）を混ぜて分布シフトを緩和
+                if use_control_trj:
+                    ctrl_gt = batch['ctrl'].to(device)
+                    ctrl_prev = batch['ctrl_prev'].to(device)
+                    traj_in = batch['traj'].to(device)
+                    if trj_mix > 0 and float(torch.rand(())) < trj_mix:
+                        sel = vocab_t[traj_logits.argmax(dim=1)]
+                        if use_residual:
+                            sel = sel + out[3]
+                        traj_in = sel.detach()
+                    ego_ctrl = torch.cat([ego_sr, ctrl_prev], dim=1)  # (B,4)
+                    pred = model.trj_control_head(traj_in, ego_ctrl)
+                    loss = loss \
+                        + lambda_control * F.l1_loss(pred, ctrl_gt) \
+                        + lambda_smooth * (pred[:, 0]
+                                           - ctrl_prev[:, 0]).abs().mean()
+                # ②: 他車検出＋マルチモーダル動き（togivad/train.py と同一損失）
+                if use_agent_motion:
+                    loss = loss + lambda_agent * agent_loss(
+                        out[1], out[agt_idx], out[mode_idx],
+                        batch['ag_pos'].to(device),
+                        batch['ag_fut'].to(device),
+                        batch['ag_mask'].to(device), cfg)
+                # T2-a: 世界モデル自己教師。教師 = 次フレーム画像の実測トークン
+                # （同一エンコーダ・stop-grad。tokens は ego 非依存なので現 ego で可）
+                if use_world_model:
+                    with torch.no_grad():
+                        _, nxt_aux = model.forward_with_aux(
+                            batch['next_images'].to(device), ego)
+                    pred_tok = model.world_head(
+                        aux["tokens"], batch['traj'].to(device),
+                        batch['dpose_next'].to(device))
+                    loss = loss + lambda_wm * F.smooth_l1_loss(
+                        pred_tok, nxt_aux["tokens"].detach())
+                # T2-b: 前後フレームの track embedding 対照損失（InfoNCE 双方向）
+                if use_track:
+                    loss = loss + lambda_track * track_loss(
+                        prev_out[1], prev_aux["agent_track"],
+                        out[1], aux["agent_track"],
+                        batch['prev_ag_pos'].to(device),
+                        batch['prev_ag_ids'].to(device),
+                        batch['prev_ag_mask'].to(device),
+                        batch['ag_pos'].to(device),
+                        batch['ids_cur'].to(device),
+                        batch['ag_mask'].to(device))
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
                 optimizer.step()
@@ -474,6 +693,13 @@ class TogivadTrainingManager:
                         ctl_mae_sum += (out[ctl_idx][:, 0]
                                         - batch['ctrl'].to(device)[:, 0]) \
                             .abs().sum().item()
+                    if use_control_trj:                    # Pilot-Trj: angle MAE
+                        ec = torch.cat([ego[:, :2],
+                                        batch['ctrl_prev'].to(device)], dim=1)
+                        pred = model.trj_control_head(traj_gt, ec)
+                        ctl_mae_sum += (pred[:, 0]
+                                        - batch['ctrl'].to(device)[:, 0]) \
+                            .abs().sum().item()
 
                     pred_idx = traj_logits.argmax(1)
                     top1 += (pred_idx == labels).sum().item()
@@ -503,7 +729,7 @@ class TogivadTrainingManager:
                 best_metrics = {"val_top1": val_top1,
                                 "val_top5": top5 / max(cnt, 1),
                                 "val_ade_m": val_ade}
-                if use_control:
+                if use_control or use_control_trj:
                     best_metrics["val_ctl_angle_mae"] = \
                         ctl_mae_sum / max(cnt, 1)
                 epochs_no_improve = 0
@@ -609,9 +835,17 @@ class TogivadTrainingManager:
                     "use_temporal": use_temporal,
                     "use_lidar": use_lidar,
                     "use_control": use_control,
+                    "use_control_trj": use_control_trj,
+                    "trj_mix": trj_mix if use_control_trj else 0.0,
                     "lambda_control": lambda_control if use_control else 0.0,
                     "lambda_consist": lambda_consist if use_control else 0.0,
                     "lambda_smooth": lambda_smooth if use_control else 0.0,
+                    "use_world_model": use_world_model,
+                    "lambda_wm": lambda_wm if use_world_model else 0.0,
+                    "use_agent_motion": use_agent_motion,
+                    "lambda_agent": lambda_agent if use_agent_motion else 0.0,
+                    "use_track": use_track,
+                    "lambda_track": lambda_track if use_track else 0.0,
                     "num_epochs": epochs,
                     "learning_rate": learning_rate,
                     "batch_size": batch_size,
@@ -638,6 +872,8 @@ class TogivadTrainingManager:
                     "best_val_top1": best_metrics.get("val_top1", 0.0),
                     "best_val_top5": best_metrics.get("val_top5", 0.0),
                     "best_val_ade_m": best_metrics.get("val_ade_m", 0.0),
+                    "best_val_ctl_angle_mae":
+                        best_metrics.get("val_ctl_angle_mae", 0.0),
                     "total_training_time": total_time,
                     "avg_epoch_time": result["avg_epoch_time"],
                     "completed_epochs": len(train_losses),
@@ -841,6 +1077,20 @@ class TogivadTrainingManager:
         vocab = np.asarray(vocab, dtype=np.float32)
         trajs = [vocab[k] + residual if residual is not None else vocab[k]
                  for k in top]
+        # Pilot-Trj: **最終軌道（best）**で学習トラッカーを評価（直前指令は
+        # 前フレームの運転アノテーション。無ければ 0）
+        if getattr(cfg, "use_control_trj", False) and control is None:
+            pa = annotations.get(target_index - 1, {}) if annotations else {}
+            ego_ctrl = torch.tensor(
+                [[speed, yaw_rate,
+                  float(pa.get("angle", 0.0) or 0.0),
+                  float(pa.get("throttle", 0.0) or 0.0)]],
+                dtype=torch.float32, device=device)
+            with torch.no_grad():
+                c = model.trj_control_head(
+                    torch.from_numpy(trajs[0]).unsqueeze(0).to(device),
+                    ego_ctrl)[0]
+            control = (float(c[0]), float(c[1]))
         # pure pursuit（togivad.infer.track と同一幾何）: 非 Pilot モデルでも
         # 運転推論表示（angle/throttle）を出せるようにする
         import math

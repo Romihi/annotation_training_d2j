@@ -324,14 +324,36 @@ class MLflowManager:
             mlflow.set_tracking_uri(self.local_tracking_uri)
 
             # 全ての実験を作成（アーティファクトは file:// ルートに保存）
+            # 論理削除(soft-deleted)された実験は名前が衝突して作成に失敗し、
+            # 以後その種別のログが記録できなくなるため、見つけたら復活させる
+            from mlflow.tracking import MlflowClient
+            from mlflow.entities import ViewType
+            _client = MlflowClient()
             for model_type, experiment_name in self.EXPERIMENT_NAMES.items():
                 experiment = mlflow.get_experiment_by_name(experiment_name)
-                if experiment is None:
+                if experiment is not None:
+                    continue
+                try:
                     mlflow.create_experiment(
                         experiment_name,
                         artifact_location=f"{self.local_artifact_root}/{experiment_name}"
                     )
                     print(f"ローカル実験を作成: {experiment_name}")
+                except Exception as create_err:
+                    # 削除済みで名前衝突している場合は復活を試みる
+                    restored = False
+                    try:
+                        for exp in _client.search_experiments(
+                                view_type=ViewType.DELETED_ONLY,
+                                filter_string=f"name = '{experiment_name}'"):
+                            _client.restore_experiment(exp.experiment_id)
+                            print(f"削除済みローカル実験を復活: {experiment_name}")
+                            restored = True
+                            break
+                    except Exception as restore_err:
+                        print(f"実験復活に失敗 ({experiment_name}): {restore_err}")
+                    if not restored:
+                        print(f"ローカル実験の作成に失敗 ({experiment_name}): {create_err}")
 
             self._local_initialized = True
             print(f"ローカルMLflow初期化成功: {self.local_tracking_uri}")
@@ -1390,7 +1412,15 @@ class MLflowManager:
             return {"status": "error", "message": "記録に失敗しました"}
 
     def _get_default_mlflow_uri(self):
-        """デフォルトのmlrunsディレクトリURI(sqlite)を取得"""
+        """同期・状態表示で使うローカルMLflowストアのURI(sqlite)を取得
+
+        ローカル学習の記録・MLflow UI（open_ui）は self.local_tracking_uri
+        （画像フォルダ内の mlflow.db）を使う。同期系がこれと別ストアを見ると
+        「取得したのに UI に出ない」不整合になるため、初期化済みなら同じストアを
+        返す。未初期化時のみ config.mlflow_dir のデフォルトにフォールバックする。
+        """
+        if self.local_tracking_uri:
+            return self.local_tracking_uri
         try:
             from config import mlflow_dir
             tracking_uri, _ = self._build_local_uris(mlflow_dir)

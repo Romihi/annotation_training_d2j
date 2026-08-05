@@ -392,6 +392,8 @@ class ImageLabel(QLabel):
         self.grid_size = DEFAULT_GRID_SIZE    
         self.inference_point = None
         self.show_inference = False
+        self.togivad_control_point = None   # TogiVAD angle/throttle 推論点（濃紫円）
+        self.show_togivad_control = False   # TogiVAD 推論表示フラグ（独立トグル）
         self.extra_inference_points = []  # 追加モデルの推論ポイントリスト [(QPoint, QColor, show_flag), ...]
         self.sequence_prediction_points = []  # 時系列予測軌道 [(QPoint, ...)]
         self.show_gru_prediction = False  # 時系列予測表示フラグ
@@ -859,7 +861,7 @@ class ImageLabel(QLabel):
             self.draw_auto_driving_direction(_ann_pw, _ann_ph, painter, _ann_rect)
             # 記録された自己位置からの実測走行軌道（緑）を描画
             self.draw_recorded_trajectory(_ann_pw, _ann_ph, painter, _ann_rect)
-            # TogiVAD 予測軌道（シアン）を同じ魚眼投影で描画（走行軌道と原点・
+            # TogiVAD 予測軌道（明るい紫）を同じ魚眼投影で描画（走行軌道と原点・
             # スケールを揃える。トップダウン overlay は使わない）
             self.draw_prediction_trajectory(_ann_pw, _ann_ph, painter, _ann_rect)
 
@@ -1603,6 +1605,16 @@ class ImageLabel(QLabel):
                         painter.setBrush(QBrush())  # 塗りつぶしなし
                         painter.drawEllipse(future_scaled_x - size // 2, future_scaled_y - size // 2, size, size)
 
+        # 濃い紫: TogiVAD の angle/throttle 推論点（自動運転モデルの推論点とは独立）
+        if self.show_togivad_control and self.togivad_control_point is not None:
+            rel_x = self.togivad_control_point.x() / pix_width
+            rel_y = self.togivad_control_point.y() / pix_height
+            scaled_x = int(target_rect.x() + rel_x * target_rect.width())
+            scaled_y = int(target_rect.y() + rel_y * target_rect.height())
+            painter.setPen(QPen(QColor(106, 27, 154), 4))   # 濃い紫
+            painter.setBrush(QBrush())                       # 塗りつぶしなし
+            painter.drawEllipse(scaled_x - 15, scaled_y - 15, 30, 30)
+
         # 明るい水色：推論点（推論結果）
         if self.show_inference and self.inference_point is not None:
             rel_x = self.inference_point.x() / pix_width
@@ -1643,12 +1655,12 @@ class ImageLabel(QLabel):
                 painter.drawEllipse(scaled_x - 15, scaled_y - 15, 30, 30)
 
         # 時系列予測軌道を描画（中実三角＋矢印接続、t+1が最大で段階的に縮小）
-        # 推論軌跡は暗めのシアン（ティール）。将来アノテーション表示（緑）と
-        # 明確に区別するため（両方緑だと重なって見分けられなかった）
+        # 推論軌跡は明るい紫。将来アノテーション表示（緑）と明確に区別し、
+        # TogiVAD の推論結果表示（濃紫円）と同系色で揃える
         if getattr(self, 'show_gru_prediction', False) and getattr(self, 'sequence_prediction_points', []):
-            traj_color = QColor(0, 150, 160)  # 暗めシアン（塗り）
-            traj_border = QColor(0, 90, 100)  # 濃いティール（枠）
-            tp1_border = QColor(0, 55, 70)    # t+1強調用の深いティール
+            traj_color = QColor(190, 80, 230)  # 明るい紫（塗り）
+            traj_border = QColor(140, 40, 180) # 濃い紫（枠）
+            tp1_border = QColor(110, 20, 150)  # t+1強調用の深い紫
             n_pts = len(self.sequence_prediction_points)
             base_r = ANNOTATION_CIRCLE_SIZE - 1  # t+1のサイズ（アノテーション円より1pt小さい）
             min_r = 3
@@ -2243,7 +2255,7 @@ class ImageLabel(QLabel):
             QColor(0, 200, 0, 220), draw_dots=True)
 
     def draw_prediction_trajectory(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
-        """TogiVAD 予測軌道(シアン)を、走行軌道と同じ魚眼投影でカメラ画像へ描く。
+        """TogiVAD 予測軌道(明るい紫)を、走行軌道と同じ魚眼投影でカメラ画像へ描く。
 
         従来はトップダウンの自動スケール overlay だったため原点・スケールが
         走行軌道(緑)と揃わなかった。ここで同一投影に統一する。
@@ -2261,7 +2273,7 @@ class ImageLabel(QLabel):
             return
         self._draw_ego_trajectory_fisheye(
             pred, pix_width, pix_height, painter, target_rect,
-            QColor(0, 170, 180, 235), draw_dots=False, arrow=True)
+            QColor(190, 80, 230, 235), draw_dots=False, arrow=True)
 
     def _bev_steering_arc(self, idx, max_fwd, n=24):
         """操舵角(annotation angle)から定曲率アークを ego座標 (n,2)[m] で作る。
@@ -2342,7 +2354,7 @@ class ImageLabel(QLabel):
             pred_raw = preds.get(idx)
             if pred_raw:
                 pred = np.asarray(pred_raw, dtype=float)
-                trajs.append((pred, QColor(0, 170, 180), 'pred'))
+                trajs.append((pred, QColor(190, 80, 230), 'pred'))
 
         # --- 表示レンジ（前方・横）を決める。前方は軌道の最大到達か既定3m ---
         fwd_vals = [float(a[:, 0].max()) for a, _, _ in trajs if len(a)]
@@ -2443,7 +2455,7 @@ class ImageLabel(QLabel):
         if getattr(mw, 'show_recorded_trajectory', False) and pm and pm.has_any_pose():
             legend.append((QColor(0, 200, 0), get_text('bev_legend_recorded')))
         if pred is not None:
-            legend.append((QColor(0, 170, 180), get_text('bev_legend_prediction')))
+            legend.append((QColor(190, 80, 230), get_text('bev_legend_prediction')))
         # 学習GT レイヤの凡例（占有・境界・他車）
         if getattr(mw, 'show_bev_occupancy', True):
             legend.append((QColor(230, 90, 60), get_text('bev_legend_occupancy')))
@@ -5906,6 +5918,148 @@ class ImageAnnotationTool(QMainWindow):
             f"削除済みインデックスの合計数: {len(self.deleted_indexes)}"
         )
 
+    def auto_annotate_locations_from_regions(self, regions, keep_manual=True,
+                                             prefer_source=None,
+                                             parent_widget=None):
+        """マップビューで定義した位置領域（閉ポリゴン）から位置ラベルを自動付与する。
+
+        各フレームの自己位置（pose）を内包するポリゴンを探し、その領域の位置
+        クラスを annotations["loc"] へ書き込む。複数ポリゴンが重なる場合は
+        **後から定義した領域を優先**する（部分的な上塗り修正ができるように）。
+        自動付与の印として "loc_auto": True を併記し、手動で位置ボタンを押すと
+        印は外れる。keep_manual=True の場合、手動付与済み（loc_auto の無い loc）
+        のフレームは上書きしない。
+
+        regions: [{"loc": int, "polygon": [(x, y), ...]}, ...]（map座標系[m]・頂点3点以上）
+        prefer_source: pose の優先ソース（マップビューのソース選択と同じ値）
+        parent_widget: 確認・進捗・結果ダイアログの親（マップビューは常に最前面の
+        ため、メインウィンドウ親のモーダルが裏に隠れる問題を避ける）。
+        """
+        parent = parent_widget if parent_widget is not None else self
+
+        # ポリゴン → matplotlib.path.Path（点内包判定用）。後定義優先のため
+        # 判定は逆順で行う
+        from matplotlib.path import Path as MplPath
+        polys = []
+        for region in regions:
+            poly = region.get("polygon") or []
+            if len(poly) >= 3:
+                polys.append((MplPath(np.asarray(poly, dtype=np.float64)),
+                              int(region["loc"])))
+        if not polys or not self.images:
+            QMessageBox.information(
+                parent, get_text('map_view_autoloc_confirm_title'),
+                get_text('map_view_region_none'))
+            return
+
+        reply = QMessageBox.question(
+            parent, get_text('map_view_autoloc_confirm_title'),
+            get_text('map_view_autoloc_confirm_msg',
+                     len(polys), "ON" if keep_manual else "OFF"),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        total = len(self.images)
+        progress = QProgressDialog(
+            get_text('map_view_autoloc_progress', 0, total),
+            get_text('btn_cancel'), 0, total, parent
+        )
+        progress.setWindowTitle(get_text('map_view_autoloc_confirm_title'))
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+
+        deleted = set(getattr(self, 'deleted_indexes', []) or [])
+        assigned = 0
+        manual_kept = 0
+        no_pose = 0
+        outside = 0
+        excluded = 0
+        cancelled = False
+        now_ms = int(time.time() * 1000)
+        assigned_locs = set()
+
+        for idx in range(total):
+            if idx % 200 == 0:
+                progress.setLabelText(
+                    get_text('map_view_autoloc_progress', idx, total))
+                progress.setValue(idx)
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    cancelled = True
+                    break
+
+            if idx in deleted:
+                excluded += 1
+                continue
+
+            # 手動アノテ保持: loc があり自動付与の印が無いフレームはスキップ
+            existing = self.annotations.get(idx)
+            if (keep_manual and existing is not None and 'loc' in existing
+                    and not existing.get('loc_auto')):
+                manual_kept += 1
+                continue
+
+            pose = self.pose_manager.get_pose(idx, prefer=prefer_source)
+            if pose is None:
+                no_pose += 1
+                continue
+
+            # 点内包判定（後から定義した領域を優先するため逆順に探す）
+            loc_value = None
+            for path, loc in reversed(polys):
+                if path.contains_point((pose.x, pose.y)):
+                    loc_value = loc
+                    break
+            if loc_value is None:
+                outside += 1
+                continue
+
+            if idx in self.annotations:
+                self.annotations[idx]['loc'] = loc_value
+            else:
+                self.annotations[idx] = {'loc': loc_value}
+            self.annotations[idx]['loc_auto'] = True
+            self.location_annotations[idx] = loc_value
+            self.annotation_timestamps[idx] = now_ms
+            assigned_locs.add(loc_value)
+            assigned += 1
+
+        progress.setValue(total)
+        progress.close()
+
+        if cancelled:
+            QMessageBox.information(
+                parent, get_text('map_view_autoloc_confirm_title'),
+                get_text('map_view_autoloc_cancelled', assigned))
+
+        # 付与された位置クラスのボタンが無ければ作成（8クラス超の定義に対応）
+        for loc_value in sorted(assigned_locs):
+            self.ensure_location_button_exists(loc_value)
+
+        # UI更新（auto_annotate と同じ後処理）
+        self.annotated_count = len(self.annotations)
+        self.update_location_button_counts()
+        self.display_current_image()
+        self.update_gallery()
+        if hasattr(self, 'update_distribution_graph'):
+            self.update_distribution_graph()
+        if hasattr(self, '_update_location_info_display'):
+            self._update_location_info_display()
+
+        if not cancelled:
+            QMessageBox.information(
+                parent, get_text('map_view_autoloc_confirm_title'),
+                get_text('map_view_autoloc_result',
+                         assigned, manual_kept, no_pose, outside, excluded))
+        print(f"位置自動アノテーション完了: assigned={assigned}, "
+              f"manual_kept={manual_kept}, no_pose={no_pose}, "
+              f"outside={outside}, excluded={excluded}, cancelled={cancelled}")
+
     def write_back_future_trajectories(self, horizon: int, dt: float, parent_widget=None):
         """マップビューで選択・編集した自己位置から将来軌道（togivad学習用の教師ラベル
         togivad/future_traj）を計算し、catalogファイルへ保存する
@@ -6177,10 +6331,14 @@ class ImageAnnotationTool(QMainWindow):
             return
         dposes = [self.pose_manager.relative_dpose(order[k], order[k + 1])
                   for k in range(len(order) - 1)]
-        agents = build_agent_labels(dets, dposes, int(horizon),
-                                    max_agents=tvcfg.num_agent_queries)
+        agents, agent_ids = build_agent_labels(
+            dets, dposes, int(horizon),
+            max_agents=tvcfg.num_agent_queries, return_ids=True)
         agents_by_entry = {entry_of[order[k]]: agents[k]
                            for k in range(len(order))}
+        # T2-b: agents と同順のトラック ID（togivad/agent_ids）も書き戻す
+        ids_by_entry = {entry_of[order[k]]: agent_ids[k]
+                        for k in range(len(order))}
 
         base_dir = os.path.dirname(manifest_path)
         written = 0
@@ -6202,6 +6360,8 @@ class ImageAnnotationTool(QMainWindow):
                     if ag is not None:
                         row['togivad/agents'] = [
                             [round(float(v), 4) for v in a] for a in ag]
+                        row['togivad/agent_ids'] = [
+                            int(t) for t in ids_by_entry.get(row['_index'], [])]
                         new_lines.append(json.dumps(row, ensure_ascii=False) + '\n')
                         modified = True
                         if ag:
@@ -6728,8 +6888,8 @@ class ImageAnnotationTool(QMainWindow):
         # 位置推論モデル追加
         self.add_location_model_section()
 
-        # ウェイポイントモデル追加
-        self.add_waypoint_model_section()
+        # ウェイポイントモデルの項は UI から削除（add_waypoint_model_section は
+        # 未使用のまま保持。waypoint_inference_checkbox 参照は hasattr ガード済み）
 
         # --- モデル管理セクションは右上ツールバーに移動済み ---
         # 内部で使用する変数のみ初期化（UIには表示しない）
@@ -6801,6 +6961,14 @@ class ImageAnnotationTool(QMainWindow):
         # 3.0s 行など）がクリップされて表示されない不具合があった。
         self.inference_info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         info_layout.addWidget(self.inference_info_label)
+
+        # TogiVAD の angle/throttle 推論表示（自動運転モデルの推論とは独立・濃紫）
+        self.togivad_control_info_label = QLabel("")
+        self.togivad_control_info_label.setWordWrap(True)
+        self.togivad_control_info_label.setStyleSheet("color: #6A1B9A;")
+        self.togivad_control_info_label.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Minimum)
+        info_layout.addWidget(self.togivad_control_info_label)
 
         # 追加モデル用推論結果表示ラベルのコンテナ
         self.extra_inference_info_layout = QVBoxLayout()
@@ -7273,16 +7441,15 @@ class ImageAnnotationTool(QMainWindow):
         self.segmentation_mode_button.clicked.connect(self.toggle_annotation_mode)
         self.segmentation_mode_button.setToolTip(get_text('tip_segmentation_mode'))
 
-        # 新規追加: waypointモードボタン
+        # waypointモードボタン: UI から削除（モード切替ロジックが参照するため
+        # オブジェクトは非表示のまま保持。レイアウトには追加しない）
         self.waypoint_mode_button = QPushButton(get_text('btn_waypoint'))
         self.waypoint_mode_button.setCheckable(True)
-        self.waypoint_mode_button.clicked.connect(self.toggle_annotation_mode)
-        self.waypoint_mode_button.setToolTip(get_text('tip_waypoint_mode'))
+        self.waypoint_mode_button.setVisible(False)
 
         mode_layout.addWidget(self.auto_mode_button)
         mode_layout.addWidget(self.detection_mode_button)
         mode_layout.addWidget(self.segmentation_mode_button)  # 追加
-        mode_layout.addWidget(self.waypoint_mode_button)  # 追加
 
         location_layout.addLayout(mode_layout)
 
@@ -7338,6 +7505,7 @@ class ImageAnnotationTool(QMainWindow):
         self.recorded_traj_source_combo = QComboBox()
         self.recorded_traj_source_combo.addItem("pose", "pose")
         self.recorded_traj_source_combo.addItem("slam", "slam")
+        self.recorded_traj_source_combo.addItem("vslam", "vslam")
         self.recorded_traj_source_combo.setToolTip(get_text('tip_recorded_traj_source'))
         self.recorded_traj_source_combo.setCurrentIndex(0)   # 既定 pose
         self.recorded_traj_source_combo.currentIndexChanged.connect(self.update_recorded_traj_source)
@@ -8379,6 +8547,22 @@ class ImageAnnotationTool(QMainWindow):
 
             # 削除キーが押された場合の処理
             elif key in [Qt.Key_Delete, Qt.Key_Backspace]:
+                # マップビュー上にマウスがある間・マップビューがアクティブな間は、
+                # メイン画面のアノテーション（運転・bbox・セグ・waypoint）を誤って
+                # 削除しないよう、削除処理をマップビュー側（位置領域のホバー/選択
+                # 削除）へ委譲して消費する。
+                # ※ underMouse() は enter/leave イベント頼みで最前面ダイアログでは
+                #    取りこぼすため、カーソル座標×ウィンドウ矩形で直接判定する
+                map_dialog = getattr(self, 'map_view_dialog', None)
+                if map_dialog is not None and map_dialog.isVisible():
+                    over_map = map_dialog.frameGeometry().contains(QCursor.pos())
+                    if over_map or QApplication.activeWindow() is map_dialog:
+                        map_dialog.handle_delete_key()
+                        return True
+                # メインウィンドウ以外（別ウィンドウ・ダイアログ）がアクティブな
+                # 間も、後ろにあるメイン画面のアノテーションは削除しない
+                if QApplication.activeWindow() is not self:
+                    return super().eventFilter(obj, event)
                 if self.current_mode == 0:  # 自動運転モードの場合
                     # 現在の画像の自動運転アノテーションを削除
                     self.delete_current_driving_annotation()
@@ -8884,7 +9068,7 @@ class ImageAnnotationTool(QMainWindow):
         self._sync_recorded_traj_dt()
 
     def update_recorded_traj_source(self, _idx=None):
-        """走行軌道(緑)の自己位置ソース(pose/slam)を更新して再描画する。"""
+        """走行軌道(緑)の自己位置ソース(pose/slam/vslam)を更新して再描画する。"""
         combo = getattr(self, 'recorded_traj_source_combo', None)
         if combo is not None:
             self.recorded_traj_source = combo.currentData()
@@ -9632,7 +9816,8 @@ class ImageAnnotationTool(QMainWindow):
             if self.current_index in self.annotations:
                 if "loc" in self.annotations[self.current_index]:
                     del self.annotations[self.current_index]["loc"]
-                
+                self.annotations[self.current_index].pop("loc_auto", None)
+
                 # 位置情報アノテーションからも削除
                 if self.current_index in self.location_annotations:
                     del self.location_annotations[self.current_index]
@@ -9659,6 +9844,8 @@ class ImageAnnotationTool(QMainWindow):
             else:
                 # 運転アノテーションがない場合でも位置アノテーション専用エントリを作成
                 self.annotations[self.current_index] = {"loc": location_value}
+            # 手動で付け直したので自動付与の印（loc_auto）は外す
+            self.annotations[self.current_index].pop("loc_auto", None)
         
         # 保存用のデータ形式を更新するため、アノテーションタイムスタンプも更新
         self.annotation_timestamps[self.current_index] = int(time.time() * 1000)
@@ -11071,8 +11258,8 @@ class ImageAnnotationTool(QMainWindow):
             self._bbox_fixed_advance_checkbox.setVisible(False)
             self.statusBar().showMessage(get_text('status_switched_to_waypoint'), 3000)
         else:
-            # Bキーでの切り替え（4つのモードをサイクル）
-            self.current_mode = (self.current_mode + 1) % 4
+            # Bキーでの切り替え（3モードをサイクル。waypoint は UI から削除済み）
+            self.current_mode = (self.current_mode + 1) % 3
             if self.current_mode == 0:
                 self.auto_mode_button.setChecked(True)
                 self.detection_mode_button.setChecked(False)
@@ -11156,13 +11343,9 @@ class ImageAnnotationTool(QMainWindow):
     
     def update_inference_checkboxes_status(self):
         """各モデルの読み込み状態に応じてチェックボックスの有効/無効を更新"""
-        # 自動運転モデル。TogiVAD（時系列側で読込・angle/throttle を
-        # inference_results へ供給）も運転推論ソースとして扱う — これを見ずに
-        # 無効化すると YOLO 読込のたびに TogiVAD の推論表示が消える。
-        has_driving = (hasattr(self, 'model') and self.model is not None) or \
-            (getattr(self, '_gru_is_togivad', False)
-             and getattr(self, '_gru_model', None) is not None)
-        if has_driving:
+        # 自動運転モデル（TogiVAD の angle/throttle は専用ストア・専用チェック
+        # で独立表示するため、ここでは通常モデルの有無だけを見る）
+        if hasattr(self, 'model') and self.model is not None:
             self.inference_checkbox.setEnabled(True)
             self.inference_checkbox.setToolTip(get_text('tip_driving_model_loaded'))
         else:
@@ -19991,31 +20174,57 @@ class ImageAnnotationTool(QMainWindow):
             self.statusBar().showMessage(get_text('status_cam_error', e), 5000)
 
     def _toggle_togivad_control_infer_display(self, state):
-        """時系列(TogiVAD)側の自動運転推論表示チェック → 既存の推論表示へ同期。
-
-        実表示は inference_checkbox（toggle_inference_display）が担う。状態が
-        既に一致している場合は表示だけ更新する。
+        """TogiVAD の angle/throttle 推論表示トグル（自動運転モデルの推論表示
+        とは**独立**。専用ストア togivad_control_results と濃紫の推論円を使う）。
         """
-        if not hasattr(self, 'inference_checkbox'):
+        self.update_togivad_control_display()
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def update_togivad_control_display(self):
+        """TogiVAD の制御推論（angle/throttle）表示を更新する。
+
+        自動運転モデルの推論表示（inference_results / シアン円）とは独立の
+        専用ストア togivad_control_results を読み、専用ラベルと**濃い紫の円**
+        （main_image_view.togivad_control_point）に反映する。
+        """
+        view = getattr(self, 'main_image_view', None)
+        label = getattr(self, 'togivad_control_info_label', None)
+        cb = getattr(self, 'togivad_control_infer_checkbox', None)
+        if view is None:
             return
-        checked = (state == Qt.Checked)
-        if self.inference_checkbox.isChecked() != checked:
-            self.inference_checkbox.setChecked(checked)   # 既存トグルが更新を実施
-        else:
-            self.update_inference_display()
+        show = cb is not None and cb.isChecked()
+        view.show_togivad_control = show
+        if show and getattr(self, '_gru_is_togivad', False):
+            # 軌道表示チェックが OFF でも angle/throttle 単独で逐次推論できる
+            # ようにここで現在フレームの推論を保証する（未推論なら実行）
+            try:
+                self._ensure_gru_current_prediction(
+                    getattr(self, 'current_index', 0))
+            except Exception:
+                pass
+        res = getattr(self, 'togivad_control_results', {}).get(
+            getattr(self, 'current_index', -1)) if show else None
+        if res is None:
+            view.togivad_control_point = None
+            if label is not None:
+                label.setText(" ")
+            return
+        view.togivad_control_point = QPoint(res['x'], res['y'])
+        if label is not None:
+            text = (f"<b>{get_text('label_togivad_control_infer')}</b><br>"
+                    f"angle = <span style='color: #6A1B9A;'>"
+                    f"{res['angle']:.4f}</span><br>"
+                    f"throttle = <span style='color: #6A1B9A;'>"
+                    f"{res['throttle']:.4f}</span>")
+            label.setText(text)
+            label.setTextFormat(Qt.RichText)
 
     def toggle_inference_display(self, state):
         """自動運転推論表示の切り替え"""
         show_inference = (state == Qt.Checked)
         self.main_image_view.show_inference = show_inference
-        # 時系列(TogiVAD)側の同項目チェックへ逆同期（ループ防止に signals 停止）
-        if hasattr(self, 'togivad_control_infer_checkbox'):
-            cb = self.togivad_control_infer_checkbox
-            if cb.isChecked() != show_inference:
-                cb.blockSignals(True)
-                cb.setChecked(show_inference)
-                cb.blockSignals(False)
-        
+
         # 画面更新
         #if hasattr(self, 'main_image_view'):
         self.main_image_view.update()
@@ -20840,6 +21049,13 @@ class ImageAnnotationTool(QMainWindow):
         """推論結果の表示を更新する"""
         if not self.images:
             return
+
+        # TogiVAD の angle/throttle 表示は独立系だが、ナビゲーション毎の
+        # 更新経路を共有する（チェック OFF/結果なしなら内部でクリアされる）
+        try:
+            self.update_togivad_control_display()
+        except Exception:
+            pass
                 
         current_index = self.current_index
         
@@ -26841,6 +27057,46 @@ class ImageAnnotationTool(QMainWindow):
         control_check.setToolTip(get_text('tip_togivad_control'))
         togivad_layout.addWidget(control_check)
 
+        # Pilot-Trj: 最終軌道入力の学習トラッカー。既定 OFF。Pilot と排他
+        control_trj_check = QCheckBox(get_text('chk_togivad_control_trj'))
+        control_trj_check.setChecked(False)
+        control_trj_check.setToolTip(get_text('tip_togivad_control_trj'))
+        togivad_layout.addWidget(control_trj_check)
+        # 排他制御: 片方を ON にするともう片方は自動 OFF
+        control_check.toggled.connect(
+            lambda on: control_trj_check.setChecked(False) if on else None)
+        control_trj_check.toggled.connect(
+            lambda on: control_check.setChecked(False) if on else None)
+
+        # T2-a: 世界モデル自己教師（学習専用・推論コスト0）。既定 OFF。
+        wm_check = QCheckBox(get_text('chk_togivad_world'))
+        wm_check.setChecked(False)
+        wm_check.setToolTip(get_text('tip_togivad_world'))
+        togivad_layout.addWidget(wm_check)
+
+        # ②: 他車動き予測（togivad/agents GT が必要）。既定 OFF。
+        agent_motion_check = QCheckBox(get_text('chk_togivad_agent_motion'))
+        agent_motion_check.setChecked(False)
+        agent_motion_check.setToolTip(get_text('tip_togivad_agent_motion'))
+        togivad_layout.addWidget(agent_motion_check)
+
+        # T2-b: agent 追跡強化。②と T1-a（時系列）が前提 — 両方 ON のときのみ
+        # 有効化し、前提が外れたら自動 OFF する。
+        track_check = QCheckBox(get_text('chk_togivad_track'))
+        track_check.setChecked(False)
+        track_check.setEnabled(False)
+        track_check.setToolTip(get_text('tip_togivad_track'))
+        togivad_layout.addWidget(track_check)
+
+        def _sync_track_enable():
+            ok = agent_motion_check.isChecked() and temporal_check.isChecked()
+            track_check.setEnabled(ok)
+            if not ok:
+                track_check.setChecked(False)
+
+        agent_motion_check.toggled.connect(_sync_track_enable)
+        temporal_check.toggled.connect(_sync_track_enable)
+
         togivad_info_label = QLabel(get_text('label_togivad_info'))
         togivad_info_label.setStyleSheet("color: #666;")
         togivad_info_label.setWordWrap(True)
@@ -27173,6 +27429,10 @@ class ImageAnnotationTool(QMainWindow):
             config['use_temporal'] = temporal_check.isChecked()  # T1-a
             config['use_lidar'] = lidar_check.isChecked()        # Fusion
             config['use_control'] = control_check.isChecked()    # Pilot
+            config['use_control_trj'] = control_trj_check.isChecked()  # Pilot-Trj
+            config['use_world_model'] = wm_check.isChecked()     # T2-a
+            config['use_agent_motion'] = agent_motion_check.isChecked()  # ②
+            config['use_track'] = track_check.isChecked()        # T2-b
             # 事前バリデーション: カメラ台数プリセットと自己位置の有無
             if len(selected_sources) not in TogivadTrainingManager.SUPPORTED_CAMERA_COUNTS:
                 QMessageBox.warning(self, get_text('dlg_warning'),
@@ -27240,7 +27500,8 @@ class ImageAnnotationTool(QMainWindow):
                 if err == 'no_sequences':
                     QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_traj_no_sequences'))
                 elif err in ('togivad_bad_source_count', 'togivad_no_pose',
-                             'togivad_bad_horizon'):
+                             'togivad_bad_horizon', 'togivad_track_prereq',
+                             'togivad_no_agents'):
                     QMessageBox.warning(self, get_text('dlg_warning'), get_text(f'msg_{err}'))
                 else:
                     QMessageBox.warning(self, get_text('dlg_warning'), err or 'Unknown error')
@@ -27410,6 +27671,7 @@ class ImageAnnotationTool(QMainWindow):
             self._gru_model_path = selected_model_path
             # モデルが変わったので予測キャッシュをクリア
             self.gru_predictions = {}
+            self.togivad_control_results = {}
             # togivad の cfg は dataclass（.get 無し）— 消費側は dict 前提の
             # ため表示用 dict に変換して保持する
             self.gru_prediction_config = (
@@ -27457,12 +27719,12 @@ class ImageAnnotationTool(QMainWindow):
             print(f"時系列逐次推論エラー: {e}")
 
     def _store_togivad_control_result(self, idx, out):
-        """TogiVAD の制御量を**通常の運転推論表示と同じ契約**で格納する。
+        """TogiVAD の制御量を**専用ストア**に格納する（自動運転モデルの
+        inference_results とは独立。表示は濃紫の円＋専用ラベル）。
 
         Pilot(use_control) は ControlHead の (angle, throttle) を直接、非 Pilot
-        は選択軌道の pure pursuit を使う。inference_results へ angle/throttle と
-        推論点座標（x=(angle+1)/2·W, y=(1−throttle)/2·H — batch_inference と同じ
-        写像）を書き、既存の情報パネル・シアン推論点・差分ベクトルに乗せる。
+        は選択軌道の pure pursuit を使う。推論点座標は通常モデルと同じ写像
+        （x=(angle+1)/2·W, y=(1−throttle)/2·H）。
         """
         ctrl = out.get("control") or out.get("pursuit")
         if ctrl is None:
@@ -27472,15 +27734,11 @@ class ImageAnnotationTool(QMainWindow):
         H = int(getattr(self, 'original_image_height', 0) or 120)
         x = max(0, min(int((a + 1) / 2 * W), W - 1))
         y = max(0, min(int((1 - t) / 2 * H), H - 1))
-        self.inference_results[idx] = {
-            "angle": a, "throttle": t,
-            "pilot/angle": a, "pilot/throttle": t,
-            "x": x, "y": y,
+        if not hasattr(self, 'togivad_control_results'):
+            self.togivad_control_results = {}
+        self.togivad_control_results[idx] = {
+            "angle": a, "throttle": t, "x": x, "y": y,
         }
-        try:
-            self.calculate_and_store_diff_vector(idx)
-        except Exception:
-            pass
 
     def run_gru_prediction(self):
         """時系列モデルを読み込み、読み込み直後に現在フレームの推論結果を表示する。
@@ -27489,12 +27747,10 @@ class ImageAnnotationTool(QMainWindow):
             return
 
         self._gru_infer_enabled = True
-        # togivad(Pilot 含む): angle/throttle を通常の運転推論表示に載せるため
-        # 推論表示チェックを有効化＋自動 ON にする（batch 推論後と同じ挙動）
+        # togivad(Pilot 含む): angle/throttle 表示（独立表示）を自動 ON にする
         if getattr(self, '_gru_is_togivad', False) \
-                and hasattr(self, 'inference_checkbox'):
-            self.inference_checkbox.setEnabled(True)
-            self.inference_checkbox.setChecked(True)
+                and hasattr(self, 'togivad_control_infer_checkbox'):
+            self.togivad_control_infer_checkbox.setChecked(True)
         self.show_gru_predictions = True
         if hasattr(self, 'gru_prediction_checkbox'):
             self.gru_prediction_checkbox.setChecked(True)
@@ -28985,11 +29241,26 @@ class ImageAnnotationTool(QMainWindow):
         # 位置推論モデルコンテナを作成
         self.location_model_container = QWidget()
         location_model_layout = QVBoxLayout(self.location_model_container)
-        
-        # ヘッダータイトル
+
+        # ヘッダー: タイトル + 展開ボタン（時系列モデルと同じ折り畳みパターン。
+        # 既定は畳んだ状態）
+        location_header_layout = QHBoxLayout()
         location_model_label = QLabel(get_text('label_location_model'))
         location_model_label.setStyleSheet("font-weight: bold")
-        location_model_layout.addWidget(location_model_label)
+        location_header_layout.addWidget(location_model_label)
+        location_header_layout.addStretch()
+        self.location_expand_button = QPushButton("▶")
+        self.location_expand_button.setFixedSize(24, 24)
+        self.location_expand_button.setStyleSheet("font-size: 10px; padding: 0px;")
+        self.location_expand_button.clicked.connect(self._toggle_location_section)
+        location_header_layout.addWidget(self.location_expand_button)
+        location_model_layout.addLayout(location_header_layout)
+
+        # 展開可能な中身コンテナ
+        self.location_content_widget = QWidget()
+        location_model_layout_outer = location_model_layout
+        location_model_layout = QVBoxLayout(self.location_content_widget)
+        location_model_layout.setContentsMargins(0, 0, 0, 0)
 
         # モデル選択
         model_type_layout = QHBoxLayout()
@@ -29034,7 +29305,11 @@ class ImageAnnotationTool(QMainWindow):
         self.location_inference_checkbox.stateChanged.connect(self.toggle_location_inference_display)
         location_inference_layout.addWidget(self.location_inference_checkbox)
         location_model_layout.addLayout(location_inference_layout)
-        
+
+        # 中身をコンテナへ格納し、既定は折り畳み状態
+        location_model_layout_outer.addWidget(self.location_content_widget)
+        self.location_content_widget.setVisible(False)
+
         left_layout.addWidget(self.location_model_container)
         
         # 推論結果格納用の辞書を初期化
@@ -29045,6 +29320,12 @@ class ImageAnnotationTool(QMainWindow):
 
         # 推論結果格納用の辞書を初期化
         self.location_inference_results = {}
+
+    def _toggle_location_section(self):
+        """位置推論モデルセクションの展開/折り畳み（時系列モデルと同パターン）。"""
+        visible = not self.location_content_widget.isVisible()
+        self.location_content_widget.setVisible(visible)
+        self.location_expand_button.setText("▼" if visible else "▶")
 
     def add_waypoint_model_section(self):
         """ウェイポイントモデルのセクションを追加する"""

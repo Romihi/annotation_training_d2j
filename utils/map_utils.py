@@ -135,6 +135,69 @@ def resolve_background_map(data_dir: str,
     return find_latest_map(maps_root) if os.path.isdir(maps_root) else None
 
 
+# ---- 位置領域（location_regions.json） ---------------------------------------
+# 軌跡マップ上で定義した「位置クラス領域」（閉ポリゴン）の永続化。地図（マップ
+# フォルダ）に紐づけて保存することで、同じコースの別セッションでも再利用できる。
+# スキーマ:
+#   {"version": 2, "map_yaml": "map_map.yaml",
+#    "regions": [{"loc": 0, "polygon": [[x, y], ...]}, ...]}
+# polygon は map 座標系 [m]（記録の pose/slam x,y と同じ座標系）の頂点列
+# （3点以上・閉路は暗黙。最終点と先頭点は自動で結ばれる）。
+LOCATION_REGIONS_FILENAME = "location_regions.json"
+
+
+def location_regions_path(dir_path: str) -> str:
+    return os.path.join(dir_path, LOCATION_REGIONS_FILENAME)
+
+
+def load_location_regions(dir_path: str) -> Optional[list]:
+    """<dir_path>/location_regions.json を読み、regions リストを返す。
+
+    無い・壊れている場合は None。各領域は {"loc": int, "polygon": [(x,y),...]}
+    に正規化し、形式不正（頂点3点未満を含む）のエントリは読み飛ばす。
+    """
+    path = location_regions_path(dir_path)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    regions = []
+    for r in (data.get("regions") or []):
+        try:
+            loc = int(r["loc"])
+            polygon = [(float(p[0]), float(p[1])) for p in r["polygon"]]
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+        if len(polygon) >= 3:
+            regions.append({"loc": loc, "polygon": polygon})
+    return regions
+
+
+def save_location_regions(dir_path: str, regions: list,
+                          map_yaml: Optional[str] = None) -> str:
+    """位置領域を <dir_path>/location_regions.json へ保存してパスを返す。
+
+    座標は mm 精度（小数3桁）へ丸めてファイルを小さく保つ。
+    """
+    data = {
+        "version": 2,
+        "map_yaml": os.path.basename(map_yaml) if map_yaml else None,
+        "regions": [
+            {"loc": int(r["loc"]),
+             "polygon": [[round(float(x), 3), round(float(y), 3)]
+                         for x, y in r["polygon"]]}
+            for r in regions
+        ],
+    }
+    path = location_regions_path(dir_path)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    return path
+
+
 # ---- 読み込み（ラスタ + メタ） ----------------------------------------------
 @dataclass
 class MapData:
