@@ -1430,6 +1430,12 @@ def detect_model_type_from_filename(filename):
     # （例: "edgenext_xx_small" が "edgenext_x_small" より先にマッチするように）
     known_types = [
         # 長いキーを先に（部分一致を避けるため）
+        # 位置推論モデルはベースのバックボーン名より先にマッチさせる
+        "mobilenetv4_conv_small_location",
+        "mobilenetv3_small_100_location",
+        "efficientnet_lite0_location",
+        "edgenext_xx_small_location",
+        "mobilevit_xxs_location",
         "swin_moe_tiny_patch4_window7_224",
         "swin_tiny_patch4_window7_224",
         "swinv2_cr_tiny_ns_224",

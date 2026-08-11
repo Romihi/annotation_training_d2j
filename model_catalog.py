@@ -155,6 +155,9 @@ def load_model_weights(model, weights_path, device):
         checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
         
         if isinstance(checkpoint, dict):
+            # 学習時のspeed正規化値（保存されていれば推論・表示側で利用）
+            if checkpoint.get('speed_normalize'):
+                model._speed_normalize = float(checkpoint['speed_normalize'])
             if 'model_state_dict' in checkpoint:
                 model.load_state_dict(checkpoint['model_state_dict'])
                 print("Loaded checkpoint format model")
@@ -912,6 +915,35 @@ class BaseLocationModel(BaseModel):
         self.prediction_history = []
         self.confirmed_class = None
 
+    def run_classification(self, img_arr):
+        """位置推論用の共通runメソッド - 確率ベクトルを返す"""
+        # 前処理パイプラインが初期化されていなければ作成
+        if self._preprocess is None:
+            self._preprocess = self.get_preprocess()
+
+        # PILイメージに変換して前処理を適用
+        pil_image = Image.fromarray(img_arr)
+        tensor_image = self._preprocess(pil_image)
+        tensor_image = tensor_image.unsqueeze(0)
+
+        # デバイスに転送（モデルのdtypeに合わせる）
+        model_dtype = next(self.parameters()).dtype
+        tensor_image = tensor_image.to(device=self.device, dtype=model_dtype)
+
+        # 勾配計算なしで推論を実行
+        with torch.no_grad():
+            logits = self(tensor_image)
+            probs = torch.softmax(logits, dim=1)
+
+        # CPU上のNumPy配列に変換して確率ベクトルを返す
+        probs_array = probs.cpu().numpy()[0]
+
+        # 推論履歴を更新
+        pred_class = np.argmax(probs_array)
+        self._update_prediction_history(pred_class)
+
+        return probs_array
+
 
 class BaseWaypointModel(BaseModel):
     """ウェイポイント推論モデル用のベースクラス"""
@@ -953,35 +985,6 @@ class BaseWaypointModel(BaseModel):
             waypoints.append([x, y])
 
         return waypoints
-    
-    def run_classification(self, img_arr):
-        """位置推論用の共通runメソッド - 確率ベクトルを返す"""
-        # 前処理パイプラインが初期化されていなければ作成
-        if self._preprocess is None:
-            self._preprocess = self.get_preprocess()
-        
-        # PILイメージに変換して前処理を適用
-        pil_image = Image.fromarray(img_arr)
-        tensor_image = self._preprocess(pil_image)
-        tensor_image = tensor_image.unsqueeze(0)
-        
-        # デバイスに転送（モデルのdtypeに合わせる）
-        model_dtype = next(self.parameters()).dtype
-        tensor_image = tensor_image.to(device=self.device, dtype=model_dtype)
-
-        # 勾配計算なしで推論を実行
-        with torch.no_grad():
-            logits = self(tensor_image)
-            probs = torch.softmax(logits, dim=1)
-        
-        # CPU上のNumPy配列に変換して確率ベクトルを返す
-        probs_array = probs.cpu().numpy()[0]
-        
-        # 推論履歴を更新
-        pred_class = np.argmax(probs_array)
-        self._update_prediction_history(pred_class)
-        
-        return probs_array
 
 class DonkeyWaypointModel(BaseWaypointModel):
     """Donkeycarモデルをベースとしたウェイポイント回帰用モデル"""
@@ -1213,6 +1216,91 @@ class ResNet18LocationModel(BaseLocationModel):
         return self.run_classification(img_arr)
 
 
+class TIMMLocationModel(BaseLocationModel):
+    """TIMMバックボーンを利用した位置分類用の汎用モデル
+
+    name は "<timmモデル名>_location" とし、バックボーン・入力サイズ・前処理は
+    "_location" を除いたtimmモデル名から解決する。分類ヘッドは既存の
+    ResNet18LocationModel と同じ regressor 名で統一し、クラス数検出や
+    ヘッド置き換えの既存ロジックをそのまま共通利用できるようにする。
+    """
+    def __init__(self, name, num_classes=8, pretrained=True):
+        super(TIMMLocationModel, self).__init__(name=name, num_classes=num_classes)
+
+        # TIMMモデルのロード（ヘッドなし）
+        timm_model_name = name.replace("_location", "")
+        self.base_model = timm.create_model(timm_model_name, pretrained=pretrained, num_classes=0)
+
+        # 特徴量の次元を取得（BatchNormのためevalモードでダミー入力を通す）
+        input_size = self._get_model_input_size()
+        dummy_input = torch.zeros(1, 3, input_size[0], input_size[1])
+        self.base_model.eval()
+        with torch.no_grad():
+            dummy_output = self.base_model(dummy_input)
+        self.base_model.train()
+        feature_dim = dummy_output.shape[1]
+
+        # 分類器
+        self.regressor = nn.Linear(feature_dim, num_classes)
+
+    def _get_model_input_size(self):
+        """モデルの入力サイズを取得"""
+        return get_model_input_size(self.name.replace("_location", ""))
+
+    def forward(self, x):
+        """順伝播処理"""
+        features = self.base_model(x)
+        logits = self.regressor(features)
+        return logits
+
+    def get_preprocess(self):
+        """バックボーンに応じた前処理"""
+        input_size = self._get_model_input_size()
+        return transforms.Compose([
+            transforms.Resize((input_size[0], input_size[1])),
+            transforms.ToTensor()
+        ])
+
+    def run(self, img_arr):
+        """推論メソッド - BaseLocationModelの共通メソッドを使用"""
+        return self.run_classification(img_arr)
+
+
+class MobileNetV3SmallLocationModel(TIMMLocationModel):
+    """MobileNetV3-Smallをベースとした位置分類用モデル（軽量・エッジ向け）"""
+    def __init__(self, num_classes=8, pretrained=True):
+        super(MobileNetV3SmallLocationModel, self).__init__(
+            name="mobilenetv3_small_100_location", num_classes=num_classes, pretrained=pretrained)
+
+
+class MobileNetV4ConvSmallLocationModel(TIMMLocationModel):
+    """MobileNetV4-Conv-Smallをベースとした位置分類用モデル（軽量・高精度バランス）"""
+    def __init__(self, num_classes=8, pretrained=True):
+        super(MobileNetV4ConvSmallLocationModel, self).__init__(
+            name="mobilenetv4_conv_small_location", num_classes=num_classes, pretrained=pretrained)
+
+
+class MobileViTXXSLocationModel(TIMMLocationModel):
+    """MobileViT-XXSをベースとした位置分類用モデル（最軽量クラス・CNN+Transformer）"""
+    def __init__(self, num_classes=8, pretrained=True):
+        super(MobileViTXXSLocationModel, self).__init__(
+            name="mobilevit_xxs_location", num_classes=num_classes, pretrained=pretrained)
+
+
+class EfficientNetLite0LocationModel(TIMMLocationModel):
+    """EfficientNet-Lite0をベースとした位置分類用モデル（エッジ最適化）"""
+    def __init__(self, num_classes=8, pretrained=True):
+        super(EfficientNetLite0LocationModel, self).__init__(
+            name="efficientnet_lite0_location", num_classes=num_classes, pretrained=pretrained)
+
+
+class EdgeNextXXSmallLocationModel(TIMMLocationModel):
+    """EdgeNeXt-XX-Smallをベースとした位置分類用モデル（最軽量クラス・CNN+Transformer）"""
+    def __init__(self, num_classes=8, pretrained=True):
+        super(EdgeNextXXSmallLocationModel, self).__init__(
+            name="edgenext_xx_small_location", num_classes=num_classes, pretrained=pretrained)
+
+
 # 利用可能なすべてのモデルを登録する辞書
 MODEL_REGISTRY = {
     # Donkeycar model
@@ -1280,6 +1368,11 @@ MODEL_REGISTRY = {
     # 位置推論モデル
     "donkey_location": DonkeyLocationModel,
     "resnet18_location": ResNet18LocationModel,
+    "mobilenetv3_small_100_location": MobileNetV3SmallLocationModel,
+    "mobilenetv4_conv_small_location": MobileNetV4ConvSmallLocationModel,
+    "mobilevit_xxs_location": MobileViTXXSLocationModel,
+    "efficientnet_lite0_location": EfficientNetLite0LocationModel,
+    "edgenext_xx_small_location": EdgeNextXXSmallLocationModel,
 
     # ウェイポイント推論モデル
     "donkey_waypoint": DonkeyWaypointModel,
@@ -1331,6 +1424,18 @@ def get_model(model_type, pretrained=False, input_size=None, num_outputs=2):
 
     # その他のモデルの場合は通常通り初期化
     return model_class(pretrained=pretrained)
+
+
+def create_location_model(model_type, num_classes=8, pretrained=False):
+    """位置推論モデルをクラス数指定付きで生成する
+
+    get_model は num_classes を受け取らないため、保存済みチェックポイントの
+    クラス数に合わせてモデルを構築する用途ではこちらを使用する。
+    """
+    if model_type not in MODEL_REGISTRY or not model_type.endswith('_location'):
+        raise ValueError(f"未対応の位置推論モデルタイプ: {model_type}")
+    return MODEL_REGISTRY[model_type](num_classes=num_classes, pretrained=pretrained)
+
 
 def list_available_models():
     """利用可能な自動運転モデル一覧を返す（厳選されたモデルのみ）"""
@@ -1740,7 +1845,8 @@ def get_sequence_model(arch_name, num_image_sources, config):
     
 class AnnotationDataset(torch.utils.data.Dataset):
     """アノテーションデータのためのカスタムデータセット"""
-    def __init__(self, image_paths, annotations, transform=None, cache_images=False, use_speed=False, use_future=False):
+    def __init__(self, image_paths, annotations, transform=None, cache_images=False, use_speed=False, use_future=False,
+                 speed_normalize=None):
         self.image_paths = image_paths
         self.annotations = annotations
         self.transform = transform
@@ -1748,6 +1854,7 @@ class AnnotationDataset(torch.utils.data.Dataset):
         self.image_cache = {} if cache_images else None
         self.use_speed = use_speed
         self.use_future = use_future
+        self.speed_normalize = speed_normalize  # speed正規化値（None時はMAX_SPEED）
         self.future_offsets = [5, 10]  # 5フレーム先と10フレーム先
 
     def __len__(self):
@@ -1758,7 +1865,8 @@ class AnnotationDataset(torch.utils.data.Dataset):
         angle = annotation.get("angle", 0.0)
         throttle = annotation.get("throttle", 0.0)
         _raw_speed = annotation.get("enc/speed", annotation.get("speed", annotation.get("user/speed", annotation.get("pilot/speed", 0.0))))
-        speed = max(0.0, min(1.0, _raw_speed / _MAX_SPEED)) if _MAX_SPEED > 0 else 0.0
+        _norm = self.speed_normalize if getattr(self, 'speed_normalize', None) else _MAX_SPEED
+        speed = max(0.0, min(1.0, _raw_speed / _norm)) if _norm > 0 else 0.0
         return angle, throttle, speed
 
     def __getitem__(self, idx):
@@ -1989,13 +2097,14 @@ class MultiSourceDataset(torch.utils.data.Dataset):
     """
 
     def __init__(self, grouped_image_paths, annotations, num_sources,
-                 transform=None, use_speed=False, use_future=False):
+                 transform=None, use_speed=False, use_future=False, speed_normalize=None):
         self.grouped_paths = grouped_image_paths
         self.annotations = annotations
         self.num_sources = num_sources
         self.transform = transform
         self.use_speed = use_speed
         self.use_future = use_future
+        self.speed_normalize = speed_normalize  # speed正規化値（None時はMAX_SPEED）
         self.future_offsets = [5, 10]
 
     def __len__(self):
@@ -2006,7 +2115,8 @@ class MultiSourceDataset(torch.utils.data.Dataset):
         angle = annotation.get("angle", 0.0)
         throttle = annotation.get("throttle", 0.0)
         _raw_speed = annotation.get("enc/speed", annotation.get("speed", annotation.get("user/speed", annotation.get("pilot/speed", 0.0))))
-        speed = max(0.0, min(1.0, _raw_speed / _MAX_SPEED)) if _MAX_SPEED > 0 else 0.0
+        _norm = self.speed_normalize if getattr(self, 'speed_normalize', None) else _MAX_SPEED
+        speed = max(0.0, min(1.0, _raw_speed / _norm)) if _norm > 0 else 0.0
         return angle, throttle, speed
 
     def __getitem__(self, idx):
@@ -2081,7 +2191,7 @@ class VirtualSourceDataset(torch.utils.data.Dataset):
 
     def __init__(self, image_paths, annotations, num_virtual_sources=3,
                  virtual_type='crop', transform=None, use_speed=False, use_future=False,
-                 temporal_interval: int = 10):
+                 temporal_interval: int = 10, speed_normalize=None):
         self.image_paths = image_paths
         self.annotations = annotations
         self.num_virtual_sources = num_virtual_sources
@@ -2090,6 +2200,7 @@ class VirtualSourceDataset(torch.utils.data.Dataset):
         self.use_speed = use_speed
         self.use_future = use_future
         self.temporal_interval = temporal_interval
+        self.speed_normalize = speed_normalize  # speed正規化値（None時はMAX_SPEED）
         self.future_offsets = [5, 10]
 
     def __len__(self):
@@ -2099,7 +2210,8 @@ class VirtualSourceDataset(torch.utils.data.Dataset):
         angle = annotation.get("angle", 0.0)
         throttle = annotation.get("throttle", 0.0)
         _raw_speed = annotation.get("enc/speed", annotation.get("speed", annotation.get("user/speed", annotation.get("pilot/speed", 0.0))))
-        speed = max(0.0, min(1.0, _raw_speed / _MAX_SPEED)) if _MAX_SPEED > 0 else 0.0
+        _norm = self.speed_normalize if getattr(self, 'speed_normalize', None) else _MAX_SPEED
+        speed = max(0.0, min(1.0, _raw_speed / _norm)) if _norm > 0 else 0.0
         return angle, throttle, speed
 
     def _spatial_crops(self, img):

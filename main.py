@@ -69,7 +69,7 @@ from utils.image_utils import (
 )
 
 # カスタムモジュールのインポート
-from model_catalog import get_model, list_available_models, VirtualSourceDataset
+from model_catalog import get_model, list_available_models, list_available_location_models, VirtualSourceDataset
 from utils.inference_utils import batch_inference
 from utils.export_utils import export_to_donkey, export_to_jetracer, export_to_video, export_to_video_multi_source
 from model_training import train_model, create_datasets
@@ -3426,6 +3426,10 @@ class ImageLabel(QLabel):
 
             inference = self.main_window.inference_results[current_index]
 
+            # 推論speedは正規化値（0-1）。学習時の正規化値（speed_normalize、
+            # 無ければバーのmax_speed）でm/sに換算し、バーのスケール上に配置する
+            _infer_snorm = inference.get('speed_normalize') or _max_speed
+
             # 将来の推論speedバーを描画（t+5, t+10）- 現在の横線の下に描画
             if self.show_future_annotations:
                 future_offsets = [10, 5]  # 先に遠い方を描画
@@ -3437,8 +3441,8 @@ class ImageLabel(QLabel):
                     if future_key in inference:
                         future_data = inference[future_key]
                         if 'speed' in future_data:
-                            future_infer_speed = future_data['speed']
-                            future_normalized = max(0, min(1, future_infer_speed))
+                            future_infer_speed_ms = future_data['speed'] * _infer_snorm
+                            future_normalized = max(0, min(1, future_infer_speed_ms / _max_speed)) if _max_speed > 0 else 0.0
 
                             future_y = bar_y + bar_height - int(bar_height * future_normalized)
                             future_color = future_colors.get(offset, QColor(0, 200, 200))
@@ -3448,17 +3452,16 @@ class ImageLabel(QLabel):
                             painter.drawLine(bar_x, future_y, bar_x + bar_width, future_y)
 
             if 'speed' in inference:
-                infer_speed = inference['speed']
-                # 推論speed値は正規化済み（0〜1）なのでそのまま使用
-                normalized_infer_speed = max(0, min(1, infer_speed))
+                # m/sに換算してからバーのスケール（max_speed）で位置を決める
+                infer_speed_ms = inference['speed'] * _infer_snorm
+                normalized_infer_speed = max(0, min(1, infer_speed_ms / _max_speed)) if _max_speed > 0 else 0.0
 
                 # 推論結果の位置にシアン色の太い横線を描画（推論点と同色）
                 infer_y = bar_y + bar_height - int(bar_height * normalized_infer_speed)
                 painter.setPen(QPen(QColor(0, 255, 255), 4))  # 明るい水色（推論点と同色）
                 painter.drawLine(bar_x - 2, infer_y, bar_x + bar_width + 2, infer_y)
 
-                # 推論speed値を横線の右側に表示（m/s実値に逆変換）
-                infer_speed_ms = infer_speed * _max_speed
+                # 推論speed値を横線の右側に表示（m/s実値）
                 painter.setPen(QPen(QColor(0, 200, 200), 1))
                 painter.setFont(QFont("Arial", 8, QFont.Bold))
                 painter.drawText(bar_x + bar_width + 25, infer_y + 4, f"({infer_speed_ms:.2f})")
@@ -5031,23 +5034,28 @@ class SpeedGaugeWidget(QWidget):
             idx = mw.current_index
             inf = mw.inference_results.get(idx)
             if inf:
+                # 推論speedは正規化値（0-1）。学習時の正規化値（speed_normalize、
+                # 無ければゲージのmax_speed）でm/sに換算し、ゲージスケール上に配置する
+                _snorm = inf.get('speed_normalize') or ms
                 if getattr(mw.main_image_view, 'show_future_annotations', False):
                     for offset, lw, lc in [(10, 2, QColor(0, 150, 150)), (5, 3, QColor(0, 200, 200))]:
                         fd = inf.get(f"future_{offset}", {})
                         if 'speed' in fd:
-                            fn = max(0.0, min(1.0, fd['speed']))
+                            f_speed_ms = fd['speed'] * _snorm
+                            fn = max(0.0, min(1.0, f_speed_ms / ms)) if ms > 0 else 0.0
                             fy = self._y_from_norm(fn, tr)
                             painter.setPen(QPen(lc, lw))
                             painter.drawLine(tx, fy, tx + tw, fy)
                 if 'speed' in inf:
-                    ni = max(0.0, min(1.0, inf['speed']))
+                    infer_speed_ms = inf['speed'] * _snorm
+                    ni = max(0.0, min(1.0, infer_speed_ms / ms)) if ms > 0 else 0.0
                     iy = self._y_from_norm(ni, tr)
                     painter.setPen(QPen(QColor(0, 255, 255), 3))
                     painter.drawLine(tx - 2, iy, tx + tw + 2, iy)
-                    # 推論値テキスト
+                    # 推論値テキスト（m/s換算値）
                     painter.setPen(QPen(QColor(0, 200, 200), 1))
                     painter.setFont(QFont("Arial", 7, QFont.Bold))
-                    painter.drawText(tx + tw + 4, iy + 4, f"({inf['speed'] * ms:.2f})")
+                    painter.drawText(tx + tw + 4, iy + 4, f"({infer_speed_ms:.2f})")
 
         # ── 目盛り ──
         num_ticks = 11
@@ -5619,6 +5627,9 @@ class ImageAnnotationTool(QMainWindow):
 
         # 位置情報関連の初期化
         self.location_buttons = []  # 位置情報ボタンのリスト
+        self._location_row_widgets = []  # 位置ボタン＋クラス入力欄の行ウィジェット
+        self.location_class_inputs = {}  # 位置値 → クラス内容入力欄(QLineEdit)
+        self.location_class_names = {}  # 位置値 → クラス内容テキスト（行再生成時の復元用）
         self.current_location = None  # 現在選択されている位置情報
         self.location_annotations = {}  # 画像ごとの位置情報アノテーション
         self._location_display_mode = 'position'  # 'position' or 'corner'
@@ -8040,12 +8051,20 @@ class ImageAnnotationTool(QMainWindow):
 
         self._loc_mode_btn_group.idClicked.connect(_on_loc_mode_changed)
 
-        # 位置情報の自動適用チェックボックス
+        # 位置情報の自動適用チェックボックス ＋ 位置クラス情報の保存ボタン
+        apply_location_row = QHBoxLayout()
         self.apply_location_checkbox = QCheckBox(get_text('chk_apply_location'))
         self.apply_location_checkbox.setChecked(False)
         self.apply_location_checkbox.setToolTip(get_text('tip_apply_location'))
         self.apply_location_checkbox.stateChanged.connect(self.toggle_auto_apply_location)
-        location_layout.addWidget(self.apply_location_checkbox)
+        apply_location_row.addWidget(self.apply_location_checkbox)
+
+        self.save_location_classes_button = QPushButton(get_text('btn_save_location_classes'))
+        self.save_location_classes_button.setToolTip(get_text('tip_save_location_classes'))
+        self.save_location_classes_button.clicked.connect(self.save_location_classes)
+        apply_location_row.addWidget(self.save_location_classes_button)
+        apply_location_row.addStretch()
+        location_layout.addLayout(apply_location_row)
         
         # 位置情報の選択肢を管理するレイアウト
         self.location_buttons_layout = QVBoxLayout()
@@ -8190,6 +8209,7 @@ class ImageAnnotationTool(QMainWindow):
                 "extra_models": extra_models_info,
                 "max_speed": self.main_image_view.max_speed if hasattr(self, 'main_image_view') else MAX_SPEED,
                 "detection_classes": self.classes_input.text() if hasattr(self, 'classes_input') else "",
+                "location_classes": {str(k): v for k, v in getattr(self, 'location_class_names', {}).items() if v.strip()},
                 "timestamp": int(time.time())
             }
             
@@ -9762,8 +9782,8 @@ class ImageAnnotationTool(QMainWindow):
             }
         """)
         
-        # レイアウトに追加
-        self.location_buttons_layout.addWidget(button)
+        # クラス内容入力欄付きの行としてレイアウトに追加
+        self._add_location_row(button, location_value)
         self.location_buttons.append(button)
 
         # 現在の表示モードに合わせてテキスト/アイコンを更新
@@ -9775,6 +9795,87 @@ class ImageAnnotationTool(QMainWindow):
         # 初期ボタンを生成するだけの場合はメッセージを表示しない
         if len(self.location_buttons) > 1:
             QMessageBox.information(self, get_text('dlg_add_complete'), get_text('msg_location_added', location_value))
+
+    def _add_location_row(self, button, location_value):
+        """位置ボタンとクラス内容入力欄を1行にまとめてレイアウトへ追加する"""
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(4)
+        row_layout.addWidget(button, 2)
+
+        class_input = QLineEdit()
+        class_input.setPlaceholderText(get_text('placeholder_location_class'))
+        class_input.setToolTip(get_text('tip_location_class_input'))
+        # 行の再生成時に以前の入力内容を復元
+        saved_name = self.location_class_names.get(location_value, '')
+        if saved_name:
+            class_input.setText(saved_name)
+        class_input.textChanged.connect(
+            lambda text, value=location_value: self.location_class_names.__setitem__(value, text))
+        row_layout.addWidget(class_input, 1)
+
+        self.location_class_inputs[location_value] = class_input
+        self._location_row_widgets.append(row)
+        self.location_buttons_layout.addWidget(row)
+
+    def save_location_classes(self):
+        """位置クラス情報（ID・内容）をtogikaidriveで再利用できるJSONとして保存する"""
+        if not self.location_buttons:
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_location_classes'))
+            return
+
+        classes = []
+        for button in self.location_buttons:
+            value = button.property("location_value")
+            name = self.location_class_names.get(value, '').strip()
+            classes.append({"id": value, "name": name})
+        classes.sort(key=lambda c: c["id"])
+
+        data = {
+            "format": "togikaidrive_location_classes",
+            "version": 1,
+            "saved_at": datetime.now().isoformat(timespec='seconds'),
+            "num_classes": len(classes),
+            "classes": classes,
+            "id_to_name": {str(c["id"]): c["name"] for c in classes},
+        }
+
+        default_dir = self.folder_path if getattr(self, 'folder_path', '') else APP_DIR_PATH
+        default_path = os.path.join(default_dir, "location_classes.json")
+        selected_file, _ = QFileDialog.getSaveFileName(
+            self, get_text('dlg_save_location_classes'), default_path, "JSON Files (*.json)")
+        if not selected_file:
+            return
+
+        try:
+            with open(selected_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            QMessageBox.information(
+                self, get_text('dlg_save_complete'),
+                get_text('msg_location_classes_saved', selected_file))
+        except Exception as e:
+            QMessageBox.critical(
+                self, get_text('dlg_error'),
+                get_text('msg_location_classes_save_failed', e))
+
+    def restore_location_classes(self, id_to_name):
+        """セッション等から読み込んだ位置クラス情報を入力欄へ反映する
+
+        まだボタンが無い位置値の内容も location_class_names に保持され、
+        後からボタンが追加された時点で _add_location_row が自動復元する。
+        """
+        for key, name in id_to_name.items():
+            try:
+                value = int(key)
+            except (TypeError, ValueError):
+                continue
+            if not name:
+                continue
+            self.location_class_names[value] = name
+            class_input = self.location_class_inputs.get(value)
+            if class_input is not None:
+                class_input.setText(name)
 
     def set_location(self, location_value):
         print("set location")
@@ -11054,6 +11155,15 @@ class ImageAnnotationTool(QMainWindow):
                 inference_text = f"<b>{get_text('label_driving_inference_header')}</b><br>"
                 inference_text += f"angle = <span style='color: #009999;'>{angle:.4f}</span><br>"
                 inference_text += f"throttle = <span style='color: #009999;'>{throttle:.4f}</span>"
+
+                # 速度推論結果（正規化値と実速度[m/s]）を表示
+                infer_speed = inference.get("pilot/speed", inference.get("speed"))
+                if infer_speed is not None:
+                    _snorm = inference.get('speed_normalize') or getattr(self.main_image_view, 'max_speed', MAX_SPEED)
+                    inference_text += (
+                        f"<br>speed = <span style='color: #009999;'>{infer_speed:.4f}</span>"
+                        f" ({infer_speed * _snorm:.2f} m/s)"
+                    )
 
                 # 位置情報を取得
                 location = None
@@ -19226,6 +19336,10 @@ class ImageAnnotationTool(QMainWindow):
             if hasattr(self, 'classes_input'):
                 self.classes_input.setText(session_info["detection_classes"])
 
+        # 位置クラス情報（プリセット）の復元
+        if session_info and session_info.get("location_classes"):
+            self.restore_location_classes(session_info["location_classes"])
+
         # 複数フォルダを優先的に使用
         has_folders = False
         
@@ -20534,6 +20648,10 @@ class ImageAnnotationTool(QMainWindow):
 
                     if speed is not None:
                         results[idx]["speed"] = float(speed)
+                        # 学習時のspeed正規化値（m/s換算・表示位置の計算用）
+                        _speed_norm = getattr(model, '_speed_normalize', None)
+                        if _speed_norm:
+                            results[idx]["speed_normalize"] = float(_speed_norm)
 
                     # 将来予測の出力
                     if num_out >= 9:
@@ -21091,6 +21209,14 @@ class ImageAnnotationTool(QMainWindow):
             inference_text += f"angle = <span style='color: #009999;'>{angle:.4f}</span><br>"
             inference_text += f"throttle = <span style='color: #009999;'>{throttle:.4f}</span>"
 
+            # 速度推論結果（正規化値と実速度[m/s]）を表示
+            infer_speed = inference.get("pilot/speed", inference.get("speed"))
+            if infer_speed is not None:
+                _snorm = inference.get('speed_normalize') or getattr(self.main_image_view, 'max_speed', MAX_SPEED)
+                inference_text += (
+                    f"<br>speed = <span style='color: #009999;'>{infer_speed:.4f}</span>"
+                    f" ({infer_speed * _snorm:.2f} m/s)"
+                )
 
             # 追加: 差分ベクトルの計算と表示
             if current_index in self.annotations:
@@ -23451,6 +23577,11 @@ class ImageAnnotationTool(QMainWindow):
                     annotation_text += f"throttle = <span style='color: #FF6666;'>{anno['throttle']:.4f}</span>"
                 else:
                     annotation_text += f"throttle = <span style='color: #999999;'>未設定</span>"
+
+                # 速度情報（m/s）があれば表示（データセットと同じキー優先順）
+                _ann_speed = anno.get('enc/speed', anno.get('speed', anno.get('user/speed', anno.get('pilot/speed'))))
+                if _ann_speed is not None:
+                    annotation_text += f"<br>speed = <span style='color: #FF6666;'>{_ann_speed:.2f} m/s</span>"
 
                 # 位置情報があれば追加して強調表示
                 if 'loc' in anno:
@@ -26462,12 +26593,9 @@ class ImageAnnotationTool(QMainWindow):
                 QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_training_data'))
                 return
 
-            # Speed値の正規化（speedが含まれている場合）
-            if use_speed_output and speed_normalize_value > 0:
-                for annotation in annotation_values:
-                    if 'speed' in annotation:
-                        # speed値を正規化値で除算
-                        annotation['speed'] = annotation['speed'] / speed_normalize_value
+            # Speed値の正規化はデータセット側（_get_annotation_values）で一元的に行う。
+            # ここで事前に除算するとデータセット側と合わせて二重正規化になり、
+            # 推論speedが実際より小さく出力される（スライダー位置のずれの原因）。
 
             # データ数の確認とバッチサイズの調整
             batch_size = min(user_batch_size, len(image_paths))
@@ -26561,6 +26689,7 @@ class ImageAnnotationTool(QMainWindow):
                 batch_size=batch_size,  # バッチサイズ
                 val_split=val_split,  # 検証データ割合
                 use_speed=use_speed_output,  # Speed出力を使用するかどうか
+                speed_normalize=speed_normalize_value if use_speed_output else None,  # speed正規化値
                 use_future=use_future_output,  # 将来予測出力を使用するかどうか
                 num_outputs=num_outputs,  # 出力数を指定
                 multi_source_paths=multi_source_paths if is_multi_source else None,
@@ -26610,9 +26739,10 @@ class ImageAnnotationTool(QMainWindow):
                     (selected_sources if is_multi_source else selected_sources)
                 ),
                 virtual_source_type=training_virtual_type if is_virtual_source else None,
-                temporal_interval=training_temporal_interval
+                temporal_interval=training_temporal_interval,
+                speed_normalize=speed_normalize_value if use_speed_output else None
             )
-            
+
             progress.close()
 
             # キャンセルされた場合の処理
@@ -26652,6 +26782,9 @@ class ImageAnnotationTool(QMainWindow):
                     "data_folder": self.folder_path if hasattr(self, 'folder_path') and self.folder_path else "unknown",
                     "model_name": model_name,
                     "comment": comment,
+                    "use_speed_output": use_speed_output,
+                    "speed_normalize": speed_normalize_value if use_speed_output else None,
+                    "use_future_output": use_future_output,
                     "is_multi_source": is_multi_source,
                     "num_sources": training_num_sources,
                     "fusion_method": training_fusion_method if is_multi_source else None,
@@ -29171,22 +29304,27 @@ class ImageAnnotationTool(QMainWindow):
         # 位置ボタン数
         num_buttons = 8
         
-        # 既存のボタンをクリア
+        # 既存の行（ボタン＋クラス入力欄）をクリア
+        for row in getattr(self, '_location_row_widgets', []):
+            if row.parent():
+                row.setParent(None)
+        self._location_row_widgets = []
+        self.location_class_inputs = {}
         for button in self.location_buttons:
             if button.parent():
                 button.setParent(None)
         self.location_buttons.clear()
-        
+
         # 8つの位置情報ボタンを作成
         for i in range(num_buttons):
             button = QPushButton(get_text('btn_location_with_count', 0, i))  # カウント0で初期化
             button.setProperty("location_value", i)
             button.setCheckable(True)  # チェック可能に設定
             button.clicked.connect(lambda checked, value=i: self.set_location(value))
-            
+
             # 対応する色を取得
             color = get_location_color(i)
-            
+
             # ボタンのスタイルを設定
             button.setStyleSheet(f"""
                 QPushButton {{
@@ -29202,11 +29340,11 @@ class ImageAnnotationTool(QMainWindow):
                     font-weight: bold;
                 }}
             """)
-            
+
             # カウントをプロパティとして保持（表示更新用）
             button.setProperty("location_count", 0)
-            # レイアウトに追加
-            self.location_buttons_layout.addWidget(button)
+            # クラス内容入力欄付きの行としてレイアウトに追加
+            self._add_location_row(button, i)
             self.location_buttons.append(button)
 
         # 初期表示を適用
@@ -29266,7 +29404,7 @@ class ImageAnnotationTool(QMainWindow):
         model_type_layout = QHBoxLayout()
         model_type_layout.addWidget(QLabel(get_text('label_model_type')))
         self.location_model_combo = QComboBox()
-        self.location_model_combo.addItems(["donkey_location", "resnet18_location"])
+        self.location_model_combo.addItems(list_available_location_models())
         # イベントハンドラを接続（追加）
         self.location_model_combo.currentIndexChanged.connect(self.on_location_model_type_changed)
         model_type_layout.addWidget(self.location_model_combo)
@@ -30689,13 +30827,13 @@ class ImageAnnotationTool(QMainWindow):
         if 'donkey_location' in model_type:
             model = get_model(model_type, pretrained=True)
             model.classifier = nn.Linear(50, num_classes)  # 出力層を置き換え
-        elif 'resnet18_location' in model_type:
+        else:
+            # TIMMバックボーン系の位置モデル（resnet18_location含む）は
+            # 共通してregressorヘッドを持つため、クラス数に合わせて置き換える
             model = get_model(model_type, pretrained=True)
             if hasattr(model, 'regressor'):
                 in_features = model.regressor.in_features if hasattr(model.regressor, 'in_features') else model.regressor[0].in_features
                 model.regressor = nn.Linear(in_features, num_classes)
-        else:
-            model = get_model(model_type, pretrained=True)
         
         return model.to(device)
 

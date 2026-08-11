@@ -714,8 +714,14 @@ class MLflowManager:
             "initial_weights": training_params.get("initial_weights", "pretrained"),
             "pretrained_model_name": training_params.get("pretrained_model_name", None),
             "sampling_strategy": training_params.get("sampling_strategy", "all"),
-            "augmentation_enabled": training_params.get("augmentation_enabled", False)
+            "augmentation_enabled": training_params.get("augmentation_enabled", False),
+            "use_speed_output": training_params.get("use_speed_output", False),
+            "use_future_output": training_params.get("use_future_output", False)
         }
+
+        # speed出力有効時はspeed正規化値（MAX_SPEED相当）も記録
+        if training_params.get("use_speed_output", False):
+            params["speed_normalize"] = training_params.get("speed_normalize", None)
 
         # コメントがあれば追加
         if training_params.get("comment"):

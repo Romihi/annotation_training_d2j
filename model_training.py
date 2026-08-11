@@ -667,6 +667,7 @@ def create_datasets(
     use_augmentation: bool = False,
     use_speed: bool = False,
     use_future: bool = False,
+    speed_normalize: float = None,
     num_outputs: int = 2,
     multi_source_paths: List[List[str]] = None,
     num_sources: int = 1,
@@ -796,7 +797,8 @@ def create_datasets(
             transform=transform,
             use_speed=use_speed,
             use_future=use_future,
-            temporal_interval=temporal_interval
+            temporal_interval=temporal_interval,
+            speed_normalize=speed_normalize
         )
         print(f"VirtualSourceDataset作成: {len(dataset)}サンプル, {num_sources}仮想ソース, タイプ={virtual_source_type}, 時間差={temporal_interval}")
     elif is_multi_source:
@@ -807,11 +809,13 @@ def create_datasets(
             num_sources=num_sources,
             transform=transform,
             use_speed=use_speed,
-            use_future=use_future
+            use_future=use_future,
+            speed_normalize=speed_normalize
         )
         print(f"MultiSourceDataset作成: {len(dataset)}サンプル, {num_sources}ソース")
     else:
-        dataset = AnnotationDataset(image_paths, annotations, transform=transform, use_speed=use_speed, use_future=use_future)
+        dataset = AnnotationDataset(image_paths, annotations, transform=transform, use_speed=use_speed, use_future=use_future,
+                                    speed_normalize=speed_normalize)
 
     # バッチサイズが小さすぎる場合の対策
     if batch_size < 2:
@@ -887,7 +891,8 @@ def train_model(
     fusion_method: str = 'concat',
     selected_sources: Optional[List[str]] = None,
     virtual_source_type: Optional[str] = None,
-    temporal_interval: int = 10
+    temporal_interval: int = 10,
+    speed_normalize: Optional[float] = None
 ) -> Dict[str, Any]:
     """モデルをトレーニングする
 
@@ -1237,6 +1242,8 @@ def train_model(
                 'input_size': model_input_size,
                 'selected_sources': selected_sources,
             }
+            if speed_normalize:
+                save_dict['speed_normalize'] = speed_normalize
             if is_multi_source:
                 save_dict['num_sources'] = num_sources
                 save_dict['fusion_method'] = fusion_method
@@ -1313,6 +1320,8 @@ def train_model(
         'input_size': model_input_size,
         'selected_sources': selected_sources,
     }
+    if speed_normalize:
+        final_save_dict['speed_normalize'] = speed_normalize
     if is_multi_source:
         final_save_dict['num_sources'] = num_sources
         final_save_dict['fusion_method'] = fusion_method
@@ -1725,9 +1734,9 @@ class LocationModelManager:
                 from model_catalog import ResNet18LocationModel
                 self.model = ResNet18LocationModel(num_classes=num_classes)
             else:
-                # その他のモデル対応
-                from model_catalog import get_model
-                self.model = get_model(model_type, num_classes=num_classes)
+                # その他の位置推論モデル（TIMMバックボーン系など）
+                from model_catalog import create_location_model
+                self.model = create_location_model(model_type, num_classes=num_classes)
             
             if progress_callback:
                 progress_callback(70, "モデルの重みをロード中...")
@@ -1983,10 +1992,10 @@ def train_location_model(
     if 'donkey_location' in model_name:
         model = get_model(model_name, pretrained=pretrained)
         model.classifier = nn.Linear(50, num_classes)  # 出力層を置き換え
-    elif 'resnet18_location' in model_name:
+    elif '_location' in model_name:
+        # TIMMバックボーン系の位置モデル（resnet18_location含む）は
+        # 共通してregressorヘッドを持つため、クラス数に合わせて置き換える
         model = get_model(model_name, pretrained=pretrained)
-        # TIMMベースモデルは初期化時にnum_outputsを設定するので
-        # コンストラクタで置き換える必要はないが、確認のため
         if hasattr(model, 'regressor'):
             in_features = model.regressor.in_features if hasattr(model.regressor, 'in_features') else model.regressor[0].in_features
             model.regressor = nn.Linear(in_features, num_classes)

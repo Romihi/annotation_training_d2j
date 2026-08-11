@@ -99,6 +99,9 @@ def _infer_with_model(
                     # モデル状態の辞書が直接保存されている場合
                     if 'model_state_dict' in checkpoint:
                         model.load_state_dict(checkpoint['model_state_dict'])
+                        # 学習時のspeed正規化値（保存されていれば表示側で利用）
+                        if checkpoint.get('speed_normalize'):
+                            model._speed_normalize = float(checkpoint['speed_normalize'])
                     else:
                         # モデルの状態が直接保存されている古い形式の場合
                         model.load_state_dict(checkpoint)
@@ -179,6 +182,10 @@ def _infer_with_model(
                     # speedがある場合は追加
                     if speed is not None:
                         results[img_path]["speed"] = float(speed)
+                        # 学習時のspeed正規化値（m/s換算・表示位置の計算用）
+                        _speed_norm = getattr(model, '_speed_normalize', None)
+                        if _speed_norm:
+                            results[img_path]["speed_normalize"] = float(_speed_norm)
 
                     # 将来予測の出力がある場合
                     # 9出力モデル（speed有り）: [angle, throttle, speed, t+5_angle, t+5_throttle, t+5_speed, t+10_angle, t+10_throttle, t+10_speed]
