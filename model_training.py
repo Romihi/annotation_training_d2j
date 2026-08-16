@@ -668,6 +668,8 @@ def create_datasets(
     use_speed: bool = False,
     use_future: bool = False,
     speed_normalize: float = None,
+    mask_polygon: List[Tuple[float, float]] = None,
+    future_offsets: List[int] = None,
     num_outputs: int = 2,
     multi_source_paths: List[List[str]] = None,
     num_sources: int = 1,
@@ -798,7 +800,9 @@ def create_datasets(
             use_speed=use_speed,
             use_future=use_future,
             temporal_interval=temporal_interval,
-            speed_normalize=speed_normalize
+            speed_normalize=speed_normalize,
+            mask_polygon=mask_polygon,
+            future_offsets=future_offsets
         )
         print(f"VirtualSourceDataset作成: {len(dataset)}サンプル, {num_sources}仮想ソース, タイプ={virtual_source_type}, 時間差={temporal_interval}")
     elif is_multi_source:
@@ -810,12 +814,15 @@ def create_datasets(
             transform=transform,
             use_speed=use_speed,
             use_future=use_future,
-            speed_normalize=speed_normalize
+            speed_normalize=speed_normalize,
+            mask_polygon=mask_polygon,
+            future_offsets=future_offsets
         )
         print(f"MultiSourceDataset作成: {len(dataset)}サンプル, {num_sources}ソース")
     else:
         dataset = AnnotationDataset(image_paths, annotations, transform=transform, use_speed=use_speed, use_future=use_future,
-                                    speed_normalize=speed_normalize)
+                                    speed_normalize=speed_normalize, mask_polygon=mask_polygon,
+                                    future_offsets=future_offsets)
 
     # バッチサイズが小さすぎる場合の対策
     if batch_size < 2:
@@ -892,7 +899,9 @@ def train_model(
     selected_sources: Optional[List[str]] = None,
     virtual_source_type: Optional[str] = None,
     temporal_interval: int = 10,
-    speed_normalize: Optional[float] = None
+    speed_normalize: Optional[float] = None,
+    vehicle_mask: Optional[List[Tuple[float, float]]] = None,
+    future_offsets: Optional[List[int]] = None
 ) -> Dict[str, Any]:
     """モデルをトレーニングする
 
@@ -1244,6 +1253,10 @@ def train_model(
             }
             if speed_normalize:
                 save_dict['speed_normalize'] = speed_normalize
+            if vehicle_mask:
+                save_dict['vehicle_mask'] = [list(p) for p in vehicle_mask]
+            if future_offsets:
+                save_dict['future_offsets'] = [int(v) for v in future_offsets]
             if is_multi_source:
                 save_dict['num_sources'] = num_sources
                 save_dict['fusion_method'] = fusion_method
@@ -1322,6 +1335,10 @@ def train_model(
     }
     if speed_normalize:
         final_save_dict['speed_normalize'] = speed_normalize
+    if vehicle_mask:
+        final_save_dict['vehicle_mask'] = [list(p) for p in vehicle_mask]
+    if future_offsets:
+        final_save_dict['future_offsets'] = [int(v) for v in future_offsets]
     if is_multi_source:
         final_save_dict['num_sources'] = num_sources
         final_save_dict['fusion_method'] = fusion_method

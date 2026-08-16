@@ -164,11 +164,38 @@ TRANSLATIONS = {
         # --- ナビゲーション ---
         'btn_reverse_play': '◀逆再生',
         'btn_forward_play': '▶再生',
-        'btn_delete_current': '現在のアノテーション削除',
-        'btn_restore_deleted': '削除状態を復元',
-        'btn_restore_all_deleted': '全ての削除状態を復元',
+        'btn_delete_current': '現在のフレームを削除',
+        'btn_restore_deleted': '現在のフレームを復元',
+        'btn_restore_all_deleted': '全フレームを復元',
+        'btn_delete_reverse': '後進フレーム削除',
+        'tip_delete_reverse': 'throttleが負（後進）のフレームを全て削除済みとしてマークします',
         'btn_current_position': '現在位置',
         'btn_range_delete': '範囲削除',
+
+        # --- 車両マスク ---
+        'btn_vehicle_mask': '車両マスク',
+        'tip_vehicle_mask': '画像下側の車体領域を学習・推論時に無視するマスクを設定します。\n'
+                            'ボタンを押すと編集モードになり、画像クリックで中央線から左右対称にポリゴン頂点を追加できます。\n'
+                            '左クリック: 頂点追加 / 頂点をドラッグ: 移動 / 頂点を右クリック: その頂点を削除\n'
+                            '右クリック: 直前の頂点を削除 / Ctrl+右クリック: 全消去\n'
+                            'もう一度ボタンを押すと確定します（学習ダイアログの「車両マスクを適用」で使用されます）。',
+        'status_vehicle_mask_edit_on': '車両マスク編集中: 左クリックで頂点追加（左右対称） / ドラッグで頂点移動 / 右クリックで頂点削除 / Ctrl+右クリックで全消去 / ボタン再押下で確定',
+        'status_vehicle_mask_set': '車両マスクを設定しました（頂点: {0}点 × 左右対称 = {1}点）',
+        'status_vehicle_mask_cleared': '車両マスクをクリアしました',
+        'status_vehicle_mask_point_added': '車両マスク頂点を追加しました（{0}点）',
+        'status_vehicle_mask_point_removed': '車両マスク頂点を削除しました（残り{0}点）',
+        'chk_use_vehicle_mask': '車両マスクを適用（車体領域を無視）',
+        'tip_use_vehicle_mask': '設定済みの車両マスク領域を黒塗りにして学習します。\nマスクはモデルに保存され、推論時にも自動的に同じマスクが適用されます。',
+        'tip_use_vehicle_mask_disabled': '車両マスクが未設定です。\n解像度スライダー右の「車両マスク」ボタンでポリゴンを設定してください。',
+        'label_vehicle_mask_info': '設定済みマスク: {0}頂点の対称ポリゴン（マスク領域は黒塗りで無視されます）',
+        'label_vehicle_mask_not_set': '車両マスク未設定（「車両マスク」ボタンで設定できます）',
+        'chk_custom_future_frames': '予測フレームを指定',
+        'tip_custom_future_frames': '将来予測（angle/throttle/speed）を何フレーム先まで出力するかをカンマ区切りで2つ指定します（例: 5,10）。\n'
+                                    '未指定またはチェックOFFの場合は5,10フレーム先を予測します。\n'
+                                    '指定値はモデルに保存され、推論表示にも反映されます。',
+        'label_future_frames_unit': 'フレーム先（カンマ区切りで2つ）',
+        'msg_invalid_future_frames': '予測フレームの指定が不正です。\n正の整数を2つ、カンマ区切りで入力してください（例: 5,10）。',
+        'tip_speed_seek_graph': 'speedの推移グラフ（薄い山）。赤マークはspeed欠損フレーム。\nクリック/ドラッグでシークできます。',
 
         # --- ダウンサンプリング ---
         'btn_detect': '検出',
@@ -648,10 +675,13 @@ TRANSLATIONS = {
         'label_speed_normalize_note': '※ Speed値はこの値で除算されます',
         'label_future_info': '※ 5フレーム先と10フレーム先のangle, throttle(, speed)を追加出力',
         'label_future_detail': '出力例（speed有）: [angle, throttle, speed, t+5_angle, t+5_throttle, t+5_speed, t+10_angle, t+10_throttle, t+10_speed]',
-        'chk_future_label_output': '将来フレームを出力',
-        'tip_future_label_output': '現在フレームの入力に対して N フレーム先のアノテーションをラベルとして学習します。\n将来フレームが削除済みの場合、その画像は学習対象から除外されます。',
-        'label_future_label_frames': 'フレーム先のアノテーションを出力',
-        'label_future_label_info': '※ 現在フレームの画像入力に対して N フレーム先のアノテーションを出力として学習（削除フレームは除外）',
+        'chk_future_label_output': 'ラベルをNフレーム先にずらす（遅延補償）',
+        'tip_future_label_output': '現在フレームの画像入力に対して N フレーム先のアノテーションを正解ラベルとして学習します。\n'
+                                   '出力数は増えず、モデルが「少し先の操作」を出力するようになるため、推論遅延の補償に使えます。\n'
+                                   '（「将来フレームの予測を出力に追加」とは別機能です）\n'
+                                   '将来フレームが削除済みの場合、その画像は学習対象から除外されます。',
+        'label_future_label_frames': 'フレーム先のアノテーションをラベルに使用',
+        'label_future_label_info': '※ 出力数は変えずにラベルだけNフレーム先へずらす遅延補償用の設定（削除フレームは除外）',
         'label_min_delta': '最小改善量:',
         'label_validation_ratio': '検証データ割合:',
         'label_skip_count': 'スキップ枚数:',
@@ -1302,7 +1332,7 @@ TRANSLATIONS = {
         'btn_reverse_play': '◀逆再生',
         'dlg_waypoint_shortage': 'Waypoint不足',
         'msg_waypoint_shortage': '現在の画像には{0}個のwaypointが配置されていますが、\n{1}個必要です。\n\n残り{2}個のwaypointを配置してから次の画像に進んでください。\n\n※配置を中止する場合は、Deleteキーで全てのwaypointを削除してください。',
-        'msg_cannot_set_location_deleted': '削除済みの画像には位置情報を設定できません。\n先に「削除状態を復元」を実行してください。',
+        'msg_cannot_set_location_deleted': '削除済みの画像には位置情報を設定できません。\n先に「現在のフレームを復元」を実行してください。',
 
         # Databricks/Colab関連
         'tip_keep_current_input': '現在の入力内容を保持',
@@ -2062,11 +2092,38 @@ Google Cloud Console での OAuth設定手順
         # --- Navigation ---
         'btn_reverse_play': '◀ Reverse',
         'btn_forward_play': '▶ Play',
-        'btn_delete_current': 'Delete Current',
-        'btn_restore_deleted': 'Restore Deleted',
-        'btn_restore_all_deleted': 'Restore All',
+        'btn_delete_current': 'Delete Current Frame',
+        'btn_restore_deleted': 'Restore Current Frame',
+        'btn_restore_all_deleted': 'Restore All Frames',
+        'btn_delete_reverse': 'Delete Reverse Frames',
+        'tip_delete_reverse': 'Mark all frames with negative throttle (reversing) as deleted',
         'btn_current_position': 'Current',
         'btn_range_delete': 'Delete Range',
+
+        # --- Vehicle Mask ---
+        'btn_vehicle_mask': 'Vehicle Mask',
+        'tip_vehicle_mask': 'Set a mask polygon to ignore the vehicle body area (bottom of image) during training and inference.\n'
+                            'Press the button to enter edit mode, then click on the image to add vertices mirrored across the center line.\n'
+                            'Left click: add vertex / Drag vertex: move / Right click on vertex: remove it\n'
+                            'Right click: remove last vertex / Ctrl+Right click: clear all\n'
+                            'Press the button again to confirm (used via "Apply vehicle mask" in the training dialog).',
+        'status_vehicle_mask_edit_on': 'Vehicle mask editing: left click to add vertex (mirrored) / drag to move / right click to remove / Ctrl+right click to clear / press button again to confirm',
+        'status_vehicle_mask_set': 'Vehicle mask set ({0} vertices x mirror = {1} points)',
+        'status_vehicle_mask_cleared': 'Vehicle mask cleared',
+        'status_vehicle_mask_point_added': 'Vehicle mask vertex added ({0} points)',
+        'status_vehicle_mask_point_removed': 'Vehicle mask vertex removed ({0} remaining)',
+        'chk_use_vehicle_mask': 'Apply vehicle mask (ignore body area)',
+        'tip_use_vehicle_mask': 'Train with the configured vehicle mask area filled in black.\nThe mask is saved with the model and automatically applied at inference time.',
+        'tip_use_vehicle_mask_disabled': 'No vehicle mask configured.\nUse the "Vehicle Mask" button next to the resolution slider to set one.',
+        'label_vehicle_mask_info': 'Configured mask: symmetric polygon with {0} vertices (masked area is blacked out and ignored)',
+        'label_vehicle_mask_not_set': 'No vehicle mask configured (set one with the "Vehicle Mask" button)',
+        'chk_custom_future_frames': 'Custom prediction frames',
+        'tip_custom_future_frames': 'Specify how many frames ahead the future predictions (angle/throttle/speed) are output,\n'
+                                    'as two comma-separated values (e.g. 5,10). Defaults to 5,10 when unchecked or empty.\n'
+                                    'The values are saved with the model and reflected in inference display.',
+        'label_future_frames_unit': 'frames ahead (two, comma-separated)',
+        'msg_invalid_future_frames': 'Invalid prediction frame specification.\nEnter two positive integers separated by a comma (e.g. 5,10).',
+        'tip_speed_seek_graph': 'Speed profile graph (faint hills). Red marks are frames with missing speed.\nClick/drag to seek.',
 
         # --- Downsampling ---
         'btn_detect': 'Detect',
@@ -2546,10 +2603,13 @@ Google Cloud Console での OAuth設定手順
         'label_speed_normalize_note': '* Speed value is divided by this value',
         'label_future_info': '* Adds angle, throttle(, speed) for +5 and +10 frames',
         'label_future_detail': 'Output example (with speed): [angle, throttle, speed, t+5_angle, t+5_throttle, t+5_speed, t+10_angle, t+10_throttle, t+10_speed]',
-        'chk_future_label_output': 'Output Future Frame',
-        'tip_future_label_output': 'Train with annotation from N frames ahead as label for current frame.\nFrames whose future annotation is deleted will be excluded from training.',
-        'label_future_label_frames': 'frames ahead as label',
-        'label_future_label_info': '* Uses annotation N frames ahead as output label (deleted future frames are excluded)',
+        'chk_future_label_output': 'Shift labels N frames ahead (latency compensation)',
+        'tip_future_label_output': 'Train with the annotation from N frames ahead as the ground-truth label for the current frame.\n'
+                                   'The number of outputs stays the same; the model learns to output slightly-future controls,\n'
+                                   'which compensates for inference latency. (Different from "Add future prediction outputs".)\n'
+                                   'Frames whose future annotation is deleted are excluded from training.',
+        'label_future_label_frames': 'frames ahead used as label',
+        'label_future_label_info': '* Shifts only the label N frames ahead without changing outputs, for latency compensation (deleted frames excluded)',
         'label_min_delta': 'Min Delta:',
         'label_validation_ratio': 'Validation Ratio:',
         'label_skip_count': 'Skip Count:',

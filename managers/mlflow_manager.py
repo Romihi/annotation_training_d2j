@@ -716,8 +716,13 @@ class MLflowManager:
             "sampling_strategy": training_params.get("sampling_strategy", "all"),
             "augmentation_enabled": training_params.get("augmentation_enabled", False),
             "use_speed_output": training_params.get("use_speed_output", False),
-            "use_future_output": training_params.get("use_future_output", False)
+            "use_future_output": training_params.get("use_future_output", False),
+            "vehicle_mask_enabled": training_params.get("vehicle_mask_enabled", False)
         }
+
+        # 将来予測有効時は予測フレームオフセットも記録
+        if training_params.get("use_future_output", False):
+            params["future_offsets"] = training_params.get("future_offsets", "5,10")
 
         # speed出力有効時はspeed正規化値（MAX_SPEED相当）も記録
         if training_params.get("use_speed_output", False):

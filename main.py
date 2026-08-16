@@ -47,8 +47,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                             QGroupBox, QRadioButton, QTabWidget, QSizePolicy,QButtonGroup,
                             QListView, QTreeView, QAbstractItemView,QStyleOptionSlider,QStyle, QTextEdit, QPlainTextEdit,
                             QGraphicsOpacityEffect, QListWidget, QListWidgetItem)
-from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont, QPolygon, QCursor, QIcon, QPainterPath
-from PyQt5.QtCore import Qt, QRect, QPoint, QSize, QTimer, QEvent, QThread, pyqtSignal
+from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont, QPolygon, QPolygonF, QCursor, QIcon, QPainterPath
+from PyQt5.QtCore import Qt, QRect, QPoint, QPointF, QSize, QTimer, QEvent, QThread, pyqtSignal
 
 from PIL import Image, ImageDraw
 
@@ -69,7 +69,7 @@ from utils.image_utils import (
 )
 
 # カスタムモジュールのインポート
-from model_catalog import get_model, list_available_models, list_available_location_models, VirtualSourceDataset
+from model_catalog import get_model, list_available_models, list_available_location_models, VirtualSourceDataset, apply_vehicle_mask
 from utils.inference_utils import batch_inference
 from utils.export_utils import export_to_donkey, export_to_jetracer, export_to_video, export_to_video_multi_source
 from model_training import train_model, create_datasets
@@ -402,6 +402,8 @@ class ImageLabel(QLabel):
         self.resolution_scale = 1.0          # 1.0=フル解像度, 0.1=10%
         self.crop_overlay_config = None      # 仮想ソース表示用
         self.virtual_overlay_mode = 'fill'   # 'none', 'border', 'fill'
+        self._mask_drag_index = None         # 車両マスク: ドラッグ中の頂点インデックス
+        self._mask_drag_mirrored = False     # 車両マスク: 鏡像側ハンドルをドラッグ中か
         self._temporal_thumb_cache = {}      # {(path, w, h): QPixmap}
         self.is_deleted = False
         self.is_downsampled = False  # ダウンサンプリング対象フラグ
@@ -831,6 +833,9 @@ class ImageLabel(QLabel):
         # CAMオーバーレイを描画（ベース画像の上、他のアノテーションの下）
         self.draw_gradcam_overlay(painter, self.target_rect)
 
+        # 車両マスクのオーバーレイ（学習時に無視される領域の可視化）
+        self.draw_vehicle_mask(painter, self.target_rect)
+
         # 各機能毎に描画（描画順序を調整）
         self.draw_grid(painter, self.target_rect)
         self.draw_background_frame(painter, self.target_rect)
@@ -902,6 +907,92 @@ class ImageLabel(QLabel):
             pix = pix.scaled(small_w, small_h, Qt.IgnoreAspectRatio, Qt.FastTransformation)
             pix = pix.scaled(self.scaled_width, self.scaled_height, Qt.IgnoreAspectRatio, Qt.FastTransformation)
         painter.drawPixmap(self.target_rect, pix)
+
+    def _find_mask_vertex(self, rel_x, rel_y):
+        """指定の正規化座標近傍にある車両マスク頂点を探す
+
+        Returns:
+            (index, is_mirrored): 見つからない場合は (None, False)。
+            is_mirrored=True は鏡像側ハンドルをつかんだことを示す。
+        """
+        mw = self.main_window
+        pts = getattr(mw, 'vehicle_mask_user_points', None)
+        if not pts or not self.target_rect or self.target_rect.width() <= 0:
+            return None, False
+
+        # スクリーン座標で半径8px以内を近傍とみなす
+        threshold = 8.0
+        tw, th = self.target_rect.width(), self.target_rect.height()
+        for i, (px, py) in enumerate(pts):
+            if abs((rel_x - px) * tw) <= threshold and abs((rel_y - py) * th) <= threshold:
+                return i, False
+            if abs((rel_x - (1.0 - px)) * tw) <= threshold and abs((rel_y - py) * th) <= threshold:
+                return i, True
+        return None, False
+
+    def draw_vehicle_mask(self, painter, target_rect):
+        """車両マスクポリゴンのオーバーレイ描画（編集モード時は頂点と中央線も表示）"""
+        mw = self.main_window
+        if not mw:
+            return
+        edit_mode = getattr(mw, 'vehicle_mask_edit_mode', False)
+        user_points = getattr(mw, 'vehicle_mask_user_points', None)
+        if not edit_mode and not user_points:
+            return
+
+        tx, ty = target_rect.x(), target_rect.y()
+        tw, th = target_rect.width(), target_rect.height()
+
+        def to_screen(p):
+            return QPointF(tx + p[0] * tw, ty + p[1] * th)
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        # 編集モード中は中央線（対称軸）を点線で表示
+        if edit_mode:
+            pen = QPen(QColor(255, 255, 0, 180), 1, Qt.DashLine)
+            painter.setPen(pen)
+            painter.drawLine(int(tx + tw / 2), ty, int(tx + tw / 2), ty + th)
+
+        # 対称ポリゴンの塗りつぶし（グレー系）
+        polygon = mw.get_vehicle_mask_polygon()
+        if polygon:
+            screen_points = [to_screen(p) for p in polygon]
+            qpoly = QPolygonF(screen_points)
+            painter.setPen(QPen(QColor(90, 90, 90, 220), 2))
+            painter.setBrush(QBrush(QColor(128, 128, 128, 110)))
+            painter.drawPolygon(qpoly)
+
+            # マスク領域の重心に「車両マスク」ラベルを表示
+            label_text = get_text('btn_vehicle_mask')
+            cx = sum(sp.x() for sp in screen_points) / len(screen_points)
+            cy = sum(sp.y() for sp in screen_points) / len(screen_points)
+            painter.setFont(QFont("Arial", 9, QFont.Bold))
+            fm = painter.fontMetrics()
+            text_x = int(cx - fm.horizontalAdvance(label_text) / 2)
+            text_y = int(cy + fm.ascent() / 2)
+            # 白の縁取りで背景に埋もれないようにする
+            painter.setPen(QPen(QColor(255, 255, 255, 200), 1))
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                painter.drawText(text_x + dx, text_y + dy, label_text)
+            painter.setPen(QPen(QColor(70, 70, 70, 230), 1))
+            painter.drawText(text_x, text_y, label_text)
+
+        # 編集モード中は頂点マーカーを表示（ユーザー頂点=塗り、鏡像=白抜き）
+        # どちらのハンドルもドラッグで移動、右クリックで削除できる
+        if edit_mode and user_points:
+            for p in user_points:
+                sp = to_screen(p)
+                painter.setPen(QPen(QColor(255, 255, 255), 1))
+                painter.setBrush(QBrush(QColor(80, 80, 80, 240)))
+                painter.drawEllipse(sp, 5, 5)
+                mp = to_screen((1.0 - p[0], p[1]))
+                painter.setPen(QPen(QColor(80, 80, 80, 240), 2))
+                painter.setBrush(QBrush(QColor(255, 255, 255, 180)))
+                painter.drawEllipse(mp, 5, 5)
+
+        painter.restore()
 
     def draw_virtual_overlay(self, painter, target_rect):
         """仮想ソース領域をオーバーレイ表示（crop/scale/temporal 対応）"""
@@ -1574,15 +1665,18 @@ class ImageLabel(QLabel):
                         painter.setBrush(QBrush())  # 塗りつぶしなし
                         painter.drawEllipse(future_scaled_x - size // 2, future_scaled_y - size // 2, size, size)
 
-        # 将来の推論点を描画（t+5, t+10）- 現在の推論点の下に描画
+        # 将来の推論点を描画（t+o1, t+o2。オフセットはモデルの学習設定に従う）- 現在の推論点の下に描画
         if self.show_inference and self.show_future_annotations and self.main_window:
             current_index = self.main_window.current_index
             if hasattr(self.main_window, 'inference_results') and current_index in self.main_window.inference_results:
                 inference_data = self.main_window.inference_results[current_index]
-                future_offsets = [10, 5]  # 先に遠い方を描画（後に描画されるものが上に来る）
-                future_sizes = {5: 22, 10: 14}  # インデックスごとのサイズ（現在は30）
-                # シアン系の色（アノテーションのオレンジ/黄色に対応）
-                future_colors = {5: QColor(0, 200, 200), 10: QColor(0, 150, 150)}  # 5:明るいシアン, 10:暗いシアン
+                _inf_offsets = inference_data.get('future_offsets', [5, 10])
+                _near = _inf_offsets[0]
+                _far = _inf_offsets[1] if len(_inf_offsets) > 1 else _inf_offsets[0]
+                future_offsets = [_far, _near]  # 先に遠い方を描画（後に描画されるものが上に来る）
+                future_sizes = {_near: 22, _far: 14}
+                # シアン系の色（アノテーションのオレンジ/黄色に対応）近:明るいシアン, 遠:暗いシアン
+                future_colors = {_near: QColor(0, 200, 200), _far: QColor(0, 150, 150)}
 
                 for offset in future_offsets:
                     future_key = f"future_{offset}"
@@ -3430,11 +3524,14 @@ class ImageLabel(QLabel):
             # 無ければバーのmax_speed）でm/sに換算し、バーのスケール上に配置する
             _infer_snorm = inference.get('speed_normalize') or _max_speed
 
-            # 将来の推論speedバーを描画（t+5, t+10）- 現在の横線の下に描画
+            # 将来の推論speedバーを描画（t+o1, t+o2。オフセットはモデルの学習設定に従う）
             if self.show_future_annotations:
-                future_offsets = [10, 5]  # 先に遠い方を描画
-                future_line_widths = {5: 3, 10: 2}  # 線の太さ
-                future_colors = {5: QColor(0, 200, 200), 10: QColor(0, 150, 150)}  # シアン系
+                _inf_offsets = inference.get('future_offsets', [5, 10])
+                _near = _inf_offsets[0]
+                _far = _inf_offsets[1] if len(_inf_offsets) > 1 else _inf_offsets[0]
+                future_offsets = [_far, _near]  # 先に遠い方を描画
+                future_line_widths = {_near: 3, _far: 2}  # 線の太さ
+                future_colors = {_near: QColor(0, 200, 200), _far: QColor(0, 150, 150)}  # シアン系
 
                 for offset in future_offsets:
                     future_key = f"future_{offset}"
@@ -3496,7 +3593,30 @@ class ImageLabel(QLabel):
             # 元の画像の座標に変換
             orig_x = int(rel_x * self.pix_width)
             orig_y = int(rel_y * self.pix_height)
-            
+
+            # 車両マスク編集モード: 通常のアノテーション処理より優先して頂点を編集
+            if getattr(self.main_window, 'vehicle_mask_edit_mode', False):
+                if event.button() == Qt.RightButton:
+                    if event.modifiers() & Qt.ControlModifier:
+                        self.main_window.clear_vehicle_mask()  # Ctrl+右クリックで全消去
+                    else:
+                        # 頂点近傍の右クリックはその頂点を削除、それ以外は直前の頂点を削除
+                        vi, _ = self._find_mask_vertex(rel_x, rel_y)
+                        if vi is not None:
+                            self.main_window.remove_vehicle_mask_point(vi)
+                        else:
+                            self.main_window.remove_last_vehicle_mask_point()
+                elif event.button() == Qt.LeftButton:
+                    # 既存頂点（鏡像側ハンドル含む）の近傍ならドラッグ移動を開始
+                    vi, mirrored = self._find_mask_vertex(rel_x, rel_y)
+                    if vi is not None:
+                        self._mask_drag_index = vi
+                        self._mask_drag_mirrored = mirrored
+                        self.setCursor(Qt.ClosedHandCursor)
+                    else:
+                        self.main_window.add_vehicle_mask_point(rel_x, rel_y)
+                return
+
             # 現在のモードに基づいて処理
             ## 物体検知モード
             if hasattr(self.main_window, 'current_mode') and self.main_window.current_mode == 1:
@@ -3922,6 +4042,13 @@ class ImageLabel(QLabel):
                     self.main_window.skip_images(1)  # デフォルトは1枚
 
     def mouseReleaseEvent(self, event):
+        # 車両マスク頂点のドラッグ終了
+        if self._mask_drag_index is not None:
+            self._mask_drag_index = None
+            self._mask_drag_mirrored = False
+            self.setCursor(Qt.ArrowCursor)
+            return
+
         # 一筆書きウェイポイント描画完了処理
         if self.is_drawing_waypoints:
             self.is_drawing_waypoints = False
@@ -4054,6 +4181,18 @@ class ImageLabel(QLabel):
     def mouseMoveEvent(self, event):
         """マウス移動時の処理 - ハンドルによるサイズ変更機能を追加"""
         pos = event.pos()
+
+        # 車両マスク頂点のドラッグ移動
+        if (getattr(self.main_window, 'vehicle_mask_edit_mode', False)
+                and self._mask_drag_index is not None):
+            if self.target_rect and self.target_rect.width() > 0 and self.target_rect.height() > 0:
+                rel_x = (pos.x() - self.target_rect.x()) / self.target_rect.width()
+                rel_y = (pos.y() - self.target_rect.y()) / self.target_rect.height()
+                # 鏡像側ハンドルをつかんでいる場合は本体側の座標に変換
+                if self._mask_drag_mirrored:
+                    rel_x = 1.0 - rel_x
+                self.main_window.move_vehicle_mask_point(self._mask_drag_index, rel_x, rel_y)
+            return
 
         # カーソルオーバーレイ更新（セグメンテーションモード）
         mode = getattr(self, 'seg_tool_mode', 'polygon')
@@ -4911,6 +5050,173 @@ class ImageLabel(QLabel):
         return None
 
 
+class SpeedSeekGraphWidget(QWidget):
+    """画像シークバーの上に表示する薄いspeedグラフ（YouTubeの再生ヒートマップ風）
+
+    - 全フレームのspeed値を薄いグレー系の面グラフとして表示
+    - speed欠損フレーム（アノテーション無し／speedキー無し）は下端に薄い赤マーク
+    - 現在位置に細い縦線を表示、クリック/ドラッグでシーク可能
+    """
+
+    GRAPH_HEIGHT = 26
+
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.setFixedHeight(self.GRAPH_HEIGHT)
+        self.setMinimumWidth(50)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(get_text('tip_speed_seek_graph'))
+
+    # --- スライダーと座標系を一致させるためのヘルパー ---
+    # QSliderのハンドルはグルーブ内側 (handle_len/2 〜 width-handle_len/2) を移動するため、
+    # グラフ側も同じマッピングで描画・シークしないと針の位置がずれる。
+    def _handle_len(self):
+        slider = getattr(self.main_window, 'image_slider', None)
+        if slider is not None:
+            try:
+                from PyQt5.QtWidgets import QStyle
+                return max(6, slider.style().pixelMetric(QStyle.PM_SliderLength, None, slider))
+            except Exception:
+                pass
+        return 11
+
+    def _x_from_index(self, idx, n, w, hl):
+        span = max(1, w - hl)
+        return int(hl / 2 + idx / max(1, n - 1) * span)
+
+    def _index_from_x(self, x, n, w, hl):
+        span = max(1, w - hl)
+        idx = int(round((x - hl / 2) / span * (n - 1)))
+        return max(0, min(n - 1, idx))
+
+    def _seek_to(self, x):
+        mw = self.main_window
+        n = len(mw.images) if mw and getattr(mw, 'images', None) else 0
+        if n <= 0 or self.width() <= 0:
+            return
+        idx = self._index_from_x(x, n, self.width(), self._handle_len())
+        if hasattr(mw, 'image_slider'):
+            mw.image_slider.setValue(idx)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._seek_to(event.pos().x())
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.LeftButton:
+            self._seek_to(event.pos().x())
+
+    def paintEvent(self, event):
+        mw = self.main_window
+        n = len(mw.images) if mw and getattr(mw, 'images', None) else 0
+        if n <= 0:
+            return
+
+        painter = QPainter(self)
+        w, h = self.width(), self.height()
+        anns = getattr(mw, 'annotations', {})
+        # 欠損赤マークは「speedデータが部分的に欠けている」場合のみ意味を持つ。
+        # speedを全く含まないデータセットで全面赤になるのを防ぐ。
+        has_speed_data = any(a.get('speed') is not None for a in anns.values())
+
+        ms = MAX_SPEED
+        if hasattr(mw, 'main_image_view'):
+            ms = getattr(mw.main_image_view, 'max_speed', MAX_SPEED) or MAX_SPEED
+
+        # スライダーのハンドル可動域（グルーブ内側）と同じ座標系で描画する
+        hl = self._handle_len()
+        pad = hl // 2
+        span = max(1, w - hl)
+
+        # 列（ピクセル）ごとにフレーム範囲を集約して speed の山と欠損を求める
+        top_points = []
+        missing_cols = []
+        for c in range(span + 1):
+            i0 = int(c / (span + 1) * n)
+            i1 = max(i0 + 1, int((c + 1) / (span + 1) * n))
+            col_speed = None
+            col_missing = False
+            for i in range(i0, min(i1, n)):
+                ann = anns.get(i)
+                spd = ann.get('speed') if ann else None
+                if spd is None:
+                    col_missing = True
+                else:
+                    col_speed = spd if col_speed is None else max(col_speed, spd)
+            x = pad + c
+            if col_speed is not None and ms > 0:
+                norm = max(0.0, min(1.0, col_speed / ms))
+                # 高さ2px分は常に確保して「データあり」を見えるようにする
+                y = h - 1 - int(norm * (h - 3))
+                top_points.append((x, y))
+            else:
+                top_points.append((x, None))
+            if col_missing and has_speed_data:
+                missing_cols.append(x)
+
+        # speedの山（薄いグレーブルーの面＋輪郭）
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(110, 140, 170, 60)))
+        run = []
+        for x, y in top_points + [(w, None)]:
+            if y is not None:
+                run.append((x, y))
+            elif run:
+                poly = QPolygonF(
+                    [QPointF(run[0][0], h)] +
+                    [QPointF(px, py) for px, py in run] +
+                    [QPointF(run[-1][0], h)]
+                )
+                painter.drawPolygon(poly)
+                painter.setPen(QPen(QColor(110, 140, 170, 110), 1))
+                painter.drawPolyline(QPolygonF([QPointF(px, py) for px, py in run]))
+                painter.setPen(Qt.NoPen)
+                run = []
+
+        # speed欠損マーク（下端の薄い赤）
+        if missing_cols:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor(230, 80, 80, 150)))
+            for x in missing_cols:
+                painter.drawRect(x, h - 4, 1, 4)
+
+        # lap境界の黒線とlap番号
+        boundaries = []
+        if hasattr(mw, 'compute_lap_boundaries'):
+            try:
+                boundaries = mw.compute_lap_boundaries()
+            except Exception:
+                boundaries = []
+        if boundaries and n > 1:
+            lap_font = QFont("Arial", 7)
+            painter.setFont(lap_font)
+            fm = painter.fontMetrics()
+            segment_starts = [0] + list(boundaries)
+            for b in boundaries:
+                bx = self._x_from_index(b, n, w, hl)
+                painter.setPen(QPen(QColor(0, 0, 0, 160), 1))
+                painter.drawLine(bx, 0, bx, h)
+            # 各lapの開始位置に番号を表示（幅が足りるセグメントのみ）
+            for li, start in enumerate(segment_starts, 1):
+                sx = self._x_from_index(start, n, w, hl)
+                end = segment_starts[li] if li < len(segment_starts) else n - 1
+                ex = self._x_from_index(end, n, w, hl)
+                text = str(li)
+                if ex - sx >= fm.horizontalAdvance(text) + 6:
+                    painter.setPen(QPen(QColor(60, 60, 60, 200), 1))
+                    painter.drawText(sx + 3, fm.ascent() + 1, text)
+
+        # 現在位置の縦線
+        cur = getattr(mw, 'current_index', 0)
+        if n > 1:
+            cx = self._x_from_index(cur, n, w, hl)
+            painter.setPen(QPen(QColor(0, 120, 215, 180), 1))
+            painter.drawLine(cx, 0, cx, h)
+
+        painter.end()
+
+
 class SpeedGaugeWidget(QWidget):
     """画像の外側に表示するスピードゲージウィジェット。
     ズームスライダーと同じ比率（上下 1/8 ずつ余白、トラック 6/8）でレイアウトし、
@@ -5038,7 +5344,10 @@ class SpeedGaugeWidget(QWidget):
                 # 無ければゲージのmax_speed）でm/sに換算し、ゲージスケール上に配置する
                 _snorm = inf.get('speed_normalize') or ms
                 if getattr(mw.main_image_view, 'show_future_annotations', False):
-                    for offset, lw, lc in [(10, 2, QColor(0, 150, 150)), (5, 3, QColor(0, 200, 200))]:
+                    _inf_offsets = inf.get('future_offsets', [5, 10])
+                    _near = _inf_offsets[0]
+                    _far = _inf_offsets[1] if len(_inf_offsets) > 1 else _inf_offsets[0]
+                    for offset, lw, lc in [(_far, 2, QColor(0, 150, 150)), (_near, 3, QColor(0, 200, 200))]:
                         fd = inf.get(f"future_{offset}", {})
                         if 'speed' in fd:
                             f_speed_ms = fd['speed'] * _snorm
@@ -5076,7 +5385,7 @@ class SpeedGaugeWidget(QWidget):
         gap = 8  # トラック上端からのクリアランス
         label_baseline = max(fm.ascent() + 2, ty - fm.descent() - gap)
         painter.setPen(QPen(text_color, 1))
-        painter.drawText(2, label_baseline, f"SPEED {speed:.2f}")
+        painter.drawText(2, label_baseline, f"speed {speed:.2f}")
 
         # ── 現在値ハンドル（赤・太め） ──
         handle_y = self._y_from_norm(normalized, tr)
@@ -5123,6 +5432,8 @@ class SpeedGaugeWidget(QWidget):
         self._hover_y = y
         self.update()
         mw = self.main_window
+        if mw and hasattr(mw, 'speed_seek_graph'):
+            mw.speed_seek_graph.update()
         if mw and hasattr(mw, 'statusBar'):
             mw.statusBar().showMessage(get_text('status_speed_updated', new_speed), 2000)
 
@@ -5624,6 +5935,10 @@ class ImageAnnotationTool(QMainWindow):
 
         self.info_panel_width = 280  # 基本の幅
         self.info_panel_margin = 20  # パネル周りの余白（左右合計）
+
+        # 車両マスク関連の初期化（画像下側の車体領域を学習時に無視するためのポリゴン）
+        self.vehicle_mask_user_points = []  # ユーザーがクリックした頂点（正規化座標、左右対称の片側）
+        self.vehicle_mask_edit_mode = False  # マスク編集モード中か
 
         # 位置情報関連の初期化
         self.location_buttons = []  # 位置情報ボタンのリスト
@@ -6499,6 +6814,22 @@ class ImageAnnotationTool(QMainWindow):
         if not has_manifest:
             overwrite_action.setToolTip("manifest.json が読み込まれていません")
 
+        # --- アノテーションを catalog へ上書き保存 ---
+        ann_overwrite_action = menu.addAction("🔴 アノテーション上書き保存（catalog）")
+        ann_overwrite_action.setEnabled(has_manifest and bool(self.annotations))
+        ann_overwrite_action.setToolTip(
+            "修正したangle/throttle/speed/位置情報を読込元のcatalogファイルへ"
+            "user/*キーとして上書き保存します（.bakバックアップ付き）")
+        ann_overwrite_action.triggered.connect(self.overwrite_catalog_annotations)
+
+        # --- speed欠損の確認・修復 ---
+        fix_speed_action = menu.addAction("🩹 speed欠損の確認・修復")
+        fix_speed_action.setEnabled(bool(self.images))
+        fix_speed_action.setToolTip(
+            "speedが欠損しているフレームを検出し、catalog再取込と前後フレームからの"
+            "線形補間で修復します")
+        fix_speed_action.triggered.connect(self.check_and_fix_missing_speed)
+
         menu.addSeparator()
 
         # --- 自動運転アノテーション ---
@@ -6586,6 +6917,345 @@ class ImageAnnotationTool(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "上書き保存エラー", f"保存中にエラーが発生しました:\n{e}")
             print(f"manifest 上書き保存エラー: {e}")
+
+    def overwrite_catalog_annotations(self):
+        """編集済みアノテーションを読込元のcatalogファイルへ上書き保存する
+
+        angle/throttle/speed/loc を user/angle, user/throttle, user/speed, user/loc
+        キーに書き込む（enc/speed などのセンサー生値は変更しない）。
+        書き換え前に各catalogファイルの .bak バックアップを作成する。
+        """
+        manifest_path = getattr(self, 'last_manifest_path', None)
+        if not manifest_path or not os.path.exists(manifest_path):
+            QMessageBox.warning(self, "アノテーション上書き保存",
+                                "catalog（manifest.json）が読み込まれていません。\n"
+                                "「アノテーション読込」でcatalogを読み込んだデータのみ上書き保存できます。")
+            return
+        if not self.annotations:
+            QMessageBox.warning(self, "アノテーション上書き保存", "保存するアノテーションがありません。")
+            return
+
+        try:
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            catalog_files = json.loads(lines[4]).get('paths', []) if len(lines) >= 5 else []
+        except Exception as e:
+            QMessageBox.critical(self, "アノテーション上書き保存",
+                                 f"manifest.json の読み込みに失敗しました:\n{e}")
+            return
+        if not catalog_files:
+            QMessageBox.warning(self, "アノテーション上書き保存",
+                                "manifest.json にcatalogファイル情報がありません。")
+            return
+
+        # 画像インデックス → catalogエントリインデックス（_index）の対応を構築
+        image_to_entry = getattr(self, '_manifest_image_to_entry', {})
+        updates = {}  # entry_index -> {catalogキー: 値}
+        for img_idx, ann in self.annotations.items():
+            entry_index = image_to_entry.get(img_idx, ann.get('original_index'))
+            if entry_index is None:
+                continue
+            upd = {}
+            if 'angle' in ann:
+                upd['user/angle'] = float(ann['angle'])
+            if 'throttle' in ann:
+                upd['user/throttle'] = float(ann['throttle'])
+            if ann.get('speed') is not None:
+                upd['user/speed'] = float(ann['speed'])
+            if 'loc' in ann:
+                upd['user/loc'] = ann['loc']
+            if upd:
+                updates[entry_index] = upd
+
+        if not updates:
+            QMessageBox.warning(self, "アノテーション上書き保存",
+                                "catalogエントリに対応するアノテーションが見つかりません。")
+            return
+
+        reply = QMessageBox.question(
+            self, "アノテーション上書き保存",
+            f"現在のアノテーション {len(updates)}件 を読込元のcatalogに上書き保存します。\n\n"
+            f"書き込み先: {os.path.dirname(manifest_path)}\n"
+            f"書き込みキー: user/angle, user/throttle, user/speed, user/loc\n"
+            f"（各catalogファイルの .bak バックアップを作成します）\n\n続行しますか？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        base_dir = os.path.dirname(manifest_path)
+        written = 0
+        try:
+            for catalog_file in catalog_files:
+                catalog_path = os.path.join(base_dir, catalog_file)
+                if not os.path.exists(catalog_path):
+                    continue
+
+                with open(catalog_path, 'r', encoding='utf-8') as f:
+                    catalog_lines = f.readlines()
+
+                modified = False
+                new_lines = []
+                for line in catalog_lines:
+                    stripped = line.strip()
+                    if not stripped:
+                        new_lines.append(line)
+                        continue
+                    row = json.loads(stripped)
+                    upd = updates.get(row.get('_index'))
+                    if upd:
+                        row.update(upd)
+                        new_lines.append(json.dumps(row, ensure_ascii=False) + '\n')
+                        modified = True
+                        written += 1
+                    else:
+                        new_lines.append(line)
+
+                if modified:
+                    shutil.copy2(catalog_path, catalog_path + '.bak')
+                    with open(catalog_path, 'w', encoding='utf-8') as f:
+                        f.writelines(new_lines)
+
+            QMessageBox.information(
+                self, "アノテーション上書き保存完了",
+                f"catalogに {written}件 のアノテーションを上書き保存しました。\n"
+                f"（バックアップ: 各catalogファイルの .bak）"
+            )
+            print(f"catalog上書き保存完了: {written}件 -> {base_dir}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "アノテーション上書き保存エラー",
+                                 f"保存中にエラーが発生しました:\n{e}")
+            import traceback
+            traceback.print_exc()
+
+    def check_and_fix_missing_speed(self):
+        """speed欠損（未読込フレーム・speed値なし）を確認し、catalog再取込＋線形補間で修復する"""
+        if not self.images:
+            QMessageBox.warning(self, "speed欠損チェック", "画像が読み込まれていません。")
+            return
+
+        n = len(self.images)
+        missing_ann = [i for i in range(n) if i not in self.annotations]
+        missing_speed = [i for i in range(n)
+                         if i in self.annotations and self.annotations[i].get('speed') is None]
+
+        if not missing_ann and not missing_speed:
+            QMessageBox.information(self, "speed欠損チェック",
+                                    f"speed欠損はありません（全{n}フレームにspeedデータあり）。")
+            return
+
+        def _fmt(lst):
+            names = [os.path.basename(self.images[i]).split('_')[0] + '_' for i in lst[:15]]
+            return ", ".join(names) + ("..." if len(lst) > 15 else "")
+
+        msg = "speed欠損を検出しました。\n\n"
+        if missing_ann:
+            msg += f"・アノテーション未読込: {len(missing_ann)}件\n   {_fmt(missing_ann)}\n"
+        if missing_speed:
+            msg += f"・speed値なし: {len(missing_speed)}件\n   {_fmt(missing_speed)}\n"
+        msg += ("\n修復しますか？\n"
+                "① catalogから該当フレームを再取込\n"
+                "② それでも欠損が残る場合は前後フレームのspeedから線形補間\n"
+                "（修復後は保存メニューの「アノテーション上書き保存」で永続化できます）")
+
+        reply = QMessageBox.question(self, "speed欠損の修復", msg,
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        # ① catalogから再取込（画像ファイル名 → エントリの対応で照合）
+        repaired_from_catalog = 0
+        entries_by_name = {}
+        manifest_path = getattr(self, 'last_manifest_path', None)
+        if manifest_path and os.path.exists(manifest_path):
+            try:
+                with open(manifest_path, 'r', encoding='utf-8') as f:
+                    mlines = f.readlines()
+                catalog_files = json.loads(mlines[4]).get('paths', []) if len(mlines) >= 5 else []
+                base_dir = os.path.dirname(manifest_path)
+                for catalog_file in catalog_files:
+                    catalog_path = os.path.join(base_dir, catalog_file)
+                    if not os.path.exists(catalog_path):
+                        continue
+                    with open(catalog_path, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            stripped = line.strip()
+                            if not stripped:
+                                continue
+                            entry = json.loads(stripped)
+                            for key in entry.keys():
+                                if key.endswith('/image_array'):
+                                    entries_by_name[os.path.basename(entry[key])] = entry
+                                    break
+            except Exception as e:
+                print(f"speed欠損修復: catalog再読込エラー: {e}")
+
+        for i in missing_ann + missing_speed:
+            entry = entries_by_name.get(os.path.basename(self.images[i]))
+            if entry is None:
+                continue
+            # 読込時と同じ優先順でspeedを取得
+            speed = entry.get('user/speed', entry.get('enc/speed'))
+            if speed is None:
+                for _k, _v in entry.items():
+                    if (_k.endswith('/speed') and _k != 'pilot/speed'
+                            and _k != 'user/speed' and _k != 'enc/speed'):
+                        speed = _v
+                        break
+            if speed is None:
+                speed = entry.get('speed', entry.get('pilot/speed', None))
+
+            if i not in self.annotations:
+                # アノテーション自体を復元（読込処理と同じ構成）
+                angle = entry.get('user/angle', entry.get('pilot/angle', 0))
+                throttle = entry.get('user/throttle', entry.get('pilot/throttle', 0))
+                try:
+                    with Image.open(self.images[i]) as img:
+                        iw, ih = img.size
+                except Exception:
+                    iw, ih = 160, 120
+                x = max(0, min(int((angle + 1) / 2 * iw), iw - 1))
+                y = max(0, min(int((1 - throttle) / 2 * ih), ih - 1))
+                self.annotations[i] = {"angle": angle, "throttle": throttle, "x": x, "y": y}
+                if entry.get('_index') is not None:
+                    self.annotations[i]["original_index"] = entry['_index']
+                    if not hasattr(self, '_manifest_image_to_entry'):
+                        self._manifest_image_to_entry = {}
+                    self._manifest_image_to_entry[i] = entry['_index']
+                loc = entry.get('user/loc', entry.get('pilot/loc', None))
+                if loc is not None:
+                    self.annotations[i]['loc'] = loc
+                    self.location_annotations[i] = loc
+
+            if speed is not None and self.annotations[i].get('speed') is None:
+                self.annotations[i]['speed'] = speed
+                repaired_from_catalog += 1
+
+        # ② 残ったspeed欠損を前後フレームから線形補間
+        import bisect
+        interpolated = 0
+        speed_indexes = sorted(i for i in self.annotations
+                               if self.annotations[i].get('speed') is not None)
+        still_missing = [i for i in range(n)
+                         if i in self.annotations and self.annotations[i].get('speed') is None]
+        for i in still_missing:
+            pos = bisect.bisect_left(speed_indexes, i)
+            prev_i = speed_indexes[pos - 1] if pos > 0 else None
+            next_i = speed_indexes[pos] if pos < len(speed_indexes) else None
+            if prev_i is not None and next_i is not None:
+                sp = self.annotations[prev_i]['speed']
+                sn = self.annotations[next_i]['speed']
+                t = (i - prev_i) / (next_i - prev_i)
+                value = sp + (sn - sp) * t
+            elif prev_i is not None:
+                value = self.annotations[prev_i]['speed']
+            elif next_i is not None:
+                value = self.annotations[next_i]['speed']
+            else:
+                continue
+            self.annotations[i]['speed'] = float(value)
+            interpolated += 1
+
+        # 修復結果の集計と表示更新
+        remaining = [i for i in range(n)
+                     if i not in self.annotations or self.annotations[i].get('speed') is None]
+        if hasattr(self, 'speed_seek_graph'):
+            self.speed_seek_graph.update()
+        self.display_current_image()
+        self._schedule_distribution_graph_update()
+
+        result = (f"speed欠損の修復が完了しました。\n\n"
+                  f"・catalogから再取込: {repaired_from_catalog}件\n"
+                  f"・線形補間で補完: {interpolated}件\n"
+                  f"・残欠損: {len(remaining)}件")
+        if remaining:
+            result += f"\n   {_fmt(remaining)}"
+        result += "\n\n保存メニューの「アノテーション上書き保存（catalog）」で永続化できます。"
+        QMessageBox.information(self, "speed欠損の修復完了", result)
+        print(f"speed欠損修復: catalog取込={repaired_from_catalog}, 補間={interpolated}, 残={len(remaining)}")
+
+    def _reserve_slider_label_width(self):
+        """再生位置ラベル（x/y）の幅をデータ総数の桁数で固定する
+
+        再生が進んで桁数が増えるとラベルが広がり、speedグラフとスライダーの
+        幅が1文字分ずれるため、最初から "総数/総数" 分の幅を確保しておく。
+        """
+        if not hasattr(self, 'slider_value_label'):
+            return
+        n = len(self.images) if getattr(self, 'images', None) else 0
+        sample = f"{n}/{n}" if n > 0 else "0/0"
+        if getattr(self, '_slider_label_width_sample', None) == sample:
+            return
+        self._slider_label_width_sample = sample
+        fm = self.slider_value_label.fontMetrics()
+        self.slider_value_label.setFixedWidth(fm.horizontalAdvance(sample) + 6)
+
+    def compute_lap_boundaries(self):
+        """speedグラフ表示用のlap境界（lap2以降の開始フレームインデックス）を推定する
+
+        優先1: 位置情報アノテーションの折返し（値が大きく巻き戻る位置 ＝ 周回開始）
+        優先2: 自己位置（fused/slam/pose）のスタート地点への回帰
+        結果はアノテーション数をキーにキャッシュする。
+        """
+        n = len(self.images) if self.images else 0
+        if n == 0:
+            return []
+
+        cache_key = (n, len(self.annotations),
+                     len(getattr(self, 'location_annotations', {}) or {}))
+        cache = getattr(self, '_lap_boundary_cache', None)
+        if cache and cache[0] == cache_key:
+            return cache[1]
+
+        boundaries = []
+
+        # --- 優先1: 位置情報アノテーションの折返し検出 ---
+        locs = getattr(self, 'location_annotations', {}) or {}
+        if len(locs) >= 10:
+            loc_items = sorted(locs.items())
+            max_loc = max(v for _, v in loc_items)
+            if max_loc >= 2:
+                wrap_threshold = max(2, (max_loc + 1) // 2)
+                prev_v = loc_items[0][1]
+                for idx, v in loc_items[1:]:
+                    if prev_v - v >= wrap_threshold:  # 例: 7→0 の巻き戻り
+                        boundaries.append(idx)
+                    prev_v = v
+
+        # --- 優先2: 自己位置のスタート地点回帰 ---
+        if not boundaries:
+            pts = []
+            for i in range(n):
+                ann = self.annotations.get(i)
+                if not ann:
+                    continue
+                for kx, ky in (('fused/x', 'fused/y'), ('slam/x', 'slam/y'),
+                               ('pose/x', 'pose/y')):
+                    if kx in ann and ky in ann:
+                        pts.append((i, ann[kx], ann[ky]))
+                        break
+            if len(pts) >= 50:
+                xs = [p[1] for p in pts]
+                ys = [p[2] for p in pts]
+                diag = ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2) ** 0.5
+                if diag > 1e-6:
+                    k = min(20, len(pts))
+                    sx = sum(p[1] for p in pts[:k]) / k
+                    sy = sum(p[2] for p in pts[:k]) / k
+                    away_thresh = diag * 0.25
+                    near_thresh = diag * 0.10
+                    armed = False
+                    for i, x, y in pts:
+                        d = ((x - sx) ** 2 + (y - sy) ** 2) ** 0.5
+                        if not armed and d > away_thresh:
+                            armed = True
+                        elif armed and d < near_thresh:
+                            boundaries.append(i)
+                            armed = False
+
+        self._lap_boundary_cache = (cache_key, boundaries)
+        return boundaries
 
     def init_ui(self):
         self.setWindowTitle(get_text('window_title'))
@@ -7105,6 +7775,13 @@ class ImageAnnotationTool(QMainWindow):
         self.resolution_slider.valueChanged.connect(self._on_resolution_scale_changed)
         resolution_row.addWidget(self.resolution_slider, 3)  # スライダー幅を縮小
 
+        # 車両マスクボタン（押下でポリゴン編集モードに入り、画像クリックで頂点を追加）
+        self.vehicle_mask_button = QPushButton(get_text('btn_vehicle_mask'))
+        self.vehicle_mask_button.setCheckable(True)
+        self.vehicle_mask_button.setToolTip(get_text('tip_vehicle_mask'))
+        self.vehicle_mask_button.toggled.connect(self.toggle_vehicle_mask_edit)
+        resolution_row.addWidget(self.vehicle_mask_button)
+
         resolution_row.addStretch(1)  # 右パディング
 
         image_column.addLayout(resolution_row)
@@ -7157,20 +7834,48 @@ class ImageAnnotationTool(QMainWindow):
         
         # スライダーの配置
         slider_layout = QHBoxLayout()
+
+        # 左側ラベル列: speedグラフ用の小ラベル ＋ シークスライダー横の「画像シーク」ラベル
+        seek_label_column = QVBoxLayout()
+        seek_label_column.setSpacing(1)
+        seek_label_column.setContentsMargins(0, 0, 0, 0)
+
+        speed_graph_label = QLabel("speed")
+        _sg_font = speed_graph_label.font()
+        _sg_font.setPointSize(7)
+        speed_graph_label.setFont(_sg_font)
+        speed_graph_label.setStyleSheet("color: #7A8CA0;")
+        speed_graph_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        speed_graph_label.setFixedHeight(SpeedSeekGraphWidget.GRAPH_HEIGHT)
+        seek_label_column.addWidget(speed_graph_label)
+
         slider_label = QLabel(get_text('image_seek'))
-        slider_layout.addWidget(slider_label)
-        
+        slider_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        seek_label_column.addWidget(slider_label)
+
+        slider_layout.addLayout(seek_label_column)
+
         #self.image_slider = QSlider(Qt.Horizontal)
         self.image_slider = DeletedIndexesSlider()
         self.image_slider.setMinimum(0)
-        self.image_slider.setMaximum(0) 
+        self.image_slider.setMaximum(0)
         self.image_slider.setValue(0)
         self.image_slider.setTickPosition(QSlider.TicksBelow)
         self.image_slider.setTickInterval(10)
         self.image_slider.valueChanged.connect(self.slider_changed)
-        slider_layout.addWidget(self.image_slider)
+
+        # speedグラフ（YouTube風）をシークバーの直上に重ねて配置（幅をスライダーと一致させる）
+        seek_column = QVBoxLayout()
+        seek_column.setSpacing(1)
+        seek_column.setContentsMargins(0, 0, 0, 0)
+        self.speed_seek_graph = SpeedSeekGraphWidget(self)
+        seek_column.addWidget(self.speed_seek_graph)
+        seek_column.addWidget(self.image_slider)
+        slider_layout.addLayout(seek_column, 1)
         
         self.slider_value_label = QLabel("0/0")
+        # 桁数の増加でレイアウト（speedグラフ・スライダー幅）が動かないよう右寄せ＋固定幅にする
+        self.slider_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         slider_layout.addWidget(self.slider_value_label)
         
         nav_container_layout.addLayout(slider_layout)
@@ -7218,6 +7923,13 @@ class ImageAnnotationTool(QMainWindow):
         delete_current_button.clicked.connect(self.delete_current_annotation)
         apply_style(delete_current_button, "destructive")
         delete_layout.addWidget(delete_current_button)
+
+        # 後進時（throttleが負）のフレームを一括削除するボタン
+        delete_reverse_button = QPushButton(get_text('btn_delete_reverse'))
+        delete_reverse_button.clicked.connect(self.delete_reverse_frames)
+        delete_reverse_button.setToolTip(get_text('tip_delete_reverse'))
+        apply_style(delete_reverse_button, "destructive")
+        delete_layout.addWidget(delete_reverse_button)
 
         # 復元ボタンを追加
         restore_button = QPushButton(get_text('restore_deleted'))
@@ -8210,6 +8922,7 @@ class ImageAnnotationTool(QMainWindow):
                 "max_speed": self.main_image_view.max_speed if hasattr(self, 'main_image_view') else MAX_SPEED,
                 "detection_classes": self.classes_input.text() if hasattr(self, 'classes_input') else "",
                 "location_classes": {str(k): v for k, v in getattr(self, 'location_class_names', {}).items() if v.strip()},
+                "vehicle_mask": [list(p) for p in getattr(self, 'vehicle_mask_user_points', [])],
                 "timestamp": int(time.time())
             }
             
@@ -10203,6 +10916,8 @@ class ImageAnnotationTool(QMainWindow):
                         img = Image.open(path).convert('RGB')
                         if first_img_size is None:
                             first_img_size = img.size
+                        # 学習時に車両マスクを使ったモデルは推論時にも同じマスクを適用
+                        img = apply_vehicle_mask(img, getattr(model, '_vehicle_mask', None))
                         if downscale_factor < 1.0:
                             W2, H2 = img.size
                             pw = max(1, int(W2 * downscale_factor))
@@ -10260,6 +10975,9 @@ class ImageAnnotationTool(QMainWindow):
                     img = Image.open(img_path).convert('RGB')
                     W, H = img.size
 
+                    # 学習時に車両マスクを使ったモデルは推論時にも同じマスクを適用
+                    img = apply_vehicle_mask(img, getattr(model, '_vehicle_mask', None))
+
                     if virtual_type == 'crop':
                         step = W / num_sources
                         overlap = step * 0.15
@@ -10282,7 +11000,8 @@ class ImageAnnotationTool(QMainWindow):
                         source_imgs = []
                         for k in range(num_sources):
                             prev_idx = max(0, idx - k * temporal_interval)
-                            source_imgs.append(Image.open(self.images[prev_idx]).convert('RGB'))
+                            _frame = Image.open(self.images[prev_idx]).convert('RGB')
+                            source_imgs.append(apply_vehicle_mask(_frame, getattr(model, '_vehicle_mask', None)))
                     else:
                         source_imgs = [img] * num_sources
 
@@ -19331,6 +20050,10 @@ class ImageAnnotationTool(QMainWindow):
         if session_info and "max_speed" in session_info:
             self.main_image_view.max_speed = session_info["max_speed"]
 
+        # 車両マスクの復元
+        if session_info and session_info.get("vehicle_mask"):
+            self.vehicle_mask_user_points = [tuple(p) for p in session_info["vehicle_mask"]]
+
         # 検知クラスの復元
         if session_info and "detection_classes" in session_info and session_info["detection_classes"]:
             if hasattr(self, 'classes_input'):
@@ -19588,6 +20311,66 @@ class ImageAnnotationTool(QMainWindow):
             f"\n{marked_as_deleted_count}個の画像を削除済みとしてマークしました。"
             f"\nアノテーションデータは保持されています。"
             f"\n\n削除済みインデックスの合計数: {len(self.deleted_indexes)}"
+        )
+
+    def delete_reverse_frames(self):
+        """後進時（throttleが負）のフレームを削除済みとしてマークする"""
+        if not self.images:
+            return
+
+        if not self.annotations:
+            QMessageBox.warning(self, "警告", "アノテーションが読み込まれていません。")
+            return
+
+        # throttleが負の未削除フレームを検出
+        deleted_set = set(self.deleted_indexes)
+        target_indexes = [
+            idx for idx, ann in self.annotations.items()
+            if isinstance(idx, int) and 0 <= idx < len(self.images)
+            and ann.get('throttle', 0.0) < 0
+            and idx not in deleted_set
+        ]
+
+        if not target_indexes:
+            QMessageBox.information(
+                self,
+                "後進フレーム削除",
+                "throttleが負（後進）の未削除フレームは見つかりませんでした。"
+            )
+            return
+
+        # 確認ダイアログ
+        reply = QMessageBox.question(
+            self,
+            "後進フレーム削除確認",
+            f"throttleが負（後進）のフレーム {len(target_indexes)}個を"
+            f"\n削除済みとしてマークします。"
+            f"\n\nこの操作は「全フレームを復元」ボタンで元に戻せます。続行しますか？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply == QMessageBox.No:
+            return
+
+        # 削除したインデックスを記録してソート・重複排除
+        self.deleted_indexes.extend(target_indexes)
+        self.deleted_indexes = sorted(set(self.deleted_indexes))
+
+        # UI更新 - 重い処理は遅延実行
+        self.display_current_image()
+        self._schedule_gallery_update()  # 遅延更新
+        if hasattr(self, 'update_location_button_counts'):
+            self.update_location_button_counts()
+        self._schedule_distribution_graph_update()  # 遅延更新
+        self.update_slider_deleted_indexes()
+
+        QMessageBox.information(
+            self,
+            "後進フレーム削除完了",
+            f"{len(target_indexes)}個の後進フレームを削除済みとしてマークしました。"
+            f"\nアノテーションデータは保持されています。"
+            f"\n\n削除済みインデックス数: {len(self.deleted_indexes)}"
         )
 
     def detect_downsampling_targets(self):
@@ -20009,6 +20792,93 @@ class ImageAnnotationTool(QMainWindow):
         self.main_image_view.zoom_factor = zoom
         self.main_image_view.update()
 
+    # ------------------------------------------------------------------
+    # 車両マスク（画像下側の車体領域を学習・推論入力から無視するポリゴン）
+    # ------------------------------------------------------------------
+    def get_vehicle_mask_polygon(self):
+        """ユーザー頂点＋中央線に対する鏡像から左右対称の閉ポリゴンを構築して返す
+
+        戻り値: [(x, y), ...] 正規化座標。頂点が2点未満の場合はNone。
+        """
+        pts = getattr(self, 'vehicle_mask_user_points', None)
+        if not pts or len(pts) < 2:
+            return None
+        # ユーザー頂点 → 鏡像頂点（逆順）で閉じた対称ポリゴンにする
+        mirrored = [(1.0 - x, y) for x, y in reversed(pts)]
+        return list(pts) + mirrored
+
+    def toggle_vehicle_mask_edit(self, checked):
+        """車両マスクボタンのトグル処理（編集モードの開始/確定）"""
+        self.vehicle_mask_edit_mode = checked
+
+        if checked:
+            self.statusBar().showMessage(get_text('status_vehicle_mask_edit_on'))
+        else:
+            n = len(self.vehicle_mask_user_points)
+            if n == 1:
+                # 1点ではポリゴンにならないためクリア
+                self.vehicle_mask_user_points = []
+                self.statusBar().showMessage(get_text('status_vehicle_mask_cleared'), 3000)
+            elif n >= 2:
+                self.statusBar().showMessage(get_text('status_vehicle_mask_set', n, n * 2), 5000)
+            else:
+                self.statusBar().showMessage(get_text('status_vehicle_mask_cleared'), 3000)
+
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    @staticmethod
+    def _snap_mask_point(rel_x, rel_y):
+        """マスク頂点のスナップ処理（下端・中央線付近を吸着し0-1にクランプ）"""
+        # 下端付近は画像下端にスナップ（車体マスクは下辺に接することが多いため）
+        if rel_y > 0.97:
+            rel_y = 1.0
+        # 中央線付近は中央にスナップ（鏡像と重なって対称形が閉じる）
+        if abs(rel_x - 0.5) < 0.02:
+            rel_x = 0.5
+        return (max(0.0, min(1.0, rel_x)), max(0.0, min(1.0, rel_y)))
+
+    def add_vehicle_mask_point(self, rel_x, rel_y):
+        """マスク頂点を追加する（正規化座標）"""
+        self.vehicle_mask_user_points.append(self._snap_mask_point(rel_x, rel_y))
+        self.statusBar().showMessage(
+            get_text('status_vehicle_mask_point_added', len(self.vehicle_mask_user_points)), 3000)
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def move_vehicle_mask_point(self, index, rel_x, rel_y):
+        """指定したマスク頂点をドラッグ移動する（編集モード中のみ呼ばれる）"""
+        if not (0 <= index < len(self.vehicle_mask_user_points)):
+            return
+        self.vehicle_mask_user_points[index] = self._snap_mask_point(rel_x, rel_y)
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def remove_vehicle_mask_point(self, index):
+        """指定したマスク頂点を削除する"""
+        if 0 <= index < len(self.vehicle_mask_user_points):
+            self.vehicle_mask_user_points.pop(index)
+            self.statusBar().showMessage(
+                get_text('status_vehicle_mask_point_removed', len(self.vehicle_mask_user_points)), 3000)
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def remove_last_vehicle_mask_point(self):
+        """直前に追加したマスク頂点を削除する"""
+        if self.vehicle_mask_user_points:
+            self.vehicle_mask_user_points.pop()
+            self.statusBar().showMessage(
+                get_text('status_vehicle_mask_point_removed', len(self.vehicle_mask_user_points)), 3000)
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def clear_vehicle_mask(self):
+        """車両マスクを全消去する"""
+        self.vehicle_mask_user_points = []
+        self.statusBar().showMessage(get_text('status_vehicle_mask_cleared'), 3000)
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
     def _on_resolution_scale_changed(self, value):
         """解像度スライダーの値が変更されたときの処理"""
         self.main_image_view.resolution_scale = value / 100.0
@@ -20054,6 +20924,11 @@ class ImageAnnotationTool(QMainWindow):
 
     def slider_changed(self, value):
         """スライダーの値が変更されたときの処理"""
+        # speedグラフの現在位置マーカーを更新
+        if hasattr(self, 'speed_seek_graph'):
+            self.speed_seek_graph.update()
+        # ラベル幅を総数分で固定（別経路で画像リストが変わった場合の保険。同一総数なら即return）
+        self._reserve_slider_label_width()
         if self.images and value != self.current_index:
             # waypointモードの場合、現在の画像のwaypoint数をチェック
             if not self._check_waypoint_count_before_transition():
@@ -20601,6 +21476,8 @@ class ImageAnnotationTool(QMainWindow):
                         img = Image.open(path).convert('RGB')
                         if first_img_size is None:
                             first_img_size = img.size  # (width, height)
+                        # 学習時に車両マスクを使ったモデルは推論時にも同じマスクを適用
+                        img = apply_vehicle_mask(img, getattr(model, '_vehicle_mask', None))
                         t = transform(img)
                         tensors.append(t)
 
@@ -20653,9 +21530,11 @@ class ImageAnnotationTool(QMainWindow):
                         if _speed_norm:
                             results[idx]["speed_normalize"] = float(_speed_norm)
 
-                    # 将来予測の出力
+                    # 将来予測の出力（フレームオフセットは学習時の設定、既定は5,10）
+                    _future_offsets = (getattr(model, '_future_offsets', None) or [5, 10])[:2]
                     if num_out >= 9:
-                        for fi, offset in enumerate([5, 10]):
+                        results[idx]["future_offsets"] = list(_future_offsets)
+                        for fi, offset in enumerate(_future_offsets):
                             base = 3 + fi * 3
                             f_angle = output_values[base]
                             f_throttle = output_values[base + 1]
@@ -20671,7 +21550,8 @@ class ImageAnnotationTool(QMainWindow):
                                 "x": f_x, "y": f_y
                             }
                     elif num_out == 6:
-                        for fi, offset in enumerate([5, 10]):
+                        results[idx]["future_offsets"] = list(_future_offsets)
+                        for fi, offset in enumerate(_future_offsets):
                             base = 2 + fi * 2
                             f_angle = output_values[base]
                             f_throttle = output_values[base + 1]
@@ -20727,6 +21607,9 @@ class ImageAnnotationTool(QMainWindow):
                     img = Image.open(img_path).convert('RGB')
                     W, H = img.size
 
+                    # 学習時に車両マスクを使ったモデルは推論時にも同じマスクを適用
+                    img = apply_vehicle_mask(img, getattr(model, '_vehicle_mask', None))
+
                     # 仮想ソース生成
                     if virtual_type == 'crop':
                         n = num_sources
@@ -20751,7 +21634,8 @@ class ImageAnnotationTool(QMainWindow):
                         source_imgs = []
                         for k in range(num_sources):
                             prev_idx = max(0, idx - k * temporal_interval)
-                            source_imgs.append(Image.open(self.images[prev_idx]).convert('RGB'))
+                            _frame = Image.open(self.images[prev_idx]).convert('RGB')
+                            source_imgs.append(apply_vehicle_mask(_frame, getattr(model, '_vehicle_mask', None)))
                     else:
                         source_imgs = [img] * num_sources
 
@@ -21628,6 +22512,9 @@ class ImageAnnotationTool(QMainWindow):
             self.image_slider.setMaximum(0)
             self.image_slider.setValue(0)
             self.slider_value_label.setText("0/0")
+
+        # データ総数分の表示幅（"6728/6728" 相当）を最初から確保する
+        self._reserve_slider_label_width()
         
         # 最終的な処理
         progress.setLabelText(get_text('msg_updating_display'))
@@ -22962,7 +23849,11 @@ class ImageAnnotationTool(QMainWindow):
             
             # 読み込んだmanifest.jsonのパスを保存
             self.last_manifest_path = manifest_path
-            
+
+            # speedグラフを更新
+            if hasattr(self, 'speed_seek_graph'):
+                self.speed_seek_graph.update()
+
             # ギャラリー更新
             progress.setLabelText(get_text('msg_updating_gallery'))
             progress.setValue(90)
@@ -23627,7 +24518,7 @@ class ImageAnnotationTool(QMainWindow):
             # 削除済みの場合のメッセージ
             self.annotation_info_label.setText(
                 "<span style='color: #FF5555;'>この画像は削除済みです。<br>"
-                "画像をクリックするか「削除状態を復元」ボタンを押して<br>"
+                "画像をクリックするか「現在のフレームを復元」ボタンを押して<br>"
                 "再度アノテーションを行えます。</span>"
             )
             self.annotation_info_label.setTextFormat(Qt.RichText)
@@ -25127,8 +26018,17 @@ class ImageAnnotationTool(QMainWindow):
         left_column = QVBoxLayout()
         right_column = QVBoxLayout()
 
+        # 各設定パネルを薄い色で塗り分けてスクロール中でも区別しやすくする
+        def _tint_group(group, bg_color, border_color):
+            group.setStyleSheet(
+                "QGroupBox { background-color: %s; border: 1px solid %s;"
+                " border-radius: 6px; margin-top: 8px; padding-top: 6px; font-weight: bold; }"
+                " QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }"
+                % (bg_color, border_color))
+
         # 初期化設定グループ（モデル選択と重みの読み込み）
         init_group = QGroupBox(get_text('label_init_settings'))
+        _tint_group(init_group, "#EAF3FB", "#B9D4EC")
         init_layout = QVBoxLayout()
 
         # モデルアーキテクチャ選択（初期化設定の先頭に配置）
@@ -25309,6 +26209,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # 出力設定グループ（Speed出力と将来予測を統合）
         output_settings_group = QGroupBox(get_text('label_output_settings'))
+        _tint_group(output_settings_group, "#EAF7EC", "#BCE0C3")
         output_settings_layout = QVBoxLayout()
 
         # Speed出力オプション（データにspeedがある場合のみ表示）
@@ -25363,6 +26264,34 @@ class ImageAnnotationTool(QMainWindow):
         future_detail_label.setWordWrap(True)
         output_settings_layout.addWidget(future_detail_label)
 
+        # 予測フレーム指定（何フレーム先のangle/throttle/speedを予測するか）
+        future_frames_row = QHBoxLayout()
+        future_frames_row.setSpacing(6)
+        custom_future_check = QCheckBox(get_text('chk_custom_future_frames'))
+        custom_future_check.setChecked(False)
+        custom_future_check.setEnabled(False)  # 将来予測がONの場合のみ有効
+        custom_future_check.setToolTip(get_text('tip_custom_future_frames'))
+        future_frames_row.addWidget(custom_future_check)
+
+        future_frames_edit = QLineEdit()
+        future_frames_edit.setPlaceholderText('5,10')
+        future_frames_edit.setToolTip(get_text('tip_custom_future_frames'))
+        future_frames_edit.setFixedWidth(90)
+        future_frames_edit.setEnabled(False)
+        future_frames_row.addWidget(future_frames_edit)
+
+        future_frames_row.addWidget(QLabel(get_text('label_future_frames_unit')))
+        future_frames_row.addStretch()
+        output_settings_layout.addLayout(future_frames_row)
+
+        def _update_future_frames_enabled():
+            use_future = future_output_check.isChecked()
+            custom_future_check.setEnabled(use_future)
+            future_frames_edit.setEnabled(use_future and custom_future_check.isChecked())
+
+        future_output_check.toggled.connect(_update_future_frames_enabled)
+        custom_future_check.toggled.connect(_update_future_frames_enabled)
+
         output_settings_layout.addSpacing(10)
 
         # 将来フレームをラベルとして使用する設定
@@ -25392,12 +26321,33 @@ class ImageAnnotationTool(QMainWindow):
 
         future_label_check.toggled.connect(future_label_spin.setEnabled)
 
+        output_settings_layout.addSpacing(10)
+
+        # 車両マスク適用オプション（マスクが設定されている場合のみ有効）
+        _mask_polygon_for_training = self.get_vehicle_mask_polygon()
+        vehicle_mask_check = QCheckBox(get_text('chk_use_vehicle_mask'))
+        if _mask_polygon_for_training:
+            vehicle_mask_check.setChecked(True)
+            vehicle_mask_check.setToolTip(get_text('tip_use_vehicle_mask'))
+            vehicle_mask_info_label = QLabel(
+                get_text('label_vehicle_mask_info', len(_mask_polygon_for_training)))
+        else:
+            vehicle_mask_check.setChecked(False)
+            vehicle_mask_check.setEnabled(False)
+            vehicle_mask_check.setToolTip(get_text('tip_use_vehicle_mask_disabled'))
+            vehicle_mask_info_label = QLabel(get_text('label_vehicle_mask_not_set'))
+        output_settings_layout.addWidget(vehicle_mask_check)
+        vehicle_mask_info_label.setStyleSheet("color: #666;")
+        vehicle_mask_info_label.setWordWrap(True)
+        output_settings_layout.addWidget(vehicle_mask_info_label)
+
         output_settings_layout.addStretch()
         output_settings_group.setLayout(output_settings_layout)
         left_column.addWidget(output_settings_group)
 
         # 入力画像ソース選択グループ
         image_source_group = QGroupBox(get_text('label_training_image_sources'))
+        _tint_group(image_source_group, "#FDF4E7", "#ECD3AC")
         image_source_layout = QVBoxLayout()
 
         # 説明ラベル
@@ -25478,6 +26428,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # 特徴融合設定グループ（マルチソース時のみ表示）
         fusion_group = QGroupBox(get_text('label_fusion_settings'))
+        _tint_group(fusion_group, "#FBF7EE", "#E3D6B8")
         fusion_layout = QVBoxLayout()
 
         fusion_info = QLabel(get_text('label_fusion_info'))
@@ -25514,6 +26465,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # 仮想ソース生成設定グループ（単一ソース選択時のみ表示）
         virtual_group = QGroupBox(get_text('label_virtual_source_settings'))
+        _tint_group(virtual_group, "#F2F0FB", "#CFC8EC")
         virtual_layout = QVBoxLayout()
 
         virtual_type_row = QHBoxLayout()
@@ -25584,6 +26536,7 @@ class ImageAnnotationTool(QMainWindow):
         _main_slider = getattr(self, 'resolution_slider', None)
         res_val = _main_slider.value() if _main_slider else 100
         resolution_mode_group = QGroupBox(get_text('label_resolution_mode_group'))
+        _tint_group(resolution_mode_group, "#FBF0F4", "#E8C6D4")
         resolution_mode_layout = QVBoxLayout()
 
         # 解像度スライダー（メインキャンバスのスライダーと双方向連動）
@@ -25654,6 +26607,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # 学習パラメータグループ
         training_params_group = QGroupBox(get_text('label_training_params'))
+        _tint_group(training_params_group, "#F3EEFA", "#D3C4EC")
         training_params_layout = QVBoxLayout()
 
         # エポック数・学習率設定（同じ行に配置）
@@ -25770,6 +26724,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # 学習対象データ選択グループボックス
         data_selection_group = QGroupBox(get_text('label_training_data_selection'))
+        _tint_group(data_selection_group, "#FFFBE5", "#E4DBA6")
         data_selection_layout = QVBoxLayout()
 
         # データ選択オプション
@@ -26080,6 +27035,7 @@ class ImageAnnotationTool(QMainWindow):
         # ドメインランダマイゼーション グループ (A-D)
         # =====================================================================
         dr_group = QGroupBox(get_text('group_domain_randomization'))
+        _tint_group(dr_group, "#EFF7F7", "#BFDCDC")
         dr_layout = QVBoxLayout()
 
         def _dr_row(check_key, checked_default, *param_widgets):
@@ -26178,6 +27134,7 @@ class ImageAnnotationTool(QMainWindow):
         # 強光・路面グレア グループ
         # =====================================================================
         sun_group = QGroupBox(get_text('group_sunlight'))
+        _tint_group(sun_group, "#FDF6EC", "#ECD9B8")
         sun_layout = QVBoxLayout()
 
         def _sun_row(check_key, checked_default, *param_widgets):
@@ -26345,6 +27302,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # モデル名編集欄
         model_name_group = QGroupBox(get_text('label_model_name_settings'))
+        _tint_group(model_name_group, "#EEF6F3", "#BFDCCF")
         model_name_layout = QVBoxLayout(model_name_group)
 
         # プレフィックス（固定）とサフィックス（編集可能）を分離
@@ -26395,6 +27353,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # コメント欄
         comment_group = QGroupBox(get_text('label_training_comment'))
+        _tint_group(comment_group, "#F4F4F4", "#CFCFCF")
         comment_layout = QVBoxLayout(comment_group)
 
         comment_layout.addWidget(QLabel(get_text('label_comment')))
@@ -26474,6 +27433,23 @@ class ImageAnnotationTool(QMainWindow):
 
         # 将来予測出力設定の取得
         use_future_output = future_output_check.isChecked()
+
+        # 予測フレーム（何フレーム先を予測するか）の取得。デフォルトは5,10フレーム先
+        future_offsets_value = [5, 10]
+        if use_future_output and custom_future_check.isChecked():
+            _frames_text = future_frames_edit.text().strip().replace('、', ',').replace(' ', ',')
+            _frames_vals = [v for v in _frames_text.split(',') if v]
+            if _frames_vals:
+                try:
+                    _offsets = sorted({int(v) for v in _frames_vals})
+                except ValueError:
+                    _offsets = []
+                if len(_offsets) == 2 and all(o > 0 for o in _offsets):
+                    future_offsets_value = _offsets
+                else:
+                    QMessageBox.warning(self, get_text('dlg_warning'),
+                                        get_text('msg_invalid_future_frames'))
+                    return
 
         # 将来フレームラベル設定の取得
         use_future_label = future_label_check.isChecked()
@@ -26680,6 +27656,10 @@ class ImageAnnotationTool(QMainWindow):
             else:
                 num_outputs = base_outputs
 
+            # 車両マスク（ダイアログでチェックされている場合のみ、車体領域を黒塗りで無視）
+            _vehicle_mask = (self.get_vehicle_mask_polygon()
+                             if vehicle_mask_check.isChecked() else None)
+
             # データセットの作成（バッチサイズと詳細オーグメンテーション設定を明示的に指定）
             train_loader, val_loader, dataset_info = create_datasets(
                 image_paths=image_paths,
@@ -26690,7 +27670,9 @@ class ImageAnnotationTool(QMainWindow):
                 val_split=val_split,  # 検証データ割合
                 use_speed=use_speed_output,  # Speed出力を使用するかどうか
                 speed_normalize=speed_normalize_value if use_speed_output else None,  # speed正規化値
+                mask_polygon=_vehicle_mask,  # 車両マスク（車体領域を無視）
                 use_future=use_future_output,  # 将来予測出力を使用するかどうか
+                future_offsets=future_offsets_value if use_future_output else None,  # 予測フレーム
                 num_outputs=num_outputs,  # 出力数を指定
                 multi_source_paths=multi_source_paths if is_multi_source else None,
                 num_sources=training_num_sources,
@@ -26740,7 +27722,9 @@ class ImageAnnotationTool(QMainWindow):
                 ),
                 virtual_source_type=training_virtual_type if is_virtual_source else None,
                 temporal_interval=training_temporal_interval,
-                speed_normalize=speed_normalize_value if use_speed_output else None
+                speed_normalize=speed_normalize_value if use_speed_output else None,
+                vehicle_mask=_vehicle_mask,
+                future_offsets=future_offsets_value if use_future_output else None
             )
 
             progress.close()
@@ -26785,6 +27769,8 @@ class ImageAnnotationTool(QMainWindow):
                     "use_speed_output": use_speed_output,
                     "speed_normalize": speed_normalize_value if use_speed_output else None,
                     "use_future_output": use_future_output,
+                    "future_offsets": ",".join(map(str, future_offsets_value)) if use_future_output else None,
+                    "vehicle_mask_enabled": bool(_vehicle_mask),
                     "is_multi_source": is_multi_source,
                     "num_sources": training_num_sources,
                     "fusion_method": training_fusion_method if is_multi_source else None,

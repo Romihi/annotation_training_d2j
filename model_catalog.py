@@ -7,7 +7,7 @@ import torch.nn as nn
 import torchvision.transforms as transforms
 import torch.fx
 import timm
-from PIL import Image
+from PIL import Image, ImageDraw
 from typing import Dict, Any, Optional, Tuple, List
 
 
@@ -158,6 +158,12 @@ def load_model_weights(model, weights_path, device):
             # 学習時のspeed正規化値（保存されていれば推論・表示側で利用）
             if checkpoint.get('speed_normalize'):
                 model._speed_normalize = float(checkpoint['speed_normalize'])
+            # 学習時の車両マスク（保存されていれば推論時にも同じマスクを適用）
+            if checkpoint.get('vehicle_mask'):
+                model._vehicle_mask = [tuple(p) for p in checkpoint['vehicle_mask']]
+            # 学習時の将来予測フレームオフセット（推論結果のキー・表示に利用）
+            if checkpoint.get('future_offsets'):
+                model._future_offsets = [int(v) for v in checkpoint['future_offsets']]
             if 'model_state_dict' in checkpoint:
                 model.load_state_dict(checkpoint['model_state_dict'])
                 print("Loaded checkpoint format model")
@@ -1843,10 +1849,25 @@ def get_sequence_model(arch_name, num_image_sources, config):
     return create_sequence_model(arch_name, num_image_sources, config)
 
     
+def apply_vehicle_mask(img, mask_polygon):
+    """車両マスク（正規化座標ポリゴン）領域を黒塗りしたコピーを返す
+
+    学習・推論の入力画像から車体などの固定領域を無視するために使用する。
+    mask_polygon: [(x, y), ...] 0-1の正規化座標。3頂点未満なら何もしない。
+    """
+    if not mask_polygon or len(mask_polygon) < 3:
+        return img
+    img = img.copy()
+    draw = ImageDraw.Draw(img)
+    W, H = img.size
+    draw.polygon([(x * W, y * H) for x, y in mask_polygon], fill=(0, 0, 0))
+    return img
+
+
 class AnnotationDataset(torch.utils.data.Dataset):
     """アノテーションデータのためのカスタムデータセット"""
     def __init__(self, image_paths, annotations, transform=None, cache_images=False, use_speed=False, use_future=False,
-                 speed_normalize=None):
+                 speed_normalize=None, mask_polygon=None, future_offsets=None):
         self.image_paths = image_paths
         self.annotations = annotations
         self.transform = transform
@@ -1855,7 +1876,8 @@ class AnnotationDataset(torch.utils.data.Dataset):
         self.use_speed = use_speed
         self.use_future = use_future
         self.speed_normalize = speed_normalize  # speed正規化値（None時はMAX_SPEED）
-        self.future_offsets = [5, 10]  # 5フレーム先と10フレーム先
+        self.mask_polygon = mask_polygon  # 車両マスク（正規化座標ポリゴン）
+        self.future_offsets = list(future_offsets) if future_offsets else [5, 10]  # 将来予測のフレームオフセット
 
     def __len__(self):
         return len(self.image_paths)
@@ -1880,6 +1902,9 @@ class AnnotationDataset(torch.utils.data.Dataset):
             img = Image.open(img_path).convert('RGB')
             if self.cache_images:
                 self.image_cache[idx] = img
+
+        # 車両マスクを適用（キャッシュには元画像を保持）
+        img = apply_vehicle_mask(img, self.mask_polygon)
 
         # 変換を適用
         if self.transform:
@@ -2097,7 +2122,8 @@ class MultiSourceDataset(torch.utils.data.Dataset):
     """
 
     def __init__(self, grouped_image_paths, annotations, num_sources,
-                 transform=None, use_speed=False, use_future=False, speed_normalize=None):
+                 transform=None, use_speed=False, use_future=False, speed_normalize=None,
+                 mask_polygon=None, future_offsets=None):
         self.grouped_paths = grouped_image_paths
         self.annotations = annotations
         self.num_sources = num_sources
@@ -2105,7 +2131,8 @@ class MultiSourceDataset(torch.utils.data.Dataset):
         self.use_speed = use_speed
         self.use_future = use_future
         self.speed_normalize = speed_normalize  # speed正規化値（None時はMAX_SPEED）
-        self.future_offsets = [5, 10]
+        self.mask_polygon = mask_polygon  # 車両マスク（正規化座標ポリゴン）
+        self.future_offsets = list(future_offsets) if future_offsets else [5, 10]
 
     def __len__(self):
         return len(self.grouped_paths)
@@ -2126,6 +2153,7 @@ class MultiSourceDataset(torch.utils.data.Dataset):
         images = []
         for path in paths:
             img = Image.open(path).convert('RGB')
+            img = apply_vehicle_mask(img, self.mask_polygon)
             if self.transform:
                 try:
                     img = self.transform(img)
@@ -2191,7 +2219,8 @@ class VirtualSourceDataset(torch.utils.data.Dataset):
 
     def __init__(self, image_paths, annotations, num_virtual_sources=3,
                  virtual_type='crop', transform=None, use_speed=False, use_future=False,
-                 temporal_interval: int = 10, speed_normalize=None):
+                 temporal_interval: int = 10, speed_normalize=None, mask_polygon=None,
+                 future_offsets=None):
         self.image_paths = image_paths
         self.annotations = annotations
         self.num_virtual_sources = num_virtual_sources
@@ -2201,7 +2230,8 @@ class VirtualSourceDataset(torch.utils.data.Dataset):
         self.use_future = use_future
         self.temporal_interval = temporal_interval
         self.speed_normalize = speed_normalize  # speed正規化値（None時はMAX_SPEED）
-        self.future_offsets = [5, 10]
+        self.mask_polygon = mask_polygon  # 車両マスク（正規化座標ポリゴン）
+        self.future_offsets = list(future_offsets) if future_offsets else [5, 10]
 
     def __len__(self):
         return len(self.image_paths)
@@ -2247,11 +2277,14 @@ class VirtualSourceDataset(torch.utils.data.Dataset):
         sources = []
         for k in range(self.num_virtual_sources):
             prev_idx = max(0, idx - k * self.temporal_interval)
-            sources.append(Image.open(self.image_paths[prev_idx]).convert('RGB'))
+            frame = Image.open(self.image_paths[prev_idx]).convert('RGB')
+            sources.append(apply_vehicle_mask(frame, self.mask_polygon))
         return sources
 
     def __getitem__(self, idx):
         img = Image.open(self.image_paths[idx]).convert('RGB')
+        # 車両マスクは元画像座標で適用（crop/scaleの仮想ソースにも正しく反映される）
+        img = apply_vehicle_mask(img, self.mask_polygon)
 
         if self.virtual_type == 'crop':
             source_imgs = self._spatial_crops(img)

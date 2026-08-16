@@ -11,7 +11,7 @@ import random
 from typing import Dict, List, Any, Optional, Tuple
 import torchvision.transforms as transforms
 
-from model_catalog import get_model, list_available_models
+from model_catalog import get_model, list_available_models, apply_vehicle_mask
 
 _MODEL_CACHE = {}
 
@@ -102,6 +102,12 @@ def _infer_with_model(
                         # 学習時のspeed正規化値（保存されていれば表示側で利用）
                         if checkpoint.get('speed_normalize'):
                             model._speed_normalize = float(checkpoint['speed_normalize'])
+                        # 学習時の車両マスク（保存されていれば推論時にも同じマスクを適用）
+                        if checkpoint.get('vehicle_mask'):
+                            model._vehicle_mask = [tuple(p) for p in checkpoint['vehicle_mask']]
+                        # 学習時の将来予測フレームオフセット（推論結果のキー・表示に利用）
+                        if checkpoint.get('future_offsets'):
+                            model._future_offsets = [int(v) for v in checkpoint['future_offsets']]
                     else:
                         # モデルの状態が直接保存されている古い形式の場合
                         model.load_state_dict(checkpoint)
@@ -129,6 +135,9 @@ def _infer_with_model(
                     # 画像を読み込む
                     img = Image.open(img_path).convert('RGB')
                     img_width, img_height = img.size
+
+                    # 学習時に車両マスクを使ったモデルは推論時にも同じマスクを適用
+                    img = apply_vehicle_mask(img, getattr(model, '_vehicle_mask', None))
 
                     # 解像度ダウンスケール（ピクセレーション）
                     if downscale_factor < 1.0:
@@ -188,74 +197,42 @@ def _infer_with_model(
                             results[img_path]["speed_normalize"] = float(_speed_norm)
 
                     # 将来予測の出力がある場合
-                    # 9出力モデル（speed有り）: [angle, throttle, speed, t+5_angle, t+5_throttle, t+5_speed, t+10_angle, t+10_throttle, t+10_speed]
-                    # 6出力モデル（speed無し）: [angle, throttle, t+5_angle, t+5_throttle, t+10_angle, t+10_throttle]
+                    # 9出力モデル（speed有り）: [angle, throttle, speed, t+o1_angle, t+o1_throttle, t+o1_speed, t+o2_angle, t+o2_throttle, t+o2_speed]
+                    # 6出力モデル（speed無し）: [angle, throttle, t+o1_angle, t+o1_throttle, t+o2_angle, t+o2_throttle]
+                    # フレームオフセット(o1, o2)は学習時の設定（チェックポイント保存値、既定は5,10）
+                    future_offsets = (getattr(model, '_future_offsets', None) or [5, 10])[:2]
                     if num_outputs >= 9:
                         # speed有りの将来予測（9出力）
-                        # t+5の値（インデックス3,4,5: angle, throttle, speed）
-                        future_5_angle = output_values[3]
-                        future_5_throttle = output_values[4]
-                        future_5_speed = output_values[5]
-                        future_5_x = int((future_5_angle + 1) / 2 * img_width)
-                        future_5_y = int((1 - future_5_throttle) / 2 * img_height)
-                        future_5_x = max(0, min(future_5_x, img_width - 1))
-                        future_5_y = max(0, min(future_5_y, img_height - 1))
-
-                        results[img_path]["future_5"] = {
-                            "angle": float(future_5_angle),
-                            "throttle": float(future_5_throttle),
-                            "speed": float(future_5_speed),
-                            "x": future_5_x,
-                            "y": future_5_y
-                        }
-
-                        # t+10の値（インデックス6,7,8: angle, throttle, speed）
-                        future_10_angle = output_values[6]
-                        future_10_throttle = output_values[7]
-                        future_10_speed = output_values[8]
-                        future_10_x = int((future_10_angle + 1) / 2 * img_width)
-                        future_10_y = int((1 - future_10_throttle) / 2 * img_height)
-                        future_10_x = max(0, min(future_10_x, img_width - 1))
-                        future_10_y = max(0, min(future_10_y, img_height - 1))
-
-                        results[img_path]["future_10"] = {
-                            "angle": float(future_10_angle),
-                            "throttle": float(future_10_throttle),
-                            "speed": float(future_10_speed),
-                            "x": future_10_x,
-                            "y": future_10_y
-                        }
+                        for fi, offset in enumerate(future_offsets):
+                            base = 3 + fi * 3
+                            f_angle = output_values[base]
+                            f_throttle = output_values[base + 1]
+                            f_speed = output_values[base + 2]
+                            f_x = max(0, min(int((f_angle + 1) / 2 * img_width), img_width - 1))
+                            f_y = max(0, min(int((1 - f_throttle) / 2 * img_height), img_height - 1))
+                            results[img_path][f"future_{offset}"] = {
+                                "angle": float(f_angle),
+                                "throttle": float(f_throttle),
+                                "speed": float(f_speed),
+                                "x": f_x,
+                                "y": f_y
+                            }
+                        results[img_path]["future_offsets"] = list(future_offsets)
                     elif num_outputs == 6:
                         # speed無しの将来予測（6出力）
-                        # t+5の値（インデックス2,3: angle, throttle）
-                        future_5_angle = output_values[2]
-                        future_5_throttle = output_values[3]
-                        future_5_x = int((future_5_angle + 1) / 2 * img_width)
-                        future_5_y = int((1 - future_5_throttle) / 2 * img_height)
-                        future_5_x = max(0, min(future_5_x, img_width - 1))
-                        future_5_y = max(0, min(future_5_y, img_height - 1))
-
-                        results[img_path]["future_5"] = {
-                            "angle": float(future_5_angle),
-                            "throttle": float(future_5_throttle),
-                            "x": future_5_x,
-                            "y": future_5_y
-                        }
-
-                        # t+10の値（インデックス4,5: angle, throttle）
-                        future_10_angle = output_values[4]
-                        future_10_throttle = output_values[5]
-                        future_10_x = int((future_10_angle + 1) / 2 * img_width)
-                        future_10_y = int((1 - future_10_throttle) / 2 * img_height)
-                        future_10_x = max(0, min(future_10_x, img_width - 1))
-                        future_10_y = max(0, min(future_10_y, img_height - 1))
-
-                        results[img_path]["future_10"] = {
-                            "angle": float(future_10_angle),
-                            "throttle": float(future_10_throttle),
-                            "x": future_10_x,
-                            "y": future_10_y
-                        }
+                        for fi, offset in enumerate(future_offsets):
+                            base = 2 + fi * 2
+                            f_angle = output_values[base]
+                            f_throttle = output_values[base + 1]
+                            f_x = max(0, min(int((f_angle + 1) / 2 * img_width), img_width - 1))
+                            f_y = max(0, min(int((1 - f_throttle) / 2 * img_height), img_height - 1))
+                            results[img_path][f"future_{offset}"] = {
+                                "angle": float(f_angle),
+                                "throttle": float(f_throttle),
+                                "x": f_x,
+                                "y": f_y
+                            }
+                        results[img_path]["future_offsets"] = list(future_offsets)
                     
                 except Exception as e:
                     print(f"画像 {img_path} の推論中にエラー: {e}")
