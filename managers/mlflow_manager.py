@@ -720,6 +720,10 @@ class MLflowManager:
             "vehicle_mask_enabled": training_params.get("vehicle_mask_enabled", False)
         }
 
+        # 画像埋込有効時は埋込ソースも記録
+        if training_params.get("pip_embed_source"):
+            params["pip_embed_source"] = training_params["pip_embed_source"]
+
         # 将来予測有効時は予測フレームオフセットも記録
         if training_params.get("use_future_output", False):
             params["future_offsets"] = training_params.get("future_offsets", "5,10")

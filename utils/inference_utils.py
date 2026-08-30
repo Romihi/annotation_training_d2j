@@ -11,7 +11,7 @@ import random
 from typing import Dict, List, Any, Optional, Tuple
 import torchvision.transforms as transforms
 
-from model_catalog import get_model, list_available_models, apply_vehicle_mask
+from model_catalog import get_model, list_available_models, apply_vehicle_mask, embed_image_pip
 
 _MODEL_CACHE = {}
 
@@ -21,7 +21,8 @@ def batch_inference(
     model_type: Optional[str] = None,
     model_path: Optional[str] = None,
     force_reload: bool = False,
-    downscale_factor: float = 1.0
+    downscale_factor: float = 1.0,
+    pip_map: Optional[Dict[str, Dict[str, str]]] = None
 ) -> Dict[str, Dict[str, Any]]:
     """画像バッチに対して推論を実行する"""
     results = {}
@@ -108,6 +109,9 @@ def _infer_with_model(
                         # 学習時の将来予測フレームオフセット（推論結果のキー・表示に利用）
                         if checkpoint.get('future_offsets'):
                             model._future_offsets = [int(v) for v in checkpoint['future_offsets']]
+                        # 学習時の画像埋込設定（推論時にも同じ合成を適用）
+                        if checkpoint.get('pip_embed'):
+                            model._pip_embed = checkpoint['pip_embed']
                     else:
                         # モデルの状態が直接保存されている古い形式の場合
                         model.load_state_dict(checkpoint)
@@ -138,6 +142,18 @@ def _infer_with_model(
 
                     # 学習時に車両マスクを使ったモデルは推論時にも同じマスクを適用
                     img = apply_vehicle_mask(img, getattr(model, '_vehicle_mask', None))
+
+                    # 学習時に画像埋込を使ったモデルは推論時にも同じ合成を適用
+                    # （pip_map: ベース画像パス → {ソース名: 埋込画像パス}）
+                    _pip_cfg = getattr(model, '_pip_embed', None)
+                    if _pip_cfg and pip_map:
+                        _pip_path = (pip_map.get(img_path) or {}).get(_pip_cfg.get('source'))
+                        if _pip_path and os.path.exists(_pip_path):
+                            try:
+                                _pip_img = Image.open(_pip_path).convert('RGB')
+                                img = embed_image_pip(img, _pip_img, _pip_cfg.get('rect'))
+                            except Exception as _pe:
+                                print(f"画像埋込エラー ({_pip_path}): {_pe}")
 
                     # 解像度ダウンスケール（ピクセレーション）
                     if downscale_factor < 1.0:

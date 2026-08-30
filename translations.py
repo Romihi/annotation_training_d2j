@@ -196,6 +196,24 @@ TRANSLATIONS = {
         'label_future_frames_unit': 'フレーム先（カンマ区切りで2つ）',
         'msg_invalid_future_frames': '予測フレームの指定が不正です。\n正の整数を2つ、カンマ区切りで入力してください（例: 5,10）。',
         'tip_speed_seek_graph': 'speedの推移グラフ（薄い山）。赤マークはspeed欠損フレーム。\nクリック/ドラッグでシークできます。',
+        'chk_pip_embed': '画像埋込',
+        'tip_pip_embed': '選択した別ソースの画像（例: lidar BEV）を縮小してベース画像に埋め込み、\n'
+                         '1枚の画像として既存のシングルソースモデルで学習します。\n'
+                         '埋込設定はモデルに保存され、推論時にも同じ合成が自動適用されます。\n'
+                         '※ マルチソース・仮想ソースとは併用できません。',
+        'label_pip_source': '埋込画像:',
+        'label_pip_position': '埋込位置:',
+        'opt_pip_pos_mask': '車両マスク位置（デフォルト）',
+        'opt_pip_pos_coords': '座標指定',
+        'label_pip_rect': 'x, y, 幅, 高さ（0-1）:',
+        'label_pip_note': '※ 車両マスク位置: マスク外形の矩形に合わせて埋め込みます（マスクで捨てた領域を再利用）',
+        'msg_pip_requires_single': '画像埋込はマルチソース・仮想ソースと併用できません。\n'
+                                   '画像ソースを1つだけ選択し、仮想ソースタイプを「なし」にしてください。',
+        'msg_pip_no_mask': '埋込位置が「車両マスク位置」ですが、車両マスクが未設定です。\n'
+                           '「車両マスク」ボタンでマスクを設定するか、「座標指定」を選択してください。',
+        'msg_pip_no_source_images': '埋込ソース「{0}」の画像が見つかりません。\n'
+                                    'データフォルダに該当ソースの画像が含まれているか確認してください。',
+        'msg_pip_invalid_rect': '埋込領域の幅と高さは0より大きい値を指定してください。',
 
         # --- ダウンサンプリング ---
         'btn_detect': '検出',
@@ -2124,6 +2142,24 @@ Google Cloud Console での OAuth設定手順
         'label_future_frames_unit': 'frames ahead (two, comma-separated)',
         'msg_invalid_future_frames': 'Invalid prediction frame specification.\nEnter two positive integers separated by a comma (e.g. 5,10).',
         'tip_speed_seek_graph': 'Speed profile graph (faint hills). Red marks are frames with missing speed.\nClick/drag to seek.',
+        'chk_pip_embed': 'Image Embedding',
+        'tip_pip_embed': 'Shrink an image from another source (e.g. lidar BEV) and embed it into the base image,\n'
+                         'training a standard single-source model on the composite.\n'
+                         'The embedding config is saved with the model and applied automatically at inference.\n'
+                         '* Cannot be combined with multi-source or virtual-source modes.',
+        'label_pip_source': 'Embed image:',
+        'label_pip_position': 'Embed position:',
+        'opt_pip_pos_mask': 'Vehicle mask area (default)',
+        'opt_pip_pos_coords': 'Coordinates',
+        'label_pip_rect': 'x, y, width, height (0-1):',
+        'label_pip_note': '* Vehicle mask area: fits the mask bounding box (reuses pixels discarded by the mask)',
+        'msg_pip_requires_single': 'Image embedding cannot be combined with multi-source or virtual-source modes.\n'
+                                   'Select exactly one image source and set virtual source type to none.',
+        'msg_pip_no_mask': 'Embed position is set to "Vehicle mask area" but no vehicle mask is configured.\n'
+                           'Set a mask with the "Vehicle Mask" button, or choose "Coordinates".',
+        'msg_pip_no_source_images': 'No images found for embed source "{0}".\n'
+                                    'Check that the data folder contains images for that source.',
+        'msg_pip_invalid_rect': 'Embed region width and height must be greater than 0.',
 
         # --- Downsampling ---
         'btn_detect': 'Detect',

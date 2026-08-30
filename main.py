@@ -870,9 +870,10 @@ class ImageLabel(QLabel):
             # スケールを揃える。トップダウン overlay は使わない）
             self.draw_prediction_trajectory(_ann_pw, _ann_ph, painter, _ann_rect)
 
-        # SpeedGaugeWidget（画像外の独立ウィジェット）を更新
-        if self.main_window and hasattr(self.main_window, 'speed_gauge'):
-            self.main_window.speed_gauge.update()
+        # 注: SpeedGaugeWidgetの更新はここでは行わない。
+        # paintEvent毎（アノテーションクリックやマウス移動のたび）にゲージが
+        # 再描画されてちらつくため、フレーム移動・推論更新・speed編集の
+        # タイミングでのみ明示的に更新する。
 
         # マウス座標表示（自動運転モードのみ、最後に描画して常に最前面に）
         if self.main_window and self.main_window.current_mode == 0:
@@ -3372,6 +3373,13 @@ class ImageLabel(QLabel):
 
         # speed値を更新
         annotation['speed'] = new_speed
+
+        # スピードゲージとspeedグラフに反映
+        if self.main_window:
+            if hasattr(self.main_window, 'speed_gauge'):
+                self.main_window.speed_gauge.update()
+            if hasattr(self.main_window, 'speed_seek_graph'):
+                self.main_window.speed_seek_graph.update()
 
         # 調整中フラグを立てる
         self.is_adjusting_speed = True
@@ -7162,6 +7170,8 @@ class ImageAnnotationTool(QMainWindow):
                      if i not in self.annotations or self.annotations[i].get('speed') is None]
         if hasattr(self, 'speed_seek_graph'):
             self.speed_seek_graph.update()
+        if hasattr(self, 'speed_gauge'):
+            self.speed_gauge.update()
         self.display_current_image()
         self._schedule_distribution_graph_update()
 
@@ -11850,6 +11860,20 @@ class ImageAnnotationTool(QMainWindow):
         # 画像表示を更新
         self.display_current_image()
 
+    @staticmethod
+    def _set_rich_text_if_changed(label, text):
+        """ラベル内容が変わった時だけsetTextする
+
+        推論結果パネルはナビゲーションのたびに全文を組み直しているため、
+        同一内容でもsetTextで再描画されてちらつく。内容が同じ場合はスキップし、
+        変わった場合のみ更新することで「同じ文字は残して値だけ更新」を実現する。
+        """
+        if label is None:
+            return
+        if label.text() != text:
+            label.setText(text)
+            label.setTextFormat(Qt.RichText)
+
     def update_driving_info_panel(self):
         """自動運転推論結果の情報パネルを更新する"""
         if not self.images:
@@ -11899,12 +11923,9 @@ class ImageAnnotationTool(QMainWindow):
                     inference_text += f"<div style='display: inline-block; background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 5px; border-radius: 5px;'>"
                     inference_text += get_text('label_inference_location', location) + "</div></div>"
 
-                # リッチテキストとして設定
+                # リッチテキストとして設定（内容が変わった時だけ更新してちらつきを防ぐ）
                 if hasattr(self, 'inference_info_label'):
-                    self.inference_info_label.setText(inference_text)
-                    self.inference_info_label.setTextFormat(Qt.RichText)
-                    self.inference_info_label.repaint()
-                    QApplication.processEvents()  # UIを即時更新
+                    self._set_rich_text_if_changed(self.inference_info_label, inference_text)
 
                 # ImageLabelに推論ポイントを設定
                 self.main_image_view.inference_point = QPoint(inference['x'], inference['y'])
@@ -11928,7 +11949,7 @@ class ImageAnnotationTool(QMainWindow):
         else:
             # 表示がオフの場合は情報パネルをクリア
             if hasattr(self, 'inference_info_label'):
-                self.inference_info_label.setText(" ")  # スペースで高さを維持
+                self._set_rich_text_if_changed(self.inference_info_label, " ")  # スペースで高さを維持
 
             self.main_image_view.inference_point = None
 
@@ -20807,6 +20828,22 @@ class ImageAnnotationTool(QMainWindow):
         mirrored = [(1.0 - x, y) for x, y in reversed(pts)]
         return list(pts) + mirrored
 
+    def get_vehicle_mask_bbox(self):
+        """車両マスクポリゴンの外接矩形を正規化座標 (x, y, w, h) で返す（未設定時None）
+
+        画像埋込の「車両マスク位置」モードで埋込領域として使用する。
+        """
+        polygon = self.get_vehicle_mask_polygon()
+        if not polygon:
+            return None
+        xs = [p[0] for p in polygon]
+        ys = [p[1] for p in polygon]
+        x0, y0 = min(xs), min(ys)
+        w, h = max(xs) - x0, max(ys) - y0
+        if w <= 0 or h <= 0:
+            return None
+        return [round(x0, 4), round(y0, 4), round(w, 4), round(h, 4)]
+
     def toggle_vehicle_mask_edit(self, checked):
         """車両マスクボタンのトグル処理（編集モードの開始/確定）"""
         self.vehicle_mask_edit_mode = checked
@@ -20924,9 +20961,12 @@ class ImageAnnotationTool(QMainWindow):
 
     def slider_changed(self, value):
         """スライダーの値が変更されたときの処理"""
-        # speedグラフの現在位置マーカーを更新
+        # speedグラフの現在位置マーカーとスピードゲージを更新
+        # （ゲージはpaintEvent駆動をやめたため、フレーム移動時にここで明示更新する）
         if hasattr(self, 'speed_seek_graph'):
             self.speed_seek_graph.update()
+        if hasattr(self, 'speed_gauge'):
+            self.speed_gauge.update()
         # ラベル幅を総数分で固定（別経路で画像リストが変わった場合の保険。同一総数なら即return）
         self._reserve_slider_label_width()
         if self.images and value != self.current_index:
@@ -21014,6 +21054,9 @@ class ImageAnnotationTool(QMainWindow):
         show_future = (state == Qt.Checked)
         self.main_image_view.show_future_annotations = show_future
         self.main_image_view.update()
+        # スピードゲージの将来マーカー表示も連動
+        if hasattr(self, 'speed_gauge'):
+            self.speed_gauge.update()
 
         if show_future:
             self.statusBar().showMessage(get_text('status_future_annotation_on'), 3000)
@@ -21246,6 +21289,23 @@ class ImageAnnotationTool(QMainWindow):
         if hasattr(self, 'model_combo'):
             self.refresh_model_list()    
     
+    def _build_pip_map(self):
+        """画像埋込モデルの推論用: 画像パス → {ソース名: パス} の対応表を構築する
+
+        image_groups（インデックス→バリアント別パス）から、どのバリアント画像を
+        ベースに推論しても埋込ソースを解決できるよう全パスをキーにする。
+        """
+        groups = getattr(self, 'image_groups', None)
+        if not groups:
+            return None
+        pip_map = {}
+        for group in groups.values():
+            if not isinstance(group, dict):
+                continue
+            for path in group.values():
+                pip_map[path] = group
+        return pip_map or None
+
     def run_inference_check(self, all_images=False):
         """推論を実行するメソッド - モデル情報表示を強化、推論実行後に推論表示をオン"""
         if not self.images:
@@ -21345,7 +21405,8 @@ class ImageAnnotationTool(QMainWindow):
                     model_type=model_type,
                     model_path=model_path,
                     force_reload=force_reload,
-                    downscale_factor=getattr(self.main_image_view, 'resolution_scale', 1.0)
+                    downscale_factor=getattr(self.main_image_view, 'resolution_scale', 1.0),
+                    pip_map=self._build_pip_map()
                 )
             else:
                 QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_inference_method_not_supported'))
@@ -22064,7 +22125,7 @@ class ImageAnnotationTool(QMainWindow):
         # 自動運転推論表示がOFFの場合は自動運転推論をクリア（GRU予測は独立処理）
         if not hasattr(self, 'inference_checkbox') or not self.inference_checkbox.isChecked():
             if hasattr(self, 'inference_info_label'):
-                self.inference_info_label.setText(" ")  # スペースで高さを維持
+                self._set_rich_text_if_changed(self.inference_info_label, " ")  # スペースで高さを維持
 
             # 推論ポイントをクリア
             if hasattr(self, 'main_image_view'):
@@ -22139,19 +22200,22 @@ class ImageAnnotationTool(QMainWindow):
                         f" {score:.0%}</font><br>"
                     )
 
-            # リッチテキストとして設定
-            self.inference_info_label.setText(inference_text)
-            self.inference_info_label.setTextFormat(Qt.RichText)
+            # リッチテキストとして設定（内容が変わった時だけ更新してちらつきを防ぐ）
+            self._set_rich_text_if_changed(self.inference_info_label, inference_text)
 
             # ImageLabelに推論ポイントを設定
             self.main_image_view.inference_point = QPoint(inference['x'], inference['y'])
         else:
             # 推論結果がない場合はクリア（スペースで高さを維持）
-            self.inference_info_label.setText(" ")
+            self._set_rich_text_if_changed(self.inference_info_label, " ")
             self.main_image_view.inference_point = None
         
         # 推論表示のチェック状態を反映
         self.main_image_view.show_inference = self.inference_checkbox.isChecked()
+
+        # スピードゲージの推論横線を更新（推論結果が変わった時のみ呼ばれる経路）
+        if hasattr(self, 'speed_gauge'):
+            self.speed_gauge.update()
 
         # 追加モデルの推論結果も更新
         self._update_extra_inference_info_panels()
@@ -23256,7 +23320,8 @@ class ImageAnnotationTool(QMainWindow):
                     method="model",
                     model_type=model_type,
                     model_path=model_path,
-                    force_reload=True
+                    force_reload=True,
+                    pip_map=self._build_pip_map()
                 )
             
             # モデルの入力サイズに合わせて解像度スライダーを同期
@@ -23850,9 +23915,11 @@ class ImageAnnotationTool(QMainWindow):
             # 読み込んだmanifest.jsonのパスを保存
             self.last_manifest_path = manifest_path
 
-            # speedグラフを更新
+            # speedグラフとスピードゲージを更新
             if hasattr(self, 'speed_seek_graph'):
                 self.speed_seek_graph.update()
+            if hasattr(self, 'speed_gauge'):
+                self.speed_gauge.update()
 
             # ギャラリー更新
             progress.setLabelText(get_text('msg_updating_gallery'))
@@ -26510,6 +26577,77 @@ class ImageAnnotationTool(QMainWindow):
         virtual_note.setWordWrap(True)
         virtual_layout.addWidget(virtual_note)
 
+        # --- 画像埋込（別ソース画像をベース画像へ縮小合成して1枚として学習）---
+        virtual_layout.addSpacing(8)
+        pip_embed_check = QCheckBox(get_text('chk_pip_embed'))
+        pip_embed_check.setChecked(False)
+        pip_embed_check.setToolTip(get_text('tip_pip_embed'))
+        virtual_layout.addWidget(pip_embed_check)
+
+        pip_settings_widget = QWidget()
+        pip_settings_layout = QVBoxLayout(pip_settings_widget)
+        pip_settings_layout.setContentsMargins(18, 0, 0, 0)
+        pip_settings_layout.setSpacing(4)
+
+        # 埋め込む画像ソースの選択
+        pip_source_row = QHBoxLayout()
+        pip_source_row.addWidget(QLabel(get_text('label_pip_source')))
+        pip_source_combo = QComboBox()
+        _pip_source_names = list(training_source_checkboxes.keys())
+        pip_source_combo.addItems(_pip_source_names)
+        # lidar系ソースがあればデフォルトにする
+        for _si, _sname in enumerate(_pip_source_names):
+            if 'lidar' in _sname.lower():
+                pip_source_combo.setCurrentIndex(_si)
+                break
+        pip_source_row.addWidget(pip_source_combo)
+        pip_source_row.addStretch()
+        pip_settings_layout.addLayout(pip_source_row)
+
+        # 埋込位置の設定（車両マスク位置 / 座標指定）
+        pip_pos_row = QHBoxLayout()
+        pip_pos_row.addWidget(QLabel(get_text('label_pip_position')))
+        pip_pos_combo = QComboBox()
+        pip_pos_combo.addItem(get_text('opt_pip_pos_mask'), 'mask')
+        pip_pos_combo.addItem(get_text('opt_pip_pos_coords'), 'coords')
+        pip_pos_row.addWidget(pip_pos_combo)
+        pip_pos_row.addStretch()
+        pip_settings_layout.addLayout(pip_pos_row)
+
+        # 座標指定行（x, y, w, h 正規化座標）
+        pip_rect_row_widget = QWidget()
+        pip_rect_row = QHBoxLayout(pip_rect_row_widget)
+        pip_rect_row.setContentsMargins(0, 0, 0, 0)
+        pip_rect_row.addWidget(QLabel(get_text('label_pip_rect')))
+        pip_rect_spins = []
+        for _default in (0.30, 0.60, 0.40, 0.40):  # x, y, w, h
+            _sp = QDoubleSpinBox()
+            _sp.setRange(0.0, 1.0)
+            _sp.setSingleStep(0.05)
+            _sp.setDecimals(2)
+            _sp.setValue(_default)
+            _sp.setFixedWidth(62)
+            pip_rect_row.addWidget(_sp)
+            pip_rect_spins.append(_sp)
+        pip_rect_row.addStretch()
+        pip_settings_layout.addWidget(pip_rect_row_widget)
+
+        pip_note = QLabel(get_text('label_pip_note'))
+        pip_note.setStyleSheet("color: #666;")
+        pip_note.setWordWrap(True)
+        pip_settings_layout.addWidget(pip_note)
+
+        virtual_layout.addWidget(pip_settings_widget)
+
+        def _update_pip_visibility():
+            enabled = pip_embed_check.isChecked()
+            pip_settings_widget.setVisible(enabled)
+            pip_rect_row_widget.setVisible(pip_pos_combo.currentData() == 'coords')
+
+        pip_embed_check.toggled.connect(_update_pip_visibility)
+        pip_pos_combo.currentIndexChanged.connect(_update_pip_visibility)
+        _update_pip_visibility()
+
         def _update_virtual_nsrc_label():
             from model_catalog import VirtualSourceDataset
             vtype = virtual_type_combo.currentData()
@@ -27489,11 +27627,37 @@ class ImageAnnotationTool(QMainWindow):
         training_num_sources = (training_virtual_nsrc if is_virtual_source
                                 else len(selected_sources) if is_multi_source else 1)
 
+        # 画像埋込設定の取得とバリデーション
+        pip_embed_config = None
+        if pip_embed_check.isChecked():
+            if is_multi_source or is_virtual_source:
+                QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_pip_requires_single'))
+                return
+            _pip_source = pip_source_combo.currentText()
+            if not _pip_source:
+                QMessageBox.warning(self, get_text('dlg_warning'),
+                                    get_text('msg_pip_no_source_images', _pip_source))
+                return
+            if pip_pos_combo.currentData() == 'mask':
+                _pip_rect = self.get_vehicle_mask_bbox()
+                if not _pip_rect:
+                    QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_pip_no_mask'))
+                    return
+            else:
+                _px, _py, _pw, _ph = [sp.value() for sp in pip_rect_spins]
+                if _pw <= 0.0 or _ph <= 0.0:
+                    QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_pip_invalid_rect'))
+                    return
+                _pip_rect = [round(_px, 4), round(_py, 4), round(_pw, 4), round(_ph, 4)]
+            pip_embed_config = {'source': _pip_source, 'rect': _pip_rect,
+                                'position_mode': pip_pos_combo.currentData()}
+
         try:
             # 学習データの準備（データ選択設定を適用）
             image_paths = []
             annotation_values = []
             multi_source_paths = []  # マルチソースモード用: [[src1, src2, ...], ...]
+            pip_embed_paths = []     # 画像埋込用: image_pathsと同順の埋込画像パス（Noneは埋込なし）
             downsampled_set = set(getattr(self, 'downsampled_indexes', []))
             has_image_groups = hasattr(self, 'image_groups') and self.image_groups
 
@@ -27557,16 +27721,27 @@ class ImageAnnotationTool(QMainWindow):
                     if source in group:
                         image_paths.append(group[source])
                         annotation_values.append(deepcopy(ann))
+                        pip_embed_paths.append(
+                            group.get(pip_embed_config['source']) if pip_embed_config else None)
                     elif source == getattr(self, 'current_variant', None):
                         image_paths.append(self.images[idx])
                         annotation_values.append(deepcopy(ann))
+                        pip_embed_paths.append(
+                            group.get(pip_embed_config['source']) if pip_embed_config else None)
                 else:
-                    # image_groupsがない場合は従来どおり
+                    # image_groupsがない場合は従来どおり（画像埋込のソース解決は不可）
                     image_paths.append(self.images[idx])
                     annotation_values.append(deepcopy(ann))
+                    pip_embed_paths.append(None)
 
             if not image_paths:
                 QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_training_data'))
+                return
+
+            # 画像埋込: 埋込ソースの画像が1枚も見つからない場合は中断
+            if pip_embed_config and not any(pip_embed_paths):
+                QMessageBox.warning(self, get_text('dlg_warning'),
+                                    get_text('msg_pip_no_source_images', pip_embed_config['source']))
                 return
 
             # Speed値の正規化はデータセット側（_get_annotation_values）で一元的に行う。
@@ -27603,6 +27778,7 @@ class ImageAnnotationTool(QMainWindow):
                 print(f"  忍耐エポック数: {patience}")
                 print(f"  最小改善量: {min_delta}")
             print(f"[出力設定]")
+            print(f"  画像埋込: {pip_embed_config if pip_embed_config else 'なし'}")
             print(f"  Speed出力: {use_speed_output}")
             print(f"  将来予測出力: {use_future_output}")
             print(f"  将来フレームラベル: {use_future_label}" + (f", +{future_label_offset}フレーム先" if use_future_label else ""))
@@ -27671,6 +27847,8 @@ class ImageAnnotationTool(QMainWindow):
                 use_speed=use_speed_output,  # Speed出力を使用するかどうか
                 speed_normalize=speed_normalize_value if use_speed_output else None,  # speed正規化値
                 mask_polygon=_vehicle_mask,  # 車両マスク（車体領域を無視）
+                pip_paths=pip_embed_paths if pip_embed_config else None,  # 画像埋込パス
+                pip_rect=pip_embed_config['rect'] if pip_embed_config else None,  # 画像埋込領域
                 use_future=use_future_output,  # 将来予測出力を使用するかどうか
                 future_offsets=future_offsets_value if use_future_output else None,  # 予測フレーム
                 num_outputs=num_outputs,  # 出力数を指定
@@ -27724,7 +27902,8 @@ class ImageAnnotationTool(QMainWindow):
                 temporal_interval=training_temporal_interval,
                 speed_normalize=speed_normalize_value if use_speed_output else None,
                 vehicle_mask=_vehicle_mask,
-                future_offsets=future_offsets_value if use_future_output else None
+                future_offsets=future_offsets_value if use_future_output else None,
+                pip_embed=pip_embed_config
             )
 
             progress.close()
@@ -27771,6 +27950,7 @@ class ImageAnnotationTool(QMainWindow):
                     "use_future_output": use_future_output,
                     "future_offsets": ",".join(map(str, future_offsets_value)) if use_future_output else None,
                     "vehicle_mask_enabled": bool(_vehicle_mask),
+                    "pip_embed_source": pip_embed_config['source'] if pip_embed_config else None,
                     "is_multi_source": is_multi_source,
                     "num_sources": training_num_sources,
                     "fusion_method": training_fusion_method if is_multi_source else None,

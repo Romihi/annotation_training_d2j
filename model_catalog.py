@@ -164,6 +164,9 @@ def load_model_weights(model, weights_path, device):
             # 学習時の将来予測フレームオフセット（推論結果のキー・表示に利用）
             if checkpoint.get('future_offsets'):
                 model._future_offsets = [int(v) for v in checkpoint['future_offsets']]
+            # 学習時の画像埋込設定（推論時にも同じ合成を適用）
+            if checkpoint.get('pip_embed'):
+                model._pip_embed = checkpoint['pip_embed']
             if 'model_state_dict' in checkpoint:
                 model.load_state_dict(checkpoint['model_state_dict'])
                 print("Loaded checkpoint format model")
@@ -1849,6 +1852,31 @@ def get_sequence_model(arch_name, num_image_sources, config):
     return create_sequence_model(arch_name, num_image_sources, config)
 
     
+def embed_image_pip(base_img, embed_img, rect_norm):
+    """ベース画像の指定領域に別ソース画像を縮小して埋め込んだコピーを返す
+
+    Args:
+        base_img: ベースとなるPIL画像（例: cam）
+        embed_img: 埋め込むPIL画像（例: lidar BEV）
+        rect_norm: (x, y, w, h) 0-1の正規化座標で埋込領域を指定
+    """
+    if embed_img is None or not rect_norm or len(rect_norm) < 4:
+        return base_img
+    W, H = base_img.size
+    x = int(max(0.0, min(1.0, float(rect_norm[0]))) * W)
+    y = int(max(0.0, min(1.0, float(rect_norm[1]))) * H)
+    w = max(1, int(float(rect_norm[2]) * W))
+    h = max(1, int(float(rect_norm[3]) * H))
+    # 領域が画像外にはみ出さないようクランプ
+    w = min(w, W - x)
+    h = min(h, H - y)
+    if w <= 0 or h <= 0:
+        return base_img
+    base = base_img.copy()
+    base.paste(embed_img.resize((w, h), Image.BILINEAR), (x, y))
+    return base
+
+
 def apply_vehicle_mask(img, mask_polygon):
     """車両マスク（正規化座標ポリゴン）領域を黒塗りしたコピーを返す
 
@@ -1867,7 +1895,8 @@ def apply_vehicle_mask(img, mask_polygon):
 class AnnotationDataset(torch.utils.data.Dataset):
     """アノテーションデータのためのカスタムデータセット"""
     def __init__(self, image_paths, annotations, transform=None, cache_images=False, use_speed=False, use_future=False,
-                 speed_normalize=None, mask_polygon=None, future_offsets=None):
+                 speed_normalize=None, mask_polygon=None, future_offsets=None,
+                 pip_paths=None, pip_rect=None):
         self.image_paths = image_paths
         self.annotations = annotations
         self.transform = transform
@@ -1878,6 +1907,8 @@ class AnnotationDataset(torch.utils.data.Dataset):
         self.speed_normalize = speed_normalize  # speed正規化値（None時はMAX_SPEED）
         self.mask_polygon = mask_polygon  # 車両マスク（正規化座標ポリゴン）
         self.future_offsets = list(future_offsets) if future_offsets else [5, 10]  # 将来予測のフレームオフセット
+        self.pip_paths = pip_paths  # 画像埋込: image_pathsと同順の埋込画像パスリスト（Noneは埋込なし）
+        self.pip_rect = pip_rect    # 画像埋込: (x, y, w, h) 正規化座標
 
     def __len__(self):
         return len(self.image_paths)
@@ -1905,6 +1936,16 @@ class AnnotationDataset(torch.utils.data.Dataset):
 
         # 車両マスクを適用（キャッシュには元画像を保持）
         img = apply_vehicle_mask(img, self.mask_polygon)
+
+        # 画像埋込（マスク適用後に貼り込む＝マスクで捨てた領域を埋込に再利用できる）
+        if self.pip_paths is not None and self.pip_rect and idx < len(self.pip_paths):
+            pip_path = self.pip_paths[idx]
+            if pip_path:
+                try:
+                    embed_img = Image.open(pip_path).convert('RGB')
+                    img = embed_image_pip(img, embed_img, self.pip_rect)
+                except Exception as e:
+                    print(f"画像埋込エラー ({pip_path}): {e}")
 
         # 変換を適用
         if self.transform:
