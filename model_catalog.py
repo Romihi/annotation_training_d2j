@@ -1,6 +1,7 @@
 """
 モデル定義ファイル - Donkeycarカスタム実装とTIMMライブラリを使用したニューラルネットワークモデルの定義
 """
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -1184,26 +1185,34 @@ class ResNet18WaypointModel(BaseWaypointModel):
 
 
 class ResNet18LocationModel(BaseLocationModel):
-    """ResNet18をベースとした位置分類用モデル"""
-    def __init__(self, num_classes=8, pretrained=True):
+    """ResNet18をベースとした位置分類用モデル
+
+    input_size を指定すると既定の入力サイズを上書きし、実画像サイズ（や縮小サイズ）で
+    構築・推論できる（自動運転モデルの TIMMBasedModel と同じ仕組み）。
+    """
+    def __init__(self, num_classes=8, pretrained=True, input_size=None):
         super(ResNet18LocationModel, self).__init__(name="resnet18_location", num_classes=num_classes)
-        
+        self._input_size_override = tuple(input_size) if input_size is not None else None
+
         # TIMMモデルのロード
         self.base_model = timm.create_model("resnet18", pretrained=pretrained, num_classes=0)
-        
+
         # 特徴量の次元を取得
         input_size = self._get_model_input_size()
+        self.input_size = tuple(input_size)
         dummy_input = torch.zeros(1, 3, input_size[0], input_size[1])
         with torch.no_grad():
             dummy_output = self.base_model(dummy_input)
-        
+
         feature_dim = dummy_output.shape[1]
-        
+
         # 分類器
         self.regressor = nn.Linear(feature_dim, num_classes)
-    
+
     def _get_model_input_size(self):
-        """モデルの入力サイズを取得"""
+        """モデルの入力サイズを取得（override > MODEL_INPUT_SIZE デフォルト）"""
+        if getattr(self, '_input_size_override', None) is not None:
+            return self._input_size_override
         return get_model_input_size(self.name.replace("_location", ""))
     
     def forward(self, x):
@@ -1233,8 +1242,11 @@ class TIMMLocationModel(BaseLocationModel):
     ResNet18LocationModel と同じ regressor 名で統一し、クラス数検出や
     ヘッド置き換えの既存ロジックをそのまま共通利用できるようにする。
     """
-    def __init__(self, name, num_classes=8, pretrained=True):
+    def __init__(self, name, num_classes=8, pretrained=True, input_size=None):
         super(TIMMLocationModel, self).__init__(name=name, num_classes=num_classes)
+        # input_size 上書き値（None なら MODEL_INPUT_SIZE のデフォルトを使用）。
+        # timm は global pool のため特徴次元は入力サイズに依存せず、実画像サイズで構築できる
+        self._input_size_override = tuple(input_size) if input_size is not None else None
 
         # TIMMモデルのロード（ヘッドなし）
         timm_model_name = name.replace("_location", "")
@@ -1242,6 +1254,7 @@ class TIMMLocationModel(BaseLocationModel):
 
         # 特徴量の次元を取得（BatchNormのためevalモードでダミー入力を通す）
         input_size = self._get_model_input_size()
+        self.input_size = tuple(input_size)
         dummy_input = torch.zeros(1, 3, input_size[0], input_size[1])
         self.base_model.eval()
         with torch.no_grad():
@@ -1253,7 +1266,9 @@ class TIMMLocationModel(BaseLocationModel):
         self.regressor = nn.Linear(feature_dim, num_classes)
 
     def _get_model_input_size(self):
-        """モデルの入力サイズを取得"""
+        """モデルの入力サイズを取得（override > MODEL_INPUT_SIZE デフォルト）"""
+        if getattr(self, '_input_size_override', None) is not None:
+            return self._input_size_override
         return get_model_input_size(self.name.replace("_location", ""))
 
     def forward(self, x):
@@ -1277,37 +1292,37 @@ class TIMMLocationModel(BaseLocationModel):
 
 class MobileNetV3SmallLocationModel(TIMMLocationModel):
     """MobileNetV3-Smallをベースとした位置分類用モデル（軽量・エッジ向け）"""
-    def __init__(self, num_classes=8, pretrained=True):
+    def __init__(self, num_classes=8, pretrained=True, input_size=None):
         super(MobileNetV3SmallLocationModel, self).__init__(
-            name="mobilenetv3_small_100_location", num_classes=num_classes, pretrained=pretrained)
+            name="mobilenetv3_small_100_location", num_classes=num_classes, pretrained=pretrained, input_size=input_size)
 
 
 class MobileNetV4ConvSmallLocationModel(TIMMLocationModel):
     """MobileNetV4-Conv-Smallをベースとした位置分類用モデル（軽量・高精度バランス）"""
-    def __init__(self, num_classes=8, pretrained=True):
+    def __init__(self, num_classes=8, pretrained=True, input_size=None):
         super(MobileNetV4ConvSmallLocationModel, self).__init__(
-            name="mobilenetv4_conv_small_location", num_classes=num_classes, pretrained=pretrained)
+            name="mobilenetv4_conv_small_location", num_classes=num_classes, pretrained=pretrained, input_size=input_size)
 
 
 class MobileViTXXSLocationModel(TIMMLocationModel):
     """MobileViT-XXSをベースとした位置分類用モデル（最軽量クラス・CNN+Transformer）"""
-    def __init__(self, num_classes=8, pretrained=True):
+    def __init__(self, num_classes=8, pretrained=True, input_size=None):
         super(MobileViTXXSLocationModel, self).__init__(
-            name="mobilevit_xxs_location", num_classes=num_classes, pretrained=pretrained)
+            name="mobilevit_xxs_location", num_classes=num_classes, pretrained=pretrained, input_size=input_size)
 
 
 class EfficientNetLite0LocationModel(TIMMLocationModel):
     """EfficientNet-Lite0をベースとした位置分類用モデル（エッジ最適化）"""
-    def __init__(self, num_classes=8, pretrained=True):
+    def __init__(self, num_classes=8, pretrained=True, input_size=None):
         super(EfficientNetLite0LocationModel, self).__init__(
-            name="efficientnet_lite0_location", num_classes=num_classes, pretrained=pretrained)
+            name="efficientnet_lite0_location", num_classes=num_classes, pretrained=pretrained, input_size=input_size)
 
 
 class EdgeNextXXSmallLocationModel(TIMMLocationModel):
     """EdgeNeXt-XX-Smallをベースとした位置分類用モデル（最軽量クラス・CNN+Transformer）"""
-    def __init__(self, num_classes=8, pretrained=True):
+    def __init__(self, num_classes=8, pretrained=True, input_size=None):
         super(EdgeNextXXSmallLocationModel, self).__init__(
-            name="edgenext_xx_small_location", num_classes=num_classes, pretrained=pretrained)
+            name="edgenext_xx_small_location", num_classes=num_classes, pretrained=pretrained, input_size=input_size)
 
 
 # 利用可能なすべてのモデルを登録する辞書
@@ -1421,7 +1436,9 @@ def get_model(model_type, pretrained=False, input_size=None, num_outputs=2):
         # ResNet18WaypointModelの場合、num_waypointsも必要（デフォルト4）
         return model_class(num_waypoints=4, pretrained=pretrained)
     elif model_type.endswith('_location'):
-        # 位置推論モデルはnum_outputsを使わない
+        # 位置推論モデルはnum_outputsを使わない（input_size は実画像サイズでの構築用）
+        if input_size is not None:
+            return model_class(pretrained=pretrained, input_size=input_size)
         return model_class(pretrained=pretrained)
 
     # TIMMベースのモデルの場合、num_outputs と input_size を伝播
@@ -1435,14 +1452,18 @@ def get_model(model_type, pretrained=False, input_size=None, num_outputs=2):
     return model_class(pretrained=pretrained)
 
 
-def create_location_model(model_type, num_classes=8, pretrained=False):
+def create_location_model(model_type, num_classes=8, pretrained=False, input_size=None):
     """位置推論モデルをクラス数指定付きで生成する
 
     get_model は num_classes を受け取らないため、保存済みチェックポイントの
     クラス数に合わせてモデルを構築する用途ではこちらを使用する。
+    input_size を指定すると実画像サイズ（縮小サイズ）でモデルを構築する。
     """
     if model_type not in MODEL_REGISTRY or not model_type.endswith('_location'):
         raise ValueError(f"未対応の位置推論モデルタイプ: {model_type}")
+    if input_size is not None:
+        return MODEL_REGISTRY[model_type](num_classes=num_classes, pretrained=pretrained,
+                                          input_size=tuple(input_size))
     return MODEL_REGISTRY[model_type](num_classes=num_classes, pretrained=pretrained)
 
 
@@ -1890,6 +1911,26 @@ def apply_vehicle_mask(img, mask_polygon):
     W, H = img.size
     draw.polygon([(x * W, y * H) for x, y in mask_polygon], fill=(0, 0, 0))
     return img
+
+
+def pixelate_image(img, factor):
+    """元サイズのまま内容を factor 倍の解像度に劣化させる（ピクセレーション）"""
+    if factor is None or factor >= 1.0:
+        return img
+    W, H = img.size
+    sw = max(1, int(W * factor))
+    sh = max(1, int(H * factor))
+    return img.resize((sw, sh), Image.NEAREST).resize((W, H), Image.NEAREST)
+
+
+class PixelateTransform:
+    """DataLoader ワーカーでも pickle できる pixelate 変換（transforms.Lambda の代替）"""
+
+    def __init__(self, factor):
+        self.factor = factor
+
+    def __call__(self, img):
+        return pixelate_image(img, self.factor)
 
 
 class AnnotationDataset(torch.utils.data.Dataset):
@@ -2382,3 +2423,392 @@ def create_multi_source_model(base_model_name, num_sources=2, fusion_method='con
         num_outputs=num_outputs,
         input_size=input_size
     )
+
+
+# ---------------------------------------------------------------------------
+# 位置推論モデル: 複数画像入力 + クラス分類 / 座標・姿勢回帰
+# ---------------------------------------------------------------------------
+
+# 出力ヘッドの正規順序。output_mode は存在するヘッド名をこの順で '_' 連結した文字列
+# （例: 'class', 'pose', 'class_pose', 'grid', 'class_grid', 'pose_grid', 'class_pose_grid'）
+#   class: 位置クラス分類 / pose: 座標・姿勢回帰 / grid: x,y を格子に離散化した格子分類
+LOCATION_HEAD_ORDER = ('class', 'pose', 'grid')
+LOCATION_OUTPUT_MODES = ('class', 'pose', 'class_pose', 'grid', 'class_grid', 'pose_grid',
+                         'class_pose_grid')
+
+
+def location_heads(output_mode):
+    """output_mode → 含まれるヘッド名のタプル（LOCATION_HEAD_ORDER 順）"""
+    parts = set(str(output_mode or 'class').split('_'))
+    unknown = parts - set(LOCATION_HEAD_ORDER)
+    if unknown:
+        raise ValueError(f"Unknown output_mode: {output_mode}. Use: {LOCATION_OUTPUT_MODES}")
+    return tuple(h for h in LOCATION_HEAD_ORDER if h in parts)
+
+
+def make_output_mode(use_class=False, use_pose=False, use_grid=False):
+    """ヘッドの有無から output_mode 文字列を組み立てる（何も無ければ 'class'）"""
+    flags = {'class': use_class, 'pose': use_pose, 'grid': use_grid}
+    heads = [h for h in LOCATION_HEAD_ORDER if flags[h]]
+    return '_'.join(heads) if heads else 'class'
+
+
+# --- 格子分類（x, y を格子セルに離散化） -----------------------------------
+
+def make_grid_config(pose_targets, cell_size=0.5, margin_ratio=0.02):
+    """[x, y, theta] リストから格子定義を作る
+
+    Returns: {'x_min', 'y_min', 'cell_size', 'nx', 'ny', 'num_cells', 'occupied': {cell: count}}
+    セル index = iy * nx + ix（ix: x方向、iy: y方向）
+    """
+    arr = np.asarray(pose_targets, dtype=np.float64).reshape(-1, 3)
+    cell = float(cell_size)
+    x_min, x_max = float(arr[:, 0].min()), float(arr[:, 0].max())
+    y_min, y_max = float(arr[:, 1].min()), float(arr[:, 1].max())
+    mx = max((x_max - x_min) * margin_ratio, cell * 0.05)
+    my = max((y_max - y_min) * margin_ratio, cell * 0.05)
+    x_min -= mx
+    y_min -= my
+    nx = max(1, int(math.ceil((x_max + mx - x_min) / cell)))
+    ny = max(1, int(math.ceil((y_max + my - y_min) / cell)))
+    cfg = {'x_min': x_min, 'y_min': y_min, 'cell_size': cell, 'nx': nx, 'ny': ny,
+           'num_cells': nx * ny}
+    occupied = {}
+    for x, y in arr[:, :2]:
+        c = grid_cell_index(x, y, cfg)
+        occupied[c] = occupied.get(c, 0) + 1
+    cfg['occupied'] = occupied
+    return cfg
+
+
+def grid_cell_index(x, y, grid_config):
+    """座標 → セル index（範囲外は端のセルにクランプ）"""
+    cell = grid_config['cell_size']
+    ix = int((x - grid_config['x_min']) / cell)
+    iy = int((y - grid_config['y_min']) / cell)
+    ix = min(max(ix, 0), grid_config['nx'] - 1)
+    iy = min(max(iy, 0), grid_config['ny'] - 1)
+    return iy * grid_config['nx'] + ix
+
+
+def grid_cell_center(cell, grid_config):
+    """セル index → セル中心座標 (x, y)"""
+    nx = grid_config['nx']
+    ix, iy = int(cell) % nx, int(cell) // nx
+    c = grid_config['cell_size']
+    return (grid_config['x_min'] + (ix + 0.5) * c, grid_config['y_min'] + (iy + 0.5) * c)
+
+
+def grid_topn(probs, grid_config, n=10):
+    """確率ベクトル → 上位 n セル [{'cell', 'ix', 'iy', 'prob', 'x', 'y'}, ...]（確率降順）"""
+    probs = np.asarray(probs, dtype=np.float64).reshape(-1)
+    n = max(1, min(int(n), probs.shape[0]))
+    order = np.argsort(probs)[::-1][:n]
+    nx = grid_config['nx']
+    items = []
+    for cell in order:
+        cx, cy = grid_cell_center(int(cell), grid_config)
+        items.append({'cell': int(cell), 'ix': int(cell) % nx, 'iy': int(cell) // nx,
+                      'prob': float(probs[cell]), 'x': cx, 'y': cy})
+    return items
+
+
+def grid_weighted_position(top_items, n=None):
+    """上位セルの中心を確率で重み付け平均した座標 (x, y)。n で使用する上位件数を絞る"""
+    items = list(top_items)[: (int(n) if n else None)]
+    if not items:
+        return None
+    w = sum(max(it['prob'], 0.0) for it in items)
+    if w <= 0:
+        return items[0]['x'], items[0]['y']
+    return (sum(it['x'] * it['prob'] for it in items) / w,
+            sum(it['y'] * it['prob'] for it in items) / w)
+
+
+def grid_position_errors(logits_or_probs, true_xy, grid_config, top_n=3):
+    """バッチの格子出力から (Top1 中心の位置誤差[m], Top-N 重み付き位置誤差[m]) を返す"""
+    p = np.asarray(logits_or_probs, dtype=np.float64)
+    p = p.reshape(-1, p.shape[-1])
+    xy = np.asarray(true_xy, dtype=np.float64).reshape(-1, 2)
+    e1, ew = [], []
+    for row, (tx, ty) in zip(p, xy):
+        top = grid_topn(row, grid_config, n=max(1, top_n))
+        e1.append(math.hypot(top[0]['x'] - tx, top[0]['y'] - ty))
+        wx, wy = grid_weighted_position(top)
+        ew.append(math.hypot(wx - tx, wy - ty))
+    return np.asarray(e1), np.asarray(ew)
+
+
+def location_virtual_sources(img, virtual_type, num_sources):
+    """単一画像から仮想ソース画像のリストを生成する（crop / scale）
+
+    VirtualSourceDataset と同じ分割規則。temporal は呼び出し側で
+    過去フレームのパスを組にして渡すため、ここでは扱わない。
+    """
+    W, H = img.size
+    if virtual_type == 'crop':
+        step = W / num_sources
+        overlap = step * 0.15
+        crops = []
+        for i in range(num_sources):
+            x0 = max(0, int(step * i - overlap))
+            x1 = min(W, int(step * (i + 1) + overlap))
+            crops.append(img.crop((x0, 0, x1, H)))
+        return crops
+    if virtual_type == 'scale':
+        sources = [img]
+        scale = 0.55
+        for _ in range(num_sources - 1):
+            cw = max(1, int(W * scale))
+            ch = max(1, int(H * scale))
+            x0 = (W - cw) // 2
+            y0 = (H - ch) // 2
+            sources.append(img.crop((x0, y0, x0 + cw, y0 + ch)).resize((W, H), Image.LANCZOS))
+            scale *= 0.55
+        return sources
+    return [img] * num_sources
+
+
+def split_location_outputs(outputs, output_mode):
+    """位置モデルの forward 出力を (class_logits, pose, grid_logits) に分解する。無いものは None。
+
+    forward はヘッドが1つならテンソル、複数なら LOCATION_HEAD_ORDER 順のタプルを返す。
+    """
+    heads = location_heads(output_mode)
+    if len(heads) == 1:
+        values = (outputs,)
+    else:
+        values = tuple(outputs)
+    by_head = dict(zip(heads, values))
+    return by_head.get('class'), by_head.get('pose'), by_head.get('grid')
+
+
+def normalize_pose_targets(poses, pose_norm, include_heading=True):
+    """[x, y, theta] の配列を学習用ベクトルへ正規化する
+
+    x, y は pose_norm の min/max で [-1, 1] へ、theta は (cos, sin) へ変換する。
+    Returns: np.ndarray [N, 4] (include_heading) または [N, 2]
+    """
+    arr = np.asarray(poses, dtype=np.float64).reshape(-1, 3)
+    x_rng = max(pose_norm['x_max'] - pose_norm['x_min'], 1e-6)
+    y_rng = max(pose_norm['y_max'] - pose_norm['y_min'], 1e-6)
+    xn = 2.0 * (arr[:, 0] - pose_norm['x_min']) / x_rng - 1.0
+    yn = 2.0 * (arr[:, 1] - pose_norm['y_min']) / y_rng - 1.0
+    cols = [xn, yn]
+    if include_heading:
+        cols.extend([np.cos(arr[:, 2]), np.sin(arr[:, 2])])
+    return np.stack(cols, axis=1).astype(np.float32)
+
+
+def denormalize_pose_output(vec, pose_norm, include_heading=True):
+    """モデル出力ベクトル → (x[m], y[m], theta[rad] or None)"""
+    vec = np.asarray(vec, dtype=np.float64).reshape(-1)
+    x_rng = pose_norm['x_max'] - pose_norm['x_min']
+    y_rng = pose_norm['y_max'] - pose_norm['y_min']
+    x = (vec[0] + 1.0) / 2.0 * x_rng + pose_norm['x_min']
+    y = (vec[1] + 1.0) / 2.0 * y_rng + pose_norm['y_min']
+    theta = None
+    if include_heading and vec.shape[0] >= 4:
+        theta = float(np.arctan2(vec[3], vec[2]))
+    return float(x), float(y), theta
+
+
+def pose_errors(pred_vec, target_vec, pose_norm, include_heading=True):
+    """正規化ベクトル同士から (位置誤差[m], 方位誤差[rad] or None) を計算する（バッチ対応）"""
+    pred = np.asarray(pred_vec, dtype=np.float64)
+    tgt = np.asarray(target_vec, dtype=np.float64)
+    pred = pred.reshape(-1, pred.shape[-1])
+    tgt = tgt.reshape(-1, tgt.shape[-1])
+    x_rng = pose_norm['x_max'] - pose_norm['x_min']
+    y_rng = pose_norm['y_max'] - pose_norm['y_min']
+    dx = (pred[:, 0] - tgt[:, 0]) / 2.0 * x_rng
+    dy = (pred[:, 1] - tgt[:, 1]) / 2.0 * y_rng
+    pos_err = np.hypot(dx, dy)
+    head_err = None
+    if include_heading and pred.shape[1] >= 4 and tgt.shape[1] >= 4:
+        th_p = np.arctan2(pred[:, 3], pred[:, 2])
+        th_t = np.arctan2(tgt[:, 3], tgt[:, 2])
+        head_err = np.abs((th_p - th_t + np.pi) % (2 * np.pi) - np.pi)
+    return pos_err, head_err
+
+
+class MultiSourceLocationModel(BaseLocationModel):
+    """位置推論モデルの汎用ラッパー（複数画像入力・複数出力ヘッド）
+
+    - 入力: [batch, num_sources*3, H, W]（MultiSourceModel と同じチャネル連結形式）
+      num_sources=1 のときは通常の [batch, 3, H, W]
+    - 出力（output_mode）:
+        'class'      : logits [B, num_classes]
+        'pose'       : pose   [B, pose_dim]   (x, y, cos, sin) 正規化値
+        'class_pose' : (logits, pose)
+    - エンコーダは既存の "<backbone>_location" モデル（base_model_name）から抽出し、
+      ソース間で共有する。num_sources=1 のときは state_dict のキーが
+      既存の単一入力位置モデル（base_model.* / regressor.*）と互換になる。
+    """
+
+    FUSION_METHODS = ('concat', 'attention')
+
+    def __init__(self, base_model_name, num_sources=1, fusion_method='concat',
+                 num_classes=8, output_mode='class', pose_dim=4, pretrained=True,
+                 input_size=None, num_grid_classes=0):
+        heads = location_heads(output_mode)   # 不正な output_mode はここで ValueError
+        if 'grid' in heads and int(num_grid_classes or 0) <= 0:
+            raise ValueError("格子分類には num_grid_classes（格子セル数）が必要です。")
+        if fusion_method not in self.FUSION_METHODS:
+            raise ValueError(f"Unknown fusion method: {fusion_method}. Use: {self.FUSION_METHODS}")
+        if base_model_name not in MODEL_REGISTRY or not base_model_name.endswith('_location'):
+            raise ValueError(f"未対応の位置推論モデルタイプ: {base_model_name}")
+
+        display_name = (base_model_name if num_sources == 1
+                        else f"multi{num_sources}_{fusion_method}_{base_model_name}")
+        super().__init__(name=display_name, num_classes=num_classes)
+        self.base_model_name = base_model_name
+        self.num_sources = num_sources
+        self.fusion_method = fusion_method
+        self.output_mode = output_mode
+        self.heads = heads
+        self.pose_dim = pose_dim
+        self.num_grid_classes = int(num_grid_classes or 0)
+
+        base_cls = MODEL_REGISTRY[base_model_name]
+        if base_model_name == 'donkey_location':
+            base = base_cls(num_classes=num_classes, pretrained=pretrained,
+                            input_size=input_size or (224, 224))
+            self.base_model = nn.Sequential(base.features, base.dense_layers)
+            self.feature_dim = base.classifier.in_features
+            self.input_size = tuple(base.input_size)
+        else:
+            # input_size を渡すと実画像サイズ（縮小サイズ）で構築（timm は global pool のため
+            # 特徴次元は入力サイズに依存しない）
+            base = base_cls(num_classes=num_classes, pretrained=pretrained, input_size=input_size)
+            self.base_model = base.base_model
+            self.feature_dim = base.regressor.in_features
+            self.input_size = tuple(base._get_model_input_size())
+
+        # --- 融合 ---
+        if num_sources == 1:
+            fused_dim = self.feature_dim
+        elif fusion_method == 'concat':
+            fused_dim = self.feature_dim * num_sources
+        else:
+            num_heads = max(1, self.feature_dim // 64)
+            while self.feature_dim % num_heads != 0 and num_heads > 1:
+                num_heads -= 1
+            self.attention = nn.MultiheadAttention(
+                embed_dim=self.feature_dim, num_heads=num_heads, batch_first=True)
+            self.norm = nn.LayerNorm(self.feature_dim)
+            self.pos_embed = nn.Parameter(torch.randn(1, num_sources, self.feature_dim) * 0.02)
+            fused_dim = self.feature_dim
+        self.fused_dim = fused_dim
+
+        # --- 出力ヘッド ---
+        # クラス分類ヘッド（既存モデルと同じ regressor 名。単一入力時は Linear で互換）
+        if 'class' in heads:
+            if num_sources == 1:
+                self.regressor = nn.Linear(fused_dim, num_classes)
+            else:
+                hidden = min(256, fused_dim)
+                self.regressor = nn.Sequential(
+                    nn.Linear(fused_dim, hidden), nn.ReLU(inplace=True),
+                    nn.Dropout(0.2), nn.Linear(hidden, num_classes))
+        # 座標・姿勢回帰ヘッド
+        if 'pose' in heads:
+            hidden = min(256, fused_dim)
+            self.pose_head = nn.Sequential(
+                nn.Linear(fused_dim, hidden), nn.ReLU(inplace=True),
+                nn.Dropout(0.2), nn.Linear(hidden, pose_dim))
+        # 格子分類ヘッド（x, y を格子セルに離散化したクラス分類）
+        if 'grid' in heads:
+            hidden = min(256, fused_dim)
+            self.grid_head = nn.Sequential(
+                nn.Linear(fused_dim, hidden), nn.ReLU(inplace=True),
+                nn.Dropout(0.2), nn.Linear(hidden, self.num_grid_classes))
+
+        fusion_desc = fusion_method if num_sources > 1 else '-'
+        print(f"MultiSourceLocationModel created: {display_name} "
+              f"(sources={num_sources}, fusion={fusion_desc}, output={output_mode}, "
+              f"feature_dim={self.feature_dim}, input_size={self.input_size})")
+
+    def _encode(self, x):
+        features = self.base_model(x)
+        if not isinstance(features, torch.Tensor):
+            features = next(iter(features.values()))
+        return features
+
+    def _fuse(self, x):
+        if self.num_sources == 1:
+            return self._encode(x)
+        feats = [self._encode(x[:, i * 3:(i + 1) * 3, :, :]) for i in range(self.num_sources)]
+        if self.fusion_method == 'concat':
+            return torch.cat(feats, dim=1)
+        seq = torch.stack(feats, dim=1) + self.pos_embed
+        attn_out, attn_weights = self.attention(seq, seq, seq, need_weights=True,
+                                                average_attn_weights=True)
+        if not (torch.jit.is_tracing()
+                or (hasattr(torch.compiler, 'is_compiling') and torch.compiler.is_compiling())):
+            self.last_attn_weights = attn_weights.detach()
+        return self.norm(seq + attn_out)[:, 0, :]
+
+    def forward(self, x):
+        """ヘッドが1つならテンソル、複数なら LOCATION_HEAD_ORDER 順のタプルを返す"""
+        fused = self._fuse(x)
+        outs = []
+        for head in self.heads:
+            if head == 'class':
+                outs.append(self.regressor(fused))
+            elif head == 'pose':
+                outs.append(self.pose_head(fused))
+            else:
+                outs.append(self.grid_head(fused))
+        return outs[0] if len(outs) == 1 else tuple(outs)
+
+    def _get_model_input_size(self):
+        return self.input_size
+
+    def get_preprocess(self):
+        """各ソース画像に個別適用する前処理（適用後にチャネル連結する）"""
+        return transforms.Compose([
+            transforms.Resize((self.input_size[0], self.input_size[1])),
+            transforms.ToTensor()
+        ])
+
+    def run(self, *img_arrs, virtual_type=None):
+        """複数画像で推論を実行し、{'probs': ndarray|None, 'pose_vec': ndarray|None} を返す
+
+        virtual_type='crop'/'scale' の場合は1枚の画像から仮想ソースを生成する。
+        pose_vec は正規化値のため、denormalize_pose_output で座標へ戻す。
+        """
+        if self._preprocess is None:
+            self._preprocess = self.get_preprocess()
+        pil_images = [Image.fromarray(a) if isinstance(a, np.ndarray) else a for a in img_arrs]
+        if virtual_type in ('crop', 'scale') and len(pil_images) == 1 and self.num_sources > 1:
+            pil_images = location_virtual_sources(pil_images[0], virtual_type, self.num_sources)
+        if len(pil_images) != self.num_sources:
+            raise ValueError(f"Expected {self.num_sources} images, got {len(pil_images)}")
+        tensors = [self._preprocess(img) for img in pil_images]
+        stacked = torch.cat(tensors, dim=0).unsqueeze(0)
+        model_dtype = next(self.parameters()).dtype
+        stacked = stacked.to(device=self.device, dtype=model_dtype)
+        with torch.no_grad():
+            outputs = self(stacked)
+        logits, pose, grid = split_location_outputs(outputs, self.output_mode)
+        result = {'probs': None, 'pose_vec': None, 'grid_probs': None}
+        if logits is not None:
+            probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+            result['probs'] = probs
+            self._update_prediction_history(int(np.argmax(probs)))
+        if pose is not None:
+            result['pose_vec'] = pose.float().cpu().numpy()[0]
+        if grid is not None:
+            result['grid_probs'] = torch.softmax(grid, dim=1).cpu().numpy()[0]
+        return result
+
+
+def create_multi_source_location_model(base_model_name, num_sources=1, fusion_method='concat',
+                                       num_classes=8, output_mode='class', pose_dim=4,
+                                       pretrained=True, input_size=None, num_grid_classes=0):
+    """位置推論ラッパーモデルのファクトリ関数"""
+    return MultiSourceLocationModel(
+        base_model_name=base_model_name, num_sources=num_sources, fusion_method=fusion_method,
+        num_classes=num_classes, output_mode=output_mode, pose_dim=pose_dim,
+        pretrained=pretrained, input_size=input_size, num_grid_classes=num_grid_classes)

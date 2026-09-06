@@ -814,6 +814,16 @@ class MLflowManager:
             "actual_classes": training_params.get("actual_classes", 0)
         }
 
+        # 入出力構成（複数画像入力 / 座標・姿勢出力）
+        output_mode = training_params.get("output_mode", "class")
+        params["output_mode"] = output_mode
+        params["task_type"] = {"class": "classification", "pose": "regression",
+                               "class_pose": "multitask"}.get(output_mode, "classification")
+        for key in ("num_sources", "fusion_method", "selected_sources", "virtual_source_type",
+                    "temporal_interval", "pose_source", "include_heading", "pose_loss_weight"):
+            if training_params.get(key) is not None:
+                params[key] = training_params[key]
+
         # コメントがあれば追加
         if training_params.get("comment"):
             params["comment"] = training_params["comment"]
@@ -827,6 +837,9 @@ class MLflowManager:
             "final_train_acc": metrics.get("final_train_acc", 0.0),
             "final_val_acc": metrics.get("final_val_acc", 0.0)
         }
+        for key in ("best_val_pos_error_m", "best_val_heading_error_deg"):
+            if key in metrics:
+                run_metrics[key] = metrics[key]
 
         # 分類精度関連のメトリクス（利用可能な場合）
         if "position_error_mean" in metrics:

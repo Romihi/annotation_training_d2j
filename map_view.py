@@ -21,7 +21,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
-from matplotlib.patches import RegularPolygon, Polygon as MplPolygon
+from matplotlib.patches import RegularPolygon, Rectangle, Polygon as MplPolygon
 from matplotlib.path import Path as MplPath
 
 from translations import get_text
@@ -150,10 +150,28 @@ class MapViewWidget(QWidget):
         self._data_dir = None              # 走行データフォルダ（地図なし時の保存先）
         # 色分け「位置」用: index -> loc（メインウィンドウのアノテーションを参照）
         self.loc_provider = None
+        # 位置推論結果: index -> {'pred_class', 'pose': {'x','y','theta'}, ...}（メイン
+        # ウィンドウの location_inference_results を参照）。推定座標のマーカー描画と
+        # 色分け「推論クラス」に使う
+        self.inference_provider = None
+        # 位置推論の表示設定 {'top_n', 'grid_mode': 'top1'|'weighted', 'grid_config'} を返す
+        # コールバック（格子分類モデルの Top-N セル表示と推定位置の決め方に使う）
+        self.inference_settings_provider = None
+        # 現在フレームの推定位置マーカー（三角＋実測との誤差線、格子分類の Top-N セル）。blit 用に animated
+        self._pred_artists = []
+        # 推論済みフレームの推定座標（中空丸）。再生中に推論結果が増えても全体再描画
+        # なしで追記できるよう animated な scatter として保持し、blit で描く
+        self._pred_scatter = None
+        self._pred_scatter_indexes = set()   # scatter に載せ済みのフレーム index
+        self._pred_scatter_points = []       # scatter の座標列 [(x, y), ...]
         # 領域の追加・削除・読込をダイアログ側へ通知（引数: ヒント文字列 or None）
         self.on_regions_changed = None
 
         self._build_ui()
+
+    # 推論位置の色: メイン画面の「位置推論結果」表示（紫）と揃える
+    PRED_COLOR = 'purple'
+    PRED_EDGE_COLOR = '#4B0082'
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -179,6 +197,7 @@ class MapViewWidget(QWidget):
         self.color_by_combo.addItem(get_text('map_view_colorby_source'), 'source')
         self.color_by_combo.addItem(get_text('map_view_colorby_status'), 'status')
         self.color_by_combo.addItem(get_text('map_view_colorby_loc'), 'loc')
+        self.color_by_combo.addItem(get_text('map_view_colorby_pred_loc'), 'pred_loc')
         self.color_by_combo.currentIndexChanged.connect(self.refresh)
         controls.addWidget(self.color_by_combo)
 
@@ -225,6 +244,13 @@ class MapViewWidget(QWidget):
         self.show_rough_checkbox.setChecked(True)
         self.show_rough_checkbox.stateChanged.connect(self.refresh)
         toggles.addWidget(self.show_rough_checkbox)
+
+        # 位置推論モデルの推定座標（座標・姿勢回帰）を青で重ねて表示する
+        self.show_inference_checkbox = QCheckBox(get_text('map_view_show_inference'))
+        self.show_inference_checkbox.setChecked(True)
+        self.show_inference_checkbox.setToolTip(get_text('map_view_show_inference_tip'))
+        self.show_inference_checkbox.stateChanged.connect(self._on_inference_toggle)
+        toggles.addWidget(self.show_inference_checkbox)
 
         # ラップタイム一覧（折り畳み式。行クリックでそのラップ先頭へジャンプ）
         self.lap_table_button = QPushButton(get_text('map_view_lap_table_btn'))
@@ -954,6 +980,24 @@ class MapViewWidget(QWidget):
                 pos = self.lap_combo.findData(lap)
                 if pos >= 0:
                     self.lap_combo.setCurrentIndex(pos)
+        self._build_current_markers(index)
+        # blitting: 背景キャッシュがあれば「背景復元＋マーカーだけ描画」で済ませ、
+        # 図全体の再描画（数十〜百ms超）を避ける。キャッシュが無い初回や
+        # リサイズ直後は通常描画にフォールバック（draw_event で再キャッシュ）。
+        if self._blit_bg is not None:
+            self.canvas.restore_region(self._blit_bg)
+            self._draw_animated_artists()
+            self.canvas.blit(self.ax.bbox)
+        else:
+            self.canvas.draw_idle()
+
+    def _build_current_markers(self, index: int) -> None:
+        """現在フレームのマーカー（実測=赤三角、推定=紫三角＋誤差線）を作り直す（描画はしない）
+
+        highlight_frame（blit 更新）と refresh（全体再描画）の両方から使う。refresh でも
+        ここでマーカーを作っておくことで、トグル切替・色分け変更・ラップ切替の直後に
+        現在フレームの三角が消えず、次のフレーム移動を待たずに表示される。
+        """
         pose = self.pose_manager.get_pose(index, prefer=self.source_combo.currentData())
         if self._current_marker is not None:
             try:
@@ -961,6 +1005,10 @@ class MapViewWidget(QWidget):
             except (ValueError, AttributeError):
                 pass
             self._current_marker = None
+        # 位置推論の推定座標（三角＋実測との誤差線）。再生中に推論されたフレームの
+        # 丸も同時に追記する（全体再描画なしで軌跡の丸が増えていく）
+        self._append_pred_point(index)
+        self._draw_pred_marker(index, pose)
         if pose is not None:
             # 現在位置は進行方向を向いた赤い三角で表示する。三角の大きさは
             # 現在の表示範囲に対する一定割合にして、ズームしても見やすく保つ。
@@ -978,16 +1026,15 @@ class MapViewWidget(QWidget):
             # animated=True: 通常の全描画から除外し blit でのみ描く
             self._current_marker.set_animated(True)
             self.ax.add_patch(self._current_marker)
-        # blitting: 背景キャッシュがあれば「背景復元＋マーカーだけ描画」で済ませ、
-        # 図全体の再描画（数十〜百ms超）を避ける。キャッシュが無い初回や
-        # リサイズ直後は通常描画にフォールバック（draw_event で再キャッシュ）。
-        if self._blit_bg is not None:
-            self.canvas.restore_region(self._blit_bg)
-            if self._current_marker is not None:
-                self.ax.draw_artist(self._current_marker)
-            self.canvas.blit(self.ax.bbox)
-        else:
-            self.canvas.draw_idle()
+
+    def _draw_animated_artists(self):
+        """blit で描く animated アーティスト（推定座標の丸・三角・誤差線・現在位置）を描画"""
+        if self._pred_scatter is not None:
+            self.ax.draw_artist(self._pred_scatter)
+        for artist in self._pred_artists:
+            self.ax.draw_artist(artist)
+        if self._current_marker is not None:
+            self.ax.draw_artist(self._current_marker)
 
     def _on_canvas_draw(self, _event=None):
         """全描画の完了時に背景（マーカー以外の全要素）をキャッシュする。
@@ -1001,8 +1048,8 @@ class MapViewWidget(QWidget):
         except Exception:
             self._blit_bg = None
             return
-        if self._current_marker is not None:
-            self.ax.draw_artist(self._current_marker)
+        if self._current_marker is not None or self._pred_artists or self._pred_scatter is not None:
+            self._draw_animated_artists()
             self.canvas.blit(self.ax.bbox)
 
     def _on_scroll(self, event):
@@ -1037,6 +1084,10 @@ class MapViewWidget(QWidget):
 
         self.ax.clear()
         self._current_marker = None
+        self._pred_artists = []   # ax.clear() で消えているため参照だけ捨てる
+        self._pred_scatter = None
+        self._pred_scatter_indexes = set()
+        self._pred_scatter_points = []
         # アノテーション画面のグリッド表示と同じ薄いグレーのグリッド
         self.ax.grid(True, color='gray', alpha=0.3, linewidth=0.5)
         self.ax.set_axisbelow(True)
@@ -1051,6 +1102,8 @@ class MapViewWidget(QWidget):
 
         # 位置領域は軌跡の有無に関わらず描く（領域だけ先に確認できるように）
         self._draw_regions()
+        # 格子分類モデルの格子線（読み込み中のモデルが格子出力を持つときのみ）
+        self._draw_grid_lines()
 
         if self.pose_manager is None or not self.pose_manager.has_any_pose():
             self._plotted_indexes = []
@@ -1179,6 +1232,9 @@ class MapViewWidget(QWidget):
                        color='none', linestyle='None', markersize=7,
                        label=f"{get_text('map_view_legend_rough')} ({len(rough_indexes)})"))
 
+        # 位置推論モデルの推定座標（座標・姿勢回帰の結果があるフレームのみ）
+        self._draw_pred_trajectory(poses, legend_handles)
+
         # 凡例（表示中のマーカーのみ、件数付き）
         if legend_handles:
             self.ax.legend(handles=legend_handles, fontsize=8, loc='upper right', framealpha=0.8)
@@ -1194,6 +1250,14 @@ class MapViewWidget(QWidget):
         self.ax.set_aspect('equal', adjustable='datalim')
         self.ax.set_xlabel('x [m]')
         self.ax.set_ylabel('y [m]')
+
+        # 現在フレームのマーカー（赤三角・推定位置の紫三角）を全体再描画に含める。
+        # 表示範囲の復元後にサイズを決めるため、_finish_draw と同じ順で範囲を先に戻す
+        if keep_view:
+            self.ax.set_xlim(saved_xlim)
+            self.ax.set_ylim(saved_ylim)
+        if self._current_index is not None:
+            self._build_current_markers(self._current_index)
         _finish_draw()
 
     # --- 内部処理 ---------------------------------------------------------
@@ -1425,7 +1489,194 @@ class MapViewWidget(QWidget):
                 colors.append(get_location_color(loc).name()
                               if loc is not None else '#d0d0d0')
             return colors, None
+        if mode == 'pred_loc':
+            # 位置推論モデルの予測クラスで色分け（「位置」と切り替えて比較する）。未推論は薄灰
+            colors = []
+            for p in poses:
+                res = self._inference_result(p.index)
+                pred = res.get('pred_class') if res else None
+                colors.append(get_location_color(pred).name()
+                              if pred is not None else '#d0d0d0')
+            return colors, None
         return ['tab:blue' for _ in poses], None
+
+    # --- 位置推論結果の重ね描き ----------------------------------------------
+
+    def _inference_result(self, index):
+        """フレーム index の位置推論結果（無ければ None）"""
+        if self.inference_provider is None:
+            return None
+        try:
+            return self.inference_provider(index)
+        except Exception:
+            return None
+
+    def _inference_settings(self):
+        """位置推論の表示設定（無ければ既定値）"""
+        if self.inference_settings_provider is not None:
+            try:
+                s = self.inference_settings_provider() or {}
+                return {'top_n': int(s.get('top_n', 3) or 3),
+                        'grid_mode': s.get('grid_mode', 'weighted') or 'weighted',
+                        'grid_config': s.get('grid_config')}
+            except Exception:
+                pass
+        return {'top_n': 3, 'grid_mode': 'weighted', 'grid_config': None}
+
+    def _predicted_pose(self, index):
+        """フレーム index の推定座標 (x, y, theta|None)
+
+        座標・姿勢回帰の出力があればそれを、無ければ格子分類の Top1 セル中心または
+        Top1〜N の重み付き平均（表示設定に従う）を返す。どちらも無ければ None。
+        """
+        res = self._inference_result(index)
+        if not res:
+            return None
+        pose = res.get('pose')
+        if pose and pose.get('x') is not None and pose.get('y') is not None:
+            return float(pose['x']), float(pose['y']), pose.get('theta')
+        grid = res.get('grid')
+        if grid and grid.get('top'):
+            s = self._inference_settings()
+            if s['grid_mode'] == 'top1':
+                t1 = grid['top'][0]
+                return float(t1['x']), float(t1['y']), None
+            from model_catalog import grid_weighted_position
+            wxy = grid_weighted_position(grid['top'], n=s['top_n'])
+            if wxy is not None:
+                return float(wxy[0]), float(wxy[1]), None
+        return None
+
+    def _draw_grid_cells(self, index):
+        """格子分類の Top-N セルを現在フレームに重ねる（確率が高いほど濃い紫。Top1 は太枠）"""
+        res = self._inference_result(index)
+        grid = res.get('grid') if res else None
+        if not grid or not grid.get('top'):
+            return
+        s = self._inference_settings()
+        cfg = s['grid_config'] or {}
+        cell = float(cfg.get('cell_size') or 0)
+        if cell <= 0:
+            return
+        top = grid['top'][:s['top_n']]
+        p_max = max(it['prob'] for it in top) or 1.0
+        for rank, it in enumerate(top):
+            x0, y0 = it['x'] - cell / 2.0, it['y'] - cell / 2.0
+            alpha = 0.12 + 0.45 * (it['prob'] / p_max)
+            rect = Rectangle((x0, y0), cell, cell, facecolor=self.PRED_COLOR, alpha=alpha,
+                             edgecolor=self.PRED_EDGE_COLOR if rank == 0 else 'none',
+                             linewidth=1.4 if rank == 0 else 0.0, zorder=3.5)
+            rect.set_animated(True)
+            self.ax.add_patch(rect)
+            self._pred_artists.append(rect)
+
+    def _draw_grid_lines(self):
+        """格子分類モデルの格子線を薄く描く（全体再描画時）"""
+        if not self.show_inference_checkbox.isChecked():
+            return
+        cfg = self._inference_settings()['grid_config'] or {}
+        cell = float(cfg.get('cell_size') or 0)
+        nx, ny = int(cfg.get('nx') or 0), int(cfg.get('ny') or 0)
+        if cell <= 0 or nx <= 0 or ny <= 0 or nx * ny > 40000:
+            return
+        x0, y0 = float(cfg['x_min']), float(cfg['y_min'])
+        x1, y1 = x0 + nx * cell, y0 + ny * cell
+        for i in range(nx + 1):
+            self.ax.plot([x0 + i * cell] * 2, [y0, y1], color=self.PRED_COLOR,
+                         linewidth=0.4, alpha=0.18, zorder=1.2)
+        for j in range(ny + 1):
+            self.ax.plot([x0, x1], [y0 + j * cell] * 2, color=self.PRED_COLOR,
+                         linewidth=0.4, alpha=0.18, zorder=1.2)
+
+    def _on_inference_toggle(self, _state=None):
+        # refresh が現在フレームのマーカー（赤三角・推定位置の紫三角）も作り直す
+        self.refresh()
+
+    def _clear_pred_artists(self):
+        for artist in self._pred_artists:
+            try:
+                artist.remove()
+            except (ValueError, AttributeError):
+                pass
+        self._pred_artists = []
+
+    def _draw_pred_marker(self, index, actual_pose):
+        """現在フレームの推定位置を青い三角で描き、実測位置との誤差を点線で結ぶ"""
+        self._clear_pred_artists()
+        if not self.show_inference_checkbox.isChecked():
+            return
+        # 格子分類なら Top-N セルを先に敷く（三角はその上）
+        self._draw_grid_cells(index)
+        pred = self._predicted_pose(index)
+        if pred is None:
+            return
+        px, py, ptheta = pred
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        span = max(abs(xlim[1] - xlim[0]), abs(ylim[1] - ylim[0]), 1e-6)
+        radius = span * 0.02
+        theta = ptheta if ptheta is not None else (getattr(actual_pose, 'theta', 0.0) or 0.0)
+        marker = RegularPolygon(
+            (px, py), numVertices=3, radius=radius,
+            orientation=theta - math.pi / 2.0,
+            facecolor=self.PRED_COLOR, edgecolor=self.PRED_EDGE_COLOR,
+            linewidth=1.0, alpha=0.9, zorder=5)
+        marker.set_animated(True)
+        self.ax.add_patch(marker)
+        self._pred_artists.append(marker)
+        if actual_pose is not None:
+            link = Line2D([actual_pose.x, px], [actual_pose.y, py], color=self.PRED_COLOR,
+                          linestyle='--', linewidth=1.0, alpha=0.8, zorder=4.5)
+            link.set_animated(True)
+            self.ax.add_line(link)
+            self._pred_artists.append(link)
+
+    def _ensure_pred_scatter(self):
+        """推定座標の丸（animated scatter）を必要なら作成して返す"""
+        if self._pred_scatter is None:
+            self._pred_scatter = self.ax.scatter(
+                [], [], marker='o', facecolors='none', edgecolors=self.PRED_COLOR,
+                s=22, linewidths=1.0, alpha=0.9, zorder=3)
+            self._pred_scatter.set_animated(True)
+        return self._pred_scatter
+
+    def _append_pred_point(self, index):
+        """フレーム index の推定座標を丸の scatter へ追記する（表示中ラップ内のみ、未追記なら）"""
+        if not self.show_inference_checkbox.isChecked():
+            return
+        if index in self._pred_scatter_indexes or index not in self._plotted_indexes:
+            return
+        pred = self._predicted_pose(index)
+        if pred is None:
+            return
+        self._pred_scatter_indexes.add(index)
+        self._pred_scatter_points.append((pred[0], pred[1]))
+        self._ensure_pred_scatter().set_offsets(self._pred_scatter_points)
+
+    def _draw_pred_trajectory(self, poses, legend_handles):
+        """推論済みフレームの推定座標を中空丸で重ね描きし、凡例に件数と平均誤差を出す
+
+        丸は animated な scatter に載せ、以後 highlight_frame で推論済みフレームが
+        増えるたびに追記する（再生中も全体再描画なしで丸が増える）。
+        """
+        if not self.show_inference_checkbox.isChecked() or self.inference_provider is None:
+            return
+        errs = []
+        for p in poses:
+            pred = self._predicted_pose(p.index)
+            if pred is None:
+                continue
+            self._pred_scatter_indexes.add(p.index)
+            self._pred_scatter_points.append((pred[0], pred[1]))
+            errs.append(math.hypot(pred[0] - p.x, pred[1] - p.y))
+        if not errs:
+            return
+        self._ensure_pred_scatter().set_offsets(self._pred_scatter_points)
+        mean_err = sum(errs) / len(errs)
+        legend_handles.append(
+            Line2D([0], [0], marker='o', markerfacecolor='none', markeredgecolor=self.PRED_COLOR,
+                   color='none', linestyle='None', markersize=7,
+                   label=get_text('map_view_legend_inference', len(errs), f"{mean_err:.2f}")))
 
     def _on_pick(self, event):
         if not self._plotted_indexes or not event.ind.size:
@@ -1678,6 +1929,14 @@ class MapViewDialog(QDialog):
             self.map_widget.loc_provider = (
                 lambda idx: getattr(self.main_window, 'location_annotations',
                                     {}).get(idx))
+            # 位置推論結果（推定座標・予測クラス）の参照。メイン側で更新される dict を
+            # 呼び出し時に引き直す
+            self.map_widget.inference_provider = (
+                lambda idx: getattr(self.main_window, 'location_inference_results',
+                                    {}).get(idx))
+            # 表示設定（Top-N / Top1・重み付き / 格子定義）。メイン側のメソッドがあれば参照
+            settings_fn = getattr(self.main_window, 'location_inference_settings', None)
+            self.map_widget.inference_settings_provider = settings_fn if callable(settings_fn) else None
         self.map_widget.set_pose_manager(pose_manager)
         self._last_quality_flags = set()
         self.quality_result_label.setText("")

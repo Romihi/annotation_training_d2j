@@ -936,7 +936,13 @@ class ImageLabel(QLabel):
         mw = self.main_window
         if not mw:
             return
+        # 結合表示中はtarget_rectが単一画像と対応せず表示位置がずれるため自動的に非表示
+        if getattr(mw, 'current_variant', None) == '__combined__':
+            return
         edit_mode = getattr(mw, 'vehicle_mask_edit_mode', False)
+        # 表示オフ設定時は描画しない（編集モード中は設定に関わらず表示する）
+        if not getattr(mw, 'vehicle_mask_overlay_visible', True) and not edit_mode:
+            return
         user_points = getattr(mw, 'vehicle_mask_user_points', None)
         if not edit_mode and not user_points:
             return
@@ -3604,6 +3610,13 @@ class ImageLabel(QLabel):
 
             # 車両マスク編集モード: 通常のアノテーション処理より優先して頂点を編集
             if getattr(self.main_window, 'vehicle_mask_edit_mode', False):
+                # 結合表示中は座標系が合わないため編集操作を受け付けない
+                # （クリックは消費して誤アノテーションを防ぐ）
+                if getattr(self.main_window, 'current_variant', None) == '__combined__':
+                    if hasattr(self.main_window, 'statusBar'):
+                        self.main_window.statusBar().showMessage(
+                            get_text('status_vehicle_mask_combined_blocked'), 4000)
+                    return
                 if event.button() == Qt.RightButton:
                     if event.modifiers() & Qt.ControlModifier:
                         self.main_window.clear_vehicle_mask()  # Ctrl+右クリックで全消去
@@ -5947,6 +5960,7 @@ class ImageAnnotationTool(QMainWindow):
         # 車両マスク関連の初期化（画像下側の車体領域を学習時に無視するためのポリゴン）
         self.vehicle_mask_user_points = []  # ユーザーがクリックした頂点（正規化座標、左右対称の片側）
         self.vehicle_mask_edit_mode = False  # マスク編集モード中か
+        self.vehicle_mask_overlay_visible = True  # マスクオーバーレイの表示ON/OFF
 
         # 位置情報関連の初期化
         self.location_buttons = []  # 位置情報ボタンのリスト
@@ -7791,6 +7805,13 @@ class ImageAnnotationTool(QMainWindow):
         self.vehicle_mask_button.setToolTip(get_text('tip_vehicle_mask'))
         self.vehicle_mask_button.toggled.connect(self.toggle_vehicle_mask_edit)
         resolution_row.addWidget(self.vehicle_mask_button)
+
+        # マスクオーバーレイの表示ON/OFF（結合表示中は設定に関わらず自動オフ）
+        self.vehicle_mask_visible_checkbox = QCheckBox(get_text('chk_vehicle_mask_visible'))
+        self.vehicle_mask_visible_checkbox.setChecked(True)
+        self.vehicle_mask_visible_checkbox.setToolTip(get_text('tip_vehicle_mask_visible'))
+        self.vehicle_mask_visible_checkbox.toggled.connect(self.toggle_vehicle_mask_visible)
+        resolution_row.addWidget(self.vehicle_mask_visible_checkbox)
 
         resolution_row.addStretch(1)  # 右パディング
 
@@ -20844,8 +20865,22 @@ class ImageAnnotationTool(QMainWindow):
             return None
         return [round(x0, 4), round(y0, 4), round(w, 4), round(h, 4)]
 
+    def toggle_vehicle_mask_visible(self, checked):
+        """車両マスクオーバーレイの表示ON/OFF切替"""
+        self.vehicle_mask_overlay_visible = checked
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
     def toggle_vehicle_mask_edit(self, checked):
         """車両マスクボタンのトグル処理（編集モードの開始/確定）"""
+        # 結合表示中は座標系が単一画像と一致せずズレるため編集不可
+        if checked and getattr(self, 'current_variant', None) == '__combined__':
+            self.vehicle_mask_button.blockSignals(True)
+            self.vehicle_mask_button.setChecked(False)
+            self.vehicle_mask_button.blockSignals(False)
+            self.statusBar().showMessage(get_text('status_vehicle_mask_combined_blocked'), 4000)
+            return
+
         self.vehicle_mask_edit_mode = checked
 
         if checked:
@@ -22562,6 +22597,8 @@ class ImageAnnotationTool(QMainWindow):
         self.annotation_timestamps = {}
         self.inference_results = {}
         self.location_annotations = {}
+        # 位置推論結果もセッションと一緒に破棄（別データの結果が残らないように）
+        self.location_inference_results = {}
         self.pose_manager.reset()
 
         if hasattr(self, 'deleted_indexes'):
@@ -23999,6 +24036,8 @@ class ImageAnnotationTool(QMainWindow):
         self.annotation_timestamps = {}
         self.inference_results = {}
         self.location_annotations = {}
+        # 位置推論結果もセッションと一緒に破棄（別データの結果が残らないように）
+        self.location_inference_results = {}
         self.pose_manager.reset()
 
         if hasattr(self, 'deleted_indexes'):
@@ -24923,8 +24962,8 @@ class ImageAnnotationTool(QMainWindow):
         
         # ここから追加: 位置推論表示チェックボックスがONの場合、自動的に推論実行
         if hasattr(self, 'location_inference_checkbox') and self.location_inference_checkbox.isChecked():
-            # 推論結果がまだない場合のみ推論を実行
-            if new_img_path not in self.location_inference_results:
+            # 推論結果がまだない場合のみ推論を実行（結果はインデックスをキーに保持）
+            if new_index not in self.location_inference_results:
                 self.run_location_inference()
             # 表示を更新
             self.update_location_inference_display()
@@ -30608,7 +30647,34 @@ class ImageAnnotationTool(QMainWindow):
         self.location_inference_checkbox.setToolTip(get_text('tip_location_model_not_loaded'))
         self.location_inference_checkbox.stateChanged.connect(self.toggle_location_inference_display)
         location_inference_layout.addWidget(self.location_inference_checkbox)
+
+        # 全画像を推論（走行軌跡マップに推定位置・推論クラスを重ねて確認するため）
+        self.location_infer_all_button = QPushButton(get_text('btn_location_inference_all'))
+        self.location_infer_all_button.setToolTip(get_text('tip_location_inference_all'))
+        self.location_infer_all_button.clicked.connect(self.run_location_inference_all)
+        location_inference_layout.addWidget(self.location_infer_all_button)
         location_model_layout.addLayout(location_inference_layout)
+
+        # 格子分類の表示設定: Top-N 件数と、位置の決め方（Top1 セル / Top1〜N の重み付き平均）
+        self.location_topn = 3
+        self.location_grid_display = 'weighted'
+        grid_disp_layout = QHBoxLayout()
+        grid_disp_layout.addWidget(QLabel(get_text('label_location_topn')))
+        self.location_topn_spin = QSpinBox()
+        self.location_topn_spin.setRange(1, LocationModelManager.GRID_TOP_KEEP)
+        self.location_topn_spin.setValue(self.location_topn)
+        self.location_topn_spin.setToolTip(get_text('tip_location_topn'))
+        self.location_topn_spin.valueChanged.connect(self._on_location_grid_display_changed)
+        grid_disp_layout.addWidget(self.location_topn_spin)
+        self.location_grid_mode_combo = QComboBox()
+        self.location_grid_mode_combo.addItem(get_text('opt_location_grid_top1'), 'top1')
+        self.location_grid_mode_combo.addItem(get_text('opt_location_grid_weighted'), 'weighted')
+        self.location_grid_mode_combo.setCurrentIndex(1)
+        self.location_grid_mode_combo.setToolTip(get_text('tip_location_grid_mode'))
+        self.location_grid_mode_combo.currentIndexChanged.connect(self._on_location_grid_display_changed)
+        grid_disp_layout.addWidget(self.location_grid_mode_combo)
+        grid_disp_layout.addStretch()
+        location_model_layout.addLayout(grid_disp_layout)
 
         # 中身をコンテナへ格納し、既定は折り畳み状態
         location_model_layout_outer.addWidget(self.location_content_widget)
@@ -31201,11 +31267,19 @@ class ImageAnnotationTool(QMainWindow):
                 return
             
             num_classes = result
-            
+
+            # 前に読み込んでいたモデルの推論結果を破棄する（入出力構成・格子定義が
+            # 異なるため、残すと情報パネルやマップに旧モデルの結果が混ざる）
+            self.location_inference_results = {}
+            if hasattr(self, 'main_image_view'):
+                self.main_image_view.location_inference_result = None
+
             update_progress(80, get_text('msg_running_initial_inference'))
-            
+
             # 現在の画像に対して推論を実行
             self.run_location_inference()
+            # マップを全体再描画して旧モデルの〇・格子線を消す
+            self._refresh_map_view_inference(self.current_index, full=True)
             
             update_progress(90, get_text('msg_updating_inference_display'))
             
@@ -31253,51 +31327,155 @@ class ImageAnnotationTool(QMainWindow):
         # モデルリストを更新
         self.refresh_location_model_list()
 
+    def _location_inference_inputs(self, index):
+        """位置モデルの入力構成（学習時に保存）に従って、フレーム index の入力画像パスを返す"""
+        manager = self.location_model_manager
+        cfg = getattr(manager, 'location_config', None) or {}
+        selected_sources = cfg.get('selected_sources') or []
+        num_sources = int(cfg.get('num_sources', 1) or 1)
+        virtual_type = cfg.get('virtual_source_type')
+        if num_sources <= 1 and not selected_sources:
+            return self.images[index]
+        paths = self._location_source_paths_for_index(
+            index, selected_sources, virtual_type, num_sources,
+            int(cfg.get('temporal_interval', 10) or 10))
+        if not paths:
+            # 学習時のソースが揃わない場合は現在の画像で代替する
+            return self.images[index]
+        return paths
+
     def run_location_inference(self):
         """現在の画像に対して位置推論を実行"""
         if not self.images or not hasattr(self, 'location_model_manager'):
             return
-        
-        current_img_path = self.images[self.current_index]
+
         current_index = self.current_index
-        
+        current_img_path = self._location_inference_inputs(current_index)
+
         # マネージャーを使用して推論を実行
         result = self.location_model_manager.run_inference(current_img_path)
-        
+
         if result:
             # 推論結果を保存（インデックスベース）
             self.location_inference_results[current_index] = result
-            
+
+            # 走行軌跡マップが開いていれば現在フレームの推定位置マーカーを更新
+            # （フレーム移動時のハイライトは推論より先に走るため、ここで描き直す）
+            self._refresh_map_view_inference(current_index)
+
             # 表示更新は呼び出し元で行うため、ここでは呼ばない
-            
+
             return True
-        
+
         return False
 
-    def train_and_save_location_model(self):
-        """位置推論モデルの学習"""
-        
-        if not self.images or not self.location_annotations:
-            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_need_location_annotations'))
+    def _on_location_grid_display_changed(self, _v=None):
+        """格子分類の表示設定（Top-N / Top1 / 重み付き）変更 → 情報パネルとマップを更新"""
+        self.location_topn = int(self.location_topn_spin.value())
+        self.location_grid_display = self.location_grid_mode_combo.currentData() or 'weighted'
+        if hasattr(self, 'location_inference_checkbox') and self.location_inference_checkbox.isChecked():
+            self.update_location_inference_display()
+        self._refresh_map_view_inference(getattr(self, 'current_index', None), full=True)
+
+    def location_inference_settings(self):
+        """マップビュー等が参照する位置推論の表示設定"""
+        mgr = getattr(self, 'location_model_manager', None)
+        cfg = getattr(mgr, 'location_config', None) or {}
+        return {
+            'top_n': int(getattr(self, 'location_topn', 3)),
+            'grid_mode': getattr(self, 'location_grid_display', 'weighted'),
+            'grid_config': cfg.get('grid_config'),
+        }
+
+    def _refresh_map_view_inference(self, index=None, full=False):
+        """走行軌跡マップに位置推論結果を反映する（開いていなければ何もしない）"""
+        dlg = getattr(self, 'map_view_dialog', None)
+        if dlg is None or not dlg.isVisible():
+            return
+        if full:
+            dlg.map_widget.refresh()
+        if index is not None:
+            dlg.highlight_frame(index)
+
+    def run_location_inference_all(self):
+        """読み込み済みの位置モデルで全画像を推論し、走行軌跡マップへ反映する"""
+        if not self.images:
+            QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_no_images'))
+            return
+        manager = getattr(self, 'location_model_manager', None)
+        if manager is None or not manager.is_model_loaded():
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('tip_location_model_not_loaded'))
             return
 
-        # 使用可能な位置情報のユニークなリストを取得
-        unique_locations = sorted(list(set(self.location_annotations.values())))
+        deleted = set(getattr(self, 'deleted_indexes', []) or [])
+        targets = [i for i in range(len(self.images)) if i not in deleted]
+        total = len(targets)
+        progress = QProgressDialog(get_text('msg_location_inference_all_progress', 0, total),
+                                   get_text('btn_cancel'), 0, total, self)
+        progress.setWindowTitle(get_text('msg_location_inference_all_running'))
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QApplication.processEvents()
+
+        done = 0
+        cancelled = False
+        for n, idx in enumerate(targets):
+            if n % 10 == 0:
+                progress.setValue(n)
+                progress.setLabelText(get_text('msg_location_inference_all_progress', n, total))
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    cancelled = True
+                    break
+            result = manager.run_inference(self._location_inference_inputs(idx))
+            if result:
+                self.location_inference_results[idx] = result
+                done += 1
+        progress.setValue(total)
+        progress.close()
+
+        # 表示を更新（情報パネル・マップ）
+        if hasattr(self, 'location_inference_checkbox') and not self.location_inference_checkbox.isChecked():
+            self.location_inference_checkbox.setChecked(True)
+        self.show_location_inference = True
+        self.update_location_inference_display()
+        self._refresh_map_view_inference(self.current_index, full=True)
+        self.statusBar().showMessage(
+            get_text('status_location_inference_all_done', done, total)
+            + (get_text('status_location_inference_all_cancelled') if cancelled else ""), 5000)
+
+    def _location_pose_available(self):
+        """座標・姿勢の教師データ（pose/slam 等の自己位置）がセッションにあるか"""
+        pm = getattr(self, 'pose_manager', None)
+        return pm is not None and pm.has_any_pose() and bool(pm.available_sources())
+
+    def train_and_save_location_model(self):
+        """位置推論モデルの学習（クラス分類 / 座標・姿勢回帰 / 両方、複数画像入力対応）"""
+
+        if not self.images:
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_images'))
+            return
+
+        has_class_labels = bool(self.location_annotations)
+        has_pose = self._location_pose_available()
+        if not has_class_labels and not has_pose:
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_need_location_or_pose'))
+            return
+
+        # 使用可能な位置情報のユニークなリストを取得（pose のみ学習の場合は空でも可）
+        unique_locations = sorted(list(set(self.location_annotations.values()))) if has_class_labels else []
         actual_classes = len(unique_locations)
 
-        if actual_classes < 2:
-            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_need_at_least_2_locations', actual_classes))
-            return
-        
         # 常に8クラスを使用（実際のクラス数に関わらず）
         num_classes = LOCATION_DEFAULT_NUM_CLASSES
-        
+
         # 選択されたモデル
         model_type = self.location_model_combo.currentText()
-        
+
         # アノテーション統計情報を収集（削除済みマークを考慮）
         total_images = len(self.images)
-        
+
         # 削除済みでない位置アノテーションをカウント
         valid_location_annotations = 0
         deleted_count = 0
@@ -31309,24 +31487,40 @@ class ImageAnnotationTool(QMainWindow):
             valid_location_annotations += 1
 
         annotated_images = len(self.location_annotations)  # 全体数
-        
+
         # 学習設定ダイアログを表示
         training_settings = self._create_location_training_dialog(model_type, actual_classes, unique_locations, num_classes, total_images, annotated_images, valid_location_annotations, deleted_count)
-        
+
         if not training_settings.exec_():
             return
-        
+
         # 設定値の取得
         training_config = self._get_location_training_config(training_settings)
-        
+        output_mode = training_config['output_mode']
+        heads = output_mode.split('_')
+        use_class = 'class' in heads
+        use_pose = 'pose' in heads
+        use_grid = 'grid' in heads
+        needs_pose = use_pose or use_grid
+
+        if use_class and actual_classes < 2:
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_need_at_least_2_locations', actual_classes))
+            return
+        if needs_pose and not has_pose:
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_need_pose_for_regression'))
+            return
+
         try:
-            # データの準備（インデックスベース修正版）
-            image_data = self._prepare_location_training_data(unique_locations)
-            
+            # データの準備（インデックスベース、複数画像入力・pose ターゲット対応）
+            image_data = self._prepare_location_training_data(unique_locations, training_config)
+
             if not image_data['image_paths']:
                 QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_valid_location_annotations'))
                 return
-            
+            if len(image_data['image_paths']) < 4:
+                QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_insufficient_data'))
+                return
+
             # 進捗ダイアログを表示
             progress = QProgressDialog(
                 get_text('msg_preparing_location_training', model_type),
@@ -31336,29 +31530,38 @@ class ImageAnnotationTool(QMainWindow):
             progress.setWindowModality(Qt.WindowModal)
             progress.show()
             QApplication.processEvents()
-            
+
             # データセット作成
             train_loader, val_loader, dataset_info = create_location_datasets(
                 image_paths=image_data['image_paths'],
-                location_labels=image_data['location_indices'],
+                location_labels=image_data['location_indices'] if use_class else None,
                 val_split=0.2,
                 model_name=model_type,
-                batch_size=training_config['batch_size'],
-                use_augmentation=training_config['use_augmentation']
+                batch_size=min(training_config['batch_size'], len(image_data['image_paths'])),
+                use_augmentation=training_config['use_augmentation'],
+                grouped_image_paths=image_data['grouped_paths'],
+                pose_targets=image_data['pose_targets'] if needs_pose else None,
+                output_mode=output_mode,
+                num_sources=training_config['num_sources'],
+                virtual_source_type=training_config['virtual_source_type'],
+                include_heading=training_config['include_heading'],
+                downscale_factor=training_config.get('downscale_factor', 1.0),
+                downscale_mode=training_config.get('downscale_mode', 'resize'),
+                grid_cell_size=training_config.get('grid_cell_size') or 0.5,
             )
-            
+
             progress.setValue(20)
             progress.setLabelText(get_text('msg_init_location_model', model_type, num_classes))
             QApplication.processEvents()
-            
+
             # 進捗コールバック関数
             def update_progress(current, total, message=None):
                 if message:
                     progress.setLabelText(message)
-                progress.setValue(20 + int(current * 70 / total))
+                progress.setValue(20 + int(current * 70 / max(1, total)))
                 QApplication.processEvents()
                 return not progress.wasCanceled()
-            
+
             # モデル学習（統合版）
             training_results = self._train_location_model_internal(
                 model_type=model_type,
@@ -31366,9 +31569,15 @@ class ImageAnnotationTool(QMainWindow):
                 val_loader=val_loader,
                 num_classes=num_classes,
                 training_config=training_config,
-                progress_callback=update_progress
+                progress_callback=update_progress,
+                dataset_info=dataset_info,
             )
-            
+
+            if training_results.get('cancelled') or not training_results.get('best_model_path'):
+                progress.close()
+                self.statusBar().showMessage(get_text('status_training_cancelled'), 5000)
+                return
+
             # モデルのメタデータ保存
             self._save_location_model_metadata(
                 training_results['best_model_path'],
@@ -31376,11 +31585,11 @@ class ImageAnnotationTool(QMainWindow):
                 actual_classes,
                 image_data['location_to_index']
             )
-            
+
             progress.setValue(95)
             progress.setLabelText("MLflowに学習結果を記録中...")
             QApplication.processEvents()
-            
+
             # MLflowに結果を記録
             mlflow_info = self._log_location_training(
                 model_type=model_type,
@@ -31395,16 +31604,26 @@ class ImageAnnotationTool(QMainWindow):
                     "num_classes": num_classes,
                     "actual_classes": actual_classes,
                     "unique_locations": unique_locations,
-                    "location_mapping": image_data['location_to_index']
+                    "location_mapping": image_data['location_to_index'],
+                    "output_mode": output_mode,
+                    "num_sources": training_config['num_sources'],
+                    "selected_sources": training_config['selected_sources'],
+                    "virtual_source_type": training_config['virtual_source_type'],
+                    "pose_source": training_config['pose_source'] if needs_pose else None,
+                    "pose_norm": dataset_info.get('pose_norm'),
+                    "grid_cell_size": training_config.get('grid_cell_size') if use_grid else None,
+                    "num_grid_classes": dataset_info.get('num_grid_classes', 0),
+                    "skipped_no_pose": image_data.get('skipped_no_pose', 0),
+                    "skipped_no_source": image_data.get('skipped_no_source', 0),
                 }
             )
-            
+
             # モデルリストを更新
             self.refresh_location_model_list()
-            
+
             progress.setValue(100)
             progress.close()
-            
+
             # 学習完了メッセージ
             self._show_location_training_success(
                 model_type=model_type,
@@ -31413,11 +31632,15 @@ class ImageAnnotationTool(QMainWindow):
                 dataset_info={
                     "image_paths_count": len(image_data['image_paths']),
                     "num_classes": num_classes,
-                    "actual_classes": actual_classes
+                    "actual_classes": actual_classes,
+                    "skipped_no_pose": image_data.get('skipped_no_pose', 0),
+                    "skipped_no_source": image_data.get('skipped_no_source', 0),
+                    "input_size": dataset_info.get('actual_image_size'),
+                    "raw_image_size": dataset_info.get('raw_image_size'),
                 },
                 mlflow_info=mlflow_info
             )
-            
+
         except Exception as e:
             if 'progress' in locals():
                 progress.close()
@@ -31433,9 +31656,30 @@ class ImageAnnotationTool(QMainWindow):
         
         training_settings = QDialog(self)
         training_settings.setWindowTitle(get_text('dlg_location_training_settings'))
-        training_settings.setMinimumWidth(500)
+        # 自動運転モデルの学習ダイアログと同様に横長の2カラム構成（縦に収まらない場合はスクロール）
+        training_settings.setMinimumSize(1100, 600)
+        training_settings.resize(1250, 780)
+        training_settings.setSizeGripEnabled(True)
 
-        settings_layout = QVBoxLayout(training_settings)
+        outer_layout = QVBoxLayout(training_settings)
+        body_scroll = QScrollArea()
+        body_scroll.setWidgetResizable(True)
+        body_scroll.setFrameShape(QScrollArea.NoFrame)
+        body_widget = QWidget()
+        columns_layout = QHBoxLayout(body_widget)
+        left_column = QVBoxLayout()
+        right_column = QVBoxLayout()
+
+        # 各設定パネルを薄い色で塗り分けて区別しやすくする（自動運転ダイアログと同じ）
+        def _tint_group(group, bg_color, border_color):
+            group.setStyleSheet(
+                "QGroupBox { background-color: %s; border: 1px solid %s;"
+                " border-radius: 6px; margin-top: 8px; padding-top: 6px; font-weight: bold; }"
+                " QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }"
+                % (bg_color, border_color))
+
+        # 左カラム: データ統計 / 入力画像ソース / 出力（教師データ）
+        settings_layout = left_column
 
         # アノテーション統計情報を表示（削除済みマークを考慮）
         stats_label = QLabel(get_text('label_location_stats', total_images, annotated_images, valid_location_annotations, deleted_count, get_text('label_deleted_excluded_note')))
@@ -31452,7 +31696,351 @@ class ImageAnnotationTool(QMainWindow):
         fixed_class_label = QLabel(get_text('label_fixed_class_note', num_classes))
         fixed_class_label.setStyleSheet("color: #666666; font-style: italic;")
         settings_layout.addWidget(fixed_class_label)
-        
+
+        # ---------------------------------------------------------------
+        # 入力画像ソース（複数選択でマルチソース入力 / 単一選択で仮想ソース）
+        # ---------------------------------------------------------------
+        source_group = QGroupBox(get_text('label_location_input_sources'))
+        _tint_group(source_group, "#EEF6EE", "#BFDABF")
+        source_layout = QVBoxLayout(source_group)
+        source_info = QLabel(get_text('label_location_input_sources_info'))
+        source_info.setStyleSheet("color: #666;")
+        source_info.setWordWrap(True)
+        source_layout.addWidget(source_info)
+
+        training_settings.source_checkboxes = {}
+        available_sources = {}
+        if hasattr(self, 'variant_images') and self.variant_images:
+            available_sources = self.variant_images
+        current_var = getattr(self, 'current_variant', None)
+        if available_sources:
+            for variant, img_list in available_sources.items():
+                if variant == current_var:
+                    label_text = get_text('label_current_source_marker', variant, len(img_list))
+                else:
+                    label_text = get_text('label_other_source_marker', variant, len(img_list))
+                cb = QCheckBox(label_text)
+                cb.setProperty("variant", variant)
+                cb.setChecked(variant == current_var)
+                training_settings.source_checkboxes[variant] = cb
+                source_layout.addWidget(cb)
+        else:
+            cb = QCheckBox(get_text('label_current_source_marker', current_var or 'cam', len(self.images)))
+            cb.setProperty("variant", current_var or 'cam')
+            cb.setChecked(True)
+            cb.setEnabled(False)
+            training_settings.source_checkboxes[current_var or 'cam'] = cb
+            source_layout.addWidget(cb)
+
+        # 融合方法（複数ソース選択時のみ表示）
+        fusion_row_widget = QWidget()
+        fusion_row = QHBoxLayout(fusion_row_widget)
+        fusion_row.setContentsMargins(0, 0, 0, 0)
+        fusion_row.addWidget(QLabel(get_text('label_fusion_method')))
+        training_settings.fusion_combo = QComboBox()
+        training_settings.fusion_combo.addItem(get_text('fusion_concat'), 'concat')
+        training_settings.fusion_combo.addItem(get_text('fusion_attention'), 'attention')
+        training_settings.fusion_combo.setCurrentIndex(1)
+        fusion_row.addWidget(training_settings.fusion_combo)
+        fusion_row.addStretch()
+        source_layout.addWidget(fusion_row_widget)
+
+        # 仮想ソース（単一ソース選択時のみ表示）
+        virtual_row_widget = QWidget()
+        virtual_rows = QVBoxLayout(virtual_row_widget)
+        virtual_rows.setContentsMargins(0, 0, 0, 0)
+        virtual_type_row = QHBoxLayout()
+        virtual_type_row.addWidget(QLabel(get_text('label_virtual_source_type')))
+        training_settings.virtual_type_combo = QComboBox()
+        training_settings.virtual_type_combo.addItem(get_text('opt_virtual_none'), None)
+        training_settings.virtual_type_combo.addItem(get_text('opt_virtual_crop'), 'crop')
+        training_settings.virtual_type_combo.addItem(get_text('opt_virtual_scale'), 'scale')
+        training_settings.virtual_type_combo.addItem(get_text('opt_virtual_temporal'), 'temporal')
+        virtual_type_row.addWidget(training_settings.virtual_type_combo)
+        virtual_type_row.addStretch()
+        virtual_rows.addLayout(virtual_type_row)
+
+        virtual_nsrc_row = QHBoxLayout()
+        virtual_nsrc_row.addWidget(QLabel(get_text('label_virtual_num_sources')))
+        training_settings.virtual_nsrc_spin = QSpinBox()
+        training_settings.virtual_nsrc_spin.setRange(2, 4)
+        training_settings.virtual_nsrc_spin.setValue(3)
+        virtual_nsrc_row.addWidget(training_settings.virtual_nsrc_spin)
+        virtual_nsrc_row.addWidget(QLabel(get_text('label_temporal_interval')))
+        training_settings.temporal_interval_spin = QSpinBox()
+        training_settings.temporal_interval_spin.setRange(1, 300)
+        training_settings.temporal_interval_spin.setValue(getattr(self, '_temporal_interval', 10))
+        training_settings.temporal_interval_spin.setSuffix(' frames')
+        virtual_nsrc_row.addWidget(training_settings.temporal_interval_spin)
+        virtual_nsrc_row.addStretch()
+        virtual_rows.addLayout(virtual_nsrc_row)
+        source_layout.addWidget(virtual_row_widget)
+
+        training_settings.source_count_label = QLabel("")
+        training_settings.source_count_label.setStyleSheet("color: #2E7D32; font-weight: bold;")
+        source_layout.addWidget(training_settings.source_count_label)
+        settings_layout.addWidget(source_group)
+
+        def _update_source_ui():
+            checked = [v for v, cb in training_settings.source_checkboxes.items() if cb.isChecked()]
+            multi = len(checked) > 1
+            fusion_row_widget.setVisible(multi)
+            virtual_row_widget.setVisible(len(checked) == 1)
+            vtype = training_settings.virtual_type_combo.currentData()
+            training_settings.virtual_nsrc_spin.setEnabled(vtype is not None)
+            training_settings.temporal_interval_spin.setEnabled(vtype == 'temporal')
+            if multi:
+                n = len(checked)
+            elif vtype:
+                n = training_settings.virtual_nsrc_spin.value()
+            else:
+                n = 1
+            training_settings.source_count_label.setText(
+                get_text('label_location_source_count', len(checked), n))
+
+        for cb in training_settings.source_checkboxes.values():
+            cb.stateChanged.connect(lambda _s: _update_source_ui())
+        training_settings.virtual_type_combo.currentIndexChanged.connect(lambda _i: _update_source_ui())
+        training_settings.virtual_nsrc_spin.valueChanged.connect(lambda _v: _update_source_ui())
+
+        # ---------------------------------------------------------------
+        # 出力（教師データ）: クラス分類 / 座標・姿勢回帰
+        # ---------------------------------------------------------------
+        output_group = QGroupBox(get_text('label_location_output_settings'))
+        _tint_group(output_group, "#FBF7EE", "#E3D6B8")
+        output_layout = QVBoxLayout(output_group)
+        output_info = QLabel(get_text('label_location_output_info'))
+        output_info.setStyleSheet("color: #666;")
+        output_info.setWordWrap(True)
+        output_layout.addWidget(output_info)
+
+        has_class = actual_classes >= 2
+        has_pose = self._location_pose_available()
+
+        training_settings.class_output_check = QCheckBox(get_text('chk_location_output_class', actual_classes))
+        training_settings.class_output_check.setChecked(has_class)
+        training_settings.class_output_check.setEnabled(has_class)
+        if not has_class:
+            training_settings.class_output_check.setToolTip(get_text('tip_location_output_class_disabled'))
+        output_layout.addWidget(training_settings.class_output_check)
+
+        pose_count = len(self.pose_manager.known_indexes()) if has_pose else 0
+        training_settings.pose_output_check = QCheckBox(get_text('chk_location_output_pose', pose_count))
+        training_settings.pose_output_check.setChecked(has_pose and not has_class)
+        training_settings.pose_output_check.setEnabled(has_pose)
+        if not has_pose:
+            training_settings.pose_output_check.setToolTip(get_text('tip_location_output_pose_disabled'))
+        output_layout.addWidget(training_settings.pose_output_check)
+
+        pose_opts_widget = QWidget()
+        pose_opts = QVBoxLayout(pose_opts_widget)
+        pose_opts.setContentsMargins(20, 0, 0, 0)
+        pose_src_row = QHBoxLayout()
+        pose_src_row.addWidget(QLabel(get_text('label_location_pose_source')))
+        training_settings.pose_source_combo = QComboBox()
+        if has_pose:
+            for src in self.pose_manager.available_sources():
+                training_settings.pose_source_combo.addItem(src, src)
+            preferred = getattr(self, 'recorded_traj_source', None)
+            if preferred:
+                idx = training_settings.pose_source_combo.findData(preferred)
+                if idx >= 0:
+                    training_settings.pose_source_combo.setCurrentIndex(idx)
+        pose_src_row.addWidget(training_settings.pose_source_combo)
+        pose_src_row.addStretch()
+        pose_opts.addLayout(pose_src_row)
+
+        training_settings.heading_check = QCheckBox(get_text('chk_location_include_heading'))
+        training_settings.heading_check.setChecked(True)
+        training_settings.heading_check.setToolTip(get_text('tip_location_include_heading'))
+        pose_opts.addWidget(training_settings.heading_check)
+
+        pose_w_row = QHBoxLayout()
+        pose_w_row.addWidget(QLabel(get_text('label_location_pose_loss_weight')))
+        training_settings.pose_weight_spin = QDoubleSpinBox()
+        training_settings.pose_weight_spin.setRange(0.01, 100.0)
+        training_settings.pose_weight_spin.setSingleStep(0.5)
+        training_settings.pose_weight_spin.setValue(1.0)
+        training_settings.pose_weight_spin.setToolTip(get_text('tip_location_pose_loss_weight'))
+        pose_w_row.addWidget(training_settings.pose_weight_spin)
+        pose_w_row.addStretch()
+        pose_opts.addLayout(pose_w_row)
+        output_layout.addWidget(pose_opts_widget)
+
+        # 格子分類: x, y を一辺 cell_size [m] の格子に離散化し、どのセルにいるかを分類する
+        training_settings.grid_output_check = QCheckBox(get_text('chk_location_output_grid'))
+        training_settings.grid_output_check.setChecked(False)
+        training_settings.grid_output_check.setEnabled(has_pose)
+        training_settings.grid_output_check.setToolTip(
+            get_text('tip_location_output_grid') if has_pose else get_text('tip_location_output_pose_disabled'))
+        output_layout.addWidget(training_settings.grid_output_check)
+
+        grid_opts_widget = QWidget()
+        grid_opts = QVBoxLayout(grid_opts_widget)
+        grid_opts.setContentsMargins(20, 0, 0, 0)
+        grid_row = QHBoxLayout()
+        grid_row.addWidget(QLabel(get_text('label_location_grid_cell_size')))
+        training_settings.grid_cell_spin = QDoubleSpinBox()
+        training_settings.grid_cell_spin.setRange(0.05, 20.0)
+        training_settings.grid_cell_spin.setSingleStep(0.1)
+        training_settings.grid_cell_spin.setDecimals(2)
+        training_settings.grid_cell_spin.setSuffix(' m')
+        training_settings.grid_cell_spin.setValue(0.5)
+        grid_row.addWidget(training_settings.grid_cell_spin)
+        grid_row.addWidget(QLabel(get_text('label_location_grid_loss_weight')))
+        training_settings.grid_weight_spin = QDoubleSpinBox()
+        training_settings.grid_weight_spin.setRange(0.01, 100.0)
+        training_settings.grid_weight_spin.setSingleStep(0.5)
+        training_settings.grid_weight_spin.setValue(1.0)
+        grid_row.addWidget(training_settings.grid_weight_spin)
+        grid_row.addStretch()
+        grid_opts.addLayout(grid_row)
+        # 学習の安定化: 近傍セルへのラベル平滑化と、セル出現頻度による重み付け
+        grid_row2 = QHBoxLayout()
+        grid_row2.addWidget(QLabel(get_text('label_location_grid_sigma')))
+        training_settings.grid_sigma_spin = QDoubleSpinBox()
+        training_settings.grid_sigma_spin.setRange(0.0, 5.0)
+        training_settings.grid_sigma_spin.setSingleStep(0.25)
+        training_settings.grid_sigma_spin.setDecimals(2)
+        training_settings.grid_sigma_spin.setValue(1.0)
+        training_settings.grid_sigma_spin.setToolTip(get_text('tip_location_grid_sigma'))
+        grid_row2.addWidget(training_settings.grid_sigma_spin)
+        training_settings.grid_balance_check = QCheckBox(get_text('chk_location_grid_balance'))
+        training_settings.grid_balance_check.setChecked(True)
+        training_settings.grid_balance_check.setToolTip(get_text('tip_location_grid_balance'))
+        grid_row2.addWidget(training_settings.grid_balance_check)
+        grid_row2.addStretch()
+        grid_opts.addLayout(grid_row2)
+        training_settings.grid_size_label = QLabel("")
+        training_settings.grid_size_label.setStyleSheet("color: #2E7D32;")
+        grid_opts.addWidget(training_settings.grid_size_label)
+        output_layout.addWidget(grid_opts_widget)
+
+        pose_note = QLabel(get_text('label_location_pose_note'))
+        pose_note.setStyleSheet("color: #1565C0; font-style: italic;")
+        pose_note.setWordWrap(True)
+        output_layout.addWidget(pose_note)
+        settings_layout.addWidget(output_group)
+
+        # 格子サイズのプレビュー（自己位置の範囲からセル数を見積もる）
+        pose_bounds = None
+        if has_pose:
+            xs, ys = [], []
+            for p in self.pose_manager.get_trajectory():
+                xs.append(p.x)
+                ys.append(p.y)
+            if xs:
+                pose_bounds = (min(xs), max(xs), min(ys), max(ys))
+
+        def _update_grid_preview(_v=None):
+            if pose_bounds is None:
+                training_settings.grid_size_label.setText("")
+                return
+            c = training_settings.grid_cell_spin.value()
+            nx = max(1, int(math.ceil((pose_bounds[1] - pose_bounds[0]) / c)) + 1)
+            ny = max(1, int(math.ceil((pose_bounds[3] - pose_bounds[2]) / c)) + 1)
+            training_settings.grid_size_label.setText(
+                get_text('label_location_grid_preview', nx, ny, nx * ny))
+
+        training_settings.grid_cell_spin.valueChanged.connect(_update_grid_preview)
+        _update_grid_preview()
+
+        def _update_output_ui():
+            pose_on = training_settings.pose_output_check.isChecked()
+            class_on = training_settings.class_output_check.isChecked()
+            grid_on = training_settings.grid_output_check.isChecked()
+            pose_opts_widget.setVisible(pose_on)
+            grid_opts_widget.setVisible(grid_on)
+            training_settings.pose_weight_spin.setEnabled(pose_on and (class_on or grid_on))
+            training_settings.grid_weight_spin.setEnabled(grid_on and (class_on or pose_on))
+            # 格子分類のみでも自己位置ソースは必要なので、pose 系オプションは格子でも表示する
+            if grid_on and not pose_on:
+                pose_opts_widget.setVisible(True)
+                training_settings.heading_check.setEnabled(False)
+                training_settings.pose_weight_spin.setEnabled(False)
+            else:
+                training_settings.heading_check.setEnabled(True)
+            # 出力が1つも選ばれていない場合は学習を開始できない
+            ok_btn = button_box.button(QDialogButtonBox.Ok)
+            if ok_btn is not None:
+                ok_btn.setEnabled(pose_on or class_on or grid_on)
+
+        training_settings.class_output_check.stateChanged.connect(lambda _s: _update_output_ui())
+        training_settings.pose_output_check.stateChanged.connect(lambda _s: _update_output_ui())
+        training_settings.grid_output_check.stateChanged.connect(lambda _s: _update_output_ui())
+
+        # 右カラム: 解像度 / 学習パラメータ / モデル名 / コメント
+        settings_layout = right_column
+
+        # ---------------------------------------------------------------
+        # 解像度モード（自動運転モデルと同じ: 実画像サイズで学習し、スライダーで縮小 / 劣化）
+        # ---------------------------------------------------------------
+        _main_slider = getattr(self, 'resolution_slider', None)
+        res_val = _main_slider.value() if _main_slider else 100
+        resolution_group = QGroupBox(get_text('label_resolution_mode_group'))
+        _tint_group(resolution_group, "#FBF0F4", "#E8C6D4")
+        resolution_layout = QVBoxLayout(resolution_group)
+        res_info = QLabel(get_text('label_location_resolution_info'))
+        res_info.setStyleSheet("color: #666;")
+        res_info.setWordWrap(True)
+        resolution_layout.addWidget(res_info)
+
+        res_slider_row = QHBoxLayout()
+        res_dlg_label = QLabel(get_text('label_resolution_scale'))
+        res_dlg_label.setFixedWidth(50)
+        res_slider_row.addWidget(res_dlg_label)
+        training_settings.res_slider = QSlider(Qt.Horizontal)
+        training_settings.res_slider.setMinimum(10)
+        training_settings.res_slider.setMaximum(100)
+        training_settings.res_slider.setValue(res_val)
+        training_settings.res_slider.setTickPosition(QSlider.TicksBelow)
+        training_settings.res_slider.setTickInterval(10)
+        training_settings.res_slider.setSingleStep(5)
+        res_slider_row.addWidget(training_settings.res_slider, 1)
+        res_value_label = QLabel(f"{res_val}%")
+        res_value_label.setFixedWidth(38)
+        res_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        res_slider_row.addWidget(res_value_label)
+        resolution_layout.addLayout(res_slider_row)
+
+        training_settings.pixelate_radio = QRadioButton(get_text('opt_resolution_pixelate'))
+        training_settings.resize_radio = QRadioButton(get_text('opt_resolution_resize'))
+        if res_val < 100:
+            training_settings.resize_radio.setChecked(True)
+        else:
+            training_settings.pixelate_radio.setChecked(True)
+        resolution_layout.addWidget(training_settings.pixelate_radio)
+        resolution_layout.addWidget(training_settings.resize_radio)
+
+        training_settings.res_size_label = QLabel("")
+        training_settings.res_size_label.setStyleSheet("color: #2E7D32;")
+        resolution_layout.addWidget(training_settings.res_size_label)
+        settings_layout.addWidget(resolution_group)
+
+        def _update_resolution_ui(v=None):
+            v = training_settings.res_slider.value()
+            res_value_label.setText(f"{v}%")
+            if _main_slider and _main_slider.value() != v:
+                _main_slider.setValue(v)  # メインキャンバスのスライダーと連動
+            raw_h = getattr(self, 'original_image_height', None) or 0
+            raw_w = getattr(self, 'original_image_width', None) or 0
+            if raw_h and raw_w:
+                if training_settings.resize_radio.isChecked() and v < 100:
+                    h, w = max(1, int(raw_h * v / 100)), max(1, int(raw_w * v / 100))
+                else:
+                    h, w = raw_h, raw_w
+                training_settings.res_size_label.setText(
+                    get_text('label_location_resolution_size', raw_w, raw_h, w, h))
+
+        training_settings.res_slider.valueChanged.connect(_update_resolution_ui)
+        training_settings.resize_radio.toggled.connect(lambda _c: _update_resolution_ui())
+        _update_resolution_ui()
+
+        # 学習パラメータ（エポック / バッチ / オーグメンテーション / Early Stopping / 学習率）
+        params_group = QGroupBox(get_text('label_training_params'))
+        _tint_group(params_group, "#EAF3FB", "#B9D4EC")
+        params_layout = QVBoxLayout(params_group)
+
         # エポック数設定
         epoch_layout = QHBoxLayout()
         epoch_layout.addWidget(QLabel(get_text('label_epochs')))
@@ -31460,8 +32048,8 @@ class ImageAnnotationTool(QMainWindow):
         training_settings.epoch_spin.setRange(1, 1000)
         training_settings.epoch_spin.setValue(30)
         epoch_layout.addWidget(training_settings.epoch_spin)
-        settings_layout.addLayout(epoch_layout)
-        
+        params_layout.addLayout(epoch_layout)
+
         # バッチサイズ設定
         batch_layout = QHBoxLayout()
         batch_layout.addWidget(QLabel(get_text('label_batch_size')))
@@ -31469,26 +32057,26 @@ class ImageAnnotationTool(QMainWindow):
         training_settings.batch_spin.setRange(1, 128)
         training_settings.batch_spin.setValue(16)
         batch_layout.addWidget(training_settings.batch_spin)
-        settings_layout.addLayout(batch_layout)
-        
+        params_layout.addLayout(batch_layout)
+
         # データオーグメンテーション設定
         training_settings.aug_check = QCheckBox(get_text('chk_data_augmentation'))
         training_settings.aug_check.setChecked(True)
-        settings_layout.addWidget(training_settings.aug_check)
-        
+        params_layout.addWidget(training_settings.aug_check)
+
         # Early Stopping設定
         training_settings.early_stopping_check = QCheckBox(get_text('chk_early_stopping'))
         training_settings.early_stopping_check.setChecked(True)
-        settings_layout.addWidget(training_settings.early_stopping_check)
-        
+        params_layout.addWidget(training_settings.early_stopping_check)
+
         patience_layout = QHBoxLayout()
         patience_layout.addWidget(QLabel(get_text('label_patience')))
         training_settings.patience_spin = QSpinBox()
         training_settings.patience_spin.setRange(1, 20)
         training_settings.patience_spin.setValue(5)
         patience_layout.addWidget(training_settings.patience_spin)
-        settings_layout.addLayout(patience_layout)
-        
+        params_layout.addLayout(patience_layout)
+
         # 学習率設定
         lr_layout = QHBoxLayout()
         lr_layout.addWidget(QLabel(get_text('label_learning_rate')))
@@ -31497,13 +32085,13 @@ class ImageAnnotationTool(QMainWindow):
         training_settings.lr_combo.addItems(learning_rates)
         training_settings.lr_combo.setCurrentIndex(0)
         lr_layout.addWidget(training_settings.lr_combo)
-        settings_layout.addLayout(lr_layout)
+        params_layout.addLayout(lr_layout)
 
-        # モデル名とコメント欄を追加
-        settings_layout.addWidget(QLabel(""))  # スペース追加
+        settings_layout.addWidget(params_group)
 
         # モデル名編集欄
         model_name_group = QGroupBox(get_text('label_model_name_settings'))
+        _tint_group(model_name_group, "#F2F0FB", "#CFC8EC")
         model_name_layout = QVBoxLayout(model_name_group)
 
         # プレフィックス（固定）とサフィックス（編集可能）を分離
@@ -31553,7 +32141,17 @@ class ImageAnnotationTool(QMainWindow):
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(training_settings.accept)
         button_box.rejected.connect(training_settings.reject)
-        settings_layout.addWidget(button_box)
+        # カラムを組み立て（幅は左右均等、余りは下に寄せる）
+        left_column.addStretch()
+        right_column.addStretch()
+        columns_layout.addLayout(left_column, 1)
+        columns_layout.addLayout(right_column, 1)
+        body_scroll.setWidget(body_widget)
+        outer_layout.addWidget(body_scroll, 1)
+        outer_layout.addWidget(button_box)
+
+        _update_source_ui()
+        _update_output_ui()
 
         return training_settings
 
@@ -31755,6 +32353,23 @@ class ImageAnnotationTool(QMainWindow):
     def _get_location_training_config(self, dialog):
         """学習設定ダイアログから設定値を取得"""
 
+        selected_sources = [v for v, cb in dialog.source_checkboxes.items() if cb.isChecked()]
+        is_multi_source = len(selected_sources) > 1
+        virtual_type = dialog.virtual_type_combo.currentData() if not is_multi_source else None
+        if is_multi_source:
+            num_sources = len(selected_sources)
+        elif virtual_type:
+            num_sources = dialog.virtual_nsrc_spin.value()
+        else:
+            num_sources = 1
+
+        use_class = dialog.class_output_check.isChecked()
+        use_pose = dialog.pose_output_check.isChecked()
+        use_grid = dialog.grid_output_check.isChecked()
+        from model_catalog import make_output_mode
+        output_mode = make_output_mode(use_class=use_class, use_pose=use_pose, use_grid=use_grid)
+        needs_pose = use_pose or use_grid   # 自己位置を教師データに使うヘッドがあるか
+
         return {
             'num_epochs': dialog.epoch_spin.value(),
             'batch_size': dialog.batch_spin.value(),
@@ -31763,228 +32378,203 @@ class ImageAnnotationTool(QMainWindow):
             'patience': dialog.patience_spin.value() if dialog.early_stopping_check.isChecked() else 0,
             'learning_rate': float(dialog.lr_combo.currentText()),
             'model_name': dialog.model_name_prefix + dialog.model_name_suffix_input.text().strip(),
-            'comment': dialog.comment_input.toPlainText().strip()
+            'comment': dialog.comment_input.toPlainText().strip(),
+            # 入力画像ソース
+            'selected_sources': selected_sources,
+            'num_sources': num_sources,
+            'fusion_method': dialog.fusion_combo.currentData() if is_multi_source else 'concat',
+            'virtual_source_type': virtual_type,
+            'temporal_interval': dialog.temporal_interval_spin.value() if virtual_type == 'temporal' else 10,
+            # 出力（教師データ）
+            'output_mode': output_mode,
+            'pose_source': dialog.pose_source_combo.currentData() if needs_pose else None,
+            'include_heading': dialog.heading_check.isChecked() if use_pose else False,
+            'pose_loss_weight': dialog.pose_weight_spin.value() if use_pose else 1.0,
+            # 格子分類
+            'grid_cell_size': dialog.grid_cell_spin.value() if use_grid else None,
+            'grid_loss_weight': dialog.grid_weight_spin.value() if use_grid else 1.0,
+            'grid_label_sigma': dialog.grid_sigma_spin.value() if use_grid else 1.0,
+            'grid_class_balance': dialog.grid_balance_check.isChecked() if use_grid else True,
+            # 解像度（自動運転モデルと同じ: 実画像サイズ × 係数 / ピクセレーション）
+            'downscale_factor': dialog.res_slider.value() / 100.0,
+            'downscale_mode': 'resize' if dialog.resize_radio.isChecked() else 'pixelate',
         }
 
-    def _prepare_location_training_data(self, unique_locations):
-        """位置学習データの準備（インデックスベース修正版）"""
-        
+    def _location_source_paths_for_index(self, idx, selected_sources, virtual_type=None,
+                                         num_sources=1, temporal_interval=10):
+        """フレーム idx の位置モデル入力画像パスの組を返す（無ければ None）
+
+        - 複数ソース（実カメラ）: image_groups[idx] から選択ソース順に取得
+        - 仮想ソース temporal: 現在＋過去フレーム（先頭でクランプ）を組にする
+        - それ以外（単一 / crop / scale）: 1枚（crop/scale はデータセット側で生成）
+        """
+        groups = getattr(self, 'image_groups', None) or {}
+        current_var = getattr(self, 'current_variant', None)
+
+        def _path_for(i, source):
+            group = groups.get(i, {})
+            if source in group:
+                return group[source]
+            if source == current_var or not groups:
+                return self.images[i] if 0 <= i < len(self.images) else None
+            return None
+
+        sources = list(selected_sources) if selected_sources else [current_var]
+        if len(sources) > 1:
+            paths = [_path_for(idx, s) for s in sources]
+            return paths if all(paths) else None
+
+        base = _path_for(idx, sources[0])
+        if base is None:
+            return None
+        if virtual_type == 'temporal' and num_sources > 1:
+            paths = [base]
+            for k in range(1, num_sources):
+                prev = max(0, idx - k * temporal_interval)
+                p = _path_for(prev, sources[0])
+                paths.append(p if p else base)
+            return paths
+        return [base]
+
+    def _prepare_location_training_data(self, unique_locations, training_config=None):
+        """位置学習データの準備（インデックスベース、複数画像入力・pose ターゲット対応）
+
+        Returns:
+            dict: image_paths（代表パス）, grouped_paths（入力画像の組）, location_indices,
+                  pose_targets([x, y, theta])、スキップ件数など
+        """
+        cfg = training_config or {}
+        output_mode = cfg.get('output_mode', 'class')
+        heads = str(output_mode).split('_')
+        use_class = 'class' in heads
+        use_pose = 'pose' in heads or 'grid' in heads   # 格子分類も自己位置を教師データに使う
+        selected_sources = cfg.get('selected_sources') or [getattr(self, 'current_variant', None)]
+        virtual_type = cfg.get('virtual_source_type')
+        num_sources = cfg.get('num_sources', 1)
+        temporal_interval = cfg.get('temporal_interval', 10)
+        pose_source = cfg.get('pose_source')
+        deleted = set(getattr(self, 'deleted_indexes', []) or [])
+
         # 位置ラベルのマッピングを作成（実際の位置値をインデックスに変換）
         location_to_index = {loc: i for i, loc in enumerate(unique_locations)}
-        
-        # データを準備（インデックスベースに修正）
+
+        # 対象フレーム: クラス分類ありなら位置アノテーション済み、pose のみなら自己位置のあるフレーム
+        if use_class:
+            candidate_indexes = sorted(k for k in self.location_annotations.keys() if isinstance(k, int))
+        else:
+            candidate_indexes = list(self.pose_manager.known_indexes())
+
         image_paths = []
+        grouped_paths = []
         location_labels = []
-        
-        for idx, location in self.location_annotations.items():
-            # インデックスが有効範囲内かチェック
-            if isinstance(idx, int) and 0 <= idx < len(self.images):
-                # 削除マークされたアノテーションは学習データから除外（actual_indexで判定）
-                is_deleted = False
-                if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
-                    is_deleted = True
-                
-                # 削除マークされていない場合のみ学習データに追加
-                if not is_deleted:
-                    # インデックスから画像パスを取得
-                    img_path = self.images[idx]
-                    image_paths.append(img_path)
-                    location_labels.append(location)
-        
-        # ラベルをインデックスに変換
-        location_indices = [location_to_index[label] for label in location_labels]
-        
+        location_indices = []
+        pose_targets = []
+        skipped_no_pose = 0
+        skipped_no_source = 0
+
+        for idx in candidate_indexes:
+            if not (0 <= idx < len(self.images)) or idx in deleted:
+                continue
+
+            paths = self._location_source_paths_for_index(
+                idx, selected_sources, virtual_type, num_sources, temporal_interval)
+            if not paths:
+                skipped_no_source += 1
+                continue
+
+            pose_value = None
+            if use_pose:
+                pose = self.pose_manager.get_pose(idx, prefer=pose_source)
+                if pose is None:
+                    skipped_no_pose += 1
+                    continue
+                pose_value = [float(pose.x), float(pose.y), float(pose.theta)]
+
+            if use_class:
+                location = self.location_annotations[idx]
+                location_labels.append(location)
+                location_indices.append(location_to_index[location])
+            if use_pose:
+                pose_targets.append(pose_value)
+            image_paths.append(paths[0])
+            grouped_paths.append(paths)
+
         return {
             'image_paths': image_paths,
+            'grouped_paths': grouped_paths,
             'location_labels': location_labels,
             'location_indices': location_indices,
-            'location_to_index': location_to_index
+            'location_to_index': location_to_index,
+            'pose_targets': pose_targets,
+            'skipped_no_pose': skipped_no_pose,
+            'skipped_no_source': skipped_no_source,
         }
 
-    def _train_location_model_internal(self, model_type, train_loader, val_loader, num_classes, training_config, progress_callback):
-        """位置モデル学習の内部実装（外部依存を排除）"""
-        
-        # デバイスの設定
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        # モデルのロード（get_model関数を使用）
-        if progress_callback:
-            progress_callback(0, training_config['num_epochs'], "モデルをロード中...")
-        
-        model = self._initialize_location_model(model_type, num_classes, device)
-        
-        # 損失関数と最適化アルゴリズム
-        criterion = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(model.parameters(), lr=training_config['learning_rate'], weight_decay=1e-4)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
-        
-        # トレーニングループ
-        train_losses = []
-        val_losses = []
-        train_accuracies = []
-        val_accuracies = []
-        best_val_loss = float('inf')
-        best_val_acc = 0.0
-        
-        # Early Stopping用の変数
-        early_stopping_counter = 0
-        early_stopped = False
-        stopped_epoch = 0
-        
-        # 保存ディレクトリとファイル名
+    def _train_location_model_internal(self, model_type, train_loader, val_loader, num_classes,
+                                       training_config, progress_callback, dataset_info=None):
+        """位置モデル学習（model_training.train_location_model へ委譲）
+
+        クラス分類 / 座標・姿勢回帰 / 両方、および複数画像入力に対応する。
+        """
+        dataset_info = dataset_info or {}
+        output_mode = training_config.get('output_mode', 'class')
+        heads = str(output_mode).split('_')
+        use_pose = 'pose' in heads
+        use_grid = 'grid' in heads
+        needs_pose = use_pose or use_grid
+
+        # 保存ディレクトリとファイル名（モデルタイプを必ず含める）
         models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
         os.makedirs(models_dir, exist_ok=True)
-
-        # カスタムモデル名が指定されていればそれを使用、ただしモデルタイプを必ず含める
-        custom_name = training_config.get('model_name', '').strip()
-        if custom_name:
-            # カスタム名がある場合: モデルタイプ_カスタム名 の形式
-            save_name = f"{model_type}_{custom_name}"
+        custom_name = (training_config.get('model_name') or '').strip()
+        if not custom_name:
+            save_name = f"{model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        elif custom_name.startswith(model_type):
+            save_name = custom_name
         else:
-            # カスタム名がない場合: モデルタイプのみ
-            save_name = model_type
+            save_name = f"{model_type}_{custom_name}"
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_path = os.path.join(models_dir, f'{save_name}.pth')
-        best_model_path = os.path.join(models_dir, f'{save_name}_best.pth')
-        
-        completed_epochs = 0
-        for epoch in range(training_config['num_epochs']):
-            # 進捗コールバック - エポック開始
-            if progress_callback:
-                message = f"エポック {epoch+1}/{training_config['num_epochs']} 開始"
-                should_continue = progress_callback(epoch, training_config['num_epochs'], message)
-                if not should_continue:
-                    break
-            
-            # トレーニングフェーズ
-            model.train()
-            epoch_loss = 0.0
-            correct = 0
-            total = 0
-            
-            for i, (inputs, targets) in enumerate(train_loader):
-                inputs, targets = inputs.to(device), targets.to(device)
-                
-                optimizer.zero_grad()
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                loss.backward()
-                optimizer.step()
-                
-                # 統計情報を更新
-                epoch_loss += loss.item() * inputs.size(0)
-                _, predicted = torch.max(outputs, 1)
-                total += targets.size(0)
-                correct += (predicted == targets).sum().item()
-            
-            # エポック損失と精度の計算
-            epoch_loss /= len(train_loader.dataset)
-            epoch_accuracy = 100 * correct / total
-            train_losses.append(epoch_loss)
-            train_accuracies.append(epoch_accuracy)
-            
-            # 検証フェーズ
-            model.eval()
-            val_loss = 0.0
-            correct = 0
-            total = 0
-            with torch.no_grad():
-                for inputs, targets in val_loader:
-                    inputs, targets = inputs.to(device), targets.to(device)
-                    
-                    outputs = model(inputs)
-                    loss = criterion(outputs, targets)
-                    
-                    val_loss += loss.item() * inputs.size(0)
-                    _, predicted = torch.max(outputs, 1)
-                    total += targets.size(0)
-                    correct += (predicted == targets).sum().item()
-            
-            val_loss /= len(val_loader.dataset)
-            val_accuracy = 100 * correct / total
-            val_losses.append(val_loss)
-            val_accuracies.append(val_accuracy)
-            
-            # 学習率の調整
-            scheduler.step(val_loss)
-            
-            completed_epochs = epoch + 1
-            
-            # 進捗コールバック - エポック終了
-            if progress_callback:
-                message = f"エポック {epoch+1}/{training_config['num_epochs']}, 学習損失: {epoch_loss:.4f}, 検証損失: {val_loss:.4f}, "
-                message += f"学習精度: {epoch_accuracy:.2f}%, 検証精度: {val_accuracy:.2f}%"
-                should_continue = progress_callback(epoch + 1, training_config['num_epochs'], message)
-                if not should_continue:
-                    break
-            
-            # 最良モデルの保存
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                early_stopping_counter = 0
-                
-                if val_accuracy > best_val_acc:
-                    best_val_acc = val_accuracy
-                
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': best_val_loss,
-                    'accuracy': best_val_acc,
-                    'num_classes': num_classes
-                }, best_model_path)
-                
-            elif val_accuracy > best_val_acc:
-                best_val_acc = val_accuracy
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': val_loss,
-                    'accuracy': best_val_acc,
-                    'num_classes': num_classes
-                }, best_model_path)
-            else:
-                # Early Stopping判定
-                if training_config['use_early_stopping']:
-                    early_stopping_counter += 1
-                    if early_stopping_counter >= training_config['patience']:
-                        early_stopped = True
-                        stopped_epoch = epoch + 1
-                        break
-        
-        # 最終モデルの保存
-        torch.save({
-            'epoch': completed_epochs,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'train_losses': train_losses,
-            'val_losses': val_losses,
-            'train_accuracies': train_accuracies,
-            'val_accuracies': val_accuracies,
-            'best_val_loss': best_val_loss,
-            'best_val_acc': best_val_acc,
-            'early_stopped': early_stopped,
-            'stopped_epoch': stopped_epoch if early_stopped else completed_epochs,
-            'num_classes': num_classes
-        }, model_path)
-        
-        return {
-            'model_name': model_type,
-            'train_losses': train_losses,
-            'val_losses': val_losses,
-            'train_accuracies': train_accuracies,
-            'val_accuracies': val_accuracies,
-            'best_val_loss': best_val_loss,
-            'best_val_acc': best_val_acc,
-            'model_path': model_path,
-            'best_model_path': best_model_path,
-            'completed_epochs': completed_epochs,
-            'early_stopped': early_stopped,
-            'stopped_epoch': stopped_epoch if early_stopped else completed_epochs
+        # チェックポイントへ保存する入出力構成（推論時に同じ入力構成を再現するため）
+        location_config = {
+            'selected_sources': training_config.get('selected_sources'),
+            'virtual_source_type': training_config.get('virtual_source_type'),
+            'temporal_interval': training_config.get('temporal_interval', 10),
+            'pose_source': training_config.get('pose_source') if needs_pose else None,
+            'pose_norm': dataset_info.get('pose_norm') if use_pose else None,
+            'include_heading': bool(dataset_info.get('include_heading')) if use_pose else False,
+            'downscale_factor': float(training_config.get('downscale_factor', 1.0)),
+            'downscale_mode': training_config.get('downscale_mode', 'resize'),
+            'grid_config': dataset_info.get('grid_config') if use_grid else None,
+            'num_grid_classes': int(dataset_info.get('num_grid_classes') or 0) if use_grid else 0,
         }
+
+        return train_location_model(
+            model_name=model_type,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            num_classes=num_classes,
+            num_epochs=training_config['num_epochs'],
+            learning_rate=training_config['learning_rate'],
+            weight_decay=1e-4,
+            save_dir=models_dir,
+            progress_callback=progress_callback,
+            pretrained=True,
+            use_early_stopping=training_config['use_early_stopping'],
+            patience=training_config['patience'],
+            custom_model_name=save_name,
+            num_sources=training_config.get('num_sources', 1),
+            fusion_method=training_config.get('fusion_method', 'concat'),
+            output_mode=output_mode,
+            pose_dim=int(dataset_info.get('pose_dim') or 4),
+            pose_loss_weight=training_config.get('pose_loss_weight', 1.0),
+            location_config=location_config,
+            input_size=dataset_info.get('actual_image_size'),
+            num_grid_classes=int(dataset_info.get('num_grid_classes') or 0) if use_grid else 0,
+            grid_loss_weight=training_config.get('grid_loss_weight', 1.0),
+            grid_top_n=int(getattr(self, 'location_topn', 3)),
+            grid_label_sigma=float(training_config.get('grid_label_sigma', 1.0)),
+            grid_class_balance=bool(training_config.get('grid_class_balance', True)),
+        )
 
     def _initialize_location_model(self, model_type, num_classes, device):
         """位置モデルの初期化"""
@@ -32034,10 +32624,31 @@ class ImageAnnotationTool(QMainWindow):
                 "val_accuracies": training_results.get('val_accuracies', []),
                 "status": "early_stopped" if training_results.get('early_stopped', False) else "completed"
             }
-            
+            output_mode = training_config.get('output_mode', 'class')
+            heads = str(output_mode).split('_')
+            if 'pose' in heads:
+                metrics["best_val_pos_error_m"] = training_results.get('best_val_pos_error') or 0.0
+                metrics["best_val_heading_error_deg"] = training_results.get('best_val_heading_error') or 0.0
+                metrics["position_error_mean"] = training_results.get('best_val_pos_error') or 0.0
+                metrics["train_pos_errors"] = training_results.get('train_pos_errors', [])
+                metrics["val_pos_errors"] = training_results.get('val_pos_errors', [])
+            if 'grid' in heads:
+                metrics["best_val_grid_acc"] = training_results.get('best_val_grid_acc') or 0.0
+                metrics["best_val_grid_top1_error_m"] = training_results.get('best_val_grid_error') or 0.0
+                metrics["best_val_grid_weighted_error_m"] = training_results.get('best_val_grid_weighted_error') or 0.0
+                metrics["val_grid_accuracies"] = training_results.get('val_grid_accuracies', [])
+                metrics["val_grid_errors"] = training_results.get('val_grid_errors', [])
+
+            _cs = {'class': 'classification', 'pose': 'map_xy_theta', 'grid': 'map_grid_cell'}
+            _em = {'class': 'cnn_classification', 'pose': 'cnn_pose_regression', 'grid': 'cnn_grid_classification'}
+            coordinate_system = '+'.join(_cs[h] for h in heads if h in _cs)
+            estimation_method = 'cnn_multitask' if len(heads) > 1 else _em.get(heads[0], 'cnn_classification')
+
             # 学習パラメータを準備
             training_params = {
                 "model_type": model_type,
+                "model_name": training_config.get('model_name', ''),
+                "comment": training_config.get('comment', ''),
                 "num_epochs": training_config['num_epochs'],
                 "completed_epochs": training_results.get('completed_epochs', training_config['num_epochs']),
                 "learning_rate": training_config['learning_rate'],
@@ -32046,10 +32657,24 @@ class ImageAnnotationTool(QMainWindow):
                 "patience": training_config['patience'],
                 "early_stopped": training_results.get('early_stopped', False),
                 "augmentation_enabled": training_config['use_augmentation'],
-                "coordinate_system": "classification",  # 位置推論特有
-                "estimation_method": "cnn_classification",  # 位置推論特有
+                "coordinate_system": coordinate_system,  # 位置推論特有
+                "estimation_method": estimation_method,  # 位置推論特有
                 "fixed_classes": dataset_info['num_classes'],
                 "actual_classes": dataset_info['actual_classes'],
+                "output_mode": output_mode,
+                "num_sources": training_config.get('num_sources', 1),
+                "fusion_method": training_config.get('fusion_method') if training_config.get('num_sources', 1) > 1 else None,
+                "selected_sources": ",".join(training_config.get('selected_sources') or []),
+                "virtual_source_type": training_config.get('virtual_source_type') or "none",
+                "temporal_interval": training_config.get('temporal_interval', 10),
+                "pose_source": training_config.get('pose_source') or "none",
+                "include_heading": training_config.get('include_heading', False),
+                "pose_loss_weight": training_config.get('pose_loss_weight', 1.0),
+                "grid_cell_size": training_config.get('grid_cell_size') if 'grid' in heads else None,
+                "num_grid_classes": dataset_info.get('num_grid_classes') if 'grid' in heads else None,
+                "grid_loss_weight": training_config.get('grid_loss_weight') if 'grid' in heads else None,
+                "grid_label_sigma": training_config.get('grid_label_sigma') if 'grid' in heads else None,
+                "grid_class_balance": training_config.get('grid_class_balance') if 'grid' in heads else None,
                 "data_folder": self.folder_path if hasattr(self, 'folder_path') and self.folder_path else "unknown"
             }
 
@@ -32103,23 +32728,79 @@ class ImageAnnotationTool(QMainWindow):
 
         columns_layout = QHBoxLayout()
 
+        output_mode = training_config.get('output_mode', 'class')
+        heads = str(output_mode).split('_')
+        use_class = 'class' in heads
+        use_pose = 'pose' in heads
+        use_grid = 'grid' in heads
+
         # 左カラム: 学習結果
         left_group = QGroupBox("学習結果")
         left_layout = QVBoxLayout(left_group)
         left_layout.addWidget(QLabel(f"最良検証損失: {training_results['best_val_loss']:.6f}"))
-        left_layout.addWidget(QLabel(f"最良検証精度: {training_results['best_val_acc']:.2f}%"))
+        if use_class:
+            left_layout.addWidget(QLabel(f"最良検証精度: {training_results['best_val_acc']:.2f}%"))
+        if use_pose:
+            pos_err = training_results.get('best_val_pos_error')
+            if pos_err is not None:
+                left_layout.addWidget(QLabel(get_text('label_location_result_pos_error', f"{pos_err:.3f}")))
+            head_err = training_results.get('best_val_heading_error')
+            if head_err is not None and training_config.get('include_heading'):
+                left_layout.addWidget(QLabel(get_text('label_location_result_heading_error', f"{head_err:.1f}")))
+        if use_grid:
+            g_acc = training_results.get('best_val_grid_acc')
+            g_err = training_results.get('best_val_grid_error')
+            g_werr = training_results.get('best_val_grid_weighted_error')
+            if g_acc is not None:
+                left_layout.addWidget(QLabel(get_text('label_location_result_grid_acc', f"{g_acc:.1f}")))
+            if g_err is not None and g_werr is not None:
+                left_layout.addWidget(QLabel(get_text('label_location_result_grid_error',
+                                                      f"{g_err:.3f}", training_results.get('grid_top_n', 3),
+                                                      f"{g_werr:.3f}")))
         left_layout.addWidget(QLabel(f"実施エポック数: {training_results['completed_epochs']}/{training_config['num_epochs']}"))
         if early_stopping_info:
             left_layout.addWidget(QLabel(early_stopping_info.strip()))
         if time_info:
             left_layout.addWidget(QLabel(time_info.strip()))
         left_layout.addWidget(QLabel(f"学習データ数: {dataset_info['image_paths_count']}枚"))
+        skipped = dataset_info.get('skipped_no_pose', 0) + dataset_info.get('skipped_no_source', 0)
+        if skipped:
+            left_layout.addWidget(QLabel(get_text('label_location_result_skipped',
+                                                  dataset_info.get('skipped_no_pose', 0),
+                                                  dataset_info.get('skipped_no_source', 0))))
         left_layout.addStretch()
 
         # 右カラム: 学習設定
         right_group = QGroupBox("学習設定")
         right_layout = QVBoxLayout(right_group)
-        right_layout.addWidget(QLabel(f"出力クラス数: {dataset_info['num_classes']} (実際の位置クラス数: {dataset_info['actual_classes']})"))
+        mode_desc = " + ".join(get_text(f'opt_location_head_{h}') for h in heads)
+        right_layout.addWidget(QLabel(get_text('label_location_result_output_mode', mode_desc)))
+        if use_grid:
+            gcfg = training_results.get('grid_config') or {}
+            right_layout.addWidget(QLabel(get_text('label_location_result_grid',
+                                                   training_config.get('grid_cell_size') or '-',
+                                                   gcfg.get('nx', '-'), gcfg.get('ny', '-'),
+                                                   gcfg.get('num_cells', '-'))))
+        if use_class:
+            right_layout.addWidget(QLabel(f"出力クラス数: {dataset_info['num_classes']} (実際の位置クラス数: {dataset_info['actual_classes']})"))
+        if use_pose:
+            right_layout.addWidget(QLabel(get_text('label_location_result_pose_source',
+                                                   training_config.get('pose_source') or '-',
+                                                   'ON' if training_config.get('include_heading') else 'OFF')))
+        n_src = training_config.get('num_sources', 1)
+        src_desc = ", ".join(training_config.get('selected_sources') or [])
+        if training_config.get('virtual_source_type'):
+            src_desc += f" / {training_config['virtual_source_type']} x{n_src}"
+        elif n_src > 1:
+            src_desc += f" / {training_config.get('fusion_method', 'concat')}"
+        right_layout.addWidget(QLabel(get_text('label_location_result_inputs', n_src, src_desc)))
+        in_size = dataset_info.get('input_size')
+        if in_size:
+            mode = training_config.get('downscale_mode', 'resize')
+            factor = training_config.get('downscale_factor', 1.0)
+            res_desc = f"{int(factor * 100)}% / {mode}" if factor < 1.0 else "100%"
+            right_layout.addWidget(QLabel(get_text('label_location_result_input_size',
+                                                   in_size[1], in_size[0], res_desc)))
         right_layout.addWidget(QLabel(f"学習率: {training_config['learning_rate']}"))
         right_layout.addWidget(QLabel(f"バッチサイズ: {training_config['batch_size']}"))
         right_layout.addWidget(QLabel(f"データオーグメンテーション: {'有効' if training_config['use_augmentation'] else '無効'}"))
@@ -32754,23 +33435,81 @@ class ImageAnnotationTool(QMainWindow):
             if current_index in self.location_inference_results:
                 # 推論結果を取得
                 result = self.location_inference_results[current_index]
-                pred_class = result['pred_class']
-                confidence = result['confidence']
+                pred_class = result.get('pred_class')
+                confidence = result.get('confidence', 0.0)
                 all_probs = result.get('all_probs', [])
-                
+                pose_result = result.get('pose')
+
                 # 情報テキストを構築（インライン表示）
                 inference_text = f"<b>{get_text('label_location_inference_result')}</b> "
-                
-                # 一番高いクラスは背景色付きで表示
-                loc_color = get_location_color(pred_class)
-                
-                # 予測クラスを背景色付きで表示
-                inference_text += f"<div style='background-color: {loc_color.name()};'>"
-                #inference_text += f"<div style='background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 5px; border-radius: 5px; margin: 5px 0;'>"
-                #inference_text += f"予測位置: {pred_class} (確信度: {confidence:.4f})</div>"
-                
+
+                if pred_class is not None:
+                    # 一番高いクラスは背景色付きで表示
+                    loc_color = get_location_color(pred_class)
+                    inference_text += f"<div style='background-color: {loc_color.name()};'>"
+                else:
+                    # 座標・姿勢のみのモデルは背景色なし
+                    inference_text += "<div>"
+
+                # 座標・姿勢推定結果（学習時の pose ソースと同じ map 座標系 [m] / [deg]）
+                if pose_result:
+                    theta = pose_result.get('theta')
+                    theta_text = f"{math.degrees(theta):.1f}°" if theta is not None else "-"
+                    x_text = f"{pose_result['x']:.2f}"
+                    y_text = f"{pose_result['y']:.2f}"
+                    pose_text = get_text('label_location_pose_result', x_text, y_text, theta_text)
+                    inference_text += f"<span style='font-weight: bold;'>{pose_text}</span><br>"
+                    # 実測の自己位置があれば誤差も表示
+                    pm = getattr(self, 'pose_manager', None)
+                    if pm is not None and pm.has_any_pose():
+                        cfg = getattr(self.location_model_manager, 'location_config', {}) or {}
+                        gt = pm.get_pose(current_index, prefer=cfg.get('pose_source'))
+                        if gt is not None:
+                            pos_err = math.hypot(pose_result['x'] - gt.x, pose_result['y'] - gt.y)
+                            if theta is not None:
+                                d = (theta - gt.theta + math.pi) % (2 * math.pi) - math.pi
+                                err_text = get_text('label_location_pose_error', f'{pos_err:.2f}', f'{abs(math.degrees(d)):.1f}')
+                            else:
+                                err_text = get_text('label_location_pose_error_pos_only', f'{pos_err:.2f}')
+                            inference_text += f"<span style='color: #444;'>{err_text}</span><br>"
+
+                # 格子分類の結果: Top1 セル / Top1〜N の重み付き位置と Top-N 一覧
+                grid_result = result.get('grid')
+                if grid_result and grid_result.get('top'):
+                    from model_catalog import grid_weighted_position
+                    top_n = int(getattr(self, 'location_topn', 3))
+                    mode = getattr(self, 'location_grid_display', 'weighted')
+                    top = grid_result['top']
+                    t1 = top[0]
+                    wx, wy = grid_weighted_position(top, n=top_n)
+                    ex, ey = (t1['x'], t1['y']) if mode == 'top1' else (wx, wy)
+                    mode_text = (get_text('opt_location_grid_top1') if mode == 'top1'
+                                 else get_text('label_location_grid_weighted_n', top_n))
+                    inference_text += (f"<span style='font-weight: bold;'>"
+                                       f"{get_text('label_location_grid_result', mode_text, f'{ex:.2f}', f'{ey:.2f}')}"
+                                       f"</span><br>")
+                    inference_text += (f"<span style='color: #444;'>"
+                                       f"{get_text('label_location_grid_top1', t1['ix'], t1['iy'], f'{t1['prob']:.3f}', f'{t1['x']:.2f}', f'{t1['y']:.2f}')}"
+                                       f"</span><br>")
+                    # 実測との誤差
+                    pm = getattr(self, 'pose_manager', None)
+                    if pm is not None and pm.has_any_pose():
+                        cfg = getattr(self.location_model_manager, 'location_config', {}) or {}
+                        gt = pm.get_pose(current_index, prefer=cfg.get('pose_source'))
+                        if gt is not None:
+                            e_top1 = math.hypot(t1['x'] - gt.x, t1['y'] - gt.y)
+                            e_w = math.hypot(wx - gt.x, wy - gt.y)
+                            inference_text += (f"<span style='color: #444;'>"
+                                               f"{get_text('label_location_grid_error', f'{e_top1:.2f}', top_n, f'{e_w:.2f}')}"
+                                               f"</span><br>")
+                    # Top-N 一覧（確率降順）
+                    for rank, it in enumerate(top[:top_n], start=1):
+                        inference_text += (f"<span style='color: #555;'>"
+                                           f"{get_text('label_location_grid_rank', rank, it['ix'], it['iy'], f'{it['prob']:.3f}')}"
+                                           f"</span><br>")
+
                 # 上位3クラスの予測結果を表示（すでに確率でソートされている前提）
-                if all_probs:
+                if pred_class is not None and all_probs:
                     # 確率が高い順にインデックスをソート
                     sorted_indices = sorted(range(len(all_probs)), key=lambda i: all_probs[i], reverse=True)
                     

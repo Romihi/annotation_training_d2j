@@ -19,6 +19,7 @@ import traceback
 
 
 from model_catalog import get_model, AnnotationDataset
+from model_info import get_model_input_size
 from managers.sequence_training_manager import SequenceTrainingManager
 
 import random
@@ -1676,7 +1677,59 @@ class LocationModelManager:
         self.model_type = None
         self.model_path = None
         self.num_classes = 8  # 固定で8クラス
-        
+        # 位置モデルの入出力構成（複数画像入力 / 座標・姿勢出力）。
+        # 旧形式チェックポイントでは単一画像・クラス分類として扱う。
+        self.location_config = self._default_location_config()
+
+    @staticmethod
+    def _default_location_config(base_model_name=None, num_classes=8):
+        return {
+            'base_model_name': base_model_name,
+            'num_sources': 1,
+            'fusion_method': 'concat',
+            'selected_sources': None,
+            'virtual_source_type': None,
+            'temporal_interval': 10,
+            'output_mode': 'class',
+            'num_classes': num_classes,
+            'pose_dim': 0,
+            'include_heading': False,
+            'pose_norm': None,
+            'pose_source': None,
+            'input_size': None,
+            'downscale_factor': 1.0,
+            'downscale_mode': 'resize',
+            'grid_config': None,
+            'num_grid_classes': 0,
+        }
+
+    # 格子分類の推論結果に保持する上位セル数（表示側の Top-N はこの範囲で選択）
+    GRID_TOP_KEEP = 10
+
+    @property
+    def output_mode(self):
+        return self.location_config.get('output_mode', 'class')
+
+    @property
+    def num_sources(self):
+        return int(self.location_config.get('num_sources', 1) or 1)
+
+    @property
+    def has_class_output(self):
+        return 'class' in self.output_mode.split('_')
+
+    @property
+    def has_pose_output(self):
+        return 'pose' in self.output_mode.split('_')
+
+    @property
+    def has_grid_output(self):
+        return 'grid' in self.output_mode.split('_')
+
+    @property
+    def grid_config(self):
+        return self.location_config.get('grid_config')
+
     def get_model_list(self, model_type=None):
         """利用可能な位置モデルまたはウェイポイントモデルのリストを取得 - モデルタイプでフィルタリング
 
@@ -1719,8 +1772,53 @@ class LocationModelManager:
                 progress_callback(30, "モデルチェックポイントを読み込み中...")
             
             # モデルチェックポイントをロード
-            checkpoint = torch.load(model_path, map_location='cpu')
-            
+            checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+
+            # 新形式（複数画像入力 / 座標・姿勢出力）のチェックポイント
+            location_config = checkpoint.get('location_config') if isinstance(checkpoint, dict) else None
+            if location_config:
+                from model_catalog import create_multi_source_location_model
+                cfg = dict(self._default_location_config(model_type))
+                cfg.update(location_config)
+                num_classes = int(cfg.get('num_classes') or checkpoint.get('num_classes', 8))
+                cfg['num_classes'] = num_classes
+                if progress_callback:
+                    progress_callback(50, f"モデル '{model_type}' をロード中... "
+                                          f"(入力{cfg['num_sources']}枚 / 出力: {cfg['output_mode']})")
+                self.model = create_multi_source_location_model(
+                    base_model_name=cfg.get('base_model_name') or model_type,
+                    num_sources=int(cfg['num_sources']),
+                    fusion_method=cfg.get('fusion_method') or 'concat',
+                    num_classes=num_classes,
+                    output_mode=cfg['output_mode'],
+                    pose_dim=int(cfg.get('pose_dim') or 4),
+                    pretrained=False,
+                    input_size=tuple(cfg['input_size']) if cfg.get('input_size') else None,
+                    num_grid_classes=int(cfg.get('num_grid_classes') or 0),
+                )
+                if progress_callback:
+                    progress_callback(70, "モデルの重みをロード中...")
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                self.model.to(device)
+                self.model.eval()
+                self.model_path = model_path
+                self.model_type = model_type
+                self.num_classes = num_classes
+                self.location_config = cfg
+                return True, num_classes
+
+            # 旧形式: 単一画像入力・クラス分類
+            self.location_config = self._default_location_config(model_type)
+            legacy_input_size = None
+            if isinstance(checkpoint, dict):
+                # 実画像サイズで学習したモデルは input_size を持つ（無ければ既定サイズ）
+                if checkpoint.get('input_size'):
+                    legacy_input_size = tuple(int(v) for v in checkpoint['input_size'])
+                    self.location_config['input_size'] = list(legacy_input_size)
+                self.location_config['downscale_factor'] = float(checkpoint.get('downscale_factor', 1.0) or 1.0)
+                self.location_config['downscale_mode'] = checkpoint.get('downscale_mode', 'resize') or 'resize'
+
             # クラス数を取得（チェックポイントから）
             num_classes = None
             if 'model_state_dict' in checkpoint:
@@ -1747,21 +1845,23 @@ class LocationModelManager:
                 num_classes = checkpoint.get('num_classes', 8)  # デフォルト8
             
             self.num_classes = num_classes
-            
+            self.location_config['num_classes'] = num_classes
+
             if progress_callback:
                 progress_callback(50, f"モデル '{model_type}' をロード中... (クラス数: {num_classes})")
             
-            # モデルを初期化
+            # モデルを初期化（学習時の入力サイズがあればそのサイズで構築）
             if model_type == 'donkey_location':
                 from model_catalog import DonkeyLocationModel
-                self.model = DonkeyLocationModel(num_classes=num_classes)
-            elif model_type == 'resnet18_location':
-                from model_catalog import ResNet18LocationModel
-                self.model = ResNet18LocationModel(num_classes=num_classes)
+                if legacy_input_size:
+                    self.model = DonkeyLocationModel(num_classes=num_classes, input_size=legacy_input_size)
+                else:
+                    self.model = DonkeyLocationModel(num_classes=num_classes)
             else:
-                # その他の位置推論モデル（TIMMバックボーン系など）
+                # TIMMバックボーン系の位置推論モデル（resnet18_location含む）
                 from model_catalog import create_location_model
-                self.model = create_location_model(model_type, num_classes=num_classes)
+                self.model = create_location_model(model_type, num_classes=num_classes,
+                                                   input_size=legacy_input_size)
             
             if progress_callback:
                 progress_callback(70, "モデルの重みをロード中...")
@@ -1788,44 +1888,94 @@ class LocationModelManager:
             return False, str(e)
     
     def run_inference(self, img_path):
-        """指定された画像に対して位置推論を実行"""
+        """指定された画像（または画像パスのリスト）に対して位置推論を実行
+
+        Args:
+            img_path: 画像パス、または複数画像入力モデル用のパスリスト
+                      （selected_sources / 時間差スタックの順）。仮想ソース
+                      crop/scale モデルは1枚から内部で生成する。
+
+        Returns:
+            dict: クラス出力があれば 'pred_class', 'confidence', 'all_probs'、
+                  座標・姿勢出力があれば 'pose': {'x', 'y', 'theta'} を含む。
+        """
         if self.model is None:
             return None
-        
+
         try:
-            # 画像を読み込む
-            img = Image.open(img_path).convert('RGB')
-            
+            paths = list(img_path) if isinstance(img_path, (list, tuple)) else [img_path]
+            cfg = self.location_config
+            num_sources = self.num_sources
+            virtual_type = cfg.get('virtual_source_type')
+
+            # 入力枚数の整合（crop/scale は1枚から生成、それ以外は不足分を先頭で補う）
+            if virtual_type in ('crop', 'scale'):
+                paths = paths[:1]
+            elif len(paths) < num_sources:
+                paths = paths + [paths[-1]] * (num_sources - len(paths))
+            elif len(paths) > num_sources:
+                paths = paths[:num_sources]
+
+            from model_catalog import (MultiSourceLocationModel, location_virtual_sources,
+                                       split_location_outputs, denormalize_pose_output,
+                                       pixelate_image)
+
+            images = [Image.open(p).convert('RGB') for p in paths]
+            # 学習時にピクセレーションモードだった場合は推論でも同じ劣化を適用する
+            # （resize モードはモデルの入力サイズに含まれているため前処理で自動的に一致する）
+            factor = float(cfg.get('downscale_factor', 1.0) or 1.0)
+            if cfg.get('downscale_mode') == 'pixelate' and factor < 1.0:
+                images = [pixelate_image(img, factor) for img in images]
+
             # モデルの前処理を取得
             if not hasattr(self.model, '_preprocess') or self.model._preprocess is None:
                 self.model._preprocess = self.model.get_preprocess()
-            
-            # 前処理を適用
-            tensor_image = self.model._preprocess(img)
-            tensor_image = tensor_image.unsqueeze(0)
-            
-            # デバイスを取得
+            if isinstance(self.model, MultiSourceLocationModel):
+                if virtual_type in ('crop', 'scale') and num_sources > 1:
+                    images = location_virtual_sources(images[0], virtual_type, num_sources)
+                tensors = [self.model._preprocess(img) for img in images]
+                tensor_image = torch.cat(tensors, dim=0).unsqueeze(0)
+            else:
+                tensor_image = self.model._preprocess(images[0]).unsqueeze(0)
+
             device = next(self.model.parameters()).device
             tensor_image = tensor_image.to(device)
-            
-            # 推論実行
+
+            result = {}
             with torch.no_grad():
-                logits = self.model(tensor_image)
-                probs = torch.softmax(logits, dim=1)
-                
-                # クラスインデックスと確率を取得
-                max_prob, pred_class = torch.max(probs, dim=1)
-                
-                # 全クラスの確率をリストとして取得
-                all_probs = probs[0].cpu().numpy().tolist()
-            
-            # 推論結果を返す
-            return {
-                'pred_class': pred_class.item(),
-                'confidence': max_prob.item(),
-                'all_probs': all_probs
-            }
-            
+                outputs = self.model(tensor_image)
+                logits, pose, grid = split_location_outputs(outputs, self.output_mode)
+
+                if logits is not None:
+                    probs = torch.softmax(logits, dim=1)
+                    max_prob, pred_class = torch.max(probs, dim=1)
+                    result['pred_class'] = pred_class.item()
+                    result['confidence'] = max_prob.item()
+                    result['all_probs'] = probs[0].cpu().numpy().tolist()
+
+                if pose is not None and cfg.get('pose_norm'):
+                    vec = pose[0].float().cpu().numpy()
+                    x, y, theta = denormalize_pose_output(
+                        vec, cfg['pose_norm'], include_heading=bool(cfg.get('include_heading')))
+                    result['pose'] = {'x': x, 'y': y, 'theta': theta}
+                    result['pose_vec'] = vec.tolist()
+
+                if grid is not None and cfg.get('grid_config'):
+                    from model_catalog import grid_topn, grid_weighted_position
+                    gprobs = torch.softmax(grid, dim=1)[0].cpu().numpy()
+                    top = grid_topn(gprobs, cfg['grid_config'], n=self.GRID_TOP_KEEP)
+                    wx, wy = grid_weighted_position(top, n=3)
+                    # top: 確率降順の上位セル（表示側で Top-N / 重み付きを選んで使う）
+                    result['grid'] = {
+                        'top': top,
+                        'top1': {'cell': top[0]['cell'], 'x': top[0]['x'], 'y': top[0]['y'],
+                                 'prob': top[0]['prob']},
+                        'weighted': {'x': wx, 'y': wy, 'n': 3},
+                    }
+
+            result['input_paths'] = paths
+            return result
+
         except Exception as e:
             print(f"位置推論実行エラー: {e}")
             traceback.print_exc()
@@ -1885,83 +2035,346 @@ class LocationClassificationDataset(torch.utils.data.Dataset):
         
         return img, target
 
+class LocationMultiSourceDataset(torch.utils.data.Dataset):
+    """位置推論用データセット（複数画像入力・クラス / 座標姿勢ターゲット）
+
+    grouped_image_paths: [[src1, src2, ...], ...]。各サンプルの画像をチャネル方向に
+    連結した [num_sources*3, H, W] テンソルを返す。virtual_source_type が
+    crop / scale の場合は各サンプル1枚目から仮想ソースを生成する
+    （temporal は呼び出し側で過去フレームのパスを組にして渡す）。
+
+    戻り値: (image_tensor,
+             class_target [long, クラスラベルが無い場合は -1],
+             pose_target  [float, pose_dim。姿勢ターゲットが無い場合は長さ0])
+    """
+
+    def __init__(self, grouped_image_paths, class_labels=None, pose_vectors=None,
+                 num_sources=1, virtual_source_type=None, transform=None, mask_polygon=None,
+                 pixelate_factor=None, grid_labels=None, grid_xy=None):
+        self.grouped_paths = grouped_image_paths
+        self.class_labels = class_labels
+        self.pose_vectors = pose_vectors
+        self.grid_labels = grid_labels     # 格子セル index（格子分類時）
+        self.grid_xy = grid_xy             # 格子分類の真値座標 [x, y]（位置誤差の評価用）
+        self.num_sources = num_sources
+        self.virtual_source_type = virtual_source_type
+        self.transform = transform
+        self.mask_polygon = mask_polygon
+        self.pixelate_factor = pixelate_factor  # ピクセレーションモード時の係数（<1.0 で有効）
+
+    def _load(self, path):
+        from model_catalog import apply_vehicle_mask, pixelate_image
+        img = apply_vehicle_mask(Image.open(path).convert('RGB'), self.mask_polygon)
+        return pixelate_image(img, self.pixelate_factor)
+
+    def __len__(self):
+        return len(self.grouped_paths)
+
+    def _apply_transform(self, img):
+        if self.transform is None:
+            return transforms.ToTensor()(img)
+        try:
+            return self.transform(img)
+        except Exception:
+            return self.transform(np.array(img))
+
+    def __getitem__(self, idx):
+        from model_catalog import location_virtual_sources
+        paths = self.grouped_paths[idx]
+        if self.virtual_source_type in ('crop', 'scale') and self.num_sources > 1:
+            images = location_virtual_sources(self._load(paths[0]), self.virtual_source_type, self.num_sources)
+        else:
+            images = [self._load(p) for p in paths]
+        stacked = torch.cat([self._apply_transform(im) for im in images], dim=0)
+
+        cls_value = self.class_labels[idx] if self.class_labels is not None else -1
+        class_target = torch.tensor(int(cls_value), dtype=torch.long)
+        if self.pose_vectors is not None:
+            pose_target = torch.tensor(self.pose_vectors[idx], dtype=torch.float)
+        else:
+            pose_target = torch.zeros(0, dtype=torch.float)
+        grid_value = self.grid_labels[idx] if self.grid_labels is not None else -1
+        grid_target = torch.tensor(int(grid_value), dtype=torch.long)
+        if self.grid_xy is not None:
+            grid_xy = torch.tensor(self.grid_xy[idx], dtype=torch.float)
+        else:
+            grid_xy = torch.zeros(0, dtype=torch.float)
+        return stacked, class_target, pose_target, grid_target, grid_xy
+
+
+def resolve_location_input_size(raw_size, downscale_factor=1.0, downscale_mode='resize',
+                                input_size=None):
+    """位置モデルの学習入力サイズと pixelate 係数を決める（自動運転モデルと同じ規則）
+
+    - 既定は実画像サイズ（input_size 指定時はそれ）でモデルを構築する
+    - downscale_factor < 1.0 かつ resize モード: サイズ自体を縮小する
+    - downscale_factor < 1.0 かつ pixelate モード: サイズは変えず内容を劣化させる
+
+    Returns: (input_size (H, W), pixelate_factor or None)
+    """
+    size = tuple(input_size) if input_size else tuple(raw_size)
+    pixelate_factor = None
+    if downscale_factor is not None and downscale_factor < 1.0:
+        if downscale_mode == 'resize':
+            size = (max(1, int(size[0] * downscale_factor)), max(1, int(size[1] * downscale_factor)))
+        else:
+            pixelate_factor = float(downscale_factor)
+    return size, pixelate_factor
+
+
+def compute_pose_norm(pose_targets, margin_ratio=0.05):
+    """[x, y, theta] リストから座標正規化の min/max を求める（少し余白を持たせる）"""
+    arr = np.asarray(pose_targets, dtype=np.float64).reshape(-1, 3)
+    x_min, x_max = float(arr[:, 0].min()), float(arr[:, 0].max())
+    y_min, y_max = float(arr[:, 1].min()), float(arr[:, 1].max())
+    x_margin = max((x_max - x_min) * margin_ratio, 0.05)
+    y_margin = max((y_max - y_min) * margin_ratio, 0.05)
+    return {'x_min': x_min - x_margin, 'x_max': x_max + x_margin,
+            'y_min': y_min - y_margin, 'y_max': y_max + y_margin}
+
+
 def create_location_datasets(
     image_paths: List[str] = None,
     location_labels: List[int] = None,
-    val_split: float = 0.2, 
+    val_split: float = 0.2,
     model_name: str = 'resnet18_location',
     batch_size: int = 32,
     num_workers: int = 4,
-    use_augmentation: bool = False
+    use_augmentation: bool = False,
+    grouped_image_paths: Optional[List[List[str]]] = None,
+    pose_targets: Optional[List[List[float]]] = None,
+    output_mode: str = 'class',
+    num_sources: int = 1,
+    virtual_source_type: Optional[str] = None,
+    include_heading: bool = True,
+    mask_polygon=None,
+    pose_norm: Optional[Dict[str, float]] = None,
+    downscale_factor: float = 1.0,
+    downscale_mode: str = 'resize',
+    input_size: Optional[Tuple[int, int]] = None,
+    grid_cell_size: float = 0.5,
+    grid_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[DataLoader, DataLoader, Dict[str, Any]]:
-    """位置分類用のデータセットを作成する
+    """位置推論用のデータセットを作成する
+
+    従来の引数（image_paths + location_labels）のみを渡した場合は、これまでどおり
+    単一画像・クラス分類用データセットを返す。
+
+    grouped_image_paths を渡すと複数画像入力（実カメラの複数ソース、または
+    仮想ソース crop / scale / temporal）用のデータセットになる。output_mode に
+    応じて class / pose / class_pose のターゲットを返す。
 
     Args:
-        image_paths: 画像パスのリスト
-        location_labels: 位置ラベルのリスト
+        image_paths: 画像パスのリスト（単一入力・従来互換）
+        location_labels: 位置クラスラベル（インデックス化済み）のリスト。pose のみの場合は None
         val_split: 検証用データの割合
-        model_name: モデル名
+        model_name: モデル名（"<backbone>_location"）
         batch_size: バッチサイズ
         num_workers: ワーカー数
         use_augmentation: データ拡張を使用するかどうか
+        grouped_image_paths: [[src1, src2, ...], ...] 各サンプルの入力画像パス
+        pose_targets: [[x, y, theta], ...] 各サンプルの座標・姿勢（map座標系[m], [rad]）
+        output_mode: 'class' / 'pose' / 'class_pose'
+        num_sources: 入力画像枚数
+        virtual_source_type: None / 'crop' / 'scale' / 'temporal'
+        include_heading: 姿勢(theta)をターゲットに含めるか
+        mask_polygon: 車両マスク（正規化座標ポリゴン）
+        pose_norm: 座標正規化の min/max（None のとき pose_targets から算出）
+        downscale_factor: 解像度スライダーの係数（1.0 = フル解像度）
+        downscale_mode: 'resize'（入力サイズ自体を縮小）/ 'pixelate'（サイズは維持し内容を劣化）
+        input_size: 学習入力サイズ (H, W) の明示指定。None なら実画像サイズを使う
+        grid_cell_size: 格子分類（output_mode に 'grid' を含む）のセル一辺 [m]
+        grid_config: 格子定義の明示指定（None なら pose_targets から算出）
 
     Returns:
         トレーニング用DataLoader, 検証用DataLoader, データセット情報
     """
-    if image_paths is None or location_labels is None or len(image_paths) == 0 or len(location_labels) == 0:
-        raise ValueError("有効な画像パスと位置ラベルが必要です。")
+    from model_catalog import PixelateTransform
 
-    # 入力サイズを取得
-    sample_img = Image.open(image_paths[0]).convert('RGB')
-    actual_size = (sample_img.height, sample_img.width)
-    print(f"実際の画像サイズ: {actual_size}")
+    legacy_mode = grouped_image_paths is None and output_mode == 'class' and num_sources == 1
+    if legacy_mode:
+        if image_paths is None or location_labels is None or len(image_paths) == 0 or len(location_labels) == 0:
+            raise ValueError("有効な画像パスと位置ラベルが必要です。")
 
-    # モデルから前処理を取得
-    model = get_model(model_name, pretrained=False, input_size=actual_size)
-    base_transform = model.get_preprocess()
+        # 入力サイズ: 実画像サイズ（解像度設定に応じて縮小 / ピクセレーション）
+        sample_img = Image.open(image_paths[0]).convert('RGB')
+        raw_size = (sample_img.height, sample_img.width)
+        actual_size, pixelate_factor = resolve_location_input_size(
+            raw_size, downscale_factor, downscale_mode, input_size)
+        print(f"実際の画像サイズ: {raw_size} / 学習入力サイズ: {actual_size}"
+              + (f" / pixelate x{pixelate_factor:.2f}" if pixelate_factor else ""))
 
-    # データ拡張
+        # データ拡張
+        head_ops = [PixelateTransform(pixelate_factor)] if pixelate_factor else []
+        if use_augmentation:
+            transform = transforms.Compose(head_ops + [
+                transforms.Resize(actual_size),
+                transforms.ToTensor(),
+                transforms.RandomHorizontalFlip(),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+                transforms.RandomAffine(degrees=5, translate=(0.1, 0.1)),
+                transforms.RandomErasing(p=0.5, scale=(0.02, 0.2))
+            ])
+        else:
+            transform = transforms.Compose(head_ops + [
+                transforms.Resize(actual_size),
+                transforms.ToTensor()
+            ])
+
+        dataset = LocationClassificationDataset(image_paths, location_labels, transform=transform)
+        val_size = int(len(dataset) * val_split)
+        train_size = len(dataset) - val_size
+        train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+        num_classes = len(set(location_labels))
+        dataset_info = {
+            'total_samples': len(dataset),
+            'train_samples': len(train_dataset),
+            'val_samples': len(val_dataset),
+            'batch_size': batch_size,
+            'num_classes': num_classes,
+            'use_augmentation': use_augmentation,
+            'actual_image_size': actual_size,
+            'raw_image_size': raw_size,
+            'downscale_factor': downscale_factor,
+            'downscale_mode': downscale_mode,
+            'output_mode': 'class',
+            'num_sources': 1,
+            'virtual_source_type': None,
+            'pose_dim': 0,
+            'pose_norm': None,
+            'include_heading': False,
+        }
+        return train_loader, val_loader, dataset_info
+
+    # --- 複数画像入力 / 座標・姿勢出力 / 格子分類 ---
+    from model_catalog import (location_heads, normalize_pose_targets, make_grid_config,
+                               grid_cell_index)
+    heads = location_heads(output_mode)   # 不正な output_mode はここで ValueError
+    if grouped_image_paths is None:
+        if not image_paths:
+            raise ValueError("有効な画像パスが必要です。")
+        grouped_image_paths = [[p] for p in image_paths]
+    if len(grouped_image_paths) == 0:
+        raise ValueError("有効な学習サンプルがありません。")
+
+    use_class = 'class' in heads
+    use_pose = 'pose' in heads
+    use_grid = 'grid' in heads
+    if use_class and (location_labels is None or len(location_labels) != len(grouped_image_paths)):
+        raise ValueError("クラス分類には全サンプル分の位置ラベルが必要です。")
+    if (use_pose or use_grid) and (pose_targets is None or len(pose_targets) != len(grouped_image_paths)):
+        raise ValueError("座標・姿勢回帰 / 格子分類には全サンプル分の pose ターゲットが必要です。")
+
+    # 入力サイズ: 実画像サイズ（解像度設定に応じて縮小 / ピクセレーション）。
+    # 自動運転モデルと同様に、このサイズでモデルを構築しチェックポイントに保存する
+    sample_img = Image.open(grouped_image_paths[0][0]).convert('RGB')
+    raw_size = (sample_img.height, sample_img.width)
+    input_size, pixelate_factor = resolve_location_input_size(
+        raw_size, downscale_factor, downscale_mode, input_size)
+    print(f"元画像サイズ: {raw_size} / 学習入力サイズ: {input_size}"
+          + (f" / pixelate x{pixelate_factor:.2f}" if pixelate_factor else ""))
+
+    # データ拡張（座標・姿勢回帰 / 格子分類では左右反転を使わない: 世界座標との対応が崩れるため）
     if use_augmentation:
-        transform = transforms.Compose([
-            transforms.Resize(actual_size),
-            transforms.ToTensor(),
-            transforms.RandomHorizontalFlip(),
+        aug_ops = [transforms.Resize(input_size), transforms.ToTensor()]
+        if not (use_pose or use_grid):
+            aug_ops.append(transforms.RandomHorizontalFlip())
+        aug_ops.extend([
             transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-            transforms.RandomAffine(degrees=5, translate=(0.1, 0.1)),
-            transforms.RandomErasing(p=0.5, scale=(0.02, 0.2))
+            transforms.RandomAffine(degrees=3, translate=(0.05, 0.05)),
+            transforms.RandomErasing(p=0.5, scale=(0.02, 0.2)),
         ])
+        transform = transforms.Compose(aug_ops)
     else:
-        transform = transforms.Compose([
-            transforms.Resize(actual_size),
-            transforms.ToTensor()
-        ])
+        transform = transforms.Compose([transforms.Resize(input_size), transforms.ToTensor()])
 
-    # データセット作成
-    dataset = LocationClassificationDataset(image_paths, location_labels, transform=transform)
+    pose_vectors = None
+    pose_dim = 0
+    if use_pose:
+        if pose_norm is None:
+            pose_norm = compute_pose_norm(pose_targets)
+        pose_vectors = normalize_pose_targets(pose_targets, pose_norm, include_heading=include_heading)
+        pose_dim = int(pose_vectors.shape[1])
+    else:
+        pose_norm = None
+        include_heading = False
 
-    # データ分割
+    # 格子分類: x, y を格子セル index に離散化（格子定義は学習データの範囲から作る）
+    grid_labels = None
+    grid_xy = None
+    if use_grid:
+        if grid_config is None:
+            grid_config = make_grid_config(pose_targets, cell_size=grid_cell_size)
+        grid_labels = [grid_cell_index(p[0], p[1], grid_config) for p in pose_targets]
+        grid_xy = [[float(p[0]), float(p[1])] for p in pose_targets]
+        print(f"格子分類: セル {grid_config['cell_size']}m x {grid_config['nx']}x{grid_config['ny']}"
+              f" = {grid_config['num_cells']}セル（サンプルのあるセル: {len(grid_config.get('occupied', {}))}）")
+    else:
+        grid_config = None
+
+    dataset = LocationMultiSourceDataset(
+        grouped_image_paths,
+        class_labels=list(location_labels) if use_class else None,
+        pose_vectors=pose_vectors,
+        num_sources=num_sources,
+        virtual_source_type=virtual_source_type,
+        transform=transform,
+        mask_polygon=mask_polygon,
+        pixelate_factor=pixelate_factor,
+        grid_labels=grid_labels,
+        grid_xy=grid_xy,
+    )
+
     val_size = int(len(dataset) * val_split)
     train_size = len(dataset) - val_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-
-    # DataLoader作成
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-
-    # ユニークなクラス数を取得
-    num_classes = len(set(location_labels))
 
     dataset_info = {
         'total_samples': len(dataset),
         'train_samples': len(train_dataset),
         'val_samples': len(val_dataset),
         'batch_size': batch_size,
-        'num_classes': num_classes,
+        'num_classes': len(set(location_labels)) if use_class else 0,
         'use_augmentation': use_augmentation,
-        'actual_image_size': actual_size
+        'actual_image_size': input_size,
+        'raw_image_size': raw_size,
+        'downscale_factor': downscale_factor,
+        'downscale_mode': downscale_mode,
+        'output_mode': output_mode,
+        'num_sources': num_sources,
+        'virtual_source_type': virtual_source_type,
+        'pose_dim': pose_dim,
+        'pose_norm': pose_norm,
+        'include_heading': include_heading,
+        'grid_config': grid_config,
+        'num_grid_classes': int(grid_config['num_cells']) if grid_config else 0,
     }
-
     return train_loader, val_loader, dataset_info
+
+
+def _unpack_location_batch(batch):
+    """位置データセットのバッチを
+    (inputs, class_targets|None, pose_targets|None, grid_targets|None, grid_xy|None) に分解"""
+    if len(batch) == 2:
+        return batch[0], batch[1], None, None, None
+    inputs, cls_t, pose_t = batch[0], batch[1], batch[2]
+    grid_t = batch[3] if len(batch) > 3 else None
+    grid_xy = batch[4] if len(batch) > 4 else None
+    if pose_t is not None and pose_t.dim() == 2 and pose_t.shape[1] == 0:
+        pose_t = None
+    if cls_t is not None and (cls_t < 0).all():
+        cls_t = None
+    if grid_t is not None and (grid_t < 0).all():
+        grid_t = None
+    if grid_xy is not None and grid_xy.dim() == 2 and grid_xy.shape[1] == 0:
+        grid_xy = None
+    return inputs, cls_t, pose_t, grid_t, grid_xy
+
 
 def train_location_model(
     model_name: str,
@@ -1981,12 +2394,25 @@ def train_location_model(
     min_delta: float = 0.0001,
     optimizer_name: str = 'Adam',
     scheduler_name: str = 'ReduceLROnPlateau',
-    custom_model_name: Optional[str] = None
+    custom_model_name: Optional[str] = None,
+    num_sources: int = 1,
+    fusion_method: str = 'concat',
+    output_mode: str = 'class',
+    pose_dim: int = 4,
+    pose_loss_weight: float = 1.0,
+    location_config: Optional[Dict[str, Any]] = None,
+    input_size: Optional[Tuple[int, int]] = None,
+    save_plot: bool = True,
+    num_grid_classes: int = 0,
+    grid_loss_weight: float = 1.0,
+    grid_top_n: int = 3,
+    grid_label_sigma: float = 1.0,
+    grid_class_balance: bool = True,
 ) -> Dict[str, Any]:
-    """位置分類モデルをトレーニングする
+    """位置推論モデルをトレーニングする（クラス分類 / 座標・姿勢回帰 / 両方）
 
     Args:
-        model_name: トレーニングするモデル名
+        model_name: トレーニングするモデル名（"<backbone>_location"）
         train_loader: トレーニングデータローダー
         val_loader: 検証用データローダー
         num_classes: クラス数
@@ -2000,65 +2426,142 @@ def train_location_model(
         model_path: 特定のモデルファイルから重みをロードする場合のパス
         use_early_stopping: Early Stoppingを使用するかどうか
         patience: Early Stoppingの忍耐値
-        min_delta: Early Stoppingの最小改善量（この値以上の改善がないと改善とみなさない）
+        min_delta: Early Stoppingの最小改善量
+        optimizer_name / scheduler_name: 最適化アルゴリズム / 学習率スケジューラ
+        custom_model_name: 保存ファイル名（Noneなら model_name）
+        num_sources: 入力画像枚数（1 = 従来の単一画像入力）
+        fusion_method: 複数入力時の特徴融合 'concat' / 'attention'
+        output_mode: 出力ヘッドの組合せ。'class'（クラス分類）/ 'pose'（座標・姿勢回帰）/
+                     'grid'（格子分類）を '_' で連結（例: 'class_pose', 'pose_grid'）
+        pose_dim: 座標・姿勢出力の次元（x, y, cos, sin = 4 / x, y = 2）
+        pose_loss_weight: 複合損失における座標・姿勢損失の重み
+        location_config: チェックポイントへ保存する入出力構成（pose_norm, grid_config,
+                         selected_sources 等）
+        input_size: donkey_location の入力サイズ
+        save_plot: 学習曲線PNGを save_dir に保存するか
+        num_grid_classes: 格子分類のセル数（location_config['grid_config'] と対応）
+        grid_loss_weight: 複合損失における格子分類損失の重み
+        grid_top_n: 格子分類の評価で重み付き位置に使う上位セル数
+        grid_label_sigma: 格子ラベルの平滑化幅（セル単位）。真値座標を中心とするガウス分布で
+                          近傍セルにも確率を配る（0 で従来の one-hot）。空間構造を学びやすくし、
+                          Top-N の重み付き平均が意味を持つようにする
+        grid_class_balance: サンプル数の多いセル（停車中など）へ予測が偏らないよう、
+                            真値セルの出現頻度の逆数（平方根）で損失を重み付けする
 
     Returns:
         トレーニング結果の辞書
     """
+    from model_catalog import (MultiSourceLocationModel, create_multi_source_location_model,
+                               split_location_outputs, pose_errors, location_heads,
+                               grid_position_errors)
+
     # デバイスの設定
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+
+    heads = location_heads(output_mode)
+    use_class = 'class' in heads
+    use_pose = 'pose' in heads
+    use_grid = 'grid' in heads
+    location_config = dict(location_config or {})
+    pose_norm = location_config.get('pose_norm')
+    include_heading = bool(location_config.get('include_heading', pose_dim >= 4))
+    grid_config = location_config.get('grid_config')
+    if use_pose and not pose_norm:
+        raise ValueError("座標・姿勢回帰には location_config['pose_norm'] が必要です。")
+    if use_grid:
+        if not grid_config:
+            raise ValueError("格子分類には location_config['grid_config'] が必要です。")
+        num_grid_classes = int(num_grid_classes or grid_config.get('num_cells') or 0)
+
     # モデルのロード
     if progress_callback:
         progress_callback(0, num_epochs, "モデルをロード中...")
-    
-    # モデルを初期化（クラス数を引数に追加）
-    if 'donkey_location' in model_name:
-        model = get_model(model_name, pretrained=pretrained)
-        model.classifier = nn.Linear(50, num_classes)  # 出力層を置き換え
-    elif '_location' in model_name:
-        # TIMMバックボーン系の位置モデル（resnet18_location含む）は
-        # 共通してregressorヘッドを持つため、クラス数に合わせて置き換える
-        model = get_model(model_name, pretrained=pretrained)
-        if hasattr(model, 'regressor'):
-            in_features = model.regressor.in_features if hasattr(model.regressor, 'in_features') else model.regressor[0].in_features
-            model.regressor = nn.Linear(in_features, num_classes)
+
+    # input_size が未指定ならデータローダーから推定（自動運転モデルと同じ）
+    if input_size is None:
+        try:
+            sample_batch = next(iter(train_loader))
+            input_size = (int(sample_batch[0].shape[2]), int(sample_batch[0].shape[3]))
+            print(f"データローダーから入力サイズを推定: {input_size}")
+        except Exception as e:
+            print(f"入力サイズの推定に失敗（既定サイズを使用）: {e}")
+
+    legacy_model = (output_mode == 'class' and num_sources == 1)
+    if legacy_model:
+        # 従来どおりの単一画像・クラス分類モデル（チェックポイント形式も従来互換）。
+        # input_size を渡して実画像サイズ（縮小サイズ）で構築する
+        from model_catalog import create_location_model
+        model = create_location_model(model_name, num_classes=num_classes,
+                                      pretrained=pretrained, input_size=input_size)
     else:
-        # その他のモデル対応
-        model = get_model(model_name, pretrained=pretrained)
-    
+        model = create_multi_source_location_model(
+            base_model_name=model_name, num_sources=num_sources, fusion_method=fusion_method,
+            num_classes=num_classes, output_mode=output_mode, pose_dim=pose_dim,
+            pretrained=pretrained, input_size=input_size,
+            num_grid_classes=num_grid_classes if use_grid else 0)
+
     # 特定のモデルファイルから重みをロードする場合
+    loaded_weights = False
     if model_path and os.path.exists(model_path):
         if progress_callback:
             progress_callback(0, num_epochs, f"保存済みモデル '{os.path.basename(model_path)}' から重みをロード中...")
-        
         try:
-            # モデルチェックポイントをロード
-            checkpoint = torch.load(model_path, map_location=device)
-            
-            # state_dictがあるかチェック
-            if 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
-                print(f"モデル重みを '{model_path}' からロードしました")
-            else:
-                # 直接state_dictが保存されている場合
-                model.load_state_dict(checkpoint)
-                print(f"モデル重みを '{model_path}' からロードしました")
-                
+            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+            state = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+            missing, unexpected = model.load_state_dict(state, strict=False)
+            loaded_weights = True
+            print(f"モデル重みを '{model_path}' からロードしました"
+                  f"（未ロード: {len(missing)}, 不一致: {len(unexpected)}）")
         except Exception as e:
             print(f"モデル重みのロードに失敗しました: {e}")
             print("事前学習済みモデルまたはランダム初期化を使用します")
-    
+
     model = model.to(device)
+    model_input_size = tuple(model.input_size) if hasattr(model, 'input_size') else input_size
+    print(f"Model input size: {model_input_size}")
 
     # 損失関数
-    criterion = nn.CrossEntropyLoss()
+    class_criterion = nn.CrossEntropyLoss()
+
+    # 格子分類の損失: 近傍セルへ平滑化したソフトラベル ＋ セル頻度による重み付け。
+    # 停車区間などで特定セルにフレームが集中すると、one-hot + 単純CE では
+    # 「どのフレームでも最頻セルを予測する」崩れが起きやすいため。
+    grid_cell_centers = None
+    grid_sample_weights = None
+    if use_grid:
+        from model_catalog import grid_cell_center
+        centers = [grid_cell_center(c, grid_config) for c in range(num_grid_classes)]
+        grid_cell_centers = torch.tensor(centers, dtype=torch.float, device=device)   # [C, 2]
+        if grid_class_balance:
+            counts = torch.ones(num_grid_classes, dtype=torch.float)
+            for c, n in (grid_config.get('occupied') or {}).items():
+                if 0 <= int(c) < num_grid_classes:
+                    counts[int(c)] = float(n)
+            w = 1.0 / torch.sqrt(counts)
+            occupied_mask = counts > 1.0
+            if occupied_mask.any():
+                w = w / w[occupied_mask].mean()   # 出現セルの平均が 1 になるよう正規化
+            grid_sample_weights = w.to(device)
+
+    def grid_loss_fn(grid_out, grid_t, grid_xy):
+        """格子分類の損失（ソフトラベル・頻度重み付き。grid_xy が無ければ通常の CE）"""
+        log_p = torch.log_softmax(grid_out, dim=1)
+        if grid_xy is not None and grid_label_sigma > 0 and grid_cell_centers is not None:
+            sigma = float(grid_label_sigma) * float(grid_config['cell_size'])
+            d2 = ((grid_xy.to(device)[:, None, :] - grid_cell_centers[None, :, :]) ** 2).sum(-1)
+            target = torch.softmax(-d2 / (2.0 * sigma * sigma), dim=1)          # [B, C]
+            per_sample = -(target * log_p).sum(1)
+        else:
+            per_sample = -log_p.gather(1, grid_t[:, None]).squeeze(1)
+        if grid_sample_weights is not None:
+            w = grid_sample_weights[grid_t]
+            return (per_sample * w).sum() / w.sum().clamp_min(1e-6)
+        return per_sample.mean()
+    pose_criterion = nn.SmoothL1Loss()
 
     # 最適化アルゴリズムの選択
-    if optimizer_name == 'Adam':
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    elif optimizer_name == 'AdamW':
+    if optimizer_name == 'AdamW':
         optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     elif optimizer_name == 'SGD':
         optimizer = optim.SGD(model.parameters(), lr=learning_rate, weight_decay=weight_decay, momentum=0.9)
@@ -2075,338 +2578,449 @@ def train_location_model(
     else:
         scheduler = None
 
-    # トレーニングループ
-    train_losses = []
-    val_losses = []
-    train_accuracies = []
-    val_accuracies = []
-    best_val_loss = float('inf')
-    best_val_acc = 0.0
-
-    # Early Stopping用の変数
-    early_stopping_counter = 0
-    early_stopped = False
-    stopped_epoch = 0
-
-    # キャンセル用の変数
-    cancelled = False
-
-    # 保存ディレクトリの作成
-    os.makedirs(save_dir, exist_ok=True)
-
-    # ファイル名に使用する名前を決定（カスタム名が指定されていればそれを使用）
-    save_name = custom_model_name if custom_model_name else model_name
-
-    # タイムスタンプを使用してファイル名を生成
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_path = os.path.join(save_dir, f'{save_name}.pth')
-    best_model_path = os.path.join(save_dir, f'{save_name}_best.pth')
-
-    # 時間計測用の変数
-    training_start_time = time.time()
-    epoch_times = []
-
-    completed_epochs = 0
-    for epoch in range(num_epochs):
-        epoch_start_time = time.time()
-
-        # 進捗コールバック - エポック開始（統一フォーマット）
-        if progress_callback:
-            elapsed_time = time.time() - training_start_time
-
-            # エポック開始メッセージ
-            message = create_unified_progress_message(
-                epoch=epoch,
-                num_epochs=num_epochs,
-                elapsed_time=elapsed_time,
-                epoch_times=epoch_times if epoch > 0 else None,
-                is_epoch_start=True
-            )
-
-            should_continue = progress_callback(epoch, num_epochs, message)
-            if not should_continue:
-                cancelled = True
-                break
-
-        # キャンセルされた場合はエポックループを抜ける
-        if cancelled:
-            break
-
-        model.train()
-        epoch_loss = 0.0
+    def run_epoch(loader, train: bool):
+        """1エポック分の学習または検証を実行し、統計を返す"""
+        nonlocal cancelled
+        model.train(train)
+        total_loss = 0.0
+        n_samples = 0
         correct = 0
-        total = 0
-        
-        # トレーニングステップ
-        for i, (inputs, targets) in enumerate(train_loader):
-            inputs, targets = inputs.to(device), targets.to(device)
-            
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
-            
-            # 統計情報を更新
-            epoch_loss += loss.item() * inputs.size(0)
-            _, predicted = torch.max(outputs, 1)
-            total += targets.size(0)
-            correct += (predicted == targets).sum().item()
-            
-            # バッチごとの進捗コールバック（10%ごと）
-            if progress_callback and (i % max(1, len(train_loader) // 10) == 0):
-                batch_progress = i / len(train_loader)
+        n_class = 0
+        pos_err_sum = 0.0
+        head_err_sum = 0.0
+        n_pose = 0
+        grid_correct = 0
+        grid_err1_sum = 0.0
+        grid_errw_sum = 0.0
+        n_grid = 0
+        for i, batch in enumerate(loader):
+            inputs, cls_t, pose_t, grid_t, grid_xy = _unpack_location_batch(batch)
+            inputs = inputs.to(device)
+            if cls_t is not None:
+                cls_t = cls_t.to(device)
+            if pose_t is not None:
+                pose_t = pose_t.to(device)
+            if grid_t is not None:
+                grid_t = grid_t.to(device)
+
+            with torch.set_grad_enabled(train):
+                outputs = model(inputs)
+                logits, pose_out, grid_out = split_location_outputs(outputs, output_mode)
+                loss = torch.zeros((), device=device)
+                if logits is not None and cls_t is not None:
+                    loss = loss + class_criterion(logits, cls_t)
+                if pose_out is not None and pose_t is not None:
+                    loss = loss + pose_loss_weight * pose_criterion(pose_out, pose_t)
+                if grid_out is not None and grid_t is not None:
+                    loss = loss + grid_loss_weight * grid_loss_fn(grid_out, grid_t, grid_xy)
+                if train:
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+            bs = inputs.size(0)
+            total_loss += loss.item() * bs
+            n_samples += bs
+            if logits is not None and cls_t is not None:
+                _, predicted = torch.max(logits, 1)
+                correct += (predicted == cls_t).sum().item()
+                n_class += bs
+            if pose_out is not None and pose_t is not None:
+                p_err, h_err = pose_errors(pose_out.detach().cpu().numpy(), pose_t.cpu().numpy(),
+                                           pose_norm, include_heading=include_heading)
+                pos_err_sum += float(p_err.sum())
+                if h_err is not None:
+                    head_err_sum += float(np.degrees(h_err).sum())
+                n_pose += bs
+            if grid_out is not None and grid_t is not None:
+                _, g_pred = torch.max(grid_out, 1)
+                grid_correct += (g_pred == grid_t).sum().item()
+                if grid_xy is not None:
+                    g_probs = torch.softmax(grid_out.detach(), dim=1).cpu().numpy()
+                    e1, ew = grid_position_errors(g_probs, grid_xy.cpu().numpy(), grid_config,
+                                                  top_n=grid_top_n)
+                    grid_err1_sum += float(e1.sum())
+                    grid_errw_sum += float(ew.sum())
+                n_grid += bs
+
+            # バッチごとの進捗コールバック（学習時のみ、10%ごと）
+            if train and progress_callback and (i % max(1, len(loader) // 10) == 0):
+                batch_progress = i / len(loader)
                 total_progress = (epoch + batch_progress) / num_epochs
-                
-                elapsed_time = time.time() - training_start_time
-                
-                # 統一フォーマットでバッチ進捗メッセージを作成
                 message = create_unified_progress_message(
-                    epoch=epoch,
-                    num_epochs=num_epochs,
-                    elapsed_time=elapsed_time,
-                    epoch_times=epoch_times,
-                    batch_info=(i, len(train_loader)),
-                    current_loss=loss.item()
-                )
-                
-                should_continue = progress_callback(int(total_progress * num_epochs), num_epochs, message)
-                if not should_continue:
+                    epoch=epoch, num_epochs=num_epochs,
+                    elapsed_time=time.time() - training_start_time,
+                    epoch_times=epoch_times, batch_info=(i, len(loader)),
+                    current_loss=loss.item())
+                if not progress_callback(int(total_progress * num_epochs), num_epochs, message):
                     cancelled = True
                     break
 
-        # バッチレベルでキャンセルされた場合はエポックループを抜ける
+        return {
+            'loss': total_loss / max(1, n_samples),
+            'accuracy': 100.0 * correct / n_class if n_class else 0.0,
+            'pos_error': pos_err_sum / n_pose if n_pose else 0.0,
+            'heading_error': head_err_sum / n_pose if (n_pose and include_heading) else 0.0,
+            'grid_accuracy': 100.0 * grid_correct / n_grid if n_grid else 0.0,
+            'grid_error': grid_err1_sum / n_grid if n_grid else 0.0,          # Top1 セル中心の位置誤差[m]
+            'grid_weighted_error': grid_errw_sum / n_grid if n_grid else 0.0, # Top-N 重み付き位置誤差[m]
+        }
+
+    # トレーニングループ
+    train_losses, val_losses = [], []
+    train_accuracies, val_accuracies = [], []
+    train_pos_errors, val_pos_errors = [], []
+    train_heading_errors, val_heading_errors = [], []
+    train_grid_accuracies, val_grid_accuracies = [], []
+    train_grid_errors, val_grid_errors = [], []
+    val_grid_weighted_errors = []
+    best_val_loss = float('inf')
+    best_val_acc = 0.0
+    best_val_pos_error = None
+    best_val_heading_error = None
+    best_val_grid_acc = None
+    best_val_grid_error = None
+    best_val_grid_weighted_error = None
+
+    early_stopping_counter = 0
+    early_stopped = False
+    stopped_epoch = 0
+    cancelled = False
+
+    os.makedirs(save_dir, exist_ok=True)
+    save_name = custom_model_name if custom_model_name else model_name
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    final_model_path = os.path.join(save_dir, f'{save_name}.pth')
+    best_model_path = os.path.join(save_dir, f'{save_name}_best.pth')
+
+    # チェックポイントへ保存する入出力構成（新形式モデルのみ）
+    checkpoint_config = None
+    if isinstance(model, MultiSourceLocationModel):
+        checkpoint_config = dict(location_config)
+        checkpoint_config.update({
+            'base_model_name': model_name,
+            'num_sources': num_sources,
+            'fusion_method': fusion_method,
+            'output_mode': output_mode,
+            'num_classes': num_classes,
+            'pose_dim': pose_dim if use_pose else 0,
+            'include_heading': include_heading if use_pose else False,
+            'pose_norm': pose_norm if use_pose else None,
+            'input_size': list(model.input_size),
+            'grid_config': grid_config if use_grid else None,
+            'num_grid_classes': num_grid_classes if use_grid else 0,
+            'grid_label_sigma': float(grid_label_sigma) if use_grid else None,
+            'grid_class_balance': bool(grid_class_balance) if use_grid else None,
+        })
+
+    def build_checkpoint(epoch_value, extra):
+        ckpt = {
+            'epoch': epoch_value,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'num_classes': num_classes,
+            'output_mode': output_mode,
+            'num_sources': num_sources,
+            # 推論時に同じ入力サイズ / 解像度設定を再現するための情報（従来形式にも保存）
+            'input_size': list(model_input_size) if model_input_size else None,
+            'downscale_factor': location_config.get('downscale_factor', 1.0),
+            'downscale_mode': location_config.get('downscale_mode', 'resize'),
+        }
+        if checkpoint_config is not None:
+            ckpt['location_config'] = checkpoint_config
+        ckpt.update(extra)
+        return ckpt
+
+    training_start_time = time.time()
+    epoch_times = []
+    completed_epochs = 0
+
+    for epoch in range(num_epochs):
+        epoch_start_time = time.time()
+
+        if progress_callback:
+            message = create_unified_progress_message(
+                epoch=epoch, num_epochs=num_epochs,
+                elapsed_time=time.time() - training_start_time,
+                epoch_times=epoch_times if epoch > 0 else None, is_epoch_start=True)
+            if not progress_callback(epoch, num_epochs, message):
+                cancelled = True
+                break
+
+        train_stats = run_epoch(train_loader, train=True)
         if cancelled:
             break
+        val_stats = run_epoch(val_loader, train=False)
 
-        # エポック損失と精度の計算
-        epoch_loss /= len(train_loader.dataset)
-        epoch_accuracy = 100 * correct / total
-        train_losses.append(epoch_loss)
-        train_accuracies.append(epoch_accuracy)
-        
-        # 検証
-        model.eval()
-        val_loss = 0.0
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for inputs, targets in val_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                
-                # 統計情報を更新
-                val_loss += loss.item() * inputs.size(0)
-                _, predicted = torch.max(outputs, 1)
-                total += targets.size(0)
-                correct += (predicted == targets).sum().item()
-        
-        # 検証損失と精度の計算
-        val_loss /= len(val_loader.dataset)
-        val_accuracy = 100 * correct / total
-        val_losses.append(val_loss)
-        val_accuracies.append(val_accuracy)
+        train_losses.append(train_stats['loss'])
+        val_losses.append(val_stats['loss'])
+        train_accuracies.append(train_stats['accuracy'])
+        val_accuracies.append(val_stats['accuracy'])
+        train_pos_errors.append(train_stats['pos_error'])
+        val_pos_errors.append(val_stats['pos_error'])
+        train_heading_errors.append(train_stats['heading_error'])
+        val_heading_errors.append(val_stats['heading_error'])
+        train_grid_accuracies.append(train_stats['grid_accuracy'])
+        val_grid_accuracies.append(val_stats['grid_accuracy'])
+        train_grid_errors.append(train_stats['grid_error'])
+        val_grid_errors.append(val_stats['grid_error'])
+        val_grid_weighted_errors.append(val_stats['grid_weighted_error'])
 
-        # 学習率の調整
         if scheduler is not None:
             if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(val_loss)
+                scheduler.step(val_stats['loss'])
             else:
                 scheduler.step()
 
-        # エポックの完了をカウント
         completed_epochs = epoch + 1
-        
-        # 進捗コールバック - エポック終了
+        epoch_times.append(time.time() - epoch_start_time)
+
+        # エポック終了メッセージ
         if progress_callback:
-            message = f"エポック {epoch+1}/{num_epochs}, 学習損失: {epoch_loss:.4f}, 検証損失: {val_loss:.4f}, "
-            message += f"学習精度: {epoch_accuracy:.2f}%, 検証精度: {val_accuracy:.2f}%"
-            should_continue = progress_callback(epoch + 1, num_epochs, message)
-            if not should_continue:
+            message = (f"エポック {epoch+1}/{num_epochs}, 学習損失: {train_stats['loss']:.4f}, "
+                       f"検証損失: {val_stats['loss']:.4f}")
+            if use_class:
+                message += f", 学習精度: {train_stats['accuracy']:.2f}%, 検証精度: {val_stats['accuracy']:.2f}%"
+            if use_pose:
+                message += f", 検証位置誤差: {val_stats['pos_error']:.3f}m"
+                if include_heading:
+                    message += f", 検証方位誤差: {val_stats['heading_error']:.1f}°"
+            if use_grid:
+                message += (f", 格子精度: {val_stats['grid_accuracy']:.1f}%"
+                            f", 格子Top1誤差: {val_stats['grid_error']:.3f}m"
+                            f", Top{grid_top_n}重み付き: {val_stats['grid_weighted_error']:.3f}m")
+            if not progress_callback(epoch + 1, num_epochs, message):
+                cancelled = True
                 break
-        
+
         # 最良モデルの保存（min_deltaを考慮した改善判定）
+        val_loss = val_stats['loss']
+        val_accuracy = val_stats['accuracy']
         improved = val_loss < best_val_loss - min_delta
         if val_loss < best_val_loss:
             best_val_loss = val_loss
 
         if improved:
-            early_stopping_counter = 0  # カウンタをリセット
-
-            # 最良精度も更新
+            early_stopping_counter = 0
             if val_accuracy > best_val_acc:
                 best_val_acc = val_accuracy
-
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': best_val_loss,
-                'accuracy': best_val_acc,
-                'num_classes': num_classes
-            }, best_model_path)
-
+            best_val_pos_error = val_stats['pos_error'] if use_pose else None
+            best_val_heading_error = val_stats['heading_error'] if (use_pose and include_heading) else None
+            best_val_grid_acc = val_stats['grid_accuracy'] if use_grid else None
+            best_val_grid_error = val_stats['grid_error'] if use_grid else None
+            best_val_grid_weighted_error = val_stats['grid_weighted_error'] if use_grid else None
+            torch.save(build_checkpoint(epoch, {
+                'loss': best_val_loss, 'accuracy': best_val_acc,
+                'pos_error': best_val_pos_error, 'heading_error': best_val_heading_error,
+            }), best_model_path)
             if progress_callback:
                 progress_callback(epoch + 1, num_epochs,
-                                f"エポック {epoch+1}/{num_epochs}: 新しい最良モデルを保存しました"
-                                f"（損失: {best_val_loss:.6f}, 精度: {best_val_acc:.2f}%）")
-        # 検証精度のみ改善した場合
-        elif val_accuracy > best_val_acc:
+                                  f"エポック {epoch+1}/{num_epochs}: 新しい最良モデルを保存しました"
+                                  f"（損失: {best_val_loss:.6f}）")
+        elif use_class and val_accuracy > best_val_acc:
+            # 検証精度のみ改善した場合も保存
             best_val_acc = val_accuracy
-            early_stopping_counter = 0  # 精度が改善した場合もカウンタをリセット
-
-            # 精度が改善した場合も保存
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': val_loss,
-                'accuracy': best_val_acc,
-                'num_classes': num_classes
-            }, best_model_path)
-
+            early_stopping_counter = 0
+            torch.save(build_checkpoint(epoch, {
+                'loss': val_loss, 'accuracy': best_val_acc,
+                'pos_error': val_stats['pos_error'] if use_pose else None,
+                'heading_error': val_stats['heading_error'] if (use_pose and include_heading) else None,
+            }), best_model_path)
             if progress_callback:
                 progress_callback(epoch + 1, num_epochs,
-                                f"エポック {epoch+1}/{num_epochs}: 新しい最良精度を保存しました"
-                                f"（精度: {best_val_acc:.2f}%, 損失: {val_loss:.6f}）")
+                                  f"エポック {epoch+1}/{num_epochs}: 新しい最良精度を保存しました"
+                                  f"（精度: {best_val_acc:.2f}%, 損失: {val_loss:.6f}）")
         else:
-            # 検証損失・精度ともに改善しなかった場合
             if use_early_stopping:
                 early_stopping_counter += 1
                 if progress_callback:
                     progress_callback(epoch + 1, num_epochs,
-                                    f"エポック {epoch+1}/{num_epochs}: 検証損失が改善しませんでした"
-                                    f"（カウンタ: {early_stopping_counter}/{patience}）")
-
-                # Early Stoppingの判定
+                                      f"エポック {epoch+1}/{num_epochs}: 検証損失が改善しませんでした"
+                                      f"（カウンタ: {early_stopping_counter}/{patience}）")
                 if early_stopping_counter >= patience:
                     if progress_callback:
                         progress_callback(epoch + 1, num_epochs,
-                                        f"エポック {epoch+1}/{num_epochs}: Early Stoppingにより"
-                                        f"トレーニングを終了します")
+                                          f"エポック {epoch+1}/{num_epochs}: Early Stoppingにより"
+                                          f"トレーニングを終了します")
                     early_stopped = True
                     stopped_epoch = epoch + 1
                     break
-    
-    # 学習時間を計算
+
     total_training_time = time.time() - training_start_time
     avg_epoch_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0
 
-    # キャンセルされた場合の処理
-    if cancelled:
-        print("学習がキャンセルされました")
-        training_results = {
-            'model_name': model_name,
-            'train_losses': train_losses,
-            'val_losses': val_losses,
-            'train_accuracies': train_accuracies,
-            'val_accuracies': val_accuracies,
-            'best_val_loss': best_val_loss,
-            'best_val_acc': best_val_acc,
-            'model_path': None,
-            'best_model_path': best_model_path if os.path.exists(best_model_path) else None,
-            'num_epochs': num_epochs,
-            'completed_epochs': completed_epochs,
-            'learning_rate': learning_rate,
-            'weight_decay': weight_decay,
-            'pretrained': pretrained,
-            'loaded_weights': False,
-            'early_stopped': False,
-            'stopped_epoch': completed_epochs,
-            'patience': patience if use_early_stopping else 0,
-            'num_classes': num_classes,
-            'total_training_time': total_training_time,
-            'avg_epoch_time': avg_epoch_time,
-            'epoch_times': epoch_times,
-            'cancelled': True
-        }
-        return training_results
-
-    # 最終モデルの保存
-    torch.save({
-        'epoch': completed_epochs,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'train_accuracies': train_accuracies,
-        'val_accuracies': val_accuracies,
-        'best_val_loss': best_val_loss,
-        'best_val_acc': best_val_acc,
-        'early_stopped': early_stopped,
-        'stopped_epoch': stopped_epoch if early_stopped else completed_epochs,
-        'num_classes': num_classes
-    }, model_path)
-
-    # トレーニング結果
     training_results = {
         'model_name': model_name,
+        'output_mode': output_mode,
+        'num_sources': num_sources,
+        'fusion_method': fusion_method if num_sources > 1 else None,
         'train_losses': train_losses,
         'val_losses': val_losses,
         'train_accuracies': train_accuracies,
         'val_accuracies': val_accuracies,
+        'train_pos_errors': train_pos_errors,
+        'val_pos_errors': val_pos_errors,
+        'train_heading_errors': train_heading_errors,
+        'val_heading_errors': val_heading_errors,
         'best_val_loss': best_val_loss,
         'best_val_acc': best_val_acc,
-        'model_path': model_path,
-        'best_model_path': best_model_path,
+        'best_val_pos_error': best_val_pos_error,
+        'best_val_heading_error': best_val_heading_error,
+        'train_grid_accuracies': train_grid_accuracies,
+        'val_grid_accuracies': val_grid_accuracies,
+        'train_grid_errors': train_grid_errors,
+        'val_grid_errors': val_grid_errors,
+        'val_grid_weighted_errors': val_grid_weighted_errors,
+        'best_val_grid_acc': best_val_grid_acc,
+        'best_val_grid_error': best_val_grid_error,
+        'best_val_grid_weighted_error': best_val_grid_weighted_error,
+        'grid_config': grid_config if use_grid else None,
+        'grid_top_n': grid_top_n,
+        'model_path': None,
+        'best_model_path': best_model_path if os.path.exists(best_model_path) else None,
         'num_epochs': num_epochs,
         'completed_epochs': completed_epochs,
         'learning_rate': learning_rate,
         'weight_decay': weight_decay,
         'pretrained': pretrained,
-        'loaded_weights': model_path is not None and os.path.exists(model_path),
+        'loaded_weights': loaded_weights,
         'early_stopped': early_stopped,
         'stopped_epoch': stopped_epoch if early_stopped else completed_epochs,
         'patience': patience if use_early_stopping else 0,
         'num_classes': num_classes,
+        'pose_norm': pose_norm if use_pose else None,
         'total_training_time': total_training_time,
         'avg_epoch_time': avg_epoch_time,
         'epoch_times': epoch_times,
-        'cancelled': False
+        'cancelled': cancelled,
     }
 
+    if cancelled:
+        print("学習がキャンセルされました")
+        training_results['early_stopped'] = False
+        training_results['stopped_epoch'] = completed_epochs
+        return training_results
+
+    # 最終モデルの保存
+    torch.save(build_checkpoint(completed_epochs, {
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'train_accuracies': train_accuracies,
+        'val_accuracies': val_accuracies,
+        'train_pos_errors': train_pos_errors,
+        'val_pos_errors': val_pos_errors,
+        'best_val_loss': best_val_loss,
+        'best_val_acc': best_val_acc,
+        'early_stopped': early_stopped,
+        'stopped_epoch': stopped_epoch if early_stopped else completed_epochs,
+    }), final_model_path)
+    training_results['model_path'] = final_model_path
+    training_results['best_model_path'] = best_model_path
+
     # トレーニング結果の可視化
-    plot_location_training_results(training_results, save_dir, timestamp)
+    if save_plot:
+        try:
+            plot_location_training_results(training_results, save_dir, timestamp)
+        except Exception as e:
+            print(f"学習曲線の保存に失敗しました: {e}")
 
     return training_results
 
+
 def plot_location_training_results(results, save_dir, timestamp):
-    """位置分類モデルのトレーニング結果をプロットする
+    """位置推論モデルのトレーニング結果をプロットする
+
+    損失に加え、クラス分類なら精度、座標・姿勢回帰なら位置誤差[m]（と方位誤差[deg]）
+    をプロットする。
 
     Args:
         results: トレーニング結果の辞書
         save_dir: プロット保存ディレクトリ
         timestamp: タイムスタンプ
     """
-    # 2x1のサブプロットを作成（損失と精度）
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
-    
+    output_mode = results.get('output_mode', 'class')
+    heads = str(output_mode).split('_')
+    use_class = 'class' in heads
+    use_pose = 'pose' in heads
+    use_grid = 'grid' in heads and bool(results.get('val_grid_accuracies'))
+    has_heading = use_pose and any(v > 0 for v in results.get('val_heading_errors', []))
+
+    panels = 1 + int(use_class) + int(use_pose) + int(has_heading) + 2 * int(use_grid)
+    fig, axes = plt.subplots(panels, 1, figsize=(10, 4.5 * panels))
+    if panels == 1:
+        axes = [axes]
+    ax_iter = iter(axes)
+
     # 損失のプロット
-    ax1.plot(results['train_losses'], label='Training Loss')
-    ax1.plot(results['val_losses'], label='Validation Loss')
-    ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('Loss')
-    ax1.set_title(f"Training Losses: {results['model_name']}")
-    ax1.legend()
-    ax1.grid(True)
-    
+    ax = next(ax_iter)
+    ax.plot(results['train_losses'], label='Training Loss')
+    ax.plot(results['val_losses'], label='Validation Loss')
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.set_title(f"Training Losses: {results['model_name']}")
+    ax.legend()
+    ax.grid(True)
+
     # 精度のプロット
-    ax2.plot(results['train_accuracies'], label='Training Accuracy')
-    ax2.plot(results['val_accuracies'], label='Validation Accuracy')
-    ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('Accuracy (%)')
-    ax2.set_title(f"Training Accuracies: {results['model_name']}")
-    ax2.legend()
-    ax2.grid(True)
-    
-    # プロットの保存
+    if use_class:
+        ax = next(ax_iter)
+        ax.plot(results['train_accuracies'], label='Training Accuracy')
+        ax.plot(results['val_accuracies'], label='Validation Accuracy')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Accuracy (%)')
+        ax.set_title(f"Training Accuracies: {results['model_name']}")
+        ax.legend()
+        ax.grid(True)
+
+    # 位置誤差のプロット
+    if use_pose:
+        ax = next(ax_iter)
+        ax.plot(results.get('train_pos_errors', []), label='Training Position Error')
+        ax.plot(results.get('val_pos_errors', []), label='Validation Position Error')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Position Error (m)')
+        ax.set_title(f"Position Error: {results['model_name']}")
+        ax.legend()
+        ax.grid(True)
+
+    if has_heading:
+        ax = next(ax_iter)
+        ax.plot(results.get('train_heading_errors', []), label='Training Heading Error')
+        ax.plot(results.get('val_heading_errors', []), label='Validation Heading Error')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Heading Error (deg)')
+        ax.set_title(f"Heading Error: {results['model_name']}")
+        ax.legend()
+        ax.grid(True)
+
+    # 格子分類: セル精度と、Top1 セル中心 / Top-N 重み付き座標の位置誤差
+    if use_grid:
+        ax = next(ax_iter)
+        ax.plot(results.get('train_grid_accuracies', []), label='Training Grid Accuracy')
+        ax.plot(results.get('val_grid_accuracies', []), label='Validation Grid Accuracy')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Grid Cell Accuracy (%)')
+        ax.set_title(f"Grid Cell Accuracy: {results['model_name']}")
+        ax.legend()
+        ax.grid(True)
+
+        ax = next(ax_iter)
+        top_n = results.get('grid_top_n', 3)
+        ax.plot(results.get('train_grid_errors', []), label='Training Top1 Cell Error')
+        ax.plot(results.get('val_grid_errors', []), label='Validation Top1 Cell Error')
+        ax.plot(results.get('val_grid_weighted_errors', []), '--',
+                label=f'Validation Top{top_n} Weighted Error')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Position Error (m)')
+        ax.set_title(f"Grid Position Error: {results['model_name']}")
+        ax.legend()
+        ax.grid(True)
+
     plt.tight_layout()
     plot_path = os.path.join(save_dir, f"{results['model_name']}_{timestamp}_training_plot.png")
     plt.savefig(plot_path)
     plt.close()
-    
+
     print(f'Training plot saved: {plot_path}')
 
 # モジュールが直接実行された場合のサンプル処理（オプション）
