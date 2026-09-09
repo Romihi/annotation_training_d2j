@@ -172,27 +172,54 @@ TRANSLATIONS = {
         'btn_current_position': '現在位置',
         'btn_range_delete': '範囲削除',
 
-        # --- 車両マスク ---
-        'btn_vehicle_mask': '車両マスク',
-        'tip_vehicle_mask': '画像下側の車体領域を学習・推論時に無視するマスクを設定します。\n'
-                            'ボタンを押すと編集モードになり、画像クリックで中央線から左右対称にポリゴン頂点を追加できます。\n'
-                            '左クリック: 頂点追加 / 頂点をドラッグ: 移動 / 頂点を右クリック: その頂点を削除\n'
-                            '右クリック: 直前の頂点を削除 / Ctrl+右クリック: 全消去\n'
-                            'もう一度ボタンを押すと確定します（学習ダイアログの「車両マスクを適用」で使用されます）。',
-        'status_vehicle_mask_edit_on': '車両マスク編集中: 左クリックで頂点追加（左右対称） / ドラッグで頂点移動 / 右クリックで頂点削除 / Ctrl+右クリックで全消去 / ボタン再押下で確定',
-        'status_vehicle_mask_set': '車両マスクを設定しました（頂点: {0}点 × 左右対称 = {1}点）',
-        'status_vehicle_mask_cleared': '車両マスクをクリアしました',
-        'status_vehicle_mask_point_added': '車両マスク頂点を追加しました（{0}点）',
-        'status_vehicle_mask_point_removed': '車両マスク頂点を削除しました（残り{0}点）',
-        'chk_vehicle_mask_visible': 'マスク表示',
-        'tip_vehicle_mask_visible': '車両マスクのオーバーレイ表示をON/OFFします（学習・推論での適用には影響しません）。\n'
-                                    '結合表示中は表示位置が合わないため、設定に関わらず自動的に非表示になります。',
-        'status_vehicle_mask_combined_blocked': '結合表示中は車両マスクの表示・編集はできません（単一画像表示に切り替えてください）',
-        'chk_use_vehicle_mask': '車両マスクを適用（車体領域を無視）',
-        'tip_use_vehicle_mask': '設定済みの車両マスク領域を黒塗りにして学習します。\nマスクはモデルに保存され、推論時にも自動的に同じマスクが適用されます。',
-        'tip_use_vehicle_mask_disabled': '車両マスクが未設定です。\n解像度スライダー右の「車両マスク」ボタンでポリゴンを設定してください。',
-        'label_vehicle_mask_info': '設定済みマスク: {0}頂点の対称ポリゴン（マスク領域は黒塗りで無視されます）',
-        'label_vehicle_mask_not_set': '車両マスク未設定（「車両マスク」ボタンで設定できます）',
+        # --- マスク（対象プルダウン + 編集ボタン + 表示チェック） ---
+        'label_mask_target': 'マスク:',
+        'opt_mask_target_vehicle': '車両',
+        'opt_mask_target_background': '背景',
+        'opt_mask_add': '＋ 新規マスクを追加…',
+        'opt_mask_delete': '− このマスクを削除',
+        'tip_mask_target': '編集・表示切替の対象マスクを選びます。\n'
+                           '車両: 画像下側の車体領域 / 背景: 背景など任意の領域\n'
+                           '「＋ 新規マスクを追加…」で任意のマスクを増やせます（車両・背景は削除できません）。\n'
+                           '編集中は対象を切り替えられません（「編集」を再度押して確定してください）。',
+        'btn_mask_edit': '編集',
+        'tip_mask_edit': '選択中のマスクのポリゴンを編集します。',
+        'tip_mask_edit_named': '「{0}」のポリゴンを編集します。\n'
+                               '押すと編集モードになり、画像クリックで頂点を追加できます。\n'
+                               '左クリック: 頂点追加 / 頂点をドラッグ: 移動 / 頂点を右クリック: その頂点を削除\n'
+                               '右クリック: 直前の頂点を削除 / Ctrl+右クリック: 全消去\n'
+                               'もう一度「編集」を押すと確定します（学習ダイアログの「マスクを適用」で使用されます）。',
+        'chk_mask_visible': '表示',
+        'tip_mask_visible': '選択中のマスクのオーバーレイ表示をON/OFFします（学習・推論での適用には影響しません）。\n'
+                            '結合表示中は表示位置が合わないため、設定に関わらず自動的に非表示になります。',
+
+        # --- マスクの追加・削除 ---
+        'dlg_add_mask_title': '新規マスクの追加',
+        'label_new_mask_name': 'マスク名:',
+        'placeholder_new_mask_name': '例: 看板',
+        'chk_new_mask_symmetric': '左右対称にする',
+        'tip_new_mask_symmetric': 'ONにすると、打った頂点が中央線の反対側にも自動でミラーされます（車両・背景と同じ挙動）。\n'
+                                  'OFFにすると打った頂点だけでポリゴンを作ります（片側だけの領域を消したい場合はOFF）。',
+        'msg_mask_name_required': 'マスク名を入力してください。',
+        'msg_mask_name_duplicate': '「{0}」は既に存在します。別の名前を入力してください。',
+        'msg_confirm_delete_mask': 'マスク「{0}」を削除しますか？\nこの操作は元に戻せません。',
+        'status_mask_added': 'マスク「{0}」を追加しました',
+        'status_mask_deleted': 'マスク「{0}」を削除しました',
+        'status_mask_builtin_undeletable': '車両・背景は組み込みマスクのため削除できません',
+
+        # --- マスク編集のステータス ---
+        'status_mask_edit_on': '「{0}」編集中: 左クリックで頂点追加 / ドラッグで頂点移動 / 右クリックで頂点削除 / Ctrl+右クリックで全消去 / 「編集」再押下で確定',
+        'status_mask_set': '「{0}」を設定しました（頂点: {1}点 → ポリゴン {2}点）',
+        'status_mask_cleared': '「{0}」の頂点をクリアしました',
+        'status_mask_point_added': '「{0}」の頂点を追加しました（{1}点）',
+        'status_mask_point_removed': '「{0}」の頂点を削除しました（残り{1}点）',
+        'status_mask_combined_blocked': '結合表示中はマスクの表示・編集はできません（単一画像表示に切り替えてください）',
+
+        # --- 学習ダイアログのマスク適用 ---
+        'chk_use_mask': '「{0}」マスクを適用（該当領域を無視）',
+        'tip_use_mask': '設定済みのマスク領域を黒塗りにして学習します。\nマスクはモデルに保存され、推論時にも自動的に同じマスクが適用されます。',
+        'label_mask_info': '　{0}頂点の閉ポリゴン（マスク領域は黒塗りで無視されます）',
+        'label_mask_not_set': 'マスク未設定（解像度スライダー右の「マスク」プルダウンで対象を選び「編集」ボタンで設定できます）',
         'chk_custom_future_frames': '予測フレームを指定',
         'tip_custom_future_frames': '将来予測（angle/throttle/speed）を何フレーム先まで出力するかをカンマ区切りで2つ指定します（例: 5,10）。\n'
                                     '未指定またはチェックOFFの場合は5,10フレーム先を予測します。\n'
@@ -214,7 +241,7 @@ TRANSLATIONS = {
         'msg_pip_requires_single': '画像埋込はマルチソース・仮想ソースと併用できません。\n'
                                    '画像ソースを1つだけ選択し、仮想ソースタイプを「なし」にしてください。',
         'msg_pip_no_mask': '埋込位置が「車両マスク位置」ですが、車両マスクが未設定です。\n'
-                           '「車両マスク」ボタンでマスクを設定するか、「座標指定」を選択してください。',
+                           '「マスク: 車両」＋「編集」ボタンでマスクを設定するか、「座標指定」を選択してください。',
         'msg_pip_no_source_images': '埋込ソース「{0}」の画像が見つかりません。\n'
                                     'データフォルダに該当ソースの画像が含まれているか確認してください。',
         'msg_pip_invalid_rect': '埋込領域の幅と高さは0より大きい値を指定してください。',
@@ -641,6 +668,33 @@ TRANSLATIONS = {
         'chk_show_inference_result': '推論結果を表示する（水色丸）',
         'chk_show_diff_vector': '差分ベクトルを表示（緑矢印）',
         'chk_add_speed_output': 'Speed（速度）を出力に追加',
+        # オフライン重み付け BC（dev/SPEC_offline_rl_throttle.md）
+        'label_rl_weight_settings': 'オフライン重み付け (RL)',
+        'chk_rl_weight_enable': '走行ログの報酬に基づくサンプル重み付けを有効化',
+        'tip_rl_weight_enable': '速度・壁距離・slip 等から報酬→リターン→アドバンテージを計算し、良い運転のフレームほど speed/throttle 出力の損失を重くします（angle は等重み）',
+        'label_rl_weight_info': '既存ログだけで RL の考え方を導入します。検証損失は重み無しで計算されるため従来モデルと比較できます。詳細: dev/SPEC_offline_rl_throttle.md',
+        'label_rl_method': '方式',
+        'label_rl_target': '対象ヘッド',
+        'label_rl_clip': 'clip',
+        'label_rl_topk': '上位k%',
+        'label_rl_baseline': 'ベースライン',
+        'label_rl_gap': 'エピソード分割 [s]',
+        'label_rl_coeffs': '報酬係数:',
+        'label_rl_thresholds': '壁閾値 [mm]:',
+        'rl_method_awr': 'AWR  w=exp(A/β)',
+        'rl_method_filtered': 'Filtered BC（上位k%）',
+        'rl_target_speed': 'speed（推奨）',
+        'rl_target_throttle': 'throttle',
+        'rl_target_both': 'both',
+        'rl_baseline_speed_bin': '速度ビン平均',
+        'rl_baseline_global': '全体平均',
+        'btn_rl_preview': '重み分布をプレビュー',
+        'label_rl_no_speed': '※ speed データが無いため対象は throttle 固定です。速度報酬は enc/speed が無い場合 0 になります',
+        'dlg_rl_preview': 'オフライン重み付けプレビュー',
+        'label_rl_top_frames': '上位フレーム（重みが大きい = 良い運転と判定）',
+        'label_rl_bottom_frames': '下位フレーム（重みが小さい）',
+        'label_rl_term_contrib': '報酬項の平均寄与',
+        'msg_rl_no_annotations': '重み計算の対象となるアノテーションがありません',
         'chk_add_future_prediction': '将来フレームの予測を出力に追加',
         'chk_exclude_downsampled': 'ダウンサンプリング対象を除外',
         'chk_overwrite_annotation': '既存のアノテーションを上書きする',
@@ -1128,6 +1182,11 @@ TRANSLATIONS = {
         'chk_location_output_pose': '座標・姿勢回帰（pose/slam の自己位置を教師データに使用: {0}フレーム）',
         'tip_location_output_pose_disabled': 'このセッションには自己位置データ（pose/slam/vslam/aruco）がありません',
         'label_location_pose_source': '自己位置ソース:',
+        'label_location_pose_source_item': '{0} ({1}フレーム)',
+        'tip_location_pose_source': '教師データに使う自己位置ソース（既定 slam: map 座標系の絶対位置）。\n'
+                                    'このセッションで有効なソース（aruco / fused / slam / vslam / pose）のみ表示し、括弧内は status ok のフレーム数です。\n'
+                                    '学習ラベルには選んだソースの値だけを使い、そのフレームに無ければ除外します（他ソースは混ぜません）。\n'
+                                    '欠損が多い場合はマップビューの「欠損補間」で埋めてから学習できます。',
         'chk_location_include_heading': '姿勢（方位 θ）も出力に含める',
         'tip_location_include_heading': 'ONの場合、出力は x, y, cosθ, sinθ の4次元。OFFの場合は x, y の2次元',
         'label_location_pose_loss_weight': '座標・姿勢損失の重み:',
@@ -1146,6 +1205,20 @@ TRANSLATIONS = {
         'label_location_grid_cell_size': 'セル一辺:',
         'label_location_grid_loss_weight': '格子損失の重み:',
         'label_location_grid_preview': '格子: 約 {0} x {1} = {2} セル（自己位置の範囲から算出）',
+        # 過去の座標・姿勢の時系列入力
+        'chk_location_pose_history': '過去の座標・姿勢を入力に加える（時系列）',
+        'tip_location_pose_history': '過去 N ステップ（間隔フレームごと）の自己位置 [x, y, θ] を画像特徴と一緒にモデルへ入力します。\n学習時は実測の自己位置にノイズを加えて入力し、推論時は実測または過去フレームの推論結果を履歴として使えます。',
+        'label_location_history_steps': 'ステップ数:',
+        'label_location_history_interval': '間隔:',
+        'label_location_history_noise': '学習時ノイズ σ (座標 / 方位):',
+        'label_location_history_drop': '履歴欠損率:',
+        'label_location_history_note': '※ 履歴に頼りすぎて画像を見なくなるのを防ぐため、学習時は座標・方位にノイズを加え、一定確率で履歴を欠損させます。推論時に履歴が無いフレームは欠損として扱われます。',
+        'chk_location_history_from_inference': '履歴に推論結果を使用（実機動作の模擬）',
+        'tip_location_history_from_inference': 'ON: 過去フレームの推論結果（推定座標）を履歴として入力します（無いフレームは実測で補完）。\nOFF: 学習時と同じ実測の自己位置を履歴に使います。\n再生や「全画像を推論」でフレーム順に推論すると推定の積み上がりを確認できます。',
+        'label_location_history_info': '履歴入力: {0}（有効 {1}/{2} ステップ）',
+        'label_location_history_src_measured': '実測',
+        'label_location_history_src_inference': '推論結果',
+        'label_location_result_history': '履歴入力: {0}ステップ x {1}フレーム間隔（学習ノイズ σ={2} m / {3}°, 欠損率 {4}）',
         'label_location_grid_sigma': 'ラベル平滑化 σ (セル):',
         'tip_location_grid_sigma': '真値座標を中心とするガウス分布で近傍セルにも確率を配って学習します（0 = one-hot）。\n空間的な近さを学びやすくなり、Top-N の重み付き平均が意味を持ちます。',
         'chk_location_grid_balance': 'セル頻度で重み付け',
@@ -2190,27 +2263,54 @@ Google Cloud Console での OAuth設定手順
         'btn_current_position': 'Current',
         'btn_range_delete': 'Delete Range',
 
-        # --- Vehicle Mask ---
-        'btn_vehicle_mask': 'Vehicle Mask',
-        'tip_vehicle_mask': 'Set a mask polygon to ignore the vehicle body area (bottom of image) during training and inference.\n'
-                            'Press the button to enter edit mode, then click on the image to add vertices mirrored across the center line.\n'
-                            'Left click: add vertex / Drag vertex: move / Right click on vertex: remove it\n'
-                            'Right click: remove last vertex / Ctrl+Right click: clear all\n'
-                            'Press the button again to confirm (used via "Apply vehicle mask" in the training dialog).',
-        'status_vehicle_mask_edit_on': 'Vehicle mask editing: left click to add vertex (mirrored) / drag to move / right click to remove / Ctrl+right click to clear / press button again to confirm',
-        'status_vehicle_mask_set': 'Vehicle mask set ({0} vertices x mirror = {1} points)',
-        'status_vehicle_mask_cleared': 'Vehicle mask cleared',
-        'status_vehicle_mask_point_added': 'Vehicle mask vertex added ({0} points)',
-        'status_vehicle_mask_point_removed': 'Vehicle mask vertex removed ({0} remaining)',
-        'chk_vehicle_mask_visible': 'Show mask',
-        'tip_vehicle_mask_visible': 'Toggle the vehicle mask overlay display (does not affect training/inference masking).\n'
-                                    'Automatically hidden in combined view because positions do not align.',
-        'status_vehicle_mask_combined_blocked': 'Vehicle mask display/editing is unavailable in combined view (switch to a single image view)',
-        'chk_use_vehicle_mask': 'Apply vehicle mask (ignore body area)',
-        'tip_use_vehicle_mask': 'Train with the configured vehicle mask area filled in black.\nThe mask is saved with the model and automatically applied at inference time.',
-        'tip_use_vehicle_mask_disabled': 'No vehicle mask configured.\nUse the "Vehicle Mask" button next to the resolution slider to set one.',
-        'label_vehicle_mask_info': 'Configured mask: symmetric polygon with {0} vertices (masked area is blacked out and ignored)',
-        'label_vehicle_mask_not_set': 'No vehicle mask configured (set one with the "Vehicle Mask" button)',
+        # --- Mask (target dropdown + edit button + show checkbox) ---
+        'label_mask_target': 'Mask:',
+        'opt_mask_target_vehicle': 'Vehicle',
+        'opt_mask_target_background': 'Background',
+        'opt_mask_add': '+ Add new mask...',
+        'opt_mask_delete': '- Delete this mask',
+        'tip_mask_target': 'Choose which mask the Edit button and Show checkbox act on.\n'
+                           'Vehicle: the car body area at the bottom / Background: any area such as the background\n'
+                           'Use "+ Add new mask..." to create more masks (Vehicle and Background cannot be deleted).\n'
+                           'The target cannot be switched while editing (press "Edit" again to confirm).',
+        'btn_mask_edit': 'Edit',
+        'tip_mask_edit': 'Edit the polygon of the selected mask.',
+        'tip_mask_edit_named': 'Edit the polygon of "{0}".\n'
+                               'Press to enter edit mode, then click on the image to add vertices.\n'
+                               'Left click: add vertex / Drag vertex: move / Right click on vertex: remove it\n'
+                               'Right click: remove last vertex / Ctrl+Right click: clear all\n'
+                               'Press "Edit" again to confirm (used via "Apply mask" in the training dialog).',
+        'chk_mask_visible': 'Show',
+        'tip_mask_visible': 'Toggle the overlay display of the selected mask (does not affect training/inference masking).\n'
+                            'Automatically hidden in combined view because positions do not align.',
+
+        # --- Adding / deleting masks ---
+        'dlg_add_mask_title': 'Add New Mask',
+        'label_new_mask_name': 'Mask name:',
+        'placeholder_new_mask_name': 'e.g. Signboard',
+        'chk_new_mask_symmetric': 'Mirror left/right',
+        'tip_new_mask_symmetric': 'When on, each vertex is automatically mirrored across the center line (same as Vehicle/Background).\n'
+                                  'When off, the polygon uses only the vertices you place (use this for one-sided areas).',
+        'msg_mask_name_required': 'Please enter a mask name.',
+        'msg_mask_name_duplicate': '"{0}" already exists. Please enter a different name.',
+        'msg_confirm_delete_mask': 'Delete the mask "{0}"?\nThis cannot be undone.',
+        'status_mask_added': 'Mask "{0}" added',
+        'status_mask_deleted': 'Mask "{0}" deleted',
+        'status_mask_builtin_undeletable': 'Vehicle and Background are built-in masks and cannot be deleted',
+
+        # --- Mask editing status ---
+        'status_mask_edit_on': 'Editing "{0}": left click to add vertex / drag to move / right click to remove / Ctrl+right click to clear / press "Edit" again to confirm',
+        'status_mask_set': '"{0}" set ({1} vertices -> {2}-point polygon)',
+        'status_mask_cleared': 'Vertices of "{0}" cleared',
+        'status_mask_point_added': 'Vertex added to "{0}" ({1} points)',
+        'status_mask_point_removed': 'Vertex removed from "{0}" ({1} remaining)',
+        'status_mask_combined_blocked': 'Mask display/editing is unavailable in combined view (switch to a single image view)',
+
+        # --- Mask options in the training dialog ---
+        'chk_use_mask': 'Apply "{0}" mask (ignore that area)',
+        'tip_use_mask': 'Train with the configured mask area filled in black.\nThe mask is saved with the model and automatically applied at inference time.',
+        'label_mask_info': '  Closed polygon with {0} vertices (masked area is blacked out and ignored)',
+        'label_mask_not_set': 'No mask configured (pick a target in the "Mask" dropdown next to the resolution slider and press "Edit")',
         'chk_custom_future_frames': 'Custom prediction frames',
         'tip_custom_future_frames': 'Specify how many frames ahead the future predictions (angle/throttle/speed) are output,\n'
                                     'as two comma-separated values (e.g. 5,10). Defaults to 5,10 when unchecked or empty.\n'
@@ -2232,7 +2332,7 @@ Google Cloud Console での OAuth設定手順
         'msg_pip_requires_single': 'Image embedding cannot be combined with multi-source or virtual-source modes.\n'
                                    'Select exactly one image source and set virtual source type to none.',
         'msg_pip_no_mask': 'Embed position is set to "Vehicle mask area" but no vehicle mask is configured.\n'
-                           'Set a mask with the "Vehicle Mask" button, or choose "Coordinates".',
+                           'Set a mask with "Mask: Vehicle" + "Edit", or choose "Coordinates".',
         'msg_pip_no_source_images': 'No images found for embed source "{0}".\n'
                                     'Check that the data folder contains images for that source.',
         'msg_pip_invalid_rect': 'Embed region width and height must be greater than 0.',
@@ -2659,6 +2759,33 @@ Google Cloud Console での OAuth設定手順
         'chk_show_inference_result': 'Show Inference Result (cyan circle)',
         'chk_show_diff_vector': 'Show Diff Vector (green arrow)',
         'chk_add_speed_output': 'Add Speed to Output',
+        # Offline weighted BC (dev/SPEC_offline_rl_throttle.md)
+        'label_rl_weight_settings': 'Offline RL Weighting',
+        'chk_rl_weight_enable': 'Enable reward-based sample weighting from driving logs',
+        'tip_rl_weight_enable': 'Computes reward -> return -> advantage from speed, wall distance, slip etc. and up-weights the speed/throttle loss of well-driven frames (angle stays unweighted)',
+        'label_rl_weight_info': 'Introduces the RL idea using existing logs only. Validation loss stays unweighted so models remain comparable. See dev/SPEC_offline_rl_throttle.md',
+        'label_rl_method': 'Method',
+        'label_rl_target': 'Target head',
+        'label_rl_clip': 'clip',
+        'label_rl_topk': 'top k%',
+        'label_rl_baseline': 'Baseline',
+        'label_rl_gap': 'Episode gap [s]',
+        'label_rl_coeffs': 'Reward coeffs:',
+        'label_rl_thresholds': 'Wall thresholds [mm]:',
+        'rl_method_awr': 'AWR  w=exp(A/β)',
+        'rl_method_filtered': 'Filtered BC (top k%)',
+        'rl_target_speed': 'speed (recommended)',
+        'rl_target_throttle': 'throttle',
+        'rl_target_both': 'both',
+        'rl_baseline_speed_bin': 'speed-bin mean',
+        'rl_baseline_global': 'global mean',
+        'btn_rl_preview': 'Preview weight distribution',
+        'label_rl_no_speed': '* No speed data: target is fixed to throttle. Speed reward is 0 without enc/speed',
+        'dlg_rl_preview': 'Offline weighting preview',
+        'label_rl_top_frames': 'Top frames (high weight = judged as good driving)',
+        'label_rl_bottom_frames': 'Bottom frames (low weight)',
+        'label_rl_term_contrib': 'Mean contribution per reward term',
+        'msg_rl_no_annotations': 'No annotations available for weight computation',
         'chk_add_future_prediction': 'Add Future Frame Prediction to Output',
         'chk_exclude_downsampled': 'Exclude Downsampling Targets',
         'chk_overwrite_annotation': 'Overwrite Existing Annotations',
@@ -3146,6 +3273,11 @@ Google Cloud Console での OAuth設定手順
         'chk_location_output_pose': 'Coordinate & heading regression (pose/slam ego-pose as targets: {0} frames)',
         'tip_location_output_pose_disabled': 'This session has no ego-pose data (pose/slam/vslam/aruco)',
         'label_location_pose_source': 'Ego-pose source:',
+        'label_location_pose_source_item': '{0} ({1} frames)',
+        'tip_location_pose_source': 'Ego-pose source used as the training target (default slam: absolute position in the map frame).\n'
+                                    'Only sources valid in this session (aruco / fused / slam / vslam / pose) are listed; the number is the count of status-ok frames.\n'
+                                    'Training labels use only the selected source; frames without it are excluded (no mixing of other sources).\n'
+                                    'If many frames are missing, fill gaps with the map view interpolation before training.',
         'chk_location_include_heading': 'Include heading (θ) in the output',
         'tip_location_include_heading': 'ON: 4-dim output (x, y, cosθ, sinθ). OFF: 2-dim output (x, y)',
         'label_location_pose_loss_weight': 'Pose loss weight:',
@@ -3164,6 +3296,20 @@ Google Cloud Console での OAuth設定手順
         'label_location_grid_cell_size': 'Cell size:',
         'label_location_grid_loss_weight': 'Grid loss weight:',
         'label_location_grid_preview': 'Grid: about {0} x {1} = {2} cells (from ego-pose extent)',
+        # Pose history (time series) input
+        'chk_location_pose_history': 'Add past coordinates & heading as input (time series)',
+        'tip_location_pose_history': 'Feed the ego-pose [x, y, θ] of the past N steps (every interval frames) to the model together with the image features.\nDuring training the measured poses are fed with noise; at inference the history can come from measured poses or from previous predictions.',
+        'label_location_history_steps': 'Steps:',
+        'label_location_history_interval': 'Interval:',
+        'label_location_history_noise': 'Training noise σ (position / heading):',
+        'label_location_history_drop': 'History dropout:',
+        'label_location_history_note': '* To keep the model from relying on the history alone, training adds noise to position/heading and drops the whole history with the given probability. Frames without history at inference are treated as missing.',
+        'chk_location_history_from_inference': 'Use predictions as history (simulate on-vehicle)',
+        'tip_location_history_from_inference': 'ON: use the estimated positions of previous frames as the history input (missing frames fall back to measured poses).\nOFF: use the measured ego-poses, as in training.\nPlayback or "Infer All Images" runs frames in order so you can see estimates accumulate.',
+        'label_location_history_info': 'History input: {0} (valid {1}/{2} steps)',
+        'label_location_history_src_measured': 'measured',
+        'label_location_history_src_inference': 'predictions',
+        'label_location_result_history': 'History input: {0} steps x {1} frame interval (training noise σ={2} m / {3}°, dropout {4})',
         'label_location_grid_sigma': 'Label smoothing σ (cells):',
         'tip_location_grid_sigma': 'Spread the target over neighboring cells with a Gaussian centered on the true position (0 = one-hot).\nMakes spatial proximity easier to learn and gives the Top-N weighted mean a meaning.',
         'chk_location_grid_balance': 'Weight by cell frequency',

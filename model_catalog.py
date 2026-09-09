@@ -13,6 +13,26 @@ from typing import Dict, Any, Optional, Tuple, List
 
 
 from config import MAX_SPEED as _MAX_SPEED
+
+# オフライン重み付け BC（dev/SPEC_offline_rl_throttle.md）: main.py が学習準備時に
+# 各アノテーション辞書へ埋め込むサンプル重みのキー。存在するデータセットは
+# (img, target, weight) の 3 要素を返し、無ければ従来どおり (img, target) を返す。
+RL_WEIGHT_KEY = '_rl_weight'
+
+
+def _annotations_have_rl_weight(annotations) -> bool:
+    try:
+        return any(isinstance(a, dict) and RL_WEIGHT_KEY in a for a in annotations)
+    except TypeError:
+        return False
+
+
+def _rl_weight_tensor(annotation) -> torch.Tensor:
+    try:
+        w = float(annotation.get(RL_WEIGHT_KEY, 1.0))
+    except (TypeError, ValueError):
+        w = 1.0
+    return torch.tensor(w, dtype=torch.float)
 import model_info
 from model_info import (
     MODEL_ACCURACY_INFO,
@@ -159,9 +179,16 @@ def load_model_weights(model, weights_path, device):
             # 学習時のspeed正規化値（保存されていれば推論・表示側で利用）
             if checkpoint.get('speed_normalize'):
                 model._speed_normalize = float(checkpoint['speed_normalize'])
-            # 学習時の車両マスク（保存されていれば推論時にも同じマスクを適用）
-            if checkpoint.get('vehicle_mask'):
-                model._vehicle_mask = [tuple(p) for p in checkpoint['vehicle_mask']]
+            # 学習時のマスク（保存されていれば推論時にも同じマスクを適用）
+            # 旧形式は vehicle_mask / background_mask の単独キーで保存されている
+            _masks = checkpoint.get('masks')
+            if _masks:
+                model._mask_polygons = [[tuple(p) for p in m['points']] for m in _masks]
+            else:
+                _legacy = [checkpoint.get('vehicle_mask'), checkpoint.get('background_mask')]
+                _legacy = [[tuple(p) for p in poly] for poly in _legacy if poly]
+                if _legacy:
+                    model._mask_polygons = _legacy
             # 学習時の将来予測フレームオフセット（推論結果のキー・表示に利用）
             if checkpoint.get('future_offsets'):
                 model._future_offsets = [int(v) for v in checkpoint['future_offsets']]
@@ -1898,8 +1925,8 @@ def embed_image_pip(base_img, embed_img, rect_norm):
     return base
 
 
-def apply_vehicle_mask(img, mask_polygon):
-    """車両マスク（正規化座標ポリゴン）領域を黒塗りしたコピーを返す
+def apply_mask_polygon(img, mask_polygon):
+    """マスク（正規化座標ポリゴン）領域を黒塗りしたコピーを返す
 
     学習・推論の入力画像から車体などの固定領域を無視するために使用する。
     mask_polygon: [(x, y), ...] 0-1の正規化座標。3頂点未満なら何もしない。
@@ -1910,6 +1937,13 @@ def apply_vehicle_mask(img, mask_polygon):
     draw = ImageDraw.Draw(img)
     W, H = img.size
     draw.polygon([(x * W, y * H) for x, y in mask_polygon], fill=(0, 0, 0))
+    return img
+
+
+def apply_masks(img, mask_polygons):
+    """複数マスク（正規化座標ポリゴンのリスト）をまとめて黒塗りする"""
+    for polygon in mask_polygons or []:
+        img = apply_mask_polygon(img, polygon)
     return img
 
 
@@ -1936,7 +1970,7 @@ class PixelateTransform:
 class AnnotationDataset(torch.utils.data.Dataset):
     """アノテーションデータのためのカスタムデータセット"""
     def __init__(self, image_paths, annotations, transform=None, cache_images=False, use_speed=False, use_future=False,
-                 speed_normalize=None, mask_polygon=None, future_offsets=None,
+                 speed_normalize=None, mask_polygons=None, future_offsets=None,
                  pip_paths=None, pip_rect=None):
         self.image_paths = image_paths
         self.annotations = annotations
@@ -1944,9 +1978,10 @@ class AnnotationDataset(torch.utils.data.Dataset):
         self.cache_images = cache_images
         self.image_cache = {} if cache_images else None
         self.use_speed = use_speed
+        self.return_weight = _annotations_have_rl_weight(annotations)  # オフライン重み付け BC
         self.use_future = use_future
         self.speed_normalize = speed_normalize  # speed正規化値（None時はMAX_SPEED）
-        self.mask_polygon = mask_polygon  # 車両マスク（正規化座標ポリゴン）
+        self.mask_polygons = mask_polygons  # マスク（正規化座標ポリゴンのリスト）
         self.future_offsets = list(future_offsets) if future_offsets else [5, 10]  # 将来予測のフレームオフセット
         self.pip_paths = pip_paths  # 画像埋込: image_pathsと同順の埋込画像パスリスト（Noneは埋込なし）
         self.pip_rect = pip_rect    # 画像埋込: (x, y, w, h) 正規化座標
@@ -1975,8 +2010,8 @@ class AnnotationDataset(torch.utils.data.Dataset):
             if self.cache_images:
                 self.image_cache[idx] = img
 
-        # 車両マスクを適用（キャッシュには元画像を保持）
-        img = apply_vehicle_mask(img, self.mask_polygon)
+        # マスクを適用（キャッシュには元画像を保持）
+        img = apply_masks(img, self.mask_polygons)
 
         # 画像埋込（マスク適用後に貼り込む＝マスクで捨てた領域を埋込に再利用できる）
         if self.pip_paths is not None and self.pip_rect and idx < len(self.pip_paths):
@@ -2026,6 +2061,8 @@ class AnnotationDataset(torch.utils.data.Dataset):
 
         target = torch.tensor(target_values, dtype=torch.float)
 
+        if self.return_weight:
+            return img, target, _rl_weight_tensor(annotation)
         return img, target
 
 
@@ -2205,15 +2242,16 @@ class MultiSourceDataset(torch.utils.data.Dataset):
 
     def __init__(self, grouped_image_paths, annotations, num_sources,
                  transform=None, use_speed=False, use_future=False, speed_normalize=None,
-                 mask_polygon=None, future_offsets=None):
+                 mask_polygons=None, future_offsets=None):
         self.grouped_paths = grouped_image_paths
         self.annotations = annotations
         self.num_sources = num_sources
         self.transform = transform
         self.use_speed = use_speed
+        self.return_weight = _annotations_have_rl_weight(annotations)  # オフライン重み付け BC
         self.use_future = use_future
         self.speed_normalize = speed_normalize  # speed正規化値（None時はMAX_SPEED）
-        self.mask_polygon = mask_polygon  # 車両マスク（正規化座標ポリゴン）
+        self.mask_polygons = mask_polygons  # マスク（正規化座標ポリゴンのリスト）
         self.future_offsets = list(future_offsets) if future_offsets else [5, 10]
 
     def __len__(self):
@@ -2235,7 +2273,7 @@ class MultiSourceDataset(torch.utils.data.Dataset):
         images = []
         for path in paths:
             img = Image.open(path).convert('RGB')
-            img = apply_vehicle_mask(img, self.mask_polygon)
+            img = apply_masks(img, self.mask_polygons)
             if self.transform:
                 try:
                     img = self.transform(img)
@@ -2268,6 +2306,8 @@ class MultiSourceDataset(torch.utils.data.Dataset):
                     target_values.extend([f_angle, f_throttle])
 
         target = torch.tensor(target_values, dtype=torch.float)
+        if self.return_weight:
+            return stacked, target, _rl_weight_tensor(annotation)
         return stacked, target
 
 
@@ -2301,7 +2341,7 @@ class VirtualSourceDataset(torch.utils.data.Dataset):
 
     def __init__(self, image_paths, annotations, num_virtual_sources=3,
                  virtual_type='crop', transform=None, use_speed=False, use_future=False,
-                 temporal_interval: int = 10, speed_normalize=None, mask_polygon=None,
+                 temporal_interval: int = 10, speed_normalize=None, mask_polygons=None,
                  future_offsets=None):
         self.image_paths = image_paths
         self.annotations = annotations
@@ -2309,10 +2349,11 @@ class VirtualSourceDataset(torch.utils.data.Dataset):
         self.virtual_type = virtual_type
         self.transform = transform
         self.use_speed = use_speed
+        self.return_weight = _annotations_have_rl_weight(annotations)  # オフライン重み付け BC
         self.use_future = use_future
         self.temporal_interval = temporal_interval
         self.speed_normalize = speed_normalize  # speed正規化値（None時はMAX_SPEED）
-        self.mask_polygon = mask_polygon  # 車両マスク（正規化座標ポリゴン）
+        self.mask_polygons = mask_polygons  # マスク（正規化座標ポリゴンのリスト）
         self.future_offsets = list(future_offsets) if future_offsets else [5, 10]
 
     def __len__(self):
@@ -2360,13 +2401,13 @@ class VirtualSourceDataset(torch.utils.data.Dataset):
         for k in range(self.num_virtual_sources):
             prev_idx = max(0, idx - k * self.temporal_interval)
             frame = Image.open(self.image_paths[prev_idx]).convert('RGB')
-            sources.append(apply_vehicle_mask(frame, self.mask_polygon))
+            sources.append(apply_masks(frame, self.mask_polygons))
         return sources
 
     def __getitem__(self, idx):
         img = Image.open(self.image_paths[idx]).convert('RGB')
-        # 車両マスクは元画像座標で適用（crop/scaleの仮想ソースにも正しく反映される）
-        img = apply_vehicle_mask(img, self.mask_polygon)
+        # マスクは元画像座標で適用（crop/scaleの仮想ソースにも正しく反映される）
+        img = apply_masks(img, self.mask_polygons)
 
         if self.virtual_type == 'crop':
             source_imgs = self._spatial_crops(img)
@@ -2409,7 +2450,10 @@ class VirtualSourceDataset(torch.utils.data.Dataset):
                 else:
                     target_values.extend([f_angle, f_throttle])
 
-        return stacked, torch.tensor(target_values, dtype=torch.float)
+        target = torch.tensor(target_values, dtype=torch.float)
+        if self.return_weight:
+            return stacked, target, _rl_weight_tensor(annotation)
+        return stacked, target
 
 
 def create_multi_source_model(base_model_name, num_sources=2, fusion_method='concat',
@@ -2539,6 +2583,43 @@ def grid_position_errors(logits_or_probs, true_xy, grid_config, top_n=3):
     return np.asarray(e1), np.asarray(ew)
 
 
+# --- 過去の座標・姿勢の時系列入力 -------------------------------------------
+
+POSE_HISTORY_FEATURES = 5   # 1ステップあたり [valid, x_norm, y_norm, cosθ, sinθ]
+
+
+def pose_history_dim(steps):
+    """過去ステップ数 → 履歴入力ベクトルの次元"""
+    return int(steps) * POSE_HISTORY_FEATURES if steps else 0
+
+
+def encode_pose_history(past_poses, pose_norm, steps):
+    """過去の座標・姿勢 → 履歴入力ベクトル [steps * 5]（float32）
+
+    past_poses: 新しい順（t-1*interval, t-2*interval, ...）の [x, y, theta] または None
+                （欠損は valid=0、他 0 で埋める）。長さが steps に満たなければ末尾を欠損扱い。
+    pose_norm: 座標正規化の min/max（座標・姿勢回帰と同じ [-1, 1] スケール）
+    """
+    steps = int(steps)
+    vec = np.zeros(steps * POSE_HISTORY_FEATURES, dtype=np.float32)
+    if steps <= 0 or not pose_norm:
+        return vec
+    x_rng = max(pose_norm['x_max'] - pose_norm['x_min'], 1e-6)
+    y_rng = max(pose_norm['y_max'] - pose_norm['y_min'], 1e-6)
+    for k in range(steps):
+        p = past_poses[k] if past_poses is not None and k < len(past_poses) else None
+        if p is None:
+            continue
+        x, y, th = float(p[0]), float(p[1]), float(p[2] if len(p) > 2 and p[2] is not None else 0.0)
+        base = k * POSE_HISTORY_FEATURES
+        vec[base + 0] = 1.0
+        vec[base + 1] = 2.0 * (x - pose_norm['x_min']) / x_rng - 1.0
+        vec[base + 2] = 2.0 * (y - pose_norm['y_min']) / y_rng - 1.0
+        vec[base + 3] = math.cos(th)
+        vec[base + 4] = math.sin(th)
+    return vec
+
+
 def location_virtual_sources(img, virtual_type, num_sources):
     """単一画像から仮想ソース画像のリストを生成する（crop / scale）
 
@@ -2650,7 +2731,7 @@ class MultiSourceLocationModel(BaseLocationModel):
 
     def __init__(self, base_model_name, num_sources=1, fusion_method='concat',
                  num_classes=8, output_mode='class', pose_dim=4, pretrained=True,
-                 input_size=None, num_grid_classes=0):
+                 input_size=None, num_grid_classes=0, pose_history_steps=0):
         heads = location_heads(output_mode)   # 不正な output_mode はここで ValueError
         if 'grid' in heads and int(num_grid_classes or 0) <= 0:
             raise ValueError("格子分類には num_grid_classes（格子セル数）が必要です。")
@@ -2699,6 +2780,15 @@ class MultiSourceLocationModel(BaseLocationModel):
             self.norm = nn.LayerNorm(self.feature_dim)
             self.pos_embed = nn.Parameter(torch.randn(1, num_sources, self.feature_dim) * 0.02)
             fused_dim = self.feature_dim
+        # --- 過去の座標・姿勢の時系列入力（小さな MLP で符号化し画像特徴に結合） ---
+        self.pose_history_steps = int(pose_history_steps or 0)
+        self.pose_history_dim = pose_history_dim(self.pose_history_steps)
+        if self.pose_history_dim > 0:
+            self.history_feat_dim = 64
+            self.history_encoder = nn.Sequential(
+                nn.Linear(self.pose_history_dim, 64), nn.ReLU(inplace=True),
+                nn.Linear(64, self.history_feat_dim), nn.ReLU(inplace=True))
+            fused_dim = fused_dim + self.history_feat_dim
         self.fused_dim = fused_dim
 
         # --- 出力ヘッド ---
@@ -2749,9 +2839,18 @@ class MultiSourceLocationModel(BaseLocationModel):
             self.last_attn_weights = attn_weights.detach()
         return self.norm(seq + attn_out)[:, 0, :]
 
-    def forward(self, x):
-        """ヘッドが1つならテンソル、複数なら LOCATION_HEAD_ORDER 順のタプルを返す"""
+    def forward(self, x, history=None):
+        """ヘッドが1つならテンソル、複数なら LOCATION_HEAD_ORDER 順のタプルを返す
+
+        history: 過去の座標・姿勢の履歴ベクトル [B, pose_history_dim]（履歴入力ありのモデルのみ。
+                 None なら全ステップ欠損（valid=0）として扱う）
+        """
         fused = self._fuse(x)
+        if self.pose_history_dim > 0:
+            if history is None:
+                history = torch.zeros(fused.shape[0], self.pose_history_dim,
+                                      device=fused.device, dtype=fused.dtype)
+            fused = torch.cat([fused, self.history_encoder(history.to(fused.dtype))], dim=1)
         outs = []
         for head in self.heads:
             if head == 'class':
@@ -2772,11 +2871,12 @@ class MultiSourceLocationModel(BaseLocationModel):
             transforms.ToTensor()
         ])
 
-    def run(self, *img_arrs, virtual_type=None):
+    def run(self, *img_arrs, virtual_type=None, history_vec=None):
         """複数画像で推論を実行し、{'probs': ndarray|None, 'pose_vec': ndarray|None} を返す
 
         virtual_type='crop'/'scale' の場合は1枚の画像から仮想ソースを生成する。
         pose_vec は正規化値のため、denormalize_pose_output で座標へ戻す。
+        history_vec: encode_pose_history で作った履歴入力（履歴入力ありのモデルのみ）
         """
         if self._preprocess is None:
             self._preprocess = self.get_preprocess()
@@ -2789,8 +2889,12 @@ class MultiSourceLocationModel(BaseLocationModel):
         stacked = torch.cat(tensors, dim=0).unsqueeze(0)
         model_dtype = next(self.parameters()).dtype
         stacked = stacked.to(device=self.device, dtype=model_dtype)
+        history = None
+        if self.pose_history_dim > 0 and history_vec is not None:
+            history = torch.as_tensor(np.asarray(history_vec, dtype=np.float32)).reshape(1, -1)
+            history = history.to(device=self.device, dtype=model_dtype)
         with torch.no_grad():
-            outputs = self(stacked)
+            outputs = self(stacked, history)
         logits, pose, grid = split_location_outputs(outputs, self.output_mode)
         result = {'probs': None, 'pose_vec': None, 'grid_probs': None}
         if logits is not None:
@@ -2806,9 +2910,11 @@ class MultiSourceLocationModel(BaseLocationModel):
 
 def create_multi_source_location_model(base_model_name, num_sources=1, fusion_method='concat',
                                        num_classes=8, output_mode='class', pose_dim=4,
-                                       pretrained=True, input_size=None, num_grid_classes=0):
+                                       pretrained=True, input_size=None, num_grid_classes=0,
+                                       pose_history_steps=0):
     """位置推論ラッパーモデルのファクトリ関数"""
     return MultiSourceLocationModel(
         base_model_name=base_model_name, num_sources=num_sources, fusion_method=fusion_method,
         num_classes=num_classes, output_mode=output_mode, pose_dim=pose_dim,
-        pretrained=pretrained, input_size=input_size, num_grid_classes=num_grid_classes)
+        pretrained=pretrained, input_size=input_size, num_grid_classes=num_grid_classes,
+        pose_history_steps=pose_history_steps)

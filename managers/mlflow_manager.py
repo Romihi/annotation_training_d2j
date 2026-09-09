@@ -717,7 +717,7 @@ class MLflowManager:
             "augmentation_enabled": training_params.get("augmentation_enabled", False),
             "use_speed_output": training_params.get("use_speed_output", False),
             "use_future_output": training_params.get("use_future_output", False),
-            "vehicle_mask_enabled": training_params.get("vehicle_mask_enabled", False)
+            "masks_enabled": training_params.get("masks_enabled", None)
         }
 
         # 画像埋込有効時は埋込ソースも記録
@@ -731,6 +731,25 @@ class MLflowManager:
         # speed出力有効時はspeed正規化値（MAX_SPEED相当）も記録
         if training_params.get("use_speed_output", False):
             params["speed_normalize"] = training_params.get("speed_normalize", None)
+
+        # オフライン重み付け BC（dev/SPEC_offline_rl_throttle.md §4.8）
+        rl_meta = training_params.get("rl_weighting") or {}
+        params["rl_weighting"] = "enabled" if rl_meta.get("enabled") else "disabled"
+        if rl_meta.get("enabled"):
+            rl_cfg = rl_meta.get("config", {}) or {}
+            for k in ("method", "target_head", "gamma", "beta", "w_min", "w_max", "top_k",
+                      "baseline_mode", "episode_gap_s", "speed_norm", "wall_mm", "side_mm"):
+                if k in rl_cfg:
+                    params[f"rl_{k}"] = rl_cfg[k]
+            params["rl_coeffs"] = ",".join(
+                f"{k}={rl_cfg[k]}" for k in ("c_speed", "c_wall", "c_side", "c_slip", "c_stuck", "c_yaw")
+                if k in rl_cfg)
+            params["rl_weight_columns"] = ",".join(map(str, rl_meta.get("weight_columns", []) or []))
+            rl_st = rl_meta.get("weight_stats", {}) or {}
+            for k in ("weight_mean", "weight_median", "weight_p05", "weight_p95", "weight_max",
+                      "n_frames", "n_episodes"):
+                if k in rl_st:
+                    params[f"rl_{k}"] = rl_st[k]
 
         # コメントがあれば追加
         if training_params.get("comment"):
@@ -759,6 +778,10 @@ class MLflowManager:
             "final_train_loss": metrics.get("final_train_loss", 0.0),
             "final_val_loss": metrics.get("final_val_loss", 0.0)
         }
+
+        # 重み付き学習時の重み無し学習損失（比較用）
+        if "final_train_loss_unweighted" in metrics:
+            run_metrics["final_train_loss_unweighted"] = metrics["final_train_loss_unweighted"]
 
         # 自動運転特有のメトリクス（利用可能な場合）
         if "steering_accuracy" in metrics:
@@ -820,7 +843,10 @@ class MLflowManager:
         params["task_type"] = {"class": "classification", "pose": "regression",
                                "class_pose": "multitask"}.get(output_mode, "classification")
         for key in ("num_sources", "fusion_method", "selected_sources", "virtual_source_type",
-                    "temporal_interval", "pose_source", "include_heading", "pose_loss_weight"):
+                    "temporal_interval", "pose_source", "include_heading", "pose_loss_weight",
+                    "grid_cell_size", "num_grid_classes", "grid_loss_weight", "grid_label_sigma",
+                    "grid_class_balance", "pose_history_steps", "pose_history_interval",
+                    "history_noise_xy_m", "history_noise_theta_deg", "history_drop_prob"):
             if training_params.get(key) is not None:
                 params[key] = training_params[key]
 
@@ -837,7 +863,8 @@ class MLflowManager:
             "final_train_acc": metrics.get("final_train_acc", 0.0),
             "final_val_acc": metrics.get("final_val_acc", 0.0)
         }
-        for key in ("best_val_pos_error_m", "best_val_heading_error_deg"):
+        for key in ("best_val_pos_error_m", "best_val_heading_error_deg",
+                    "best_val_grid_acc", "best_val_grid_top1_error_m", "best_val_grid_weighted_error_m"):
             if key in metrics:
                 run_metrics[key] = metrics[key]
 

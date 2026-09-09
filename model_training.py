@@ -3,6 +3,7 @@
 """
 
 import os
+import math
 import time
 import json
 import torch
@@ -198,6 +199,57 @@ def create_unified_progress_message(epoch, num_epochs, elapsed_time, epoch_times
     message_parts.append(time_line)
     
     return "\n".join(message_parts)
+
+
+def _unpack_batch(batch):
+    """DataLoader のバッチを (inputs, targets, sample_weights or None) に分解する。
+
+    オフライン重み付け BC 有効時のみデータセットは 3 要素 (img, target, weight) を返す。
+    """
+    if isinstance(batch, (list, tuple)) and len(batch) >= 3:
+        return batch[0], batch[1], batch[2]
+    return batch[0], batch[1], None
+
+
+def build_column_weights(num_outputs: int, head_weights: Optional[Dict[str, float]],
+                         use_speed: bool) -> Optional[torch.Tensor]:
+    """出力列ごとの固定重み c_j を作る（angle / throttle / speed を各フレーム群に適用）。
+
+    head_weights が None または全て 1.0 なら None（= 従来の等重み MSE）。
+    """
+    if not head_weights:
+        return None
+    group = 3 if use_speed else 2
+    names = ['angle', 'throttle', 'speed'][:group]
+    cols = []
+    for j in range(num_outputs):
+        cols.append(float(head_weights.get(names[j % group], 1.0)))
+    if all(abs(c - 1.0) < 1e-12 for c in cols):
+        return None
+    return torch.tensor(cols, dtype=torch.float)
+
+
+def weighted_mse_loss(outputs: torch.Tensor, targets: torch.Tensor,
+                      column_weights: Optional[torch.Tensor] = None,
+                      sample_weights: Optional[torch.Tensor] = None,
+                      weight_columns: Optional[List[int]] = None) -> torch.Tensor:
+    """L = mean_ij( c_j * m_ij * (o_ij - t_ij)^2 )
+
+    c_j   : column_weights（None なら 1）
+    m_ij  : weight_columns に含まれる列だけ sample_weights[i]、それ以外は 1
+    どちらも無ければ nn.MSELoss() と同値。
+    """
+    sq = (outputs - targets) ** 2
+    if column_weights is not None:
+        sq = sq * column_weights.to(sq.device).view(1, -1)
+    if sample_weights is not None and weight_columns:
+        mask = torch.ones_like(sq)
+        sw = sample_weights.to(sq.device).view(-1, 1).float()
+        cols = [c for c in weight_columns if c < sq.shape[1]]
+        if cols:
+            mask[:, cols] = sw.expand(-1, len(cols))
+        sq = sq * mask
+    return sq.mean()
 
 
 def calculate_individual_losses(outputs, targets, criterion):
@@ -669,7 +721,7 @@ def create_datasets(
     use_speed: bool = False,
     use_future: bool = False,
     speed_normalize: float = None,
-    mask_polygon: List[Tuple[float, float]] = None,
+    mask_polygons: List[List[Tuple[float, float]]] = None,
     future_offsets: List[int] = None,
     pip_paths: List[Optional[str]] = None,
     pip_rect: Tuple[float, float, float, float] = None,
@@ -804,7 +856,7 @@ def create_datasets(
             use_future=use_future,
             temporal_interval=temporal_interval,
             speed_normalize=speed_normalize,
-            mask_polygon=mask_polygon,
+            mask_polygons=mask_polygons,
             future_offsets=future_offsets
         )
         print(f"VirtualSourceDataset作成: {len(dataset)}サンプル, {num_sources}仮想ソース, タイプ={virtual_source_type}, 時間差={temporal_interval}")
@@ -818,13 +870,13 @@ def create_datasets(
             use_speed=use_speed,
             use_future=use_future,
             speed_normalize=speed_normalize,
-            mask_polygon=mask_polygon,
+            mask_polygons=mask_polygons,
             future_offsets=future_offsets
         )
         print(f"MultiSourceDataset作成: {len(dataset)}サンプル, {num_sources}ソース")
     else:
         dataset = AnnotationDataset(image_paths, annotations, transform=transform, use_speed=use_speed, use_future=use_future,
-                                    speed_normalize=speed_normalize, mask_polygon=mask_polygon,
+                                    speed_normalize=speed_normalize, mask_polygons=mask_polygons,
                                     future_offsets=future_offsets,
                                     pip_paths=pip_paths, pip_rect=pip_rect)
 
@@ -904,9 +956,12 @@ def train_model(
     virtual_source_type: Optional[str] = None,
     temporal_interval: int = 10,
     speed_normalize: Optional[float] = None,
-    vehicle_mask: Optional[List[Tuple[float, float]]] = None,
+    masks: Optional[List[Dict[str, Any]]] = None,
     future_offsets: Optional[List[int]] = None,
-    pip_embed: Optional[Dict[str, Any]] = None
+    pip_embed: Optional[Dict[str, Any]] = None,
+    rl_weight_columns: Optional[List[int]] = None,
+    head_weights: Optional[Dict[str, float]] = None,
+    rl_weighting: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """モデルをトレーニングする
 
@@ -929,6 +984,10 @@ def train_model(
         scheduler_name: 学習率スケジューラ名（ReduceLROnPlateau, StepLR, CosineAnnealingLR, None）
         num_outputs: 出力数（2=angle/throttle, 3=angle/throttle/speed）
         input_size: 入力画像サイズ (高さ, 幅)。Noneの場合はデータローダーから推定
+        rl_weight_columns: オフライン重み付け BC でサンプル重みを掛ける出力列インデックス
+            （データセットが (img, target, weight) を返すときのみ有効）
+        head_weights: 出力ヘッド別の固定損失重み {'angle':1.0,'throttle':1.0,'speed':1.0}
+        rl_weighting: チェックポイント/結果に保存するオフライン重み付けの設定・統計
 
     Returns:
         トレーニング結果の辞書
@@ -1004,8 +1063,17 @@ def train_model(
 
     model = model.to(device)
 
-    # 損失関数
+    # 損失関数（検証・個別損失表示は常に重み無し MSE）
     criterion = nn.MSELoss()
+
+    # 学習用の列別重み付き MSE（オフライン重み付け BC / ヘッド別重み）
+    _use_speed_cols = (num_outputs % 3 == 0)
+    column_weights = build_column_weights(num_outputs, head_weights, _use_speed_cols)
+    rl_weight_columns = [int(c) for c in (rl_weight_columns or []) if 0 <= int(c) < num_outputs]
+    use_weighted_loss = column_weights is not None or bool(rl_weight_columns)
+    if use_weighted_loss:
+        print(f"重み付き損失を使用: 列重み={None if column_weights is None else column_weights.tolist()}, "
+              f"サンプル重み対象列={rl_weight_columns}")
 
     # 最適化アルゴリズムの選択
     if optimizer_name == 'Adam':
@@ -1029,6 +1097,7 @@ def train_model(
     
     # トレーニングループ
     train_losses = []
+    train_losses_unweighted = []  # 重み付き学習時のみ記録
     val_losses = []
     train_steering_losses = []
     train_throttle_losses = []
@@ -1089,12 +1158,14 @@ def train_model(
 
         model.train()
         epoch_loss = 0.0
+        epoch_plain_loss = 0.0  # 重み無し MSE（重み付き学習時の比較用）
         epoch_steering_loss = 0.0
         epoch_throttle_loss = 0.0
         epoch_speed_loss = 0.0
 
         # トレーニングステップ
-        for i, (inputs, targets) in enumerate(train_loader):
+        for i, batch in enumerate(train_loader):
+            inputs, targets, sample_weights = _unpack_batch(batch)
             inputs = inputs.to(device)
             targets = targets.to(device)
 
@@ -1103,7 +1174,14 @@ def train_model(
 
             # 順伝播
             outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            if use_weighted_loss:
+                loss = weighted_mse_loss(outputs, targets, column_weights,
+                                         sample_weights if rl_weight_columns else None,
+                                         rl_weight_columns)
+                with torch.no_grad():
+                    epoch_plain_loss += criterion(outputs, targets).item() * inputs.size(0)
+            else:
+                loss = criterion(outputs, targets)
 
             # 個別損失の計算
             steering_loss, throttle_loss, speed_loss, future_5_losses, future_10_losses = calculate_individual_losses(outputs, targets, criterion)
@@ -1167,6 +1245,8 @@ def train_model(
         train_losses.append(epoch_loss)
         train_steering_losses.append(epoch_steering_loss)
         train_throttle_losses.append(epoch_throttle_loss)
+        if use_weighted_loss:
+            train_losses_unweighted.append(epoch_plain_loss / len(train_loader.dataset))
 
         # 検証
         model.eval()
@@ -1175,7 +1255,8 @@ def train_model(
         val_throttle_loss = 0.0
         val_speed_loss = 0.0
         with torch.no_grad():
-            for inputs, targets in val_loader:
+            for batch in val_loader:
+                inputs, targets, _ = _unpack_batch(batch)
                 inputs = inputs.to(device)
                 targets = targets.to(device)
 
@@ -1258,12 +1339,15 @@ def train_model(
             }
             if speed_normalize:
                 save_dict['speed_normalize'] = speed_normalize
-            if vehicle_mask:
-                save_dict['vehicle_mask'] = [list(p) for p in vehicle_mask]
+            if masks:
+                save_dict['masks'] = [{'name': m['name'], 'points': [list(p) for p in m['points']]}
+                                      for m in masks]
             if future_offsets:
                 save_dict['future_offsets'] = [int(v) for v in future_offsets]
             if pip_embed:
                 save_dict['pip_embed'] = pip_embed
+            if rl_weighting:
+                save_dict['rl_weighting'] = rl_weighting
             if is_multi_source:
                 save_dict['num_sources'] = num_sources
                 save_dict['fusion_method'] = fusion_method
@@ -1342,12 +1426,15 @@ def train_model(
     }
     if speed_normalize:
         final_save_dict['speed_normalize'] = speed_normalize
-    if vehicle_mask:
-        final_save_dict['vehicle_mask'] = [list(p) for p in vehicle_mask]
+    if masks:
+        final_save_dict['masks'] = [{'name': m['name'], 'points': [list(p) for p in m['points']]}
+                                    for m in masks]
     if future_offsets:
         final_save_dict['future_offsets'] = [int(v) for v in future_offsets]
     if pip_embed:
         final_save_dict['pip_embed'] = pip_embed
+    if rl_weighting:
+        final_save_dict['rl_weighting'] = rl_weighting
     if is_multi_source:
         final_save_dict['num_sources'] = num_sources
         final_save_dict['fusion_method'] = fusion_method
@@ -1381,6 +1468,8 @@ def train_model(
         'train_throttle_losses': train_throttle_losses,
         'val_steering_losses': val_steering_losses,
         'val_throttle_losses': val_throttle_losses,
+        'train_losses_unweighted': train_losses_unweighted,
+        'rl_weighting': rl_weighting,
         'cancelled': False
     }
 
@@ -1395,7 +1484,8 @@ def validate_model(model, dataloader, criterion, device):
     val_loss = 0.0
     
     with torch.no_grad():
-        for inputs, targets in dataloader:
+        for batch in dataloader:
+            inputs, targets, _ = _unpack_batch(batch)
             inputs = inputs.to(device)
             targets = targets.to(device)
             
@@ -1473,7 +1563,8 @@ def evaluate_model(
     start_time = time.time()
     
     with torch.no_grad():
-        for inputs, targets in tqdm(test_loader, desc='Evaluating'):
+        for batch in tqdm(test_loader, desc='Evaluating'):
+            inputs, targets, _ = _unpack_batch(batch)
             inputs = inputs.to(device)
             targets = targets.to(device)
             
@@ -1701,6 +1792,8 @@ class LocationModelManager:
             'downscale_mode': 'resize',
             'grid_config': None,
             'num_grid_classes': 0,
+            'pose_history_steps': 0,
+            'pose_history_interval': 10,
         }
 
     # 格子分類の推論結果に保持する上位セル数（表示側の Top-N はこの範囲で選択）
@@ -1795,6 +1888,7 @@ class LocationModelManager:
                     pretrained=False,
                     input_size=tuple(cfg['input_size']) if cfg.get('input_size') else None,
                     num_grid_classes=int(cfg.get('num_grid_classes') or 0),
+                    pose_history_steps=int(cfg.get('pose_history_steps') or 0),
                 )
                 if progress_callback:
                     progress_callback(70, "モデルの重みをロード中...")
@@ -1887,7 +1981,15 @@ class LocationModelManager:
             traceback.print_exc()
             return False, str(e)
     
-    def run_inference(self, img_path):
+    @property
+    def pose_history_steps(self):
+        return int(self.location_config.get('pose_history_steps', 0) or 0)
+
+    @property
+    def has_history_input(self):
+        return self.pose_history_steps > 0
+
+    def run_inference(self, img_path, pose_history=None):
         """指定された画像（または画像パスのリスト）に対して位置推論を実行
 
         Args:
@@ -1943,7 +2045,15 @@ class LocationModelManager:
 
             result = {}
             with torch.no_grad():
-                outputs = self.model(tensor_image)
+                if isinstance(self.model, MultiSourceLocationModel) and self.has_history_input:
+                    # 過去の座標・姿勢の履歴入力（None なら全ステップ欠損として推論）
+                    from model_catalog import encode_pose_history
+                    hvec = encode_pose_history(pose_history, cfg.get('pose_norm'), self.pose_history_steps)
+                    history = torch.as_tensor(hvec).reshape(1, -1).to(device)
+                    outputs = self.model(tensor_image, history)
+                    result['history_valid_steps'] = int(round(float(hvec[::5].sum())))
+                else:
+                    outputs = self.model(tensor_image)
                 logits, pose, grid = split_location_outputs(outputs, self.output_mode)
 
                 if logits is not None:
@@ -2050,12 +2160,14 @@ class LocationMultiSourceDataset(torch.utils.data.Dataset):
 
     def __init__(self, grouped_image_paths, class_labels=None, pose_vectors=None,
                  num_sources=1, virtual_source_type=None, transform=None, mask_polygon=None,
-                 pixelate_factor=None, grid_labels=None, grid_xy=None):
+                 pixelate_factor=None, grid_labels=None, grid_xy=None,
+                 history_vectors=None):
         self.grouped_paths = grouped_image_paths
         self.class_labels = class_labels
         self.pose_vectors = pose_vectors
         self.grid_labels = grid_labels     # 格子セル index（格子分類時）
         self.grid_xy = grid_xy             # 格子分類の真値座標 [x, y]（位置誤差の評価用）
+        self.history_vectors = history_vectors   # 過去の座標・姿勢の履歴入力（encode_pose_history 済み）
         self.num_sources = num_sources
         self.virtual_source_type = virtual_source_type
         self.transform = transform
@@ -2063,8 +2175,8 @@ class LocationMultiSourceDataset(torch.utils.data.Dataset):
         self.pixelate_factor = pixelate_factor  # ピクセレーションモード時の係数（<1.0 で有効）
 
     def _load(self, path):
-        from model_catalog import apply_vehicle_mask, pixelate_image
-        img = apply_vehicle_mask(Image.open(path).convert('RGB'), self.mask_polygon)
+        from model_catalog import apply_mask_polygon, pixelate_image
+        img = apply_mask_polygon(Image.open(path).convert('RGB'), self.mask_polygon)
         return pixelate_image(img, self.pixelate_factor)
 
     def __len__(self):
@@ -2099,7 +2211,11 @@ class LocationMultiSourceDataset(torch.utils.data.Dataset):
             grid_xy = torch.tensor(self.grid_xy[idx], dtype=torch.float)
         else:
             grid_xy = torch.zeros(0, dtype=torch.float)
-        return stacked, class_target, pose_target, grid_target, grid_xy
+        if self.history_vectors is not None:
+            history = torch.tensor(self.history_vectors[idx], dtype=torch.float)
+        else:
+            history = torch.zeros(0, dtype=torch.float)
+        return stacked, class_target, pose_target, grid_target, grid_xy, history
 
 
 def resolve_location_input_size(raw_size, downscale_factor=1.0, downscale_mode='resize',
@@ -2154,6 +2270,8 @@ def create_location_datasets(
     input_size: Optional[Tuple[int, int]] = None,
     grid_cell_size: float = 0.5,
     grid_config: Optional[Dict[str, Any]] = None,
+    pose_history: Optional[List[List[Optional[List[float]]]]] = None,
+    pose_history_steps: int = 0,
 ) -> Tuple[DataLoader, DataLoader, Dict[str, Any]]:
     """位置推論用のデータセットを作成する
 
@@ -2185,6 +2303,9 @@ def create_location_datasets(
         input_size: 学習入力サイズ (H, W) の明示指定。None なら実画像サイズを使う
         grid_cell_size: 格子分類（output_mode に 'grid' を含む）のセル一辺 [m]
         grid_config: 格子定義の明示指定（None なら pose_targets から算出）
+        pose_history: 各サンプルの過去の座標・姿勢 [[x, y, theta] | None, ...]（新しい順、
+                      長さ pose_history_steps）。指定すると履歴入力ありのデータセットになる
+        pose_history_steps: 履歴入力のステップ数（0 で履歴入力なし）
 
     Returns:
         トレーニング用DataLoader, 検証用DataLoader, データセット情報
@@ -2291,16 +2412,36 @@ def create_location_datasets(
     else:
         transform = transforms.Compose([transforms.Resize(input_size), transforms.ToTensor()])
 
+    use_history = bool(pose_history_steps) and pose_history is not None
+    if use_history and len(pose_history) != len(grouped_image_paths):
+        raise ValueError("履歴入力には全サンプル分の pose_history が必要です。")
+
     pose_vectors = None
     pose_dim = 0
-    if use_pose:
+    if use_pose or use_history:
+        # 座標の正規化パラメータ（座標・姿勢出力と履歴入力で共通）
         if pose_norm is None:
-            pose_norm = compute_pose_norm(pose_targets)
+            if pose_targets is not None and len(pose_targets) == len(grouped_image_paths):
+                pose_norm = compute_pose_norm(pose_targets)
+            else:
+                hist_poses = [p for h in pose_history for p in (h or []) if p is not None]
+                if not hist_poses:
+                    raise ValueError("履歴入力の正規化には pose_targets または有効な pose_history が必要です。")
+                pose_norm = compute_pose_norm(hist_poses)
+    if use_pose:
         pose_vectors = normalize_pose_targets(pose_targets, pose_norm, include_heading=include_heading)
         pose_dim = int(pose_vectors.shape[1])
     else:
-        pose_norm = None
         include_heading = False
+        if not use_history:
+            pose_norm = None
+
+    history_vectors = None
+    if use_history:
+        from model_catalog import encode_pose_history
+        history_vectors = [encode_pose_history(h, pose_norm, pose_history_steps) for h in pose_history]
+        n_valid = sum(1 for h in pose_history if h and any(p is not None for p in h))
+        print(f"履歴入力: {pose_history_steps}ステップ（履歴のあるサンプル: {n_valid}/{len(pose_history)}）")
 
     # 格子分類: x, y を格子セル index に離散化（格子定義は学習データの範囲から作る）
     grid_labels = None
@@ -2326,6 +2467,7 @@ def create_location_datasets(
         pixelate_factor=pixelate_factor,
         grid_labels=grid_labels,
         grid_xy=grid_xy,
+        history_vectors=history_vectors,
     )
 
     val_size = int(len(dataset) * val_split)
@@ -2353,18 +2495,20 @@ def create_location_datasets(
         'include_heading': include_heading,
         'grid_config': grid_config,
         'num_grid_classes': int(grid_config['num_cells']) if grid_config else 0,
+        'pose_history_steps': int(pose_history_steps) if use_history else 0,
     }
     return train_loader, val_loader, dataset_info
 
 
 def _unpack_location_batch(batch):
     """位置データセットのバッチを
-    (inputs, class_targets|None, pose_targets|None, grid_targets|None, grid_xy|None) に分解"""
+    (inputs, class_targets|None, pose_targets|None, grid_targets|None, grid_xy|None, history|None) に分解"""
     if len(batch) == 2:
-        return batch[0], batch[1], None, None, None
+        return batch[0], batch[1], None, None, None, None
     inputs, cls_t, pose_t = batch[0], batch[1], batch[2]
     grid_t = batch[3] if len(batch) > 3 else None
     grid_xy = batch[4] if len(batch) > 4 else None
+    history = batch[5] if len(batch) > 5 else None
     if pose_t is not None and pose_t.dim() == 2 and pose_t.shape[1] == 0:
         pose_t = None
     if cls_t is not None and (cls_t < 0).all():
@@ -2373,7 +2517,41 @@ def _unpack_location_batch(batch):
         grid_t = None
     if grid_xy is not None and grid_xy.dim() == 2 and grid_xy.shape[1] == 0:
         grid_xy = None
-    return inputs, cls_t, pose_t, grid_t, grid_xy
+    if history is not None and history.dim() == 2 and history.shape[1] == 0:
+        history = None
+    return inputs, cls_t, pose_t, grid_t, grid_xy, history
+
+
+def augment_pose_history(history, pose_norm, steps, sigma_xy_m=0.1, sigma_theta_deg=5.0,
+                         drop_prob=0.1):
+    """学習時の履歴入力ノイズ付与（デッドレコニングへの過度な依存を防ぐ）
+
+    history: [B, steps*5] の正規化済み履歴ベクトル（valid, x_n, y_n, cos, sin）
+    - x, y に σ_xy [m] のガウスノイズ（正規化スケールに換算）
+    - θ に σ_θ [deg] のガウスノイズ（cos/sin を回転）
+    - 確率 drop_prob でサンプル全体の履歴を欠損（valid=0, 他 0）にする
+    """
+    if history is None or steps <= 0 or not pose_norm:
+        return history
+    B = history.shape[0]
+    h = history.view(B, steps, 5).clone()
+    x_rng = max(pose_norm['x_max'] - pose_norm['x_min'], 1e-6)
+    y_rng = max(pose_norm['y_max'] - pose_norm['y_min'], 1e-6)
+    if sigma_xy_m > 0:
+        h[:, :, 1] += torch.randn(B, steps, device=h.device) * (2.0 * sigma_xy_m / x_rng)
+        h[:, :, 2] += torch.randn(B, steps, device=h.device) * (2.0 * sigma_xy_m / y_rng)
+    if sigma_theta_deg > 0:
+        d = torch.randn(B, steps, device=h.device) * math.radians(sigma_theta_deg)
+        c, s = h[:, :, 3].clone(), h[:, :, 4].clone()
+        h[:, :, 3] = c * torch.cos(d) - s * torch.sin(d)
+        h[:, :, 4] = s * torch.cos(d) + c * torch.sin(d)
+    # 欠損ステップは 0 のまま維持
+    valid = (h[:, :, 0:1] > 0.5).to(h.dtype)
+    h = h * valid
+    if drop_prob > 0:
+        keep = (torch.rand(B, 1, 1, device=h.device) >= drop_prob).to(h.dtype)
+        h = h * keep
+    return h.view(B, steps * 5)
 
 
 def train_location_model(
@@ -2408,6 +2586,10 @@ def train_location_model(
     grid_top_n: int = 3,
     grid_label_sigma: float = 1.0,
     grid_class_balance: bool = True,
+    pose_history_steps: int = 0,
+    history_noise_xy_m: float = 0.1,
+    history_noise_theta_deg: float = 5.0,
+    history_drop_prob: float = 0.1,
 ) -> Dict[str, Any]:
     """位置推論モデルをトレーニングする（クラス分類 / 座標・姿勢回帰 / 両方）
 
@@ -2447,6 +2629,10 @@ def train_location_model(
                           Top-N の重み付き平均が意味を持つようにする
         grid_class_balance: サンプル数の多いセル（停車中など）へ予測が偏らないよう、
                             真値セルの出現頻度の逆数（平方根）で損失を重み付けする
+        pose_history_steps: 過去の座標・姿勢の履歴入力ステップ数（0 で履歴入力なし。
+                            location_config['pose_norm'] が必要）
+        history_noise_xy_m / history_noise_theta_deg / history_drop_prob:
+                            学習時の履歴ノイズ（座標[m]・方位[deg]の標準偏差、履歴全体の欠損確率）
 
     Returns:
         トレーニング結果の辞書
@@ -2469,6 +2655,9 @@ def train_location_model(
     grid_config = location_config.get('grid_config')
     if use_pose and not pose_norm:
         raise ValueError("座標・姿勢回帰には location_config['pose_norm'] が必要です。")
+    use_history = int(pose_history_steps or 0) > 0
+    if use_history and not pose_norm:
+        raise ValueError("履歴入力には location_config['pose_norm'] が必要です。")
     if use_grid:
         if not grid_config:
             raise ValueError("格子分類には location_config['grid_config'] が必要です。")
@@ -2487,7 +2676,7 @@ def train_location_model(
         except Exception as e:
             print(f"入力サイズの推定に失敗（既定サイズを使用）: {e}")
 
-    legacy_model = (output_mode == 'class' and num_sources == 1)
+    legacy_model = (output_mode == 'class' and num_sources == 1 and not use_history)
     if legacy_model:
         # 従来どおりの単一画像・クラス分類モデル（チェックポイント形式も従来互換）。
         # input_size を渡して実画像サイズ（縮小サイズ）で構築する
@@ -2499,7 +2688,8 @@ def train_location_model(
             base_model_name=model_name, num_sources=num_sources, fusion_method=fusion_method,
             num_classes=num_classes, output_mode=output_mode, pose_dim=pose_dim,
             pretrained=pretrained, input_size=input_size,
-            num_grid_classes=num_grid_classes if use_grid else 0)
+            num_grid_classes=num_grid_classes if use_grid else 0,
+            pose_history_steps=int(pose_history_steps) if use_history else 0)
 
     # 特定のモデルファイルから重みをロードする場合
     loaded_weights = False
@@ -2594,7 +2784,7 @@ def train_location_model(
         grid_errw_sum = 0.0
         n_grid = 0
         for i, batch in enumerate(loader):
-            inputs, cls_t, pose_t, grid_t, grid_xy = _unpack_location_batch(batch)
+            inputs, cls_t, pose_t, grid_t, grid_xy, history = _unpack_location_batch(batch)
             inputs = inputs.to(device)
             if cls_t is not None:
                 cls_t = cls_t.to(device)
@@ -2602,9 +2792,18 @@ def train_location_model(
                 pose_t = pose_t.to(device)
             if grid_t is not None:
                 grid_t = grid_t.to(device)
+            if history is not None and use_history:
+                history = history.to(device)
+                if train:
+                    history = augment_pose_history(
+                        history, pose_norm, int(pose_history_steps),
+                        sigma_xy_m=history_noise_xy_m, sigma_theta_deg=history_noise_theta_deg,
+                        drop_prob=history_drop_prob)
+            else:
+                history = None
 
             with torch.set_grad_enabled(train):
-                outputs = model(inputs)
+                outputs = model(inputs, history) if use_history else model(inputs)
                 logits, pose_out, grid_out = split_location_outputs(outputs, output_mode)
                 loss = torch.zeros((), device=device)
                 if logits is not None and cls_t is not None:
@@ -2711,7 +2910,14 @@ def train_location_model(
             'num_grid_classes': num_grid_classes if use_grid else 0,
             'grid_label_sigma': float(grid_label_sigma) if use_grid else None,
             'grid_class_balance': bool(grid_class_balance) if use_grid else None,
+            # 履歴入力（推論時に同じステップ数・正規化で履歴ベクトルを作るための情報）
+            'pose_history_steps': int(pose_history_steps) if use_history else 0,
+            'history_noise_xy_m': float(history_noise_xy_m) if use_history else None,
+            'history_noise_theta_deg': float(history_noise_theta_deg) if use_history else None,
+            'history_drop_prob': float(history_drop_prob) if use_history else None,
         })
+        if use_history:
+            checkpoint_config['pose_norm'] = pose_norm   # pose ヘッドが無くても履歴正規化に必要
 
     def build_checkpoint(epoch_value, extra):
         ckpt = {

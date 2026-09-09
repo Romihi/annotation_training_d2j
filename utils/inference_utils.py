@@ -11,7 +11,7 @@ import random
 from typing import Dict, List, Any, Optional, Tuple
 import torchvision.transforms as transforms
 
-from model_catalog import get_model, list_available_models, apply_vehicle_mask, embed_image_pip
+from model_catalog import get_model, list_available_models, apply_masks, embed_image_pip
 
 _MODEL_CACHE = {}
 
@@ -103,9 +103,16 @@ def _infer_with_model(
                         # 学習時のspeed正規化値（保存されていれば表示側で利用）
                         if checkpoint.get('speed_normalize'):
                             model._speed_normalize = float(checkpoint['speed_normalize'])
-                        # 学習時の車両マスク（保存されていれば推論時にも同じマスクを適用）
-                        if checkpoint.get('vehicle_mask'):
-                            model._vehicle_mask = [tuple(p) for p in checkpoint['vehicle_mask']]
+                        # 学習時のマスク（保存されていれば推論時にも同じマスクを適用）
+                        # 旧形式は vehicle_mask / background_mask の単独キーで保存されている
+                        _masks = checkpoint.get('masks')
+                        if _masks:
+                            model._mask_polygons = [[tuple(p) for p in m['points']] for m in _masks]
+                        else:
+                            _legacy = [checkpoint.get('vehicle_mask'), checkpoint.get('background_mask')]
+                            _legacy = [[tuple(p) for p in poly] for poly in _legacy if poly]
+                            if _legacy:
+                                model._mask_polygons = _legacy
                         # 学習時の将来予測フレームオフセット（推論結果のキー・表示に利用）
                         if checkpoint.get('future_offsets'):
                             model._future_offsets = [int(v) for v in checkpoint['future_offsets']]
@@ -140,8 +147,8 @@ def _infer_with_model(
                     img = Image.open(img_path).convert('RGB')
                     img_width, img_height = img.size
 
-                    # 学習時に車両マスクを使ったモデルは推論時にも同じマスクを適用
-                    img = apply_vehicle_mask(img, getattr(model, '_vehicle_mask', None))
+                    # 学習時にマスクを使ったモデルは推論時にも同じマスクを適用
+                    img = apply_masks(img, getattr(model, '_mask_polygons', None))
 
                     # 学習時に画像埋込を使ったモデルは推論時にも同じ合成を適用
                     # （pip_map: ベース画像パス → {ソース名: 埋込画像パス}）

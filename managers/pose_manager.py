@@ -24,7 +24,9 @@ import numpy as np
 # slam: 2D LiDAR SLAM（地図座標系、通常は安定）
 # vslam: Visual/Inertial SLAM（連続的だがドリフトしうる）
 # pose: 車載デッドレコニング＋IMU融合（常時稼働だが長時間でドリフト）
-DEFAULT_PRIORITY = ["aruco", "slam", "vslam", "pose"]
+# fused: 複数ソースを融合した推定値（fused/x, y, theta, status）。現行の記録には
+#        含まれないが、将来のキーとして認識する（データが無ければ候補に出ない）
+DEFAULT_PRIORITY = ["aruco", "fused", "slam", "vslam", "pose"]
 
 OK_STATUSES = {"ok"}
 INTERP_SOURCE = "interp"
@@ -199,6 +201,32 @@ class PoseSourceManager:
         if len(xs) < 2:
             return True
         return (max(xs) - min(xs) < 1e-6) and (max(ys) - min(ys) < 1e-6)
+
+    def source_frame_count(self, source: str, ok_only: bool = True) -> int:
+        """指定ソースのサンプルを持つフレーム数（ok_only=True なら status ok のみ）"""
+        if ok_only:
+            return int(self._source_ok_counts.get(source, 0))
+        return int(self._source_total_counts.get(source, 0))
+
+    def get_source_pose(self, index: int, source: str, require_ok: bool = True,
+                        allow_interp: bool = True) -> Optional[PoseSample]:
+        """指定ソースのサンプルだけを返す（他ソースへはフォールバックしない）
+
+        学習ラベルのように「選んだソースの値だけを使いたい」用途向け。get_pose は
+        優先順位に従って他ソースへ落ちるため、slam を選んでも欠損フレームでは
+        pose が混ざる。補間結果（interpolate_gaps）は allow_interp=True なら返す。
+        """
+        samples = self._raw.get(index)
+        if not samples:
+            return None
+        if allow_interp and index in self._interpolated_indexes and INTERP_SOURCE in samples:
+            return samples[INTERP_SOURCE]
+        sample = samples.get(source)
+        if sample is None:
+            return None
+        if require_ok and not sample.is_ok:
+            return None
+        return sample
 
     def get_pose(self, index: int, prefer: Optional[str] = None) -> Optional[PoseSample]:
         """指定フレームの自己位置を優先順位に従って取得（statusがokのものを優先）

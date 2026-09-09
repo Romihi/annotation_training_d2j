@@ -125,6 +125,23 @@ SEGMENTATION_HOVER_VERTEX_RADIUS = 5
 # Speed
 MAX_SPEED = 5  # speed正規化の最大値 (m/s)
 
+# オフライン重み付け BC（強化学習要素）の UI 既定値
+# 詳細: dev/SPEC_offline_rl_throttle.md §4.1 / §6。キーは managers.offline_reward.RewardConfig に対応
+RL_WEIGHT_DEFAULTS = {
+    'method': 'awr',            # 'awr' | 'filtered'
+    'target_head': 'speed',     # 'speed' | 'throttle' | 'both'（speed 出力が無いモデルは throttle）
+    'gamma': 0.97,              # 割引率
+    'beta': 0.7,                # AWR 温度
+    'w_min': 0.1,               # 重み下限
+    'w_max': 5.0,               # 重み上限
+    'top_k': 0.4,               # Filtered BC の上位割合
+    'baseline_mode': 'speed_bin',  # 'speed_bin' | 'global'
+    'episode_gap_s': 1.0,       # エピソード分割の時間間隔 [s]
+    'c_speed': 1.0, 'c_wall': 1.0, 'c_side': 0.5, 'c_slip': 2.0, 'c_stuck': 5.0, 'c_yaw': 0.2,
+    'wall_mm': 1000.0,          # 前方壁ペナルティ開始距離 [mm]
+    'side_mm': 500.0,           # 斜め前壁ペナルティ開始距離 [mm]
+}
+
 # ===========================================
 # 色設定（QColorは使用側で生成）
 # ===========================================

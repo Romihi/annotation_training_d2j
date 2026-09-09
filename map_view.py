@@ -34,6 +34,7 @@ plt.rcParams['axes.unicode_minus'] = False
 
 SOURCE_COLORS = {
     "aruco": "tab:red",
+    "fused": "tab:purple",
     "slam": "tab:blue",
     "vslam": "tab:green",
     "pose": "tab:gray",

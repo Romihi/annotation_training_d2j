@@ -69,7 +69,7 @@ from utils.image_utils import (
 )
 
 # カスタムモジュールのインポート
-from model_catalog import get_model, list_available_models, list_available_location_models, VirtualSourceDataset, apply_vehicle_mask
+from model_catalog import get_model, list_available_models, list_available_location_models, VirtualSourceDataset, apply_masks
 from utils.inference_utils import batch_inference
 from utils.export_utils import export_to_donkey, export_to_jetracer, export_to_video, export_to_video_multi_source
 from model_training import train_model, create_datasets
@@ -97,6 +97,43 @@ sys.excepthook = exception_hook
 # グローバル設定変数（移植中）
 from config import *
 from translations import get_text, set_language, get_current_language, t
+
+# ─── マスク ─────────────────────────────────────────────
+
+# 組み込みマスクのID（プルダウンから削除できない）
+BUILTIN_MASK_IDS = ('vehicle', 'background')
+
+# マスクオーバーレイの色（インデックス順に割り当て、超えた分は循環）
+MASK_OVERLAY_COLORS = [
+    (128, 128, 128),  # 車両: グレー
+    (60, 130, 220),   # 背景: 青
+    (220, 140, 40),   # 以降は追加マスク用
+    (80, 180, 100),
+    (200, 80, 180),
+    (200, 190, 60),
+]
+
+
+def mask_overlay_color(index):
+    """マスクindexに対応するオーバーレイ色 (r, g, b) を返す"""
+    return MASK_OVERLAY_COLORS[index % len(MASK_OVERLAY_COLORS)]
+
+
+# ─── モデル表示名 ヘルパー関数 ─────────────────────────────────────────────
+
+def _shorten_model_display_name(filename, prefix=None):
+    """モデルファイル名からプレフィックス（アーキ/タイプ名）とサフィックス（拡張子）を省略した表示名を作る
+
+    例: donkeycar_20260902_184035.pth, prefix="donkeycar" -> "20260902_184035"
+    """
+    name = os.path.basename(filename)
+    if name.lower().endswith('.pth'):
+        name = name[:-len('.pth')]
+    if prefix:
+        p = prefix if prefix.endswith('_') else f"{prefix}_"
+        if name.lower().startswith(p.lower()):
+            name = name[len(p):]
+    return name if name else os.path.basename(filename)
 
 # ─── フラッドフィル ヘルパー関数 ─────────────────────────────────────────────
 
@@ -402,8 +439,8 @@ class ImageLabel(QLabel):
         self.resolution_scale = 1.0          # 1.0=フル解像度, 0.1=10%
         self.crop_overlay_config = None      # 仮想ソース表示用
         self.virtual_overlay_mode = 'fill'   # 'none', 'border', 'fill'
-        self._mask_drag_index = None         # 車両マスク: ドラッグ中の頂点インデックス
-        self._mask_drag_mirrored = False     # 車両マスク: 鏡像側ハンドルをドラッグ中か
+        self._mask_drag_index = None         # マスク編集: ドラッグ中の頂点インデックス
+        self._mask_drag_mirrored = False     # マスク編集: 鏡像側ハンドルをドラッグ中か
         self._temporal_thumb_cache = {}      # {(path, w, h): QPixmap}
         self.is_deleted = False
         self.is_downsampled = False  # ダウンサンプリング対象フラグ
@@ -833,8 +870,8 @@ class ImageLabel(QLabel):
         # CAMオーバーレイを描画（ベース画像の上、他のアノテーションの下）
         self.draw_gradcam_overlay(painter, self.target_rect)
 
-        # 車両マスクのオーバーレイ（学習時に無視される領域の可視化）
-        self.draw_vehicle_mask(painter, self.target_rect)
+        # マスクのオーバーレイ（学習時に無視される領域の可視化）
+        self.draw_masks(painter, self.target_rect)
 
         # 各機能毎に描画（描画順序を調整）
         self.draw_grid(painter, self.target_rect)
@@ -910,45 +947,44 @@ class ImageLabel(QLabel):
         painter.drawPixmap(self.target_rect, pix)
 
     def _find_mask_vertex(self, rel_x, rel_y):
-        """指定の正規化座標近傍にある車両マスク頂点を探す
+        """編集中マスクの頂点のうち、指定の正規化座標近傍にあるものを探す
 
         Returns:
             (index, is_mirrored): 見つからない場合は (None, False)。
-            is_mirrored=True は鏡像側ハンドルをつかんだことを示す。
+            is_mirrored=True は鏡像側ハンドルをつかんだことを示す（左右対称マスクのみ）。
         """
         mw = self.main_window
-        pts = getattr(mw, 'vehicle_mask_user_points', None)
-        if not pts or not self.target_rect or self.target_rect.width() <= 0:
+        mask = mw.editing_mask() if mw else None
+        if not mask or not mask['points'] or not self.target_rect or self.target_rect.width() <= 0:
             return None, False
 
         # スクリーン座標で半径8px以内を近傍とみなす
         threshold = 8.0
+        symmetric = mask.get('symmetric', True)
         tw, th = self.target_rect.width(), self.target_rect.height()
-        for i, (px, py) in enumerate(pts):
+        for i, (px, py) in enumerate(mask['points']):
             if abs((rel_x - px) * tw) <= threshold and abs((rel_y - py) * th) <= threshold:
                 return i, False
-            if abs((rel_x - (1.0 - px)) * tw) <= threshold and abs((rel_y - py) * th) <= threshold:
+            if symmetric and (abs((rel_x - (1.0 - px)) * tw) <= threshold
+                              and abs((rel_y - py) * th) <= threshold):
                 return i, True
         return None, False
 
-    def draw_vehicle_mask(self, painter, target_rect):
-        """車両マスクポリゴンのオーバーレイ描画（編集モード時は頂点と中央線も表示）"""
+    def draw_masks(self, painter, target_rect):
+        """全マスクポリゴンのオーバーレイ描画（編集中のマスクは頂点と中央線も表示）"""
         mw = self.main_window
         if not mw:
             return
         # 結合表示中はtarget_rectが単一画像と対応せず表示位置がずれるため自動的に非表示
         if getattr(mw, 'current_variant', None) == '__combined__':
             return
-        edit_mode = getattr(mw, 'vehicle_mask_edit_mode', False)
-        # 表示オフ設定時は描画しない（編集モード中は設定に関わらず表示する）
-        if not getattr(mw, 'vehicle_mask_overlay_visible', True) and not edit_mode:
-            return
-        user_points = getattr(mw, 'vehicle_mask_user_points', None)
-        if not edit_mode and not user_points:
+        masks = getattr(mw, 'masks', None)
+        if not masks:
             return
 
         tx, ty = target_rect.x(), target_rect.y()
         tw, th = target_rect.width(), target_rect.height()
+        edit_index = getattr(mw, 'mask_edit_index', None)
 
         def to_screen(p):
             return QPointF(tx + p[0] * tw, ty + p[1] * th)
@@ -956,48 +992,58 @@ class ImageLabel(QLabel):
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, True)
 
-        # 編集モード中は中央線（対称軸）を点線で表示
-        if edit_mode:
-            pen = QPen(QColor(255, 255, 0, 180), 1, Qt.DashLine)
-            painter.setPen(pen)
-            painter.drawLine(int(tx + tw / 2), ty, int(tx + tw / 2), ty + th)
+        for i, mask in enumerate(masks):
+            editing = (i == edit_index)
+            # 表示オフ設定時は描画しない（編集中は設定に関わらず表示する）
+            if not mask.get('visible', True) and not editing:
+                continue
+            points = mask['points']
+            if not editing and not points:
+                continue
 
-        # 対称ポリゴンの塗りつぶし（グレー系）
-        polygon = mw.get_vehicle_mask_polygon()
-        if polygon:
-            screen_points = [to_screen(p) for p in polygon]
-            qpoly = QPolygonF(screen_points)
-            painter.setPen(QPen(QColor(90, 90, 90, 220), 2))
-            painter.setBrush(QBrush(QColor(128, 128, 128, 110)))
-            painter.drawPolygon(qpoly)
+            r, g, b = mask_overlay_color(i)
+            symmetric = mask.get('symmetric', True)
 
-            # マスク領域の重心に「車両マスク」ラベルを表示
-            label_text = get_text('btn_vehicle_mask')
-            cx = sum(sp.x() for sp in screen_points) / len(screen_points)
-            cy = sum(sp.y() for sp in screen_points) / len(screen_points)
-            painter.setFont(QFont("Arial", 9, QFont.Bold))
-            fm = painter.fontMetrics()
-            text_x = int(cx - fm.horizontalAdvance(label_text) / 2)
-            text_y = int(cy + fm.ascent() / 2)
-            # 白の縁取りで背景に埋もれないようにする
-            painter.setPen(QPen(QColor(255, 255, 255, 200), 1))
-            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                painter.drawText(text_x + dx, text_y + dy, label_text)
-            painter.setPen(QPen(QColor(70, 70, 70, 230), 1))
-            painter.drawText(text_x, text_y, label_text)
+            # 編集中かつ左右対称なら中央線（対称軸）を点線で表示
+            if editing and symmetric:
+                painter.setPen(QPen(QColor(r, g, b, 200), 1, Qt.DashLine))
+                painter.drawLine(int(tx + tw / 2), ty, int(tx + tw / 2), ty + th)
 
-        # 編集モード中は頂点マーカーを表示（ユーザー頂点=塗り、鏡像=白抜き）
-        # どちらのハンドルもドラッグで移動、右クリックで削除できる
-        if edit_mode and user_points:
-            for p in user_points:
-                sp = to_screen(p)
-                painter.setPen(QPen(QColor(255, 255, 255), 1))
-                painter.setBrush(QBrush(QColor(80, 80, 80, 240)))
-                painter.drawEllipse(sp, 5, 5)
-                mp = to_screen((1.0 - p[0], p[1]))
-                painter.setPen(QPen(QColor(80, 80, 80, 240), 2))
-                painter.setBrush(QBrush(QColor(255, 255, 255, 180)))
-                painter.drawEllipse(mp, 5, 5)
+            polygon = mw.get_mask_polygon(i)
+            if polygon:
+                screen_points = [to_screen(p) for p in polygon]
+                painter.setPen(QPen(QColor(max(0, r - 40), max(0, g - 40), max(0, b - 40), 220), 2))
+                painter.setBrush(QBrush(QColor(r, g, b, 110)))
+                painter.drawPolygon(QPolygonF(screen_points))
+
+                # マスク領域の重心にマスク名ラベルを表示
+                label_text = mw.mask_display_name(mask)
+                cx = sum(sp.x() for sp in screen_points) / len(screen_points)
+                cy = sum(sp.y() for sp in screen_points) / len(screen_points)
+                painter.setFont(QFont("Arial", 9, QFont.Bold))
+                fm = painter.fontMetrics()
+                text_x = int(cx - fm.horizontalAdvance(label_text) / 2)
+                text_y = int(cy + fm.ascent() / 2)
+                # 白の縁取りで背景に埋もれないようにする
+                painter.setPen(QPen(QColor(255, 255, 255, 200), 1))
+                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    painter.drawText(text_x + dx, text_y + dy, label_text)
+                painter.setPen(QPen(QColor(max(0, r - 60), max(0, g - 60), max(0, b - 60), 230), 1))
+                painter.drawText(text_x, text_y, label_text)
+
+            # 編集中は頂点マーカーを表示（ユーザー頂点=塗り、鏡像=白抜き）
+            # どちらのハンドルもドラッグで移動、右クリックで削除できる
+            if editing and points:
+                for p in points:
+                    sp = to_screen(p)
+                    painter.setPen(QPen(QColor(255, 255, 255), 1))
+                    painter.setBrush(QBrush(QColor(r, g, b, 240)))
+                    painter.drawEllipse(sp, 5, 5)
+                    if symmetric:
+                        mp = to_screen((1.0 - p[0], p[1]))
+                        painter.setPen(QPen(QColor(r, g, b, 240), 2))
+                        painter.setBrush(QBrush(QColor(255, 255, 255, 180)))
+                        painter.drawEllipse(mp, 5, 5)
 
         painter.restore()
 
@@ -3608,25 +3654,25 @@ class ImageLabel(QLabel):
             orig_x = int(rel_x * self.pix_width)
             orig_y = int(rel_y * self.pix_height)
 
-            # 車両マスク編集モード: 通常のアノテーション処理より優先して頂点を編集
-            if getattr(self.main_window, 'vehicle_mask_edit_mode', False):
+            # マスク編集モード: 通常のアノテーション処理より優先して頂点を編集
+            if getattr(self.main_window, 'mask_edit_index', None) is not None:
                 # 結合表示中は座標系が合わないため編集操作を受け付けない
                 # （クリックは消費して誤アノテーションを防ぐ）
                 if getattr(self.main_window, 'current_variant', None) == '__combined__':
                     if hasattr(self.main_window, 'statusBar'):
                         self.main_window.statusBar().showMessage(
-                            get_text('status_vehicle_mask_combined_blocked'), 4000)
+                            get_text('status_mask_combined_blocked'), 4000)
                     return
                 if event.button() == Qt.RightButton:
                     if event.modifiers() & Qt.ControlModifier:
-                        self.main_window.clear_vehicle_mask()  # Ctrl+右クリックで全消去
+                        self.main_window.clear_mask_points()  # Ctrl+右クリックで全消去
                     else:
                         # 頂点近傍の右クリックはその頂点を削除、それ以外は直前の頂点を削除
                         vi, _ = self._find_mask_vertex(rel_x, rel_y)
                         if vi is not None:
-                            self.main_window.remove_vehicle_mask_point(vi)
+                            self.main_window.remove_mask_point(vi)
                         else:
-                            self.main_window.remove_last_vehicle_mask_point()
+                            self.main_window.remove_last_mask_point()
                 elif event.button() == Qt.LeftButton:
                     # 既存頂点（鏡像側ハンドル含む）の近傍ならドラッグ移動を開始
                     vi, mirrored = self._find_mask_vertex(rel_x, rel_y)
@@ -3635,7 +3681,7 @@ class ImageLabel(QLabel):
                         self._mask_drag_mirrored = mirrored
                         self.setCursor(Qt.ClosedHandCursor)
                     else:
-                        self.main_window.add_vehicle_mask_point(rel_x, rel_y)
+                        self.main_window.add_mask_point(rel_x, rel_y)
                 return
 
             # 現在のモードに基づいて処理
@@ -4063,7 +4109,7 @@ class ImageLabel(QLabel):
                     self.main_window.skip_images(1)  # デフォルトは1枚
 
     def mouseReleaseEvent(self, event):
-        # 車両マスク頂点のドラッグ終了
+        # マスク頂点のドラッグ終了
         if self._mask_drag_index is not None:
             self._mask_drag_index = None
             self._mask_drag_mirrored = False
@@ -4203,8 +4249,8 @@ class ImageLabel(QLabel):
         """マウス移動時の処理 - ハンドルによるサイズ変更機能を追加"""
         pos = event.pos()
 
-        # 車両マスク頂点のドラッグ移動
-        if (getattr(self.main_window, 'vehicle_mask_edit_mode', False)
+        # マスク頂点のドラッグ移動
+        if (getattr(self.main_window, 'mask_edit_index', None) is not None
                 and self._mask_drag_index is not None):
             if self.target_rect and self.target_rect.width() > 0 and self.target_rect.height() > 0:
                 rel_x = (pos.x() - self.target_rect.x()) / self.target_rect.width()
@@ -4212,7 +4258,7 @@ class ImageLabel(QLabel):
                 # 鏡像側ハンドルをつかんでいる場合は本体側の座標に変換
                 if self._mask_drag_mirrored:
                     rel_x = 1.0 - rel_x
-                self.main_window.move_vehicle_mask_point(self._mask_drag_index, rel_x, rel_y)
+                self.main_window.move_mask_point(self._mask_drag_index, rel_x, rel_y)
             return
 
         # カーソルオーバーレイ更新（セグメンテーションモード）
@@ -5957,10 +6003,16 @@ class ImageAnnotationTool(QMainWindow):
         self.info_panel_width = 280  # 基本の幅
         self.info_panel_margin = 20  # パネル周りの余白（左右合計）
 
-        # 車両マスク関連の初期化（画像下側の車体領域を学習時に無視するためのポリゴン）
-        self.vehicle_mask_user_points = []  # ユーザーがクリックした頂点（正規化座標、左右対称の片側）
-        self.vehicle_mask_edit_mode = False  # マスク編集モード中か
-        self.vehicle_mask_overlay_visible = True  # マスクオーバーレイの表示ON/OFF
+        # マスク関連の初期化（指定領域を学習・推論入力から無視するためのポリゴン）
+        # points: ユーザーがクリックした頂点（正規化座標。symmetric時は左右対称の片側）
+        # 先頭2つは組み込みマスクで削除不可。プルダウンから任意個を追加できる。
+        self.masks = [
+            {'id': 'vehicle', 'name': None, 'points': [], 'visible': True, 'symmetric': True},
+            {'id': 'background', 'name': None, 'points': [], 'visible': True, 'symmetric': True},
+        ]
+        self.mask_edit_index = None   # 編集中マスクのindex（Noneなら非編集）
+        self._mask_target_index = 0   # プルダウンで選択中のマスクindex
+        self._mask_combo_updating = False  # コンボ再構築中の再入防止
 
         # 位置情報関連の初期化
         self.location_buttons = []  # 位置情報ボタンのリスト
@@ -7786,8 +7838,6 @@ class ImageAnnotationTool(QMainWindow):
         self.resolution_value_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         resolution_row.addWidget(self.resolution_value_label)
 
-        resolution_row.addStretch(1)  # 左パディング
-
         self.resolution_slider = QSlider(Qt.Horizontal)
         self.resolution_slider.setMinimum(10)
         self.resolution_slider.setMaximum(100)
@@ -7797,23 +7847,35 @@ class ImageAnnotationTool(QMainWindow):
         self.resolution_slider.setSingleStep(5)
         self.resolution_slider.setToolTip(get_text('tooltip_resolution_scale'))
         self.resolution_slider.valueChanged.connect(self._on_resolution_scale_changed)
-        resolution_row.addWidget(self.resolution_slider, 3)  # スライダー幅を縮小
+        resolution_row.addWidget(self.resolution_slider, 1)  # 余白をすべて吸収して行を画像幅いっぱいに広げる
 
-        # 車両マスクボタン（押下でポリゴン編集モードに入り、画像クリックで頂点を追加）
-        self.vehicle_mask_button = QPushButton(get_text('btn_vehicle_mask'))
-        self.vehicle_mask_button.setCheckable(True)
-        self.vehicle_mask_button.setToolTip(get_text('tip_vehicle_mask'))
-        self.vehicle_mask_button.toggled.connect(self.toggle_vehicle_mask_edit)
-        resolution_row.addWidget(self.vehicle_mask_button)
+        # マスク編集UI: 対象コンボで車両/背景を選び、編集ボタンと表示チェックは選択中のマスクに作用する
+        mask_target_label = QLabel(get_text('label_mask_target'))
+        mask_target_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        resolution_row.addWidget(mask_target_label)
+
+        self.mask_target_combo = QComboBox()
+        self.mask_target_combo.setToolTip(get_text('tip_mask_target'))
+        self.mask_target_combo.currentIndexChanged.connect(self._on_mask_target_changed)
+        resolution_row.addWidget(self.mask_target_combo)
+
+        # 押下でポリゴン編集モードに入り、画像クリックで頂点を追加
+        self.mask_edit_button = QPushButton(get_text('btn_mask_edit'))
+        self.mask_edit_button.setCheckable(True)
+        self.mask_edit_button.setToolTip(get_text('tip_mask_edit'))
+        self.mask_edit_button.toggled.connect(self.toggle_mask_edit)
+        # 既定のボタン高はコンボより大きくなるため、対象コンボの高さに揃える
+        self.mask_edit_button.setFixedHeight(self.mask_target_combo.sizeHint().height())
+        resolution_row.addWidget(self.mask_edit_button)
 
         # マスクオーバーレイの表示ON/OFF（結合表示中は設定に関わらず自動オフ）
-        self.vehicle_mask_visible_checkbox = QCheckBox(get_text('chk_vehicle_mask_visible'))
-        self.vehicle_mask_visible_checkbox.setChecked(True)
-        self.vehicle_mask_visible_checkbox.setToolTip(get_text('tip_vehicle_mask_visible'))
-        self.vehicle_mask_visible_checkbox.toggled.connect(self.toggle_vehicle_mask_visible)
-        resolution_row.addWidget(self.vehicle_mask_visible_checkbox)
+        self.mask_visible_checkbox = QCheckBox(get_text('chk_mask_visible'))
+        self.mask_visible_checkbox.setChecked(True)
+        self.mask_visible_checkbox.setToolTip(get_text('tip_mask_visible'))
+        self.mask_visible_checkbox.toggled.connect(self.toggle_mask_visible)
+        resolution_row.addWidget(self.mask_visible_checkbox)
 
-        resolution_row.addStretch(1)  # 右パディング
+        self._rebuild_mask_target_combo()
 
         image_column.addLayout(resolution_row)
 
@@ -8260,6 +8322,8 @@ class ImageAnnotationTool(QMainWindow):
         self.recorded_traj_source_combo.addItem("pose", "pose")
         self.recorded_traj_source_combo.addItem("slam", "slam")
         self.recorded_traj_source_combo.addItem("vslam", "vslam")
+        self.recorded_traj_source_combo.addItem("aruco", "aruco")
+        self.recorded_traj_source_combo.addItem("fused", "fused")
         self.recorded_traj_source_combo.setToolTip(get_text('tip_recorded_traj_source'))
         self.recorded_traj_source_combo.setCurrentIndex(0)   # 既定 pose
         self.recorded_traj_source_combo.currentIndexChanged.connect(self.update_recorded_traj_source)
@@ -8953,7 +9017,10 @@ class ImageAnnotationTool(QMainWindow):
                 "max_speed": self.main_image_view.max_speed if hasattr(self, 'main_image_view') else MAX_SPEED,
                 "detection_classes": self.classes_input.text() if hasattr(self, 'classes_input') else "",
                 "location_classes": {str(k): v for k, v in getattr(self, 'location_class_names', {}).items() if v.strip()},
-                "vehicle_mask": [list(p) for p in getattr(self, 'vehicle_mask_user_points', [])],
+                "masks": [{'id': m['id'], 'name': m['name'], 'visible': m.get('visible', True),
+                           'symmetric': m.get('symmetric', True),
+                           'points': [list(p) for p in m['points']]}
+                          for m in getattr(self, 'masks', [])],
                 "timestamp": int(time.time())
             }
             
@@ -10947,8 +11014,8 @@ class ImageAnnotationTool(QMainWindow):
                         img = Image.open(path).convert('RGB')
                         if first_img_size is None:
                             first_img_size = img.size
-                        # 学習時に車両マスクを使ったモデルは推論時にも同じマスクを適用
-                        img = apply_vehicle_mask(img, getattr(model, '_vehicle_mask', None))
+                        # 学習時にマスクを使ったモデルは推論時にも同じマスクを適用
+                        img = apply_masks(img, getattr(model, '_mask_polygons', None))
                         if downscale_factor < 1.0:
                             W2, H2 = img.size
                             pw = max(1, int(W2 * downscale_factor))
@@ -11006,8 +11073,8 @@ class ImageAnnotationTool(QMainWindow):
                     img = Image.open(img_path).convert('RGB')
                     W, H = img.size
 
-                    # 学習時に車両マスクを使ったモデルは推論時にも同じマスクを適用
-                    img = apply_vehicle_mask(img, getattr(model, '_vehicle_mask', None))
+                    # 学習時にマスクを使ったモデルは推論時にも同じマスクを適用
+                    img = apply_masks(img, getattr(model, '_mask_polygons', None))
 
                     if virtual_type == 'crop':
                         step = W / num_sources
@@ -11032,7 +11099,7 @@ class ImageAnnotationTool(QMainWindow):
                         for k in range(num_sources):
                             prev_idx = max(0, idx - k * temporal_interval)
                             _frame = Image.open(self.images[prev_idx]).convert('RGB')
-                            source_imgs.append(apply_vehicle_mask(_frame, getattr(model, '_vehicle_mask', None)))
+                            source_imgs.append(apply_masks(_frame, getattr(model, '_mask_polygons', None)))
                     else:
                         source_imgs = [img] * num_sources
 
@@ -11077,7 +11144,8 @@ class ImageAnnotationTool(QMainWindow):
 
     def _update_model_combo_tooltip(self, index):
         """model_comboの選択変更時にコンボ本体のツールチップを更新"""
-        self.model_combo.setToolTip(self.model_combo.itemText(index))
+        full_name = self.model_combo.itemData(index)
+        self.model_combo.setToolTip(full_name if full_name else self.model_combo.itemText(index))
 
     def _refresh_extra_model_list(self, model_combo, method_combo):
         """追加モデルスロットのモデルリストを更新"""
@@ -11187,19 +11255,20 @@ class ImageAnnotationTool(QMainWindow):
         for model_file in model_files:
             model_full_path = os.path.join(models_dir, model_file)
             ms_info = detect_multi_source_from_checkpoint(model_full_path)
+            short_name = _shorten_model_display_name(model_file, current_arch)
             if ms_info['num_sources'] > 1:
                 marker = get_text('label_multi_source_model_marker',
                                   ms_info['num_sources'],
                                   ms_info['fusion_method'] or '?')
-                display_name = f"{model_file} {marker}"
+                display_name = f"{short_name} {marker}"
             else:
-                display_name = model_file
+                display_name = short_name
             self.model_combo.addItem(display_name, model_file)  # userData=実ファイル名
-            self.model_combo.setItemData(self.model_combo.count() - 1, display_name, Qt.ToolTipRole)
+            self.model_combo.setItemData(self.model_combo.count() - 1, model_file, Qt.ToolTipRole)
 
         # 選択中アイテムのツールチップを同期（折りたたみ状態でもホバー表示）
         if self.model_combo.count() > 0:
-            self.model_combo.setToolTip(self.model_combo.currentText())
+            self.model_combo.setToolTip(self.model_combo.currentData() or self.model_combo.currentText())
         try:
             self.model_combo.currentIndexChanged.disconnect(self._update_model_combo_tooltip)
         except TypeError:
@@ -20092,9 +20161,9 @@ class ImageAnnotationTool(QMainWindow):
         if session_info and "max_speed" in session_info:
             self.main_image_view.max_speed = session_info["max_speed"]
 
-        # 車両マスクの復元
-        if session_info and session_info.get("vehicle_mask"):
-            self.vehicle_mask_user_points = [tuple(p) for p in session_info["vehicle_mask"]]
+        # マスクの復元（旧形式の vehicle_mask / background_mask も読み込む）
+        if session_info:
+            self._restore_masks_from_session(session_info)
 
         # 検知クラスの復元
         if session_info and "detection_classes" in session_info and session_info["detection_classes"]:
@@ -20835,26 +20904,65 @@ class ImageAnnotationTool(QMainWindow):
         self.main_image_view.update()
 
     # ------------------------------------------------------------------
-    # 車両マスク（画像下側の車体領域を学習・推論入力から無視するポリゴン）
+    # マスク（指定領域を学習・推論入力から無視するポリゴン）
+    # 先頭2つ（車両・背景）は組み込み。プルダウンから任意個を追加できる。
     # ------------------------------------------------------------------
-    def get_vehicle_mask_polygon(self):
-        """ユーザー頂点＋中央線に対する鏡像から左右対称の閉ポリゴンを構築して返す
+    def mask_display_name(self, mask):
+        """マスクの表示名（組み込みマスクは言語設定に追従させるため都度解決する）"""
+        if mask.get('name'):
+            return mask['name']
+        return get_text('opt_mask_target_background' if mask['id'] == 'background'
+                        else 'opt_mask_target_vehicle')
 
-        戻り値: [(x, y), ...] 正規化座標。頂点が2点未満の場合はNone。
-        """
-        pts = getattr(self, 'vehicle_mask_user_points', None)
-        if not pts or len(pts) < 2:
+    def current_mask_index(self):
+        """プルダウンで選択中のマスクindex（範囲外なら0に丸める）"""
+        if not self.masks:
+            return 0
+        return min(max(0, self._mask_target_index), len(self.masks) - 1)
+
+    def editing_mask(self):
+        """編集中のマスクdict（非編集ならNone）"""
+        i = self.mask_edit_index
+        if i is None or not (0 <= i < len(self.masks)):
             return None
-        # ユーザー頂点 → 鏡像頂点（逆順）で閉じた対称ポリゴンにする
-        mirrored = [(1.0 - x, y) for x, y in reversed(pts)]
-        return list(pts) + mirrored
+        return self.masks[i]
+
+    def get_mask_polygon(self, index):
+        """マスクの閉ポリゴンを正規化座標で返す（頂点不足ならNone）
+
+        symmetric=True の場合はユーザー頂点＋中央線に対する鏡像で左右対称に閉じる。
+        """
+        if not (0 <= index < len(self.masks)):
+            return None
+        mask = self.masks[index]
+        pts = mask['points']
+        if mask.get('symmetric', True):
+            if len(pts) < 2:
+                return None
+            return list(pts) + [(1.0 - x, y) for x, y in reversed(pts)]
+        if len(pts) < 3:
+            return None
+        return list(pts)
+
+    def get_mask_polygons_with_names(self):
+        """ポリゴンが成立している全マスクを [(index, 表示名, polygon), ...] で返す"""
+        result = []
+        for i, mask in enumerate(self.masks):
+            polygon = self.get_mask_polygon(i)
+            if polygon:
+                result.append((i, self.mask_display_name(mask), polygon))
+        return result
 
     def get_vehicle_mask_bbox(self):
         """車両マスクポリゴンの外接矩形を正規化座標 (x, y, w, h) で返す（未設定時None）
 
         画像埋込の「車両マスク位置」モードで埋込領域として使用する。
         """
-        polygon = self.get_vehicle_mask_polygon()
+        polygon = None
+        for i, mask in enumerate(self.masks):
+            if mask['id'] == 'vehicle':
+                polygon = self.get_mask_polygon(i)
+                break
         if not polygon:
             return None
         xs = [p[0] for p in polygon]
@@ -20865,89 +20973,282 @@ class ImageAnnotationTool(QMainWindow):
             return None
         return [round(x0, 4), round(y0, 4), round(w, 4), round(h, 4)]
 
-    def toggle_vehicle_mask_visible(self, checked):
-        """車両マスクオーバーレイの表示ON/OFF切替"""
-        self.vehicle_mask_overlay_visible = checked
-        if hasattr(self, 'main_image_view'):
-            self.main_image_view.update()
+    def _restore_masks_from_session(self, session_info):
+        """セッションからマスク定義を復元する（旧形式の単独キーにも対応）"""
+        saved = session_info.get("masks")
+        if saved:
+            restored = []
+            for entry in saved:
+                mask_id = entry.get('id')
+                if not mask_id:
+                    continue
+                restored.append({
+                    'id': mask_id,
+                    'name': entry.get('name'),
+                    'points': [tuple(p) for p in entry.get('points', [])],
+                    'visible': entry.get('visible', True),
+                    'symmetric': entry.get('symmetric', True),
+                })
+            # 組み込みマスクは常に先頭2つとして存在させる
+            for pos, builtin_id in enumerate(BUILTIN_MASK_IDS):
+                if not any(m['id'] == builtin_id for m in restored):
+                    restored.insert(pos, {'id': builtin_id, 'name': None, 'points': [],
+                                          'visible': True, 'symmetric': True})
+            self.masks = restored
+        else:
+            for mask in self.masks:
+                legacy = session_info.get(f"{mask['id']}_mask")
+                if legacy:
+                    mask['points'] = [tuple(p) for p in legacy]
 
-    def toggle_vehicle_mask_edit(self, checked):
-        """車両マスクボタンのトグル処理（編集モードの開始/確定）"""
-        # 結合表示中は座標系が単一画像と一致せずズレるため編集不可
-        if checked and getattr(self, 'current_variant', None) == '__combined__':
-            self.vehicle_mask_button.blockSignals(True)
-            self.vehicle_mask_button.setChecked(False)
-            self.vehicle_mask_button.blockSignals(False)
-            self.statusBar().showMessage(get_text('status_vehicle_mask_combined_blocked'), 4000)
+        if hasattr(self, 'mask_target_combo'):
+            self._rebuild_mask_target_combo(select_index=0)
+
+    # --- プルダウン（対象選択 / 新規追加 / 削除） ---
+    def _rebuild_mask_target_combo(self, select_index=None):
+        """マスク一覧＋「新規追加」「削除」項目でプルダウンを作り直す"""
+        if select_index is not None:
+            self._mask_target_index = select_index
+        target = self.current_mask_index()
+
+        self._mask_combo_updating = True
+        try:
+            self.mask_target_combo.clear()
+            for i, mask in enumerate(self.masks):
+                self.mask_target_combo.addItem(self.mask_display_name(mask), i)
+            self.mask_target_combo.insertSeparator(self.mask_target_combo.count())
+            self.mask_target_combo.addItem(get_text('opt_mask_add'), '__add__')
+            self.mask_target_combo.addItem(get_text('opt_mask_delete'), '__delete__')
+            self.mask_target_combo.setCurrentIndex(target)
+        finally:
+            self._mask_combo_updating = False
+
+        self._sync_mask_controls()
+
+    def _sync_mask_controls(self):
+        """選択中マスクに合わせて表示チェック・ツールチップ・削除項目の有効/無効を更新"""
+        if not self.masks:
+            return
+        mask = self.masks[self.current_mask_index()]
+
+        self.mask_visible_checkbox.blockSignals(True)
+        self.mask_visible_checkbox.setChecked(mask.get('visible', True))
+        self.mask_visible_checkbox.blockSignals(False)
+
+        self.mask_edit_button.setToolTip(
+            get_text('tip_mask_edit_named', self.mask_display_name(mask)))
+
+        # 組み込みマスクは削除不可なので「削除」項目をグレーアウトする
+        model = self.mask_target_combo.model()
+        delete_row = self.mask_target_combo.findData('__delete__')
+        if delete_row >= 0 and hasattr(model, 'item'):
+            model.item(delete_row).setEnabled(mask['id'] not in BUILTIN_MASK_IDS)
+
+    def _on_mask_target_changed(self):
+        """プルダウン選択の変更（対象切替 / 新規追加 / 削除）"""
+        if self._mask_combo_updating:
+            return
+        data = self.mask_target_combo.currentData()
+        # 追加・削除はモーダルダイアログを開くため、コンボのシグナル処理を抜けてから実行する
+        if data == '__add__':
+            QTimer.singleShot(0, self._add_new_mask)
+        elif data == '__delete__':
+            QTimer.singleShot(0, self._delete_current_mask)
+        elif isinstance(data, int):
+            self._mask_target_index = data
+            self._sync_mask_controls()
+
+    def _add_new_mask(self):
+        """新規マスクを追加する（名前と左右対称の有無をダイアログで入力）"""
+        name, symmetric, ok = self._prompt_new_mask()
+        if not ok:
+            self._rebuild_mask_target_combo()  # 選択を元のマスクに戻す
             return
 
-        self.vehicle_mask_edit_mode = checked
+        existing = {self.mask_display_name(m) for m in self.masks}
+        if name in existing:
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_mask_name_duplicate', name))
+            self._rebuild_mask_target_combo()
+            return
+
+        # idは既存と重複しない連番にする（セッション・チェックポイントの識別用）
+        used_ids = {m['id'] for m in self.masks}
+        n = len(self.masks)
+        while f'mask{n}' in used_ids:
+            n += 1
+        self.masks.append({'id': f'mask{n}', 'name': name, 'points': [],
+                           'visible': True, 'symmetric': symmetric})
+
+        self._rebuild_mask_target_combo(select_index=len(self.masks) - 1)
+        self.statusBar().showMessage(get_text('status_mask_added', name), 4000)
+        # 追加直後はそのまま頂点を打てるよう編集モードに入る
+        self.mask_edit_button.setChecked(True)
+
+    def _prompt_new_mask(self):
+        """新規マスクの名前と左右対称フラグを尋ねる → (name, symmetric, ok)"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle(get_text('dlg_add_mask_title'))
+        layout = QVBoxLayout(dialog)
+
+        layout.addWidget(QLabel(get_text('label_new_mask_name')))
+        name_input = QLineEdit()
+        name_input.setPlaceholderText(get_text('placeholder_new_mask_name'))
+        layout.addWidget(name_input)
+
+        symmetric_check = QCheckBox(get_text('chk_new_mask_symmetric'))
+        symmetric_check.setChecked(True)
+        symmetric_check.setToolTip(get_text('tip_new_mask_symmetric'))
+        layout.addWidget(symmetric_check)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return '', True, False
+        name = name_input.text().strip()
+        if not name:
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_mask_name_required'))
+            return '', True, False
+        return name, symmetric_check.isChecked(), True
+
+    def _delete_current_mask(self):
+        """選択中の追加マスクを削除する（組み込みマスクは削除不可）"""
+        index = self.current_mask_index()
+        mask = self.masks[index]
+        if mask['id'] in BUILTIN_MASK_IDS:
+            self.statusBar().showMessage(get_text('status_mask_builtin_undeletable'), 4000)
+            self._rebuild_mask_target_combo()
+            return
+
+        name = self.mask_display_name(mask)
+        reply = QMessageBox.question(
+            self, get_text('dlg_confirm'), get_text('msg_confirm_delete_mask', name),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            self._rebuild_mask_target_combo()
+            return
+
+        if self.mask_edit_index == index:
+            self.mask_edit_button.setChecked(False)  # 編集中なら先に解除
+        self.masks.pop(index)
+        self.mask_edit_index = None
+        self._rebuild_mask_target_combo(select_index=min(index, len(self.masks) - 1))
+        self.statusBar().showMessage(get_text('status_mask_deleted', name), 4000)
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    # --- 表示・編集 ---
+    def toggle_mask_visible(self, checked):
+        """マスクオーバーレイの表示ON/OFF切替（プルダウンで選択中のマスク）"""
+        if self.masks:
+            self.masks[self.current_mask_index()]['visible'] = checked
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def toggle_mask_edit(self, checked):
+        """マスク編集ボタンのトグル処理（選択中マスクの編集モードの開始/確定）"""
+        index = self.current_mask_index()
+
+        # 結合表示中は座標系が単一画像と一致せずズレるため編集不可
+        if checked and getattr(self, 'current_variant', None) == '__combined__':
+            self.mask_edit_button.blockSignals(True)
+            self.mask_edit_button.setChecked(False)
+            self.mask_edit_button.blockSignals(False)
+            self.statusBar().showMessage(get_text('status_mask_combined_blocked'), 4000)
+            return
+
+        # 編集中に対象が変わると確定先を取り違えるためプルダウンを固定する
+        self.mask_target_combo.setEnabled(not checked)
+        self.mask_edit_index = index if checked else None
+
+        mask = self.masks[index]
+        name = self.mask_display_name(mask)
+        points = mask['points']
+        # 左右対称マスクは2点（鏡像を足して4点）、自由形状は3点でポリゴンが成立する
+        min_points = 2 if mask.get('symmetric', True) else 3
 
         if checked:
-            self.statusBar().showMessage(get_text('status_vehicle_mask_edit_on'))
+            self.statusBar().showMessage(get_text('status_mask_edit_on', name))
+        elif len(points) >= min_points:
+            polygon = self.get_mask_polygon(index)
+            self.statusBar().showMessage(
+                get_text('status_mask_set', name, len(points), len(polygon)), 5000)
         else:
-            n = len(self.vehicle_mask_user_points)
-            if n == 1:
-                # 1点ではポリゴンにならないためクリア
-                self.vehicle_mask_user_points = []
-                self.statusBar().showMessage(get_text('status_vehicle_mask_cleared'), 3000)
-            elif n >= 2:
-                self.statusBar().showMessage(get_text('status_vehicle_mask_set', n, n * 2), 5000)
-            else:
-                self.statusBar().showMessage(get_text('status_vehicle_mask_cleared'), 3000)
+            points.clear()  # 頂点が足りずポリゴンにならないためクリア
+            self.statusBar().showMessage(get_text('status_mask_cleared', name), 3000)
 
         if hasattr(self, 'main_image_view'):
             self.main_image_view.update()
 
+    # --- 頂点操作（編集中のマスクに対して行う） ---
     @staticmethod
-    def _snap_mask_point(rel_x, rel_y):
+    def _snap_mask_point(rel_x, rel_y, symmetric=True):
         """マスク頂点のスナップ処理（下端・中央線付近を吸着し0-1にクランプ）"""
         # 下端付近は画像下端にスナップ（車体マスクは下辺に接することが多いため）
         if rel_y > 0.97:
             rel_y = 1.0
         # 中央線付近は中央にスナップ（鏡像と重なって対称形が閉じる）
-        if abs(rel_x - 0.5) < 0.02:
+        if symmetric and abs(rel_x - 0.5) < 0.02:
             rel_x = 0.5
         return (max(0.0, min(1.0, rel_x)), max(0.0, min(1.0, rel_y)))
 
-    def add_vehicle_mask_point(self, rel_x, rel_y):
-        """マスク頂点を追加する（正規化座標）"""
-        self.vehicle_mask_user_points.append(self._snap_mask_point(rel_x, rel_y))
-        self.statusBar().showMessage(
-            get_text('status_vehicle_mask_point_added', len(self.vehicle_mask_user_points)), 3000)
-        if hasattr(self, 'main_image_view'):
-            self.main_image_view.update()
-
-    def move_vehicle_mask_point(self, index, rel_x, rel_y):
-        """指定したマスク頂点をドラッグ移動する（編集モード中のみ呼ばれる）"""
-        if not (0 <= index < len(self.vehicle_mask_user_points)):
+    def add_mask_point(self, rel_x, rel_y):
+        """編集中マスクに頂点を追加する（正規化座標）"""
+        mask = self.editing_mask()
+        if mask is None:
             return
-        self.vehicle_mask_user_points[index] = self._snap_mask_point(rel_x, rel_y)
+        mask['points'].append(self._snap_mask_point(rel_x, rel_y, mask.get('symmetric', True)))
+        self.statusBar().showMessage(
+            get_text('status_mask_point_added', self.mask_display_name(mask),
+                     len(mask['points'])), 3000)
         if hasattr(self, 'main_image_view'):
             self.main_image_view.update()
 
-    def remove_vehicle_mask_point(self, index):
-        """指定したマスク頂点を削除する"""
-        if 0 <= index < len(self.vehicle_mask_user_points):
-            self.vehicle_mask_user_points.pop(index)
+    def move_mask_point(self, index, rel_x, rel_y):
+        """編集中マスクの指定頂点をドラッグ移動する"""
+        mask = self.editing_mask()
+        if mask is None or not (0 <= index < len(mask['points'])):
+            return
+        mask['points'][index] = self._snap_mask_point(rel_x, rel_y, mask.get('symmetric', True))
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def remove_mask_point(self, index):
+        """編集中マスクの指定頂点を削除する"""
+        mask = self.editing_mask()
+        if mask is None:
+            return
+        if 0 <= index < len(mask['points']):
+            mask['points'].pop(index)
             self.statusBar().showMessage(
-                get_text('status_vehicle_mask_point_removed', len(self.vehicle_mask_user_points)), 3000)
+                get_text('status_mask_point_removed', self.mask_display_name(mask),
+                         len(mask['points'])), 3000)
         if hasattr(self, 'main_image_view'):
             self.main_image_view.update()
 
-    def remove_last_vehicle_mask_point(self):
-        """直前に追加したマスク頂点を削除する"""
-        if self.vehicle_mask_user_points:
-            self.vehicle_mask_user_points.pop()
+    def remove_last_mask_point(self):
+        """編集中マスクの直前に追加した頂点を削除する"""
+        mask = self.editing_mask()
+        if mask is None:
+            return
+        if mask['points']:
+            mask['points'].pop()
             self.statusBar().showMessage(
-                get_text('status_vehicle_mask_point_removed', len(self.vehicle_mask_user_points)), 3000)
+                get_text('status_mask_point_removed', self.mask_display_name(mask),
+                         len(mask['points'])), 3000)
         if hasattr(self, 'main_image_view'):
             self.main_image_view.update()
 
-    def clear_vehicle_mask(self):
-        """車両マスクを全消去する"""
-        self.vehicle_mask_user_points = []
-        self.statusBar().showMessage(get_text('status_vehicle_mask_cleared'), 3000)
+    def clear_mask_points(self):
+        """編集中マスクの頂点を全消去する"""
+        mask = self.editing_mask()
+        if mask is None:
+            return
+        mask['points'].clear()
+        self.statusBar().showMessage(
+            get_text('status_mask_cleared', self.mask_display_name(mask)), 3000)
         if hasattr(self, 'main_image_view'):
             self.main_image_view.update()
 
@@ -21572,8 +21873,8 @@ class ImageAnnotationTool(QMainWindow):
                         img = Image.open(path).convert('RGB')
                         if first_img_size is None:
                             first_img_size = img.size  # (width, height)
-                        # 学習時に車両マスクを使ったモデルは推論時にも同じマスクを適用
-                        img = apply_vehicle_mask(img, getattr(model, '_vehicle_mask', None))
+                        # 学習時にマスクを使ったモデルは推論時にも同じマスクを適用
+                        img = apply_masks(img, getattr(model, '_mask_polygons', None))
                         t = transform(img)
                         tensors.append(t)
 
@@ -21703,8 +22004,8 @@ class ImageAnnotationTool(QMainWindow):
                     img = Image.open(img_path).convert('RGB')
                     W, H = img.size
 
-                    # 学習時に車両マスクを使ったモデルは推論時にも同じマスクを適用
-                    img = apply_vehicle_mask(img, getattr(model, '_vehicle_mask', None))
+                    # 学習時にマスクを使ったモデルは推論時にも同じマスクを適用
+                    img = apply_masks(img, getattr(model, '_mask_polygons', None))
 
                     # 仮想ソース生成
                     if virtual_type == 'crop':
@@ -21731,7 +22032,7 @@ class ImageAnnotationTool(QMainWindow):
                         for k in range(num_sources):
                             prev_idx = max(0, idx - k * temporal_interval)
                             _frame = Image.open(self.images[prev_idx]).convert('RGB')
-                            source_imgs.append(apply_vehicle_mask(_frame, getattr(model, '_vehicle_mask', None)))
+                            source_imgs.append(apply_masks(_frame, getattr(model, '_mask_polygons', None)))
                     else:
                         source_imgs = [img] * num_sources
 
@@ -26254,11 +26555,13 @@ class ImageAnnotationTool(QMainWindow):
 
             finetune_model_combo.clear()
             if filtered:
-                finetune_model_combo.addItems(filtered)
+                for f in filtered:
+                    finetune_model_combo.addItem(_shorten_model_display_name(f, selected_type), f)
                 # 現在選択されているモデルがリストにあればデフォルトにする
                 current_model = self.get_selected_model_filename()
-                if current_model in filtered:
-                    finetune_model_combo.setCurrentText(current_model)
+                idx = finetune_model_combo.findData(current_model)
+                if idx >= 0:
+                    finetune_model_combo.setCurrentIndex(idx)
                 # ファインチューニングオプションを有効化
                 weights_radio_finetune.setEnabled(True)
                 weights_radio_finetune.setToolTip(get_text('tip_finetune'))
@@ -26279,10 +26582,12 @@ class ImageAnnotationTool(QMainWindow):
 
         # 初期リストを設定
         if has_valid_models:
-            finetune_model_combo.addItems(filtered_models)
+            for f in filtered_models:
+                finetune_model_combo.addItem(_shorten_model_display_name(f, model_type), f)
             current_model = self.get_selected_model_filename()
-            if current_model in filtered_models:
-                finetune_model_combo.setCurrentText(current_model)
+            idx = finetune_model_combo.findData(current_model)
+            if idx >= 0:
+                finetune_model_combo.setCurrentIndex(idx)
         else:
             finetune_model_combo.addItem(get_text('msg_no_model_for_type', model_type))
 
@@ -26429,27 +26734,183 @@ class ImageAnnotationTool(QMainWindow):
 
         output_settings_layout.addSpacing(10)
 
-        # 車両マスク適用オプション（マスクが設定されている場合のみ有効）
-        _mask_polygon_for_training = self.get_vehicle_mask_polygon()
-        vehicle_mask_check = QCheckBox(get_text('chk_use_vehicle_mask'))
-        if _mask_polygon_for_training:
-            vehicle_mask_check.setChecked(True)
-            vehicle_mask_check.setToolTip(get_text('tip_use_vehicle_mask'))
-            vehicle_mask_info_label = QLabel(
-                get_text('label_vehicle_mask_info', len(_mask_polygon_for_training)))
+        # マスク適用オプション（ポリゴンが成立しているマスクごとにチェックを出す）
+        _mask_entries_for_training = self.get_mask_polygons_with_names()
+        mask_checks = []  # [(チェックボックス, 表示名, polygon), ...]
+        if _mask_entries_for_training:
+            for _mi, _mname, _mpolygon in _mask_entries_for_training:
+                _check = QCheckBox(get_text('chk_use_mask', _mname))
+                _check.setChecked(True)
+                _check.setToolTip(get_text('tip_use_mask'))
+                output_settings_layout.addWidget(_check)
+                _info = QLabel(get_text('label_mask_info', len(_mpolygon)))
+                _info.setStyleSheet("color: #666;")
+                _info.setWordWrap(True)
+                output_settings_layout.addWidget(_info)
+                mask_checks.append((_check, _mname, _mpolygon))
         else:
-            vehicle_mask_check.setChecked(False)
-            vehicle_mask_check.setEnabled(False)
-            vehicle_mask_check.setToolTip(get_text('tip_use_vehicle_mask_disabled'))
-            vehicle_mask_info_label = QLabel(get_text('label_vehicle_mask_not_set'))
-        output_settings_layout.addWidget(vehicle_mask_check)
-        vehicle_mask_info_label.setStyleSheet("color: #666;")
-        vehicle_mask_info_label.setWordWrap(True)
-        output_settings_layout.addWidget(vehicle_mask_info_label)
+            _no_mask_label = QLabel(get_text('label_mask_not_set'))
+            _no_mask_label.setStyleSheet("color: #666;")
+            _no_mask_label.setWordWrap(True)
+            output_settings_layout.addWidget(_no_mask_label)
 
         output_settings_layout.addStretch()
         output_settings_group.setLayout(output_settings_layout)
         left_column.addWidget(output_settings_group)
+
+        # ------------------------------------------------------------------
+        # オフライン重み付け (RL) グループ — dev/SPEC_offline_rl_throttle.md §4.7
+        # 走行ログの報酬から求めたサンプル重みを speed/throttle 列の損失に掛ける
+        # ------------------------------------------------------------------
+        from managers.offline_reward import RewardConfig as _RewardConfig
+        _rl_def = _RewardConfig.from_dict(globals().get('RL_WEIGHT_DEFAULTS', {}))
+        rl_group = QGroupBox(get_text('label_rl_weight_settings'))
+        _tint_group(rl_group, "#FBF1E6", "#E8C9A8")
+        rl_layout = QVBoxLayout()
+
+        rl_enable_check = QCheckBox(get_text('chk_rl_weight_enable'))
+        rl_enable_check.setChecked(False)
+        rl_enable_check.setToolTip(get_text('tip_rl_weight_enable'))
+        rl_layout.addWidget(rl_enable_check)
+
+        rl_info_label = QLabel(get_text('label_rl_weight_info'))
+        rl_info_label.setStyleSheet("color: #666;")
+        rl_info_label.setWordWrap(True)
+        rl_layout.addWidget(rl_info_label)
+
+        rl_widgets = []  # 有効化チェックで一括 enable/disable する部品
+
+        def _rl_spin(minv, maxv, val, decimals=2, step=None, width=70):
+            sp = QDoubleSpinBox()
+            sp.setRange(minv, maxv)
+            sp.setDecimals(decimals)
+            if step is not None:
+                sp.setSingleStep(step)
+            sp.setValue(val)
+            sp.setFixedWidth(width)
+            rl_widgets.append(sp)
+            return sp
+
+        def _rl_row(*pairs):
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            for label_text, widget in pairs:
+                if label_text:
+                    lb = QLabel(label_text)
+                    rl_widgets.append(lb)
+                    row.addWidget(lb)
+                if widget is not None:
+                    row.addWidget(widget)
+            row.addStretch()
+            return row
+
+        rl_method_combo = QComboBox()
+        rl_method_combo.addItem(get_text('rl_method_awr'), 'awr')
+        rl_method_combo.addItem(get_text('rl_method_filtered'), 'filtered')
+        rl_method_combo.setCurrentIndex(0 if _rl_def.method == 'awr' else 1)
+        rl_widgets.append(rl_method_combo)
+        rl_target_combo = QComboBox()
+        if has_speed_data:
+            rl_target_combo.addItem(get_text('rl_target_speed'), 'speed')
+        rl_target_combo.addItem(get_text('rl_target_throttle'), 'throttle')
+        if has_speed_data:
+            rl_target_combo.addItem(get_text('rl_target_both'), 'both')
+            _rl_ti = rl_target_combo.findData(_rl_def.target_head)
+            rl_target_combo.setCurrentIndex(_rl_ti if _rl_ti >= 0 else 0)
+        rl_widgets.append(rl_target_combo)
+        rl_layout.addLayout(_rl_row((get_text('label_rl_method'), rl_method_combo),
+                                    (get_text('label_rl_target'), rl_target_combo)))
+        if not has_speed_data:
+            _rl_nospeed = QLabel(get_text('label_rl_no_speed'))
+            _rl_nospeed.setStyleSheet("color: #a65;")
+            _rl_nospeed.setWordWrap(True)
+            rl_widgets.append(_rl_nospeed)
+            rl_layout.addWidget(_rl_nospeed)
+
+        rl_gamma_spin = _rl_spin(0.5, 0.999, _rl_def.gamma, 3, 0.01)
+        rl_beta_spin = _rl_spin(0.05, 5.0, _rl_def.beta, 2, 0.1)
+        rl_wmin_spin = _rl_spin(0.0, 1.0, _rl_def.w_min, 2, 0.05)
+        rl_wmax_spin = _rl_spin(1.0, 20.0, _rl_def.w_max, 1, 0.5)
+        rl_topk_spin = _rl_spin(1.0, 100.0, _rl_def.top_k * 100.0, 0, 5.0, 60)
+        rl_layout.addLayout(_rl_row(('γ', rl_gamma_spin), ('β', rl_beta_spin),
+                                    (get_text('label_rl_clip'), rl_wmin_spin), ('〜', rl_wmax_spin),
+                                    (get_text('label_rl_topk'), rl_topk_spin)))
+
+        rl_baseline_combo = QComboBox()
+        rl_baseline_combo.addItem(get_text('rl_baseline_speed_bin'), 'speed_bin')
+        rl_baseline_combo.addItem(get_text('rl_baseline_global'), 'global')
+        rl_baseline_combo.setCurrentIndex(0 if _rl_def.baseline_mode == 'speed_bin' else 1)
+        rl_widgets.append(rl_baseline_combo)
+        rl_gap_spin = _rl_spin(0.1, 10.0, _rl_def.episode_gap_s, 1, 0.1)
+        rl_layout.addLayout(_rl_row((get_text('label_rl_baseline'), rl_baseline_combo),
+                                    (get_text('label_rl_gap'), rl_gap_spin)))
+
+        rl_c_speed = _rl_spin(0.0, 10.0, _rl_def.c_speed, 2, 0.1, 60)
+        rl_c_wall = _rl_spin(0.0, 10.0, _rl_def.c_wall, 2, 0.1, 60)
+        rl_c_side = _rl_spin(0.0, 10.0, _rl_def.c_side, 2, 0.1, 60)
+        rl_c_slip = _rl_spin(0.0, 10.0, _rl_def.c_slip, 2, 0.1, 60)
+        rl_c_stuck = _rl_spin(0.0, 10.0, _rl_def.c_stuck, 2, 0.1, 60)
+        rl_c_yaw = _rl_spin(0.0, 10.0, _rl_def.c_yaw, 2, 0.1, 60)
+        rl_layout.addLayout(_rl_row((get_text('label_rl_coeffs'), None),
+                                    ('speed', rl_c_speed), ('wall', rl_c_wall), ('side', rl_c_side),
+                                    ('slip', rl_c_slip), ('stuck', rl_c_stuck), ('yaw', rl_c_yaw)))
+
+        rl_wall_spin = _rl_spin(0.0, 5000.0, _rl_def.wall_mm, 0, 100.0, 70)
+        rl_side_spin = _rl_spin(0.0, 5000.0, _rl_def.side_mm, 0, 100.0, 70)
+        rl_layout.addLayout(_rl_row((get_text('label_rl_thresholds'), None),
+                                    ('FrFR', rl_wall_spin), ('FrLH/FrRH', rl_side_spin)))
+
+        rl_preview_btn = QPushButton(get_text('btn_rl_preview'))
+        rl_widgets.append(rl_preview_btn)
+        rl_stats_label = QLabel('')
+        rl_stats_label.setStyleSheet("color: #666;")
+        rl_stats_label.setWordWrap(True)
+        rl_widgets.append(rl_stats_label)
+        rl_layout.addLayout(_rl_row((None, rl_preview_btn), (None, rl_stats_label)))
+
+        rl_group.setLayout(rl_layout)
+        left_column.addWidget(rl_group)
+
+        def _rl_set_enabled(on):
+            for _w in rl_widgets:
+                _w.setEnabled(bool(on))
+        rl_enable_check.toggled.connect(_rl_set_enabled)
+        _rl_set_enabled(False)
+
+        def _build_rl_config():
+            _sn = MAX_SPEED
+            if speed_normalize_spin is not None:
+                _sn = speed_normalize_spin.value()
+            return _RewardConfig(
+                method=rl_method_combo.currentData(),
+                target_head=rl_target_combo.currentData(),
+                gamma=rl_gamma_spin.value(), beta=rl_beta_spin.value(),
+                w_min=rl_wmin_spin.value(), w_max=rl_wmax_spin.value(),
+                top_k=rl_topk_spin.value() / 100.0,
+                baseline_mode=rl_baseline_combo.currentData(),
+                episode_gap_s=rl_gap_spin.value(),
+                c_speed=rl_c_speed.value(), c_wall=rl_c_wall.value(), c_side=rl_c_side.value(),
+                c_slip=rl_c_slip.value(), c_stuck=rl_c_stuck.value(), c_yaw=rl_c_yaw.value(),
+                speed_norm=float(_sn), wall_mm=rl_wall_spin.value(), side_mm=rl_side_spin.value())
+
+        def _rl_source_annotations():
+            """重み計算の対象（削除済みを除く全アノテーション、時系列 = インデックス順）"""
+            _del = set(getattr(self, 'deleted_indexes', []))
+            return {i: a for i, a in self.annotations.items()
+                    if isinstance(i, int) and i not in _del and 0 <= i < len(self.images)}
+
+        def _rl_preview():
+            from managers.offline_reward import compute_offline_weights, summarize_stats
+            _src = _rl_source_annotations()
+            if not _src:
+                QMessageBox.warning(training_settings, get_text('dlg_warning'),
+                                    get_text('msg_rl_no_annotations'))
+                return
+            _cfg = _build_rl_config()
+            _w, _stats = compute_offline_weights(_src, getattr(self, 'annotation_timestamps', {}), _cfg)
+            rl_stats_label.setText(summarize_stats(_stats))
+            self._show_rl_weight_preview(_stats, _cfg, parent=training_settings)
+        rl_preview_btn.clicked.connect(_rl_preview)
 
         # 入力画像ソース選択グループ
         image_source_group = QGroupBox(get_text('label_training_image_sources'))
@@ -27594,7 +28055,7 @@ class ImageAnnotationTool(QMainWindow):
         use_pretrained = weights_radio_pretrained.isChecked()  # 事前学習済みの重みを使用
         use_random_init = weights_radio_random.isChecked()  # ランダム初期化
         load_weights = weights_radio_finetune.isChecked()  # ファインチューニング
-        selected_finetune_model = finetune_model_combo.currentText() if load_weights else None
+        selected_finetune_model = finetune_model_combo.currentData() if load_weights else None
         # ファインチューニング用モデルが有効かどうかを確認
         filtered_models_for_check = get_filtered_models(model_type)
         has_valid_finetune_models = len(filtered_models_for_check) > 0 and selected_finetune_model in filtered_models_for_check
@@ -27631,6 +28092,10 @@ class ImageAnnotationTool(QMainWindow):
         # 将来フレームラベル設定の取得
         use_future_label = future_label_check.isChecked()
         future_label_offset = future_label_spin.value() if use_future_label else 0
+
+        # オフライン重み付け (RL) 設定の取得
+        rl_weight_enabled = rl_enable_check.isChecked()
+        rl_reward_cfg = _build_rl_config() if rl_weight_enabled else None
 
         # データ選択設定の取得
         use_all = data_radio_all.isChecked()
@@ -27724,6 +28189,15 @@ class ImageAnnotationTool(QMainWindow):
                     if range_start <= idx <= range_end:
                         valid_indexes.append(idx)
 
+            # オフライン重み付け: 全フレームで重みを計算（スキップ/範囲指定の前に時系列で計算）
+            rl_weights = None
+            rl_weight_stats = None
+            if rl_weight_enabled:
+                from managers.offline_reward import compute_offline_weights, summarize_stats
+                rl_weights, rl_weight_stats = compute_offline_weights(
+                    _rl_source_annotations(), getattr(self, 'annotation_timestamps', {}), rl_reward_cfg)
+                print(f"[オフライン重み付け] {summarize_stats(rl_weight_stats)}")
+
             # 各有効インデックスについて画像パスを収集
             deleted_indexes_set = set(getattr(self, 'deleted_indexes', []))
             for idx in valid_indexes:
@@ -27737,6 +28211,8 @@ class ImageAnnotationTool(QMainWindow):
                     if label_idx not in self.annotations:
                         continue
                 ann = deepcopy(self.annotations[label_idx])
+                if rl_weights is not None:
+                    ann['_rl_weight'] = float(rl_weights.get(label_idx, 1.0))
 
                 if is_multi_source and has_image_groups:
                     # マルチソースモード: 全ソースの画像が揃っているインデックスのみ使用
@@ -27821,6 +28297,13 @@ class ImageAnnotationTool(QMainWindow):
             print(f"  Speed出力: {use_speed_output}")
             print(f"  将来予測出力: {use_future_output}")
             print(f"  将来フレームラベル: {use_future_label}" + (f", +{future_label_offset}フレーム先" if use_future_label else ""))
+            print(f"[オフライン重み付け (RL)]")
+            print(f"  有効: {rl_weight_enabled}")
+            if rl_weight_enabled and rl_weight_stats:
+                print(f"  設定: {rl_reward_cfg.to_dict()}")
+                print(f"  重み統計: mean={rl_weight_stats['weight_mean']:.2f} median={rl_weight_stats['weight_median']:.2f} "
+                      f"p95={rl_weight_stats['weight_p95']:.2f} max={rl_weight_stats['weight_max']:.2f} "
+                      f"episodes={rl_weight_stats['n_episodes']}")
             print(f"[データ設定]")
             print(f"  画像ソース: {selected_sources}")
             if is_multi_source:
@@ -27871,9 +28354,27 @@ class ImageAnnotationTool(QMainWindow):
             else:
                 num_outputs = base_outputs
 
-            # 車両マスク（ダイアログでチェックされている場合のみ、車体領域を黒塗りで無視）
-            _vehicle_mask = (self.get_vehicle_mask_polygon()
-                             if vehicle_mask_check.isChecked() else None)
+            # オフライン重み付け: サンプル重みを掛ける出力列とチェックポイント用メタデータ
+            rl_weight_columns = None
+            rl_weighting_meta = None
+            if rl_weight_enabled and rl_weights:
+                from managers.offline_reward import rl_weight_column_indices
+                rl_weight_columns = rl_weight_column_indices(num_outputs, use_speed_output,
+                                                             rl_reward_cfg.target_head)
+                rl_weighting_meta = {
+                    'enabled': True,
+                    'config': rl_reward_cfg.to_dict(),
+                    'weight_columns': rl_weight_columns,
+                    'weight_stats': {k: v for k, v in rl_weight_stats.items()
+                                     if not k.startswith('series_')},
+                }
+                print(f"[オフライン重み付け] 対象列={rl_weight_columns} "
+                      f"(num_outputs={num_outputs}, head={rl_reward_cfg.target_head})")
+
+            # マスク（ダイアログでチェックされたものだけ、指定領域を黒塗りで無視）
+            _selected_masks = [{'name': name, 'points': polygon}
+                               for check, name, polygon in mask_checks if check.isChecked()]
+            _mask_polygons = [m['points'] for m in _selected_masks]
 
             # データセットの作成（バッチサイズと詳細オーグメンテーション設定を明示的に指定）
             train_loader, val_loader, dataset_info = create_datasets(
@@ -27885,7 +28386,7 @@ class ImageAnnotationTool(QMainWindow):
                 val_split=val_split,  # 検証データ割合
                 use_speed=use_speed_output,  # Speed出力を使用するかどうか
                 speed_normalize=speed_normalize_value if use_speed_output else None,  # speed正規化値
-                mask_polygon=_vehicle_mask,  # 車両マスク（車体領域を無視）
+                mask_polygons=_mask_polygons,  # マスク（指定領域を無視）
                 pip_paths=pip_embed_paths if pip_embed_config else None,  # 画像埋込パス
                 pip_rect=pip_embed_config['rect'] if pip_embed_config else None,  # 画像埋込領域
                 use_future=use_future_output,  # 将来予測出力を使用するかどうか
@@ -27940,9 +28441,11 @@ class ImageAnnotationTool(QMainWindow):
                 virtual_source_type=training_virtual_type if is_virtual_source else None,
                 temporal_interval=training_temporal_interval,
                 speed_normalize=speed_normalize_value if use_speed_output else None,
-                vehicle_mask=_vehicle_mask,
+                masks=_selected_masks,
                 future_offsets=future_offsets_value if use_future_output else None,
-                pip_embed=pip_embed_config
+                pip_embed=pip_embed_config,
+                rl_weight_columns=rl_weight_columns,
+                rl_weighting=rl_weighting_meta
             )
 
             progress.close()
@@ -27988,12 +28491,13 @@ class ImageAnnotationTool(QMainWindow):
                     "speed_normalize": speed_normalize_value if use_speed_output else None,
                     "use_future_output": use_future_output,
                     "future_offsets": ",".join(map(str, future_offsets_value)) if use_future_output else None,
-                    "vehicle_mask_enabled": bool(_vehicle_mask),
+                    "masks_enabled": ", ".join(m['name'] for m in _selected_masks) or None,
                     "pip_embed_source": pip_embed_config['source'] if pip_embed_config else None,
                     "is_multi_source": is_multi_source,
                     "num_sources": training_num_sources,
                     "fusion_method": training_fusion_method if is_multi_source else None,
                     "selected_sources": selected_sources if is_multi_source else None,
+                    "rl_weighting": rl_weighting_meta,
                 },
                 dataset_info={
                     "total_annotations": len(self.annotations),
@@ -28939,7 +29443,7 @@ class ImageAnnotationTool(QMainWindow):
             QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_need_annotations_to_train'))
             return False
 
-        selected_model_name = self.traj_model_combo.currentText()
+        selected_model_name = self.traj_model_combo.currentData() or self.traj_model_combo.currentText()
         if not selected_model_name or selected_model_name == get_text('combo_model_not_found'):
             QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_traj_models'))
             return False
@@ -29226,6 +29730,96 @@ class ImageAnnotationTool(QMainWindow):
                 f"時系列推論中にエラーが発生しました: {str(e)}"
             )
 
+    def _show_rl_weight_preview(self, stats, cfg, parent=None):
+        """オフライン重み付けの重み分布・上位/下位フレームを表示（dev/SPEC_offline_rl_throttle.md §4.7）"""
+        from managers.offline_reward import summarize_stats
+        dlg = QDialog(parent or self)
+        dlg.setWindowTitle(get_text('dlg_rl_preview'))
+        dlg.resize(1150, 820)
+        outer = QVBoxLayout(dlg)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+
+        summary = QLabel(summarize_stats(stats))
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+        contrib = stats.get('term_contrib', {}) or {}
+        contrib_label = QLabel(get_text('label_rl_term_contrib') + ': ' +
+                               ', '.join(f"{k}={v:+.3f}" for k, v in contrib.items()))
+        contrib_label.setWordWrap(True)
+        layout.addWidget(contrib_label)
+
+        # グラフ（Agg で描画して QPixmap に変換）
+        try:
+            w = np.asarray(stats.get('series_weight', []), dtype=float)
+            idxs = np.asarray(stats.get('series_idx', []))
+            spd = np.asarray(stats.get('series_speed', []), dtype=float)
+            fig, axes = plt.subplots(2, 1, figsize=(10.5, 5.5))
+            axes[0].hist(w, bins=50, color='#d98c3f')
+            axes[0].set_title(f"weight histogram (method={cfg.method}, target={cfg.target_head}, "
+                              f"gamma={cfg.gamma}, beta={cfg.beta})")
+            axes[0].set_xlabel('weight')
+            axes[0].set_ylabel('frames')
+            ax1 = axes[1]
+            ax1.plot(idxs, w, color='#d98c3f', lw=0.8, label='weight')
+            ax1.set_xlabel('frame index')
+            ax1.set_ylabel('weight')
+            ax2 = ax1.twinx()
+            ax2.plot(idxs, spd, color='#3f7fd9', lw=0.6, alpha=0.7, label='speed [m/s]')
+            ax2.set_ylabel('speed [m/s]')
+            fig.tight_layout()
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=100)
+            plt.close(fig)
+            pix = QPixmap()
+            pix.loadFromData(buf.getvalue())
+            graph_label = QLabel()
+            graph_label.setPixmap(pix)
+            layout.addWidget(graph_label)
+        except Exception as e:
+            layout.addWidget(QLabel(f"graph error: {e}"))
+
+        # 上位 / 下位フレームのサムネイル（何が「良い」と判定されたかを目視確認）
+        wmap = dict(zip(stats.get('series_idx', []), stats.get('series_weight', [])))
+        for title_key, key in (('label_rl_top_frames', 'top_frames'),
+                               ('label_rl_bottom_frames', 'bottom_frames')):
+            layout.addWidget(QLabel(f"<b>{get_text(title_key)}</b>"))
+            grid = QGridLayout()
+            for col, idx in enumerate(stats.get(key, []) or []):
+                cell = QVBoxLayout()
+                thumb = QLabel()
+                try:
+                    pm = QPixmap(self.images[idx]).scaled(140, 105, Qt.KeepAspectRatio,
+                                                          Qt.SmoothTransformation)
+                    thumb.setPixmap(pm)
+                except Exception:
+                    thumb.setText('N/A')
+                cell.addWidget(thumb)
+                ann = self.annotations.get(idx, {}) or {}
+                spd_v = ann.get('speed', ann.get('enc/speed', 0.0)) or 0.0
+                try:
+                    spd_v = float(spd_v)
+                except (TypeError, ValueError):
+                    spd_v = 0.0
+                cell.addWidget(QLabel(f"#{idx} w={wmap.get(idx, 1.0):.2f}\n"
+                                      f"v={spd_v:.2f} th={float(ann.get('throttle', 0.0) or 0.0):.2f}"))
+                wrap = QWidget()
+                wrap.setLayout(cell)
+                grid.addWidget(wrap, 0, col)
+            grid_widget = QWidget()
+            grid_widget.setLayout(grid)
+            layout.addWidget(grid_widget)
+
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
+        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.rejected.connect(dlg.reject)
+        btns.accepted.connect(dlg.accept)
+        outer.addWidget(btns)
+        dlg.exec_()
+
     def _log_autonomous_driving_training(self, model_type, training_results, training_params, dataset_info, image_paths):
         """自動運転モデルの学習結果をMLflowに記録"""
         
@@ -29244,6 +29838,10 @@ class ImageAnnotationTool(QMainWindow):
                 "status": "early_stopped" if training_results.get('early_stopped', False) else "completed"
             }
             
+            # 重み付き学習時の重み無し学習損失（比較用）
+            if training_results.get('train_losses_unweighted'):
+                metrics["final_train_loss_unweighted"] = training_results['train_losses_unweighted'][-1]
+
             # 自動運転特有のメトリクスを追加（可能であれば）
             if 'steering_accuracy' in training_results:
                 metrics["steering_accuracy"] = training_results['steering_accuracy']
@@ -30676,6 +31274,14 @@ class ImageAnnotationTool(QMainWindow):
         grid_disp_layout.addStretch()
         location_model_layout.addLayout(grid_disp_layout)
 
+        # 履歴入力ありのモデルで、過去フレームの推論結果を履歴として使う（実機動作の模擬）
+        self.location_history_from_inference = False
+        self.location_history_source_check = QCheckBox(get_text('chk_location_history_from_inference'))
+        self.location_history_source_check.setChecked(False)
+        self.location_history_source_check.setToolTip(get_text('tip_location_history_from_inference'))
+        self.location_history_source_check.stateChanged.connect(self._on_location_history_source_changed)
+        location_model_layout.addWidget(self.location_history_source_check)
+
         # 中身をコンテナへ格納し、既定は折り畳み状態
         location_model_layout_outer.addWidget(self.location_content_widget)
         self.location_content_widget.setVisible(False)
@@ -30958,7 +31564,8 @@ class ImageAnnotationTool(QMainWindow):
         model_files.sort(key=lambda f: os.path.getmtime(os.path.join(models_dir, f)), reverse=True)
 
         for model_file in model_files:
-            self.traj_model_combo.addItem(model_file)
+            display_name = _shorten_model_display_name(model_file, filter_prefix)
+            self.traj_model_combo.addItem(display_name, model_file)
 
     def _toggle_gru_section(self):
         """時系列セクションの展開/折りたたみ"""
@@ -30998,7 +31605,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # モデルファイルをコンボボックスに追加
         for model_file in model_files:
-            display_name = os.path.basename(model_file).replace('.pth', '')
+            display_name = _shorten_model_display_name(model_file, selected_model_type)
             self.waypoint_saved_model_combo.addItem(display_name, model_file)
 
         self.statusBar().showMessage(get_text('status_waypoint_models_found', len(model_files)), 2000)
@@ -31201,7 +31808,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # コンボボックスに追加（モデル名のみを表示、フルパスはユーザーデータとして保持）
         for model_file in model_files:
-            display_name = os.path.basename(model_file).replace('.pth', '')
+            display_name = _shorten_model_display_name(model_file, selected_model_type)
             self.location_saved_model_combo.addItem(display_name, model_file)
 
         # 更新完了メッセージ
@@ -31327,6 +31934,57 @@ class ImageAnnotationTool(QMainWindow):
         # モデルリストを更新
         self.refresh_location_model_list()
 
+    def _location_pose_history_measured(self, index, steps, interval, pose_source=None):
+        """フレーム index より前の実測自己位置を新しい順に steps 件返す（欠損は None）"""
+        history = []
+        for k in range(1, int(steps) + 1):
+            past = index - k * int(interval)
+            pose = self.pose_manager.get_pose(past, prefer=pose_source) if past >= 0 else None
+            history.append([float(pose.x), float(pose.y), float(pose.theta)] if pose is not None else None)
+        return history
+
+    def _location_result_position(self, result):
+        """推論結果から推定座標・姿勢 [x, y, theta] を取り出す（pose ヘッド → 格子の順。無ければ None）"""
+        if not result:
+            return None
+        pose = result.get('pose')
+        if pose and pose.get('x') is not None:
+            th = pose.get('theta')
+            return [float(pose['x']), float(pose['y']), float(th) if th is not None else 0.0]
+        grid = result.get('grid')
+        if grid and grid.get('top'):
+            from model_catalog import grid_weighted_position
+            if getattr(self, 'location_grid_display', 'weighted') == 'top1':
+                t1 = grid['top'][0]
+                return [float(t1['x']), float(t1['y']), 0.0]
+            wxy = grid_weighted_position(grid['top'], n=int(getattr(self, 'location_topn', 3)))
+            if wxy is not None:
+                return [float(wxy[0]), float(wxy[1]), 0.0]
+        return None
+
+    def _location_inference_history(self, index):
+        """履歴入力ありのモデル向けに、フレーム index の過去の座標・姿勢を組み立てる
+
+        既定は学習時と同じ実測の自己位置。「履歴に推論結果を使用」が ON のときは
+        過去フレームの推論結果（推定座標）を優先し、無いフレームは実測で補う
+        （実機のように自己の推定を積み上げる動作を模擬する）。
+        """
+        manager = self.location_model_manager
+        cfg = getattr(manager, 'location_config', None) or {}
+        steps = int(cfg.get('pose_history_steps', 0) or 0)
+        if steps <= 0:
+            return None
+        interval = int(cfg.get('pose_history_interval', 10) or 10)
+        measured = self._location_pose_history_measured(index, steps, interval, cfg.get('pose_source'))
+        if not getattr(self, 'location_history_from_inference', False):
+            return measured
+        history = []
+        for k in range(1, steps + 1):
+            past = index - k * interval
+            est = self._location_result_position(self.location_inference_results.get(past)) if past >= 0 else None
+            history.append(est if est is not None else measured[k - 1])
+        return history
+
     def _location_inference_inputs(self, index):
         """位置モデルの入力構成（学習時に保存）に従って、フレーム index の入力画像パスを返す"""
         manager = self.location_model_manager
@@ -31353,7 +32011,8 @@ class ImageAnnotationTool(QMainWindow):
         current_img_path = self._location_inference_inputs(current_index)
 
         # マネージャーを使用して推論を実行
-        result = self.location_model_manager.run_inference(current_img_path)
+        result = self.location_model_manager.run_inference(
+            current_img_path, pose_history=self._location_inference_history(current_index))
 
         if result:
             # 推論結果を保存（インデックスベース）
@@ -31368,6 +32027,16 @@ class ImageAnnotationTool(QMainWindow):
             return True
 
         return False
+
+    def _on_location_history_source_changed(self, _s=None):
+        """履歴入力のソース切替（実測 / 推論結果）。以後の推論から反映する"""
+        self.location_history_from_inference = self.location_history_source_check.isChecked()
+        mgr = getattr(self, 'location_model_manager', None)
+        if mgr is not None and mgr.is_model_loaded() and getattr(mgr, 'has_history_input', False):
+            # 現在フレームだけ再推論して表示を更新（全体は「全画像を推論」で）
+            self.run_location_inference()
+            if hasattr(self, 'location_inference_checkbox') and self.location_inference_checkbox.isChecked():
+                self.update_location_inference_display()
 
     def _on_location_grid_display_changed(self, _v=None):
         """格子分類の表示設定（Top-N / Top1 / 重み付き）変更 → 情報パネルとマップを更新"""
@@ -31428,7 +32097,8 @@ class ImageAnnotationTool(QMainWindow):
                 if progress.wasCanceled():
                     cancelled = True
                     break
-            result = manager.run_inference(self._location_inference_inputs(idx))
+            result = manager.run_inference(self._location_inference_inputs(idx),
+                                           pose_history=self._location_inference_history(idx))
             if result:
                 self.location_inference_results[idx] = result
                 done += 1
@@ -31501,7 +32171,8 @@ class ImageAnnotationTool(QMainWindow):
         use_class = 'class' in heads
         use_pose = 'pose' in heads
         use_grid = 'grid' in heads
-        needs_pose = use_pose or use_grid
+        use_history = bool(training_config.get('use_pose_history'))
+        needs_pose = use_pose or use_grid or use_history
 
         if use_class and actual_classes < 2:
             QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_need_at_least_2_locations', actual_classes))
@@ -31548,6 +32219,8 @@ class ImageAnnotationTool(QMainWindow):
                 downscale_factor=training_config.get('downscale_factor', 1.0),
                 downscale_mode=training_config.get('downscale_mode', 'resize'),
                 grid_cell_size=training_config.get('grid_cell_size') or 0.5,
+                pose_history=image_data.get('pose_history') if use_history else None,
+                pose_history_steps=training_config.get('pose_history_steps', 0) if use_history else 0,
             )
 
             progress.setValue(20)
@@ -31613,6 +32286,8 @@ class ImageAnnotationTool(QMainWindow):
                     "pose_norm": dataset_info.get('pose_norm'),
                     "grid_cell_size": training_config.get('grid_cell_size') if use_grid else None,
                     "num_grid_classes": dataset_info.get('num_grid_classes', 0),
+                    "pose_history_steps": training_config.get('pose_history_steps', 0) if use_history else 0,
+                    "pose_history_interval": training_config.get('pose_history_interval') if use_history else None,
                     "skipped_no_pose": image_data.get('skipped_no_pose', 0),
                     "skipped_no_source": image_data.get('skipped_no_source', 0),
                 }
@@ -31776,6 +32451,66 @@ class ImageAnnotationTool(QMainWindow):
         virtual_rows.addLayout(virtual_nsrc_row)
         source_layout.addWidget(virtual_row_widget)
 
+        # 過去の座標・姿勢の時系列を入力に加える（自己位置データがあるときのみ）
+        has_pose_input = self._location_pose_available()
+        training_settings.history_check = QCheckBox(get_text('chk_location_pose_history'))
+        training_settings.history_check.setChecked(False)
+        training_settings.history_check.setEnabled(has_pose_input)
+        training_settings.history_check.setToolTip(
+            get_text('tip_location_pose_history') if has_pose_input else get_text('tip_location_output_pose_disabled'))
+        source_layout.addWidget(training_settings.history_check)
+
+        history_opts_widget = QWidget()
+        history_opts = QVBoxLayout(history_opts_widget)
+        history_opts.setContentsMargins(20, 0, 0, 0)
+        hist_row1 = QHBoxLayout()
+        hist_row1.addWidget(QLabel(get_text('label_location_history_steps')))
+        training_settings.history_steps_spin = QSpinBox()
+        training_settings.history_steps_spin.setRange(1, 20)
+        training_settings.history_steps_spin.setValue(5)
+        hist_row1.addWidget(training_settings.history_steps_spin)
+        hist_row1.addWidget(QLabel(get_text('label_location_history_interval')))
+        training_settings.history_interval_spin = QSpinBox()
+        training_settings.history_interval_spin.setRange(1, 300)
+        training_settings.history_interval_spin.setValue(10)
+        training_settings.history_interval_spin.setSuffix(' frames')
+        hist_row1.addWidget(training_settings.history_interval_spin)
+        hist_row1.addStretch()
+        history_opts.addLayout(hist_row1)
+        hist_row2 = QHBoxLayout()
+        hist_row2.addWidget(QLabel(get_text('label_location_history_noise')))
+        training_settings.history_noise_xy_spin = QDoubleSpinBox()
+        training_settings.history_noise_xy_spin.setRange(0.0, 5.0)
+        training_settings.history_noise_xy_spin.setSingleStep(0.05)
+        training_settings.history_noise_xy_spin.setDecimals(2)
+        training_settings.history_noise_xy_spin.setSuffix(' m')
+        training_settings.history_noise_xy_spin.setValue(0.1)
+        hist_row2.addWidget(training_settings.history_noise_xy_spin)
+        training_settings.history_noise_th_spin = QDoubleSpinBox()
+        training_settings.history_noise_th_spin.setRange(0.0, 90.0)
+        training_settings.history_noise_th_spin.setSingleStep(1.0)
+        training_settings.history_noise_th_spin.setDecimals(1)
+        training_settings.history_noise_th_spin.setSuffix(' °')
+        training_settings.history_noise_th_spin.setValue(5.0)
+        hist_row2.addWidget(training_settings.history_noise_th_spin)
+        hist_row2.addWidget(QLabel(get_text('label_location_history_drop')))
+        training_settings.history_drop_spin = QDoubleSpinBox()
+        training_settings.history_drop_spin.setRange(0.0, 1.0)
+        training_settings.history_drop_spin.setSingleStep(0.05)
+        training_settings.history_drop_spin.setDecimals(2)
+        training_settings.history_drop_spin.setValue(0.1)
+        hist_row2.addWidget(training_settings.history_drop_spin)
+        hist_row2.addStretch()
+        history_opts.addLayout(hist_row2)
+        history_note = QLabel(get_text('label_location_history_note'))
+        history_note.setStyleSheet("color: #1565C0; font-style: italic;")
+        history_note.setWordWrap(True)
+        history_opts.addWidget(history_note)
+        source_layout.addWidget(history_opts_widget)
+        history_opts_widget.setVisible(False)
+        training_settings.history_check.stateChanged.connect(
+            lambda s: history_opts_widget.setVisible(training_settings.history_check.isChecked()))
+
         training_settings.source_count_label = QLabel("")
         training_settings.source_count_label.setStyleSheet("color: #2E7D32; font-weight: bold;")
         source_layout.addWidget(training_settings.source_count_label)
@@ -31838,14 +32573,24 @@ class ImageAnnotationTool(QMainWindow):
         pose_src_row = QHBoxLayout()
         pose_src_row.addWidget(QLabel(get_text('label_location_pose_source')))
         training_settings.pose_source_combo = QComboBox()
+        training_settings.pose_source_combo.setToolTip(get_text('tip_location_pose_source'))
         if has_pose:
+            # 各ソースの ok フレーム数を併記（学習に使えるフレーム数の目安）
             for src in self.pose_manager.available_sources():
-                training_settings.pose_source_combo.addItem(src, src)
-            preferred = getattr(self, 'recorded_traj_source', None)
-            if preferred:
-                idx = training_settings.pose_source_combo.findData(preferred)
-                if idx >= 0:
-                    training_settings.pose_source_combo.setCurrentIndex(idx)
+                n_ok = self.pose_manager.source_frame_count(src, ok_only=True)
+                training_settings.pose_source_combo.addItem(
+                    get_text('label_location_pose_source_item', src, n_ok), src)
+            # 既定は slam（map 座標系の絶対位置。無ければ優先順位の先頭）
+            idx = training_settings.pose_source_combo.findData('slam')
+            training_settings.pose_source_combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+        def _update_pose_count_label(_i=None):
+            src = training_settings.pose_source_combo.currentData()
+            n = self.pose_manager.source_frame_count(src, ok_only=True) if (has_pose and src) else pose_count
+            training_settings.pose_output_check.setText(get_text('chk_location_output_pose', n))
+
+        training_settings.pose_source_combo.currentIndexChanged.connect(_update_pose_count_label)
+        _update_pose_count_label()
         pose_src_row.addWidget(training_settings.pose_source_combo)
         pose_src_row.addStretch()
         pose_opts.addLayout(pose_src_row)
@@ -32368,7 +33113,8 @@ class ImageAnnotationTool(QMainWindow):
         use_grid = dialog.grid_output_check.isChecked()
         from model_catalog import make_output_mode
         output_mode = make_output_mode(use_class=use_class, use_pose=use_pose, use_grid=use_grid)
-        needs_pose = use_pose or use_grid   # 自己位置を教師データに使うヘッドがあるか
+        use_history = dialog.history_check.isChecked() and dialog.history_check.isEnabled()
+        needs_pose = use_pose or use_grid or use_history   # 自己位置を教師データ / 入力に使うか
 
         return {
             'num_epochs': dialog.epoch_spin.value(),
@@ -32395,6 +33141,13 @@ class ImageAnnotationTool(QMainWindow):
             'grid_loss_weight': dialog.grid_weight_spin.value() if use_grid else 1.0,
             'grid_label_sigma': dialog.grid_sigma_spin.value() if use_grid else 1.0,
             'grid_class_balance': dialog.grid_balance_check.isChecked() if use_grid else True,
+            # 過去の座標・姿勢の時系列入力
+            'use_pose_history': use_history,
+            'pose_history_steps': dialog.history_steps_spin.value() if use_history else 0,
+            'pose_history_interval': dialog.history_interval_spin.value() if use_history else 10,
+            'history_noise_xy_m': dialog.history_noise_xy_spin.value() if use_history else 0.0,
+            'history_noise_theta_deg': dialog.history_noise_th_spin.value() if use_history else 0.0,
+            'history_drop_prob': dialog.history_drop_spin.value() if use_history else 0.0,
             # 解像度（自動運転モデルと同じ: 実画像サイズ × 係数 / ピクセレーション）
             'downscale_factor': dialog.res_slider.value() / 100.0,
             'downscale_mode': 'resize' if dialog.resize_radio.isChecked() else 'pixelate',
@@ -32447,7 +33200,11 @@ class ImageAnnotationTool(QMainWindow):
         output_mode = cfg.get('output_mode', 'class')
         heads = str(output_mode).split('_')
         use_class = 'class' in heads
-        use_pose = 'pose' in heads or 'grid' in heads   # 格子分類も自己位置を教師データに使う
+        use_history = bool(cfg.get('use_pose_history'))
+        history_steps = int(cfg.get('pose_history_steps', 0) or 0) if use_history else 0
+        history_interval = int(cfg.get('pose_history_interval', 10) or 10)
+        # 格子分類・履歴入力も自己位置（教師データ / 正規化）を使う
+        use_pose = 'pose' in heads or 'grid' in heads or use_history
         selected_sources = cfg.get('selected_sources') or [getattr(self, 'current_variant', None)]
         virtual_type = cfg.get('virtual_source_type')
         num_sources = cfg.get('num_sources', 1)
@@ -32469,6 +33226,7 @@ class ImageAnnotationTool(QMainWindow):
         location_labels = []
         location_indices = []
         pose_targets = []
+        pose_history = []
         skipped_no_pose = 0
         skipped_no_source = 0
 
@@ -32484,7 +33242,12 @@ class ImageAnnotationTool(QMainWindow):
 
             pose_value = None
             if use_pose:
-                pose = self.pose_manager.get_pose(idx, prefer=pose_source)
+                # 学習ラベルは選択したソースの値だけを使う（他ソースへはフォールバックしない。
+                # 欠損フレームは除外して、slam のテレポート補完不可区間に pose が混ざらないようにする）
+                if pose_source:
+                    pose = self.pose_manager.get_source_pose(idx, pose_source, require_ok=True)
+                else:
+                    pose = self.pose_manager.get_pose(idx)
                 if pose is None:
                     skipped_no_pose += 1
                     continue
@@ -32496,6 +33259,9 @@ class ImageAnnotationTool(QMainWindow):
                 location_indices.append(location_to_index[location])
             if use_pose:
                 pose_targets.append(pose_value)
+            if use_history:
+                pose_history.append(self._location_pose_history_measured(
+                    idx, history_steps, history_interval, pose_source))
             image_paths.append(paths[0])
             grouped_paths.append(paths)
 
@@ -32506,6 +33272,7 @@ class ImageAnnotationTool(QMainWindow):
             'location_indices': location_indices,
             'location_to_index': location_to_index,
             'pose_targets': pose_targets,
+            'pose_history': pose_history,
             'skipped_no_pose': skipped_no_pose,
             'skipped_no_source': skipped_no_source,
         }
@@ -32521,7 +33288,8 @@ class ImageAnnotationTool(QMainWindow):
         heads = str(output_mode).split('_')
         use_pose = 'pose' in heads
         use_grid = 'grid' in heads
-        needs_pose = use_pose or use_grid
+        use_history = bool(training_config.get('use_pose_history'))
+        needs_pose = use_pose or use_grid or use_history
 
         # 保存ディレクトリとファイル名（モデルタイプを必ず含める）
         models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
@@ -32546,7 +33314,13 @@ class ImageAnnotationTool(QMainWindow):
             'downscale_mode': training_config.get('downscale_mode', 'resize'),
             'grid_config': dataset_info.get('grid_config') if use_grid else None,
             'num_grid_classes': int(dataset_info.get('num_grid_classes') or 0) if use_grid else 0,
+            # 過去の座標・姿勢の履歴入力（推論時に同じ間隔で履歴を組み立てる）
+            'pose_history_steps': int(training_config.get('pose_history_steps', 0) or 0) if use_history else 0,
+            'pose_history_interval': int(training_config.get('pose_history_interval', 10) or 10),
         }
+        if use_history:
+            # pose ヘッドが無くても履歴の正規化に pose_norm が必要
+            location_config['pose_norm'] = dataset_info.get('pose_norm')
 
         return train_location_model(
             model_name=model_type,
@@ -32574,6 +33348,10 @@ class ImageAnnotationTool(QMainWindow):
             grid_top_n=int(getattr(self, 'location_topn', 3)),
             grid_label_sigma=float(training_config.get('grid_label_sigma', 1.0)),
             grid_class_balance=bool(training_config.get('grid_class_balance', True)),
+            pose_history_steps=int(training_config.get('pose_history_steps', 0) or 0) if use_history else 0,
+            history_noise_xy_m=float(training_config.get('history_noise_xy_m', 0.1)),
+            history_noise_theta_deg=float(training_config.get('history_noise_theta_deg', 5.0)),
+            history_drop_prob=float(training_config.get('history_drop_prob', 0.1)),
         )
 
     def _initialize_location_model(self, model_type, num_classes, device):
@@ -32675,6 +33453,11 @@ class ImageAnnotationTool(QMainWindow):
                 "grid_loss_weight": training_config.get('grid_loss_weight') if 'grid' in heads else None,
                 "grid_label_sigma": training_config.get('grid_label_sigma') if 'grid' in heads else None,
                 "grid_class_balance": training_config.get('grid_class_balance') if 'grid' in heads else None,
+                "pose_history_steps": training_config.get('pose_history_steps', 0) if training_config.get('use_pose_history') else 0,
+                "pose_history_interval": training_config.get('pose_history_interval') if training_config.get('use_pose_history') else None,
+                "history_noise_xy_m": training_config.get('history_noise_xy_m') if training_config.get('use_pose_history') else None,
+                "history_noise_theta_deg": training_config.get('history_noise_theta_deg') if training_config.get('use_pose_history') else None,
+                "history_drop_prob": training_config.get('history_drop_prob') if training_config.get('use_pose_history') else None,
                 "data_folder": self.folder_path if hasattr(self, 'folder_path') and self.folder_path else "unknown"
             }
 
@@ -32794,6 +33577,13 @@ class ImageAnnotationTool(QMainWindow):
         elif n_src > 1:
             src_desc += f" / {training_config.get('fusion_method', 'concat')}"
         right_layout.addWidget(QLabel(get_text('label_location_result_inputs', n_src, src_desc)))
+        if training_config.get('use_pose_history'):
+            right_layout.addWidget(QLabel(get_text('label_location_result_history',
+                                                   training_config.get('pose_history_steps', 0),
+                                                   training_config.get('pose_history_interval', 10),
+                                                   training_config.get('history_noise_xy_m', 0.0),
+                                                   training_config.get('history_noise_theta_deg', 0.0),
+                                                   training_config.get('history_drop_prob', 0.0))))
         in_size = dataset_info.get('input_size')
         if in_size:
             mode = training_config.get('downscale_mode', 'resize')
@@ -33472,6 +34262,16 @@ class ImageAnnotationTool(QMainWindow):
                             else:
                                 err_text = get_text('label_location_pose_error_pos_only', f'{pos_err:.2f}')
                             inference_text += f"<span style='color: #444;'>{err_text}</span><br>"
+
+                # 履歴入力ありのモデル: 履歴のソースと有効ステップ数
+                if 'history_valid_steps' in result:
+                    cfg = getattr(self.location_model_manager, 'location_config', {}) or {}
+                    src_text = (get_text('label_location_history_src_inference')
+                                if getattr(self, 'location_history_from_inference', False)
+                                else get_text('label_location_history_src_measured'))
+                    inference_text += (f"<span style='color: #444;'>"
+                                       f"{get_text('label_location_history_info', src_text, result['history_valid_steps'], cfg.get('pose_history_steps', 0))}"
+                                       f"</span><br>")
 
                 # 格子分類の結果: Top1 セル / Top1〜N の重み付き位置と Top-N 一覧
                 grid_result = result.get('grid')
