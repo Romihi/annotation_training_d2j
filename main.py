@@ -44,7 +44,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                             QScrollArea, QGridLayout, QFrame, QLineEdit, QProgressDialog,
                             QCheckBox, QSpinBox, QComboBox, QSlider, QInputDialog,
                             QDoubleSpinBox, QDialog, QDialogButtonBox, QFormLayout,
-                            QGroupBox, QRadioButton, QTabWidget, QSizePolicy,QButtonGroup,
+                            QGroupBox, QRadioButton, QTabWidget, QSizePolicy,QButtonGroup, QSplitter,
                             QListView, QTreeView, QAbstractItemView,QStyleOptionSlider,QStyle, QTextEdit, QPlainTextEdit,
                             QGraphicsOpacityEffect, QListWidget, QListWidgetItem)
 from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont, QPolygon, QPolygonF, QCursor, QIcon, QPainterPath
@@ -345,6 +345,69 @@ def _seg_annotation_to_mask(seg, img_h, img_w):
         img_p = _PILImg.new('1', (img_w, img_h), 0)
         _IDraw.Draw(img_p).polygon(pts, fill=1)
         return _np.array(img_p, dtype=bool)
+
+# 排他選択（セグメンテッドコントロール）用の共通スタイル。
+# アノテーションモード切替と位置/コーナー切替で見た目を揃えるために共有する。
+SEGMENTED_BTN_QSS = (
+    "QPushButton{border:1px solid #aaa;border-radius:3px;padding:4px 8px;background:#f0f0f0;}"
+    "QPushButton:hover{background:#e6e6e6;}"
+    "QPushButton:checked{background:#4a90d9;color:white;border-color:#2a70b9;font-weight:bold;}"
+)
+
+# タイトル無しの枠だけの群（QGroupBox）用スタイル。上マージンは不要。
+PANEL_FRAME_QSS = "QGroupBox{border:1px solid #d0d0d0;border-radius:4px;}"
+
+# 折り返した2段目の行頭インデント（親のチェックボックスにぶら下がって見せる）
+_INDENT_WIDTH = 18
+
+# パネル境界のドラッグハンドル。掴める場所と分かるよう見えるグリップを出す。
+SPLITTER_HANDLE_QSS = (
+    "QSplitter::handle:horizontal{background:#dcdcdc;border-left:1px solid #c4c4c4;"
+    "border-right:1px solid #c4c4c4;margin:2px 0;}"
+    "QSplitter::handle:horizontal:hover{background:#4a90d9;}"
+    "QSplitter::handle:horizontal:pressed{background:#2a70b9;}"
+)
+
+
+def make_panel_splitter(widgets, stretches, handle_width=6):
+    """パネル境界をドラッグで動かせる QSplitter を組み立てる。
+
+    widgets: 左から順に並べるウィジェット
+    stretches: 各ウィジェットのストレッチ係数（ウィンドウ拡大時の配分）
+    子は畳めないようにして、ドラッグでパネルが消えるのを防ぐ。
+    """
+    splitter = QSplitter(Qt.Horizontal)
+    splitter.setChildrenCollapsible(False)
+    splitter.setHandleWidth(handle_width)
+    splitter.setStyleSheet(SPLITTER_HANDLE_QSS)
+    for index, widget in enumerate(widgets):
+        splitter.addWidget(widget)
+        splitter.setStretchFactor(index, stretches[index])
+    return splitter
+
+
+def panel_group_qss(font_metrics):
+    """タイトル付き QGroupBox（右パネルの群）用スタイルを返す。
+
+    QSS で border を指定すると Qt がタイトル分の余白を自動確保しなくなるため、
+    タイトルの実高さから margin-top を算出してフレームを押し下げる。
+    フォントサイズ変更で高さが変わるので、そのたびに作り直して適用する。
+    """
+    title_h = font_metrics.height()
+    return (
+        "QGroupBox{border:1px solid #d0d0d0;border-radius:4px;"
+        f"margin-top:{title_h}px;padding-top:6px;font-weight:bold;}}"
+        "QGroupBox::title{subcontrol-origin:margin;subcontrol-position:top left;"
+        "left:8px;padding:0 4px;}"
+    )
+
+# アノテーションモードID → ステータスバー用メッセージキー
+_MODE_STATUS_KEYS = {
+    0: 'status_switched_to_auto_driving',
+    1: 'status_switched_to_detection',
+    2: 'status_switched_to_segmentation',
+    3: 'status_switched_to_waypoint',
+}
 
 # 位置インデックス → (角度deg, ラベル) のマッピング（コーナー表示モード用）
 _CORNER_INFO = [
@@ -7350,7 +7413,7 @@ class ImageAnnotationTool(QMainWindow):
         left_scroll_area.setWidgetResizable(True)
         left_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         left_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        left_scroll_area.setMaximumWidth(LEFT_PANEL_MAX_WIDTH + 20)  # スクロールバー分の余裕
+        # 幅はスプリッタのドラッグで決めるので上限は設けず、最小幅だけ守る
         left_scroll_area.setMinimumWidth(LEFT_PANEL_MIN_WIDTH)  # 最小幅を設定
 
         left_panel = QWidget()
@@ -7358,7 +7421,9 @@ class ImageAnnotationTool(QMainWindow):
         left_panel.setMinimumWidth(LEFT_PANEL_MIN_WIDTH - 20)  # スクロールバー分を考慮した最小幅を確保
 
         left_scroll_area.setWidget(left_panel)
-        main_layout.addWidget(left_scroll_area)
+        # get_left_layout がレイアウトのインデックス探索に頼らずに済むよう保持
+        self.left_panel_widget = left_panel
+        self.left_scroll_area = left_scroll_area
 
         # Stats と画像ソース切替はツールバーに移動済み
 
@@ -7687,10 +7752,17 @@ class ImageAnnotationTool(QMainWindow):
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 5)  # 下部マージンを削減
         right_layout.setSpacing(3)  # スペーシングを削減
-        main_layout.addWidget(right_panel)
-        
-        # メイン画像と位置情報パネルを横に並べるレイアウト - 1:4:1の比率に変更
-        main_panel_layout = QHBoxLayout()
+
+        # 左パネルと画像側の境界をドラッグで動かせるようにする
+        # （左は初期幅を保ち、ウィンドウ拡大分は画像側が受け取る）
+        # 初期配分は初回表示時に _apply_default_splitter_sizes で確定させる
+        self.main_splitter = make_panel_splitter(
+            (left_scroll_area, right_panel), (0, 1))
+        main_layout.addWidget(self.main_splitter)
+
+        # 情報パネル / メイン画像 / 位置情報パネルは QSplitter で横に並べ、
+        # 各境界をドラッグして幅を調整できるようにする（初期比 1:4:1）。
+        # 3枚のウィジェットはこの後それぞれ組み立て、最後にまとめて追加する。
         
         # 1. 左側の情報パネル（アノテーション情報表示用）- 追加
         info_panel = QWidget()
@@ -7797,11 +7869,12 @@ class ImageAnnotationTool(QMainWindow):
         
         # パネルのサイズ設定
         # info_panel.setMinimumWidth(200)  # 最小幅
-        main_panel_layout.addWidget(info_panel, 1)  # 比率1
-        
+
         # 2. 中央の画像パネル - 既存のmain_image_containerをそのまま利用
         # メインイメージの周りにマージンを調整 - 左側マージンを0に変更（情報パネルを別ウィジェットにしたため）
-        main_image_container = QVBoxLayout()
+        # QSplitter に載せるためコンテナウィジェットで包む
+        self.image_area_widget = QWidget()
+        main_image_container = QVBoxLayout(self.image_area_widget)
         main_image_container.setContentsMargins(0, 0, 0, 0)  # マージンを0に変更
 
         # 画像とズームスライダーを横に並べるレイアウト
@@ -8216,45 +8289,36 @@ class ImageAnnotationTool(QMainWindow):
 
         # ナビゲーションコンテナをメイン画像コンテナに追加
         main_image_container.addWidget(nav_container)
-        
-        # 中央パネルをメインパネルに追加 - 比率4に設定
-        main_panel_layout.addLayout(main_image_container, 4)
-        
+
         # 3. 右側の位置情報パネル - 既存のright_layoutをそのまま利用、比率1に設定
         location_panel = QWidget()
         location_layout = QVBoxLayout(location_panel)
         location_layout.setSpacing(5)
         
-        # アノテーションモード ラベル（右にヒントを横並び）
-        mode_header_row = QHBoxLayout()
-        mode_header_row.setSpacing(6)
-        mode_layout_label = QLabel(get_text('label_annotation_mode'))
-        mode_layout_label.setStyleSheet("font-weight: bold;")
-        mode_header_row.addWidget(mode_layout_label)
-        self.mode_hint_label = QLabel(get_text('label_mode_hint'))
-        self.mode_hint_label.setStyleSheet("color: #888; font-style: italic; font-size: 10px;")
-        mode_header_row.addWidget(self.mode_hint_label)
-        mode_header_row.addStretch()
-        location_layout.addLayout(mode_header_row)
+        # ── 群1: アノテーションモード（モード選択＋全モード共通設定）
+        # タイトル付きの群はフォント高に応じた上マージンが要るので
+        # _panel_group_boxes に集めて _refresh_panel_group_styles で一括適用する
+        self._panel_group_boxes = []
+        mode_group = QGroupBox(get_text('label_annotation_mode').rstrip(':：'))
+        self._panel_group_boxes.append(mode_group)
+        mode_group_layout = QVBoxLayout(mode_group)
+        mode_group_layout.setContentsMargins(6, 2, 6, 6)
+        mode_group_layout.setSpacing(4)
 
-        # アノテーションモード切替ボタン
+        # アノテーションモード切替ボタン（排他制御は QButtonGroup に一元化し、
+        # 見た目は位置/コーナー切替と同じセグメンテッドコントロールに揃える）
         mode_layout = QHBoxLayout()
-        
+        mode_layout.setSpacing(2)
+        self.mode_button_group = QButtonGroup(self)
+        self.mode_button_group.setExclusive(True)
+
         self.auto_mode_button = QPushButton(get_text('btn_auto_driving'))
-        self.auto_mode_button.setCheckable(True)
-        self.auto_mode_button.setChecked(True)
-        self.auto_mode_button.clicked.connect(self.toggle_annotation_mode)
         self.auto_mode_button.setToolTip(get_text('tip_auto_driving_mode'))
 
         self.detection_mode_button = QPushButton(get_text('btn_detection'))
-        self.detection_mode_button.setCheckable(True)
-        self.detection_mode_button.clicked.connect(self.toggle_annotation_mode)
         self.detection_mode_button.setToolTip(get_text('tip_detection_mode'))
 
-        # 新規追加: セグメンテーションモードボタン
         self.segmentation_mode_button = QPushButton(get_text('btn_segmentation'))
-        self.segmentation_mode_button.setCheckable(True)
-        self.segmentation_mode_button.clicked.connect(self.toggle_annotation_mode)
         self.segmentation_mode_button.setToolTip(get_text('tip_segmentation_mode'))
 
         # waypointモードボタン: UI から削除（モード切替ロジックが参照するため
@@ -8263,11 +8327,25 @@ class ImageAnnotationTool(QMainWindow):
         self.waypoint_mode_button.setCheckable(True)
         self.waypoint_mode_button.setVisible(False)
 
-        mode_layout.addWidget(self.auto_mode_button)
-        mode_layout.addWidget(self.detection_mode_button)
-        mode_layout.addWidget(self.segmentation_mode_button)  # 追加
+        for _mode_id, _mode_btn in ((0, self.auto_mode_button),
+                                    (1, self.detection_mode_button),
+                                    (2, self.segmentation_mode_button)):
+            _mode_btn.setCheckable(True)
+            _mode_btn.setStyleSheet(SEGMENTED_BTN_QSS)
+            self.mode_button_group.addButton(_mode_btn, _mode_id)
+            mode_layout.addWidget(_mode_btn)
+        self.mode_button_group.addButton(self.waypoint_mode_button, 3)
+        self.auto_mode_button.setChecked(True)
+        self.mode_button_group.idClicked.connect(self.toggle_annotation_mode)
 
-        location_layout.addLayout(mode_layout)
+        mode_group_layout.addLayout(mode_layout)
+
+        # モード切替ヒント（独立行にして見切れを防ぐ。フォントを縮めると
+        # 潰れて読めなくなるので、色だけ落として本文サイズを保つ）
+        self.mode_hint_label = QLabel(get_text('label_mode_hint'))
+        self.mode_hint_label.setStyleSheet("color: #777;")
+        self.mode_hint_label.setWordWrap(True)
+        mode_group_layout.addWidget(self.mode_hint_label)
 
         # クリック時の自動スキップ枚数（全モード共通、モードボタン直下）
         skip_layout = QHBoxLayout()
@@ -8280,13 +8358,16 @@ class ImageAnnotationTool(QMainWindow):
         self.skip_count_spin.valueChanged.connect(self.update_skip_button_labels)
         skip_layout.addWidget(self.skip_count_spin)
         skip_layout.addStretch()
-        location_layout.addLayout(skip_layout)
+        mode_group_layout.addLayout(skip_layout)
 
-        # 自動運転走行軌跡制御パネル
-        self.auto_driving_control_widget = QWidget()
+        # パネルへの追加はオーバーレイ群の生成後（表示順は オーバーレイ → モード）
+
+        # ── 群2: 表示オーバーレイ（自動運転モードで画像に重ねて描くもの）
+        self.auto_driving_control_widget = QGroupBox(get_text('label_overlay_group'))
+        self._panel_group_boxes.append(self.auto_driving_control_widget)
         auto_driving_control_layout = QVBoxLayout(self.auto_driving_control_widget)
-        auto_driving_control_layout.setContentsMargins(0, 2, 0, 2)
-        auto_driving_control_layout.setSpacing(3)
+        auto_driving_control_layout.setContentsMargins(6, 2, 6, 6)
+        auto_driving_control_layout.setSpacing(4)
 
         # ラベル/チェックボックスが縦方向に潰れないための高さ（フォント高さ基準）
         _label_h = self.fontMetrics().height() + 4
@@ -8315,6 +8396,14 @@ class ImageAnnotationTool(QMainWindow):
         self.show_recorded_trajectory_checkbox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.show_recorded_trajectory_checkbox.setMinimumHeight(_label_h)
         rec_row.addWidget(self.show_recorded_trajectory_checkbox)
+        rec_row.addStretch()
+        auto_driving_control_layout.addLayout(rec_row)
+
+        # 行1b-2: 走行軌道のパラメータ（ソース/秒数/点数）。1行に並べると
+        # パネルの最小幅を押し上げるので、チェックボックスの下へ折り返す。
+        rec_param_row = QHBoxLayout()
+        rec_param_row.setSpacing(4)
+        rec_param_row.addSpacing(_INDENT_WIDTH)
 
         # 走行軌道の自己位置ソース（既定 pose。slam はテレポートで補完不可に
         # なるフレームが多く、軌道が途切れやすいため既定にしない）
@@ -8327,7 +8416,7 @@ class ImageAnnotationTool(QMainWindow):
         self.recorded_traj_source_combo.setToolTip(get_text('tip_recorded_traj_source'))
         self.recorded_traj_source_combo.setCurrentIndex(0)   # 既定 pose
         self.recorded_traj_source_combo.currentIndexChanged.connect(self.update_recorded_traj_source)
-        rec_row.addWidget(self.recorded_traj_source_combo)
+        rec_param_row.addWidget(self.recorded_traj_source_combo)
 
         # 走行軌道の表示時間窓 [秒]（0.5秒刻み・小数第1位。TogiVADモデル読込時は
         # モデルの秒数へ同期）。単位「秒」は入力欄の外に別ラベルで表示する
@@ -8341,11 +8430,11 @@ class ImageAnnotationTool(QMainWindow):
         self.recorded_traj_seconds_input.setToolTip(get_text('tip_recorded_traj_seconds'))
         self.recorded_traj_seconds_input.setValue(self.recorded_traj_seconds)
         self.recorded_traj_seconds_input.valueChanged.connect(self.update_recorded_traj_seconds)
-        rec_row.addWidget(self.recorded_traj_seconds_input)
+        rec_param_row.addWidget(self.recorded_traj_seconds_input)
         # 秒数入力の右に単位「秒」ラベル（点数の「点」と同じ扱い）
         self.recorded_traj_seconds_unit = QLabel(get_text('unit_seconds_label'))
         self.recorded_traj_seconds_unit.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        rec_row.addWidget(self.recorded_traj_seconds_unit)
+        rec_param_row.addWidget(self.recorded_traj_seconds_unit)
 
         # 走行軌道の標本点数（プレースホルダーで調整。空欄はデフォルト20点）
         self.recorded_traj_points_input = QLineEdit()
@@ -8354,37 +8443,59 @@ class ImageAnnotationTool(QMainWindow):
         self.recorded_traj_points_input.setFixedWidth(44)
         self.recorded_traj_points_input.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.recorded_traj_points_input.textChanged.connect(self.update_recorded_traj_points)
-        rec_row.addWidget(self.recorded_traj_points_input)
+        rec_param_row.addWidget(self.recorded_traj_points_input)
         # 点数入力の右に単位「点」ラベル
         self.recorded_traj_points_unit = QLabel(get_text('unit_points_label'))
         self.recorded_traj_points_unit.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        rec_row.addWidget(self.recorded_traj_points_unit)
-        rec_row.addStretch()
-        auto_driving_control_layout.addLayout(rec_row)
+        rec_param_row.addWidget(self.recorded_traj_points_unit)
+        rec_param_row.addStretch()
+        auto_driving_control_layout.addLayout(rec_param_row)
 
         # 行1c: BEV(真上図)レイヤのトグル — CAM投影/障害物/境界/他車
+        #       画像ソースが BEV のときにしか効かないので、それ以外では
+        #       無効表示にして「押しても反応しない」状態を作らない
+        self._bev_layer_widgets = []
+        # 4つを1行に並べるとパネルの最小幅を押し上げるので2段に折り返す
         bev_layer_row = QHBoxLayout()
         bev_layer_row.setSpacing(6)
-        for attr, key, default in (
+        bev_hint_label = QLabel(get_text('label_bev_layers_only'))
+        bev_hint_label.setStyleSheet("color: #777;")
+        bev_hint_label.setToolTip(get_text('tip_bev_layers_only'))
+        bev_hint_label.setMinimumHeight(_label_h)
+        bev_layer_row.addWidget(bev_hint_label)
+        self._bev_layer_widgets.append(bev_hint_label)
+
+        bev_layer_row2 = QHBoxLayout()
+        bev_layer_row2.setSpacing(6)
+        bev_layer_row2.addSpacing(_INDENT_WIDTH)
+        for index, (attr, key, default) in enumerate((
                 ('show_bev_camera', 'chk_bev_camera', False),
                 ('show_bev_occupancy', 'chk_bev_occupancy', True),
                 ('show_bev_boundary', 'chk_bev_boundary', True),
-                ('show_bev_agents', 'chk_bev_agents', True)):
+                ('show_bev_agents', 'chk_bev_agents', True))):
             setattr(self, attr, default)
             cb = QCheckBox(get_text(key))
             cb.setChecked(default)
             cb.setMinimumHeight(_label_h)
             cb.stateChanged.connect(self._make_bev_layer_toggle(attr))
-            bev_layer_row.addWidget(cb)
+            # 前半2つはラベルと同じ行、後半2つは折り返した2段目へ
+            (bev_layer_row if index < 2 else bev_layer_row2).addWidget(cb)
+            self._bev_layer_widgets.append(cb)
         bev_layer_row.addStretch()
+        bev_layer_row2.addStretch()
         auto_driving_control_layout.addLayout(bev_layer_row)
+        auto_driving_control_layout.addLayout(bev_layer_row2)
+        self._update_bev_layer_enabled()
 
-        # 行2: 最大舵角 / 俯角 / FOV を横に並べる（各列：ラベルを値の上に配置）
-        #   狭いパネル幅でもラベルが全部見えるよう、1項目=1列(ラベル＋入力欄)とする
-        params_row = QHBoxLayout()
+        # 行2: カメラ幾何（最大舵角/俯角/FOV/カメラ高）
+        #   車両とカメラの物理定数でセッション中はほぼ固定のため、パネルには
+        #   現在値のサマリだけを置き、入力欄は「変更」で開くダイアログへ退避する。
+        #   入力欄ウィジェットはここで生成して既定値を各ハンドラへ流す。
+        self.camera_params_widget = QWidget()
+        params_row = QHBoxLayout(self.camera_params_widget)
         params_row.setSpacing(10)
 
-        def _mk_spin(decimals, lo, hi, width=64):
+        def _mk_spin(decimals, lo, hi, width=76):
             sb = QDoubleSpinBox()
             sb.setRange(lo, hi)
             sb.setSuffix("°")
@@ -8433,7 +8544,7 @@ class ImageAnnotationTool(QMainWindow):
         self.auto_cam_height_spin.setSuffix(" m")
         self.auto_cam_height_spin.setDecimals(2)
         self.auto_cam_height_spin.setSingleStep(0.01)
-        self.auto_cam_height_spin.setFixedWidth(64)
+        self.auto_cam_height_spin.setFixedWidth(76)
         self.auto_cam_height_spin.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.auto_cam_height_spin.setToolTip(get_text('tip_auto_cam_height'))
         self.auto_cam_height_spin.valueChanged.connect(self.update_auto_cam_height)
@@ -8441,12 +8552,33 @@ class ImageAnnotationTool(QMainWindow):
         _add_param_col('label_auto_cam_height', self.auto_cam_height_spin)
 
         params_row.addStretch()
-        auto_driving_control_layout.addLayout(params_row)
+        # パネルには載せず、ダイアログを開いたときに移設する
+        self.camera_params_widget.setVisible(False)
+
+        # カメラ幾何の現在値サマリ ＋ 変更ボタン（パネル上は1行に圧縮）
+        cam_summary_row = QHBoxLayout()
+        cam_summary_row.setSpacing(6)
+        self.camera_geometry_summary_label = QLabel()
+        self.camera_geometry_summary_label.setStyleSheet("color: #555;")
+        cam_summary_row.addWidget(self.camera_geometry_summary_label)
+        cam_summary_row.addStretch()
+        self.camera_geometry_button = QPushButton(get_text('btn_camera_geometry'))
+        self.camera_geometry_button.setToolTip(get_text('tip_camera_geometry'))
+        self.camera_geometry_button.clicked.connect(self.show_camera_geometry_dialog)
+        cam_summary_row.addWidget(self.camera_geometry_button)
+        auto_driving_control_layout.addLayout(cam_summary_row)
+
+        for _cam_spin in (self.auto_max_steering_spin, self.auto_cam_pitch_spin,
+                          self.auto_fov_spin, self.auto_cam_height_spin):
+            _cam_spin.valueChanged.connect(self._update_camera_geometry_summary)
+        self._update_camera_geometry_summary()
 
         # ウィジェット全体が縦方向に圧縮されないようにする（ラベルの潰れ防止）
         self.auto_driving_control_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         self.auto_driving_control_widget.setVisible(True)  # 初期は自動運転モードで表示
+        # 表示オーバーレイ群をアノテーションモード群より上に置く
         location_layout.addWidget(self.auto_driving_control_widget)
+        location_layout.addWidget(mode_group)
 
         # waypoint制御パネル
         self.waypoint_control_widget = QWidget()
@@ -8821,9 +8953,38 @@ class ImageAnnotationTool(QMainWindow):
         self.apply_last_segmentation_checkbox.setVisible(False)  # 初期は非表示（セグメンテーションモード時のみ表示）
         location_layout.addWidget(self.apply_last_segmentation_checkbox)
 
-        location_label = QLabel(get_text('label_location_info'))
+        # ── 群3: コースの位置情報（折り畳み式。既定は畳んでパネル高を空ける）
+        # タイトルはヘッダー行に自前で置くので、枠だけのスタイルを当てる
+        self.location_info_group = QGroupBox()
+        self.location_info_group.setStyleSheet(PANEL_FRAME_QSS)
+        loc_group_layout = QVBoxLayout(self.location_info_group)
+        loc_group_layout.setContentsMargins(6, 6, 6, 6)
+        loc_group_layout.setSpacing(4)
+
+        # ヘッダー: タイトル ＋ 現在値 ＋ 展開ボタン
+        # （畳んだままでも「今どの位置か」が読めるようにヘッダーへ出す）
+        loc_header_row = QHBoxLayout()
+        loc_header_row.setSpacing(6)
+        # タイトル末尾のコロンは「現在: なし」と続けると二重になるので落とす
+        location_label = QLabel(get_text('label_location_info').rstrip(':：'))
         location_label.setStyleSheet("font-weight: bold;")
-        location_layout.addWidget(location_label)
+        loc_header_row.addWidget(location_label)
+        self.current_location_label = QLabel(get_text('label_current_location'))
+        loc_header_row.addWidget(self.current_location_label)
+        loc_header_row.addStretch()
+        self.location_info_expand_button = QPushButton("▶")
+        self.location_info_expand_button.setFixedSize(26, 24)
+        self.location_info_expand_button.setStyleSheet("padding: 0px;")
+        self.location_info_expand_button.setToolTip(get_text('tip_toggle_location_info'))
+        self.location_info_expand_button.clicked.connect(self.toggle_location_info_section)
+        loc_header_row.addWidget(self.location_info_expand_button)
+        loc_group_layout.addLayout(loc_header_row)
+
+        # 折り畳み対象の中身
+        self.location_info_content = QWidget()
+        location_content_layout = QVBoxLayout(self.location_info_content)
+        location_content_layout.setContentsMargins(0, 2, 0, 0)
+        location_content_layout.setSpacing(4)
 
         # 位置 / コーナー 切り替えボタン
         loc_mode_row = QHBoxLayout()
@@ -8834,23 +8995,19 @@ class ImageAnnotationTool(QMainWindow):
         self._loc_pos_btn.setCheckable(True)
         self._loc_pos_btn.setChecked(True)
         self._loc_pos_btn.setFixedHeight(24)
-        self._loc_pos_btn.setStyleSheet(
-            "QPushButton{border:1px solid #aaa;border-radius:3px;padding:2px 8px;background:#f0f0f0;}"
-            "QPushButton:checked{background:#4a90d9;color:white;border-color:#2a70b9;}"
-        )
+        self._loc_pos_btn.setToolTip(get_text('tip_loc_mode_position'))
+        self._loc_pos_btn.setStyleSheet(SEGMENTED_BTN_QSS)
         self._loc_corner_btn = QPushButton("コーナー")
         self._loc_corner_btn.setCheckable(True)
         self._loc_corner_btn.setFixedHeight(24)
-        self._loc_corner_btn.setStyleSheet(
-            "QPushButton{border:1px solid #aaa;border-radius:3px;padding:2px 8px;background:#f0f0f0;}"
-            "QPushButton:checked{background:#4a90d9;color:white;border-color:#2a70b9;}"
-        )
+        self._loc_corner_btn.setToolTip(get_text('tip_loc_mode_corner'))
+        self._loc_corner_btn.setStyleSheet(SEGMENTED_BTN_QSS)
         self._loc_mode_btn_group.addButton(self._loc_pos_btn, 0)
         self._loc_mode_btn_group.addButton(self._loc_corner_btn, 1)
         loc_mode_row.addWidget(self._loc_pos_btn)
         loc_mode_row.addWidget(self._loc_corner_btn)
         loc_mode_row.addStretch()
-        location_layout.addLayout(loc_mode_row)
+        location_content_layout.addLayout(loc_mode_row)
 
         def _on_loc_mode_changed(btn_id):
             self._location_display_mode = 'corner' if btn_id == 1 else 'position'
@@ -8871,40 +9028,52 @@ class ImageAnnotationTool(QMainWindow):
         self.save_location_classes_button.clicked.connect(self.save_location_classes)
         apply_location_row.addWidget(self.save_location_classes_button)
         apply_location_row.addStretch()
-        location_layout.addLayout(apply_location_row)
-        
+        location_content_layout.addLayout(apply_location_row)
+
         # 位置情報の選択肢を管理するレイアウト
         self.location_buttons_layout = QVBoxLayout()
-        location_layout.addLayout(self.location_buttons_layout)
-        
-        # 位置情報の追加ボタン
+        location_content_layout.addLayout(self.location_buttons_layout)
+
+        # 位置情報の追加ボタン（裸のスピンでは何の値か分からないのでラベルを付ける）
         add_location_layout = QHBoxLayout()
+        add_location_layout.addWidget(QLabel(get_text('label_new_location_id')))
         self.new_location_input = QSpinBox()
         self.new_location_input.setRange(0, 100)
         self.new_location_input.setValue(8)  # 初期値を8に設定（8個作成後）
         add_location_layout.addWidget(self.new_location_input)
-        
+
         add_location_button = QPushButton(get_text('btn_add_location'))
         add_location_button.clicked.connect(self.add_location_button)
         add_location_layout.addWidget(add_location_button)
-        location_layout.addLayout(add_location_layout)
-        
-        # 現在の位置情報表示ラベル
-        self.current_location_label = QLabel(get_text('label_current_location'))
-        location_layout.addWidget(self.current_location_label)
-        
+        add_location_layout.addStretch()
+        location_content_layout.addLayout(add_location_layout)
+
+        # 初期は畳んだ状態（位置アノテーション済みなら自動で開く）
+        self.location_info_content.setVisible(False)
+        loc_group_layout.addWidget(self.location_info_content)
+        location_layout.addWidget(self.location_info_group)
+
+        # 群のタイトル余白をフォント高から算出して適用
+        self._refresh_panel_group_styles()
+
         # スペーサーを追加して上部に配置
         location_layout.addStretch()
         
-        # 位置情報パネルをメインパネルに追加
-        main_panel_layout.addWidget(location_panel, 1)  # 比率1に設定
-        
-        # メインパネルをレイアウトに追加
-        right_layout.addLayout(main_panel_layout)
+        # 情報パネル / 画像 / 位置情報パネルをスプリッタに載せる。
+        # 右パネルはスクロールさせず生のウィジェットのまま載せることで、
+        # 中身の自然幅がそのまま下限になり、ドラッグしても見切れない。
+        self.center_splitter = make_panel_splitter(
+            (info_panel, self.image_area_widget, location_panel), (1, 4, 1))
+        # 縦の余りはギャラリーではなくキャンバス側（この行）に配分する
+        self.center_splitter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        right_layout.addWidget(self.center_splitter, 1)
 
         # Gallery
         gallery_label = QLabel(get_text('label_gallery'))
-        right_layout.addWidget(gallery_label)
+        # 既定の Preferred のままだと余った高さをこのラベルが吸ってしまい、
+        # ウィンドウを広げてもキャンバスが縦に伸びない
+        gallery_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        right_layout.addWidget(gallery_label, 0)
         
         self.gallery_widget = QWidget()
         self.gallery_layout = QGridLayout(self.gallery_widget)
@@ -8916,7 +9085,7 @@ class ImageAnnotationTool(QMainWindow):
         gallery_scroll.setWidget(self.gallery_widget)
         gallery_scroll.setMinimumHeight(GALLERY_MIN_HEIGHT)
         gallery_scroll.setMaximumHeight(GALLERY_MIN_HEIGHT + 20)  # 最大高さを制限
-        right_layout.addWidget(gallery_scroll)
+        right_layout.addWidget(gallery_scroll, 0)
         
         # 位置情報ボタンを初期化（8個作成）
         self.init_location_buttons()
@@ -9932,6 +10101,93 @@ class ImageAnnotationTool(QMainWindow):
         if hasattr(self, 'main_image_view') and self.show_recorded_trajectory:
             self.main_image_view.update()
 
+    def _update_camera_geometry_summary(self):
+        """右パネルのカメラ幾何サマリ表示を現在値に合わせる。"""
+        if not hasattr(self, 'camera_geometry_summary_label'):
+            return
+        self.camera_geometry_summary_label.setText(get_text(
+            'label_camera_geometry_summary',
+            f"{self.auto_max_steering_spin.value():.0f}",
+            f"{self.auto_cam_pitch_spin.value():.0f}",
+            f"{self.auto_fov_spin.value():.0f}",
+            f"{self.auto_cam_height_spin.value():.2f}"))
+
+    def show_camera_geometry_dialog(self):
+        """カメラ幾何（最大舵角/俯角/FOV/カメラ高）の設定ダイアログを開く。
+
+        入力欄は起動時に生成済みの self.camera_params_widget をそのまま抱える
+        ため、ダイアログは一度だけ生成して以後は show/hide で使い回す。
+        """
+        if getattr(self, '_camera_geometry_dialog', None) is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle(get_text('dlg_camera_geometry'))
+            dialog_layout = QVBoxLayout(dialog)
+
+            info_label = QLabel(get_text('label_camera_geometry_info'))
+            info_label.setWordWrap(True)
+            info_label.setStyleSheet("color: #666;")
+            dialog_layout.addWidget(info_label)
+
+            self.camera_params_widget.setVisible(True)
+            dialog_layout.addWidget(self.camera_params_widget)
+
+            button_row = QHBoxLayout()
+            button_row.addStretch()
+            close_button = QPushButton(get_text('btn_close'))
+            close_button.clicked.connect(dialog.hide)
+            button_row.addWidget(close_button)
+            dialog_layout.addLayout(button_row)
+
+            self._camera_geometry_dialog = dialog
+
+        self._camera_geometry_dialog.show()
+        self._camera_geometry_dialog.raise_()
+        self._camera_geometry_dialog.activateWindow()
+
+    def _refresh_panel_group_styles(self):
+        """右パネルの群（タイトル付き QGroupBox）のスタイルを現在のフォントで貼り直す。
+
+        タイトル分の上マージンはフォント高から算出しているため、表示設定で
+        フォントサイズを変えたときは作り直さないとタイトルが中身に重なる。
+        """
+        groups = getattr(self, '_panel_group_boxes', None)
+        if not groups:
+            return
+        for group in groups:
+            qss = panel_group_qss(group.fontMetrics())
+            group.setStyleSheet(qss)
+            group.updateGeometry()
+
+    def _update_bev_layer_enabled(self):
+        """BEVレイヤのトグルは画像ソースが BEV のときだけ操作可能にする。"""
+        widgets = getattr(self, '_bev_layer_widgets', None)
+        if not widgets:
+            return
+        enabled = (getattr(self, 'current_variant', None) == '__bev__')
+        for widget in widgets:
+            widget.setEnabled(enabled)
+
+    def toggle_location_info_section(self):
+        """コースの位置情報セクションの展開/折り畳み。"""
+        visible = not self.location_info_content.isVisible()
+        self.location_info_content.setVisible(visible)
+        self.location_info_expand_button.setText("▼" if visible else "▶")
+        # 以後は自動展開でユーザーの意思を上書きしない
+        self._location_section_user_toggled = True
+        self._relayout_location_info_group()
+
+    def _relayout_location_info_group(self):
+        """位置情報グループの高さ変化を親レイアウトへ反映する。
+
+        子を隠しただけでは sizeHint は縮んでも実高さが据え置かれるため、
+        親レイアウトを明示的に再計算させる。
+        """
+        self.location_info_group.updateGeometry()
+        parent = self.location_info_group.parentWidget()
+        parent_layout = parent.layout() if parent is not None else None
+        if parent_layout is not None:
+            parent_layout.activate()
+
     def toggle_seg_driving_direction(self, state):
         """走行方向矢印の表示/非表示を切り替え"""
         self.show_seg_driving_direction = (state == Qt.Checked)
@@ -10561,6 +10817,16 @@ class ImageAnnotationTool(QMainWindow):
         # テキスト・アイコンを現在のモードで更新
         self._update_location_button_display()
 
+        # 位置アノテーションが既にあるセッションでは自動で展開する
+        # （ユーザーが自分で開閉した後はその状態を尊重する）
+        if (location_counts
+                and not getattr(self, '_location_section_user_toggled', False)
+                and hasattr(self, 'location_info_content')
+                and not self.location_info_content.isVisible()):
+            self.location_info_content.setVisible(True)
+            self.location_info_expand_button.setText("▼")
+            self._relayout_location_info_group()
+
     def add_location_button(self):
         """位置情報選択ボタンを追加する"""
         location_value = self.new_location_input.value()
@@ -10603,9 +10869,9 @@ class ImageAnnotationTool(QMainWindow):
         # 次の値にインクリメント
         self.new_location_input.setValue(location_value + 1)
 
-        # 初期ボタンを生成するだけの場合はメッセージを表示しない
+        # 追加のたびにモーダルを出すと連続追加の邪魔になるのでステータスバーで通知
         if len(self.location_buttons) > 1:
-            QMessageBox.information(self, get_text('dlg_add_complete'), get_text('msg_location_added', location_value))
+            self.statusBar().showMessage(get_text('msg_location_added', location_value), 3000)
 
     def _add_location_row(self, button, location_value):
         """位置ボタンとクラス内容入力欄を1行にまとめてレイアウトへ追加する"""
@@ -11394,6 +11660,7 @@ class ImageAnnotationTool(QMainWindow):
         if not hasattr(self, 'available_variants') or not self.available_variants:
             print("キー情報がまだ初期化されていません。load_images後に設定されます。")
             self.current_variant = variant  # キー名だけは保存しておく
+            self._update_bev_layer_enabled()
             return
         
         # 以前と同じキーが選択された場合は何もしない（結合表示は設定変更があるため常に更新）
@@ -11403,6 +11670,8 @@ class ImageAnnotationTool(QMainWindow):
         # 現在のキーを更新
         self.current_variant = variant
         print(f"キーを '{variant}' に変更しました")
+        # BEVレイヤのトグルは BEV 選択時のみ有効
+        self._update_bev_layer_enabled()
 
         # BEV(真上から見た図)モードの切替。カメラ画像リスト(self.images)は
         # そのまま保持し、paintEvent が BEV を描く（軌道は ego座標で自己完結）。
@@ -11482,19 +11751,53 @@ class ImageAnnotationTool(QMainWindow):
         # キーボタン群を更新
         self.update_variant_buttons()
 
+    def showEvent(self, event):
+        """初回表示時にスプリッタの初期配分を確定させる。
+
+        構築中は各パネルのレイアウトが未計算で自然幅が取れないため、
+        表示されてから配分し直す。
+        """
+        super().showEvent(event)
+        if not getattr(self, '_splitter_sizes_initialized', False):
+            self._splitter_sizes_initialized = True
+            self._apply_default_splitter_sizes()
+
+    def _apply_default_splitter_sizes(self):
+        """各パネルの自然幅をもとにスプリッタの初期幅を決める。
+
+        右のアノテーションパネルと左の情報パネルは中身が収まる幅を与え、
+        残りを画像エリアに割り当てる（見切れを作らない）。
+        """
+        splitter = getattr(self, 'center_splitter', None)
+        if splitter is None:
+            return
+
+        def natural(index, floor=0):
+            widget = splitter.widget(index)
+            return max(widget.sizeHint().width(),
+                       widget.minimumSizeHint().width(), floor)
+
+        handles = splitter.handleWidth() * (splitter.count() - 1)
+        info_w = natural(0)
+        location_w = natural(2)
+        image_w = max(splitter.width() - info_w - location_w - handles,
+                      natural(1))
+        splitter.setSizes([info_w, image_w, location_w])
+
+        main_splitter = getattr(self, 'main_splitter', None)
+        if main_splitter is not None:
+            left_w = LEFT_PANEL_MAX_WIDTH + 20
+            main_splitter.setSizes(
+                [left_w, max(main_splitter.width() - left_w - main_splitter.handleWidth(), 1)])
+
     def get_left_layout(self):
-        """左パネルのレイアウトを安全に取得するヘルパーメソッド"""
+        """左パネルのレイアウトを安全に取得するヘルパーメソッド
+
+        レイアウト階層をインデックスで辿るとスプリッタ導入のような構造変更で
+        壊れるため、構築時に保持した左パネルの参照を使う。
+        """
         try:
-            central_widget = self.centralWidget()
-            if central_widget is None:
-                return None
-            main_layout = central_widget.layout()
-            if main_layout is None:
-                return None
-            left_scroll_area = main_layout.itemAt(0).widget()  # QScrollArea
-            if left_scroll_area is None:
-                return None
-            left_panel = left_scroll_area.widget()  # QWidget
+            left_panel = getattr(self, 'left_panel_widget', None)
             if left_panel is None:
                 return None
             return left_panel.layout()  # QVBoxLayout
@@ -12132,125 +12435,49 @@ class ImageAnnotationTool(QMainWindow):
             self.auto_method_container.setVisible(False)
             self.object_detection_container.setVisible(True)
 
-    def toggle_annotation_mode(self, checked=None):
-        # 既存のコードを修正して3つのモードに対応
-        sender = self.sender()
-        
+    def toggle_annotation_mode(self, mode=None):
+        """アノテーションモードを切り替える。
+
+        QButtonGroup.idClicked から呼ばれた場合は押されたボタンのモードID、
+        Bキー（引数なし）の場合は次のモードへサイクルする。
+        """
         # モード切り替え前に選択状態をクリア
         self.clear_all_selections()
-        
-        if sender == self.auto_mode_button:
-            self.current_mode = 0
-            self.auto_mode_button.setChecked(True)
-            self.detection_mode_button.setChecked(False)
-            self.segmentation_mode_button.setChecked(False)
-            self.waypoint_mode_button.setChecked(False)
-            self.auto_driving_control_widget.setVisible(True)
-            self.waypoint_control_widget.setVisible(False)
-            self.segmentation_control_widget.setVisible(False)
-            self.apply_last_bbox_checkbox.setVisible(False)
-            self.apply_last_segmentation_checkbox.setVisible(False)
-            self._bbox_fixed_advance_checkbox.setVisible(False)
-            self.statusBar().showMessage(get_text('status_switched_to_auto_driving'), 3000)
-        elif sender == self.detection_mode_button:
-            self.current_mode = 1
-            self.auto_mode_button.setChecked(False)
-            self.detection_mode_button.setChecked(True)
-            self.segmentation_mode_button.setChecked(False)
-            self.waypoint_mode_button.setChecked(False)
-            self.auto_driving_control_widget.setVisible(False)
-            self.waypoint_control_widget.setVisible(False)
-            self.segmentation_control_widget.setVisible(False)
-            self.apply_last_bbox_checkbox.setVisible(True)
-            self.apply_last_segmentation_checkbox.setVisible(False)
-            self._bbox_fixed_advance_checkbox.setVisible(True)
-            self.statusBar().showMessage(get_text('status_switched_to_detection'), 3000)
-        elif sender == self.segmentation_mode_button:
-            self.current_mode = 2
-            self.auto_mode_button.setChecked(False)
-            self.detection_mode_button.setChecked(False)
-            self.segmentation_mode_button.setChecked(True)
-            self.waypoint_mode_button.setChecked(False)
-            self.auto_driving_control_widget.setVisible(False)
-            self.waypoint_control_widget.setVisible(False)
-            self.segmentation_control_widget.setVisible(True)
-            self.apply_last_bbox_checkbox.setVisible(False)
-            self.apply_last_segmentation_checkbox.setVisible(True)
-            self._bbox_fixed_advance_checkbox.setVisible(False)
+
+        # bool は int のサブクラスなので、旧 clicked(checked) 接続が残っていても
+        # モードIDと誤認しないよう明示的に弾く
+        if isinstance(mode, bool) or not isinstance(mode, int) or mode not in _MODE_STATUS_KEYS:
+            # 3モードをサイクル（waypoint は UI から削除済みなので対象外）
+            mode = (self.current_mode + 1) % 3
+
+        self.current_mode = mode
+        self._apply_mode_visibility(mode)
+        self.statusBar().showMessage(get_text(_MODE_STATUS_KEYS[mode]), 3000)
+        self.main_image_view.update()
+
+    def _apply_mode_visibility(self, mode):
+        """モードに応じた制御パネル／チェックボックスの表示を一括で適用する。"""
+        for mode_id, btn in ((0, self.auto_mode_button),
+                             (1, self.detection_mode_button),
+                             (2, self.segmentation_mode_button),
+                             (3, self.waypoint_mode_button)):
+            btn.setChecked(mode_id == mode)
+
+        self.auto_driving_control_widget.setVisible(mode == 0)
+        self.waypoint_control_widget.setVisible(mode == 3)
+        self.segmentation_control_widget.setVisible(mode == 2)
+        self.apply_last_bbox_checkbox.setVisible(mode == 1)
+        self._bbox_fixed_advance_checkbox.setVisible(mode == 1)
+        self.apply_last_segmentation_checkbox.setVisible(mode == 2)
+
+        if mode == 2:
             # ツールをポリゴンにリセット
             self._seg_polygon_btn.setChecked(True)
             self.main_image_view.seg_tool_mode = 'polygon'
             self.main_image_view.is_painting = False
             self.main_image_view.current_paint_strokes = []
             self.main_image_view.setCursor(Qt.ArrowCursor)
-            self.statusBar().showMessage(get_text('status_switched_to_segmentation'), 3000)
-        elif sender == self.waypoint_mode_button:
-            self.current_mode = 3
-            self.auto_mode_button.setChecked(False)
-            self.detection_mode_button.setChecked(False)
-            self.segmentation_mode_button.setChecked(False)
-            self.waypoint_mode_button.setChecked(True)
-            self.auto_driving_control_widget.setVisible(False)
-            self.waypoint_control_widget.setVisible(True)
-            self.segmentation_control_widget.setVisible(False)
-            self.apply_last_bbox_checkbox.setVisible(False)
-            self.apply_last_segmentation_checkbox.setVisible(False)
-            self._bbox_fixed_advance_checkbox.setVisible(False)
-            self.statusBar().showMessage(get_text('status_switched_to_waypoint'), 3000)
-        else:
-            # Bキーでの切り替え（3モードをサイクル。waypoint は UI から削除済み）
-            self.current_mode = (self.current_mode + 1) % 3
-            if self.current_mode == 0:
-                self.auto_mode_button.setChecked(True)
-                self.detection_mode_button.setChecked(False)
-                self.segmentation_mode_button.setChecked(False)
-                self.waypoint_mode_button.setChecked(False)
-                self.auto_driving_control_widget.setVisible(True)
-                self.waypoint_control_widget.setVisible(False)
-                self.segmentation_control_widget.setVisible(False)
-                self.apply_last_bbox_checkbox.setVisible(False)
-                self.apply_last_segmentation_checkbox.setVisible(False)
-                self._bbox_fixed_advance_checkbox.setVisible(False)
-                self.statusBar().showMessage(get_text('status_switched_to_auto_driving'), 3000)
-            elif self.current_mode == 1:
-                self.auto_mode_button.setChecked(False)
-                self.detection_mode_button.setChecked(True)
-                self.segmentation_mode_button.setChecked(False)
-                self.waypoint_mode_button.setChecked(False)
-                self.auto_driving_control_widget.setVisible(False)
-                self.waypoint_control_widget.setVisible(False)
-                self.segmentation_control_widget.setVisible(False)
-                self.apply_last_bbox_checkbox.setVisible(True)
-                self.apply_last_segmentation_checkbox.setVisible(False)
-                self._bbox_fixed_advance_checkbox.setVisible(True)
-                self.statusBar().showMessage(get_text('status_switched_to_detection'), 3000)
-            elif self.current_mode == 2:
-                self.auto_mode_button.setChecked(False)
-                self.detection_mode_button.setChecked(False)
-                self.segmentation_mode_button.setChecked(True)
-                self.waypoint_mode_button.setChecked(False)
-                self.auto_driving_control_widget.setVisible(False)
-                self.waypoint_control_widget.setVisible(False)
-                self.segmentation_control_widget.setVisible(True)
-                self.apply_last_bbox_checkbox.setVisible(False)
-                self.apply_last_segmentation_checkbox.setVisible(True)
-                self._bbox_fixed_advance_checkbox.setVisible(False)
-                self.statusBar().showMessage(get_text('status_switched_to_segmentation'), 3000)
-            else:  # current_mode == 3
-                self.auto_mode_button.setChecked(False)
-                self.detection_mode_button.setChecked(False)
-                self.segmentation_mode_button.setChecked(False)
-                self.waypoint_mode_button.setChecked(True)
-                self.auto_driving_control_widget.setVisible(False)
-                self.waypoint_control_widget.setVisible(True)
-                self.segmentation_control_widget.setVisible(False)
-                self.apply_last_bbox_checkbox.setVisible(False)
-                self.apply_last_segmentation_checkbox.setVisible(False)
-                self._bbox_fixed_advance_checkbox.setVisible(False)
-                self.statusBar().showMessage(get_text('status_switched_to_waypoint'), 3000)
-        
-        self.main_image_view.update()
-    
+
     def clear_all_selections(self):
         """全ての選択状態をクリア"""
         # バウンディングボックスの選択をクリア
@@ -17468,7 +17695,10 @@ class ImageAnnotationTool(QMainWindow):
         
         # すべての子ウィジェットにフォントを適用
         self.apply_font_to_children(self, font)
-        
+
+        # 群のタイトル余白はフォント高依存なので貼り直す
+        self._refresh_panel_group_styles()
+
         # 設定を保存
         if self.save_settings_check.isChecked():
             self.save_display_settings(new_width, new_height, new_font_size, self.is_dark_mode)
@@ -31107,16 +31337,15 @@ class ImageAnnotationTool(QMainWindow):
         # 位置ボタン数
         num_buttons = 8
         
-        # 既存の行（ボタン＋クラス入力欄）をクリア
-        for row in getattr(self, '_location_row_widgets', []):
-            if row.parent():
-                row.setParent(None)
-        self._location_row_widgets = []
-        self.location_class_inputs = {}
-        for button in self.location_buttons:
-            if button.parent():
-                button.setParent(None)
+        # 既存の行（ボタン＋クラス入力欄）をクリア。
+        # 行ウィジェットを捨てると子のボタン／入力欄も C++ 側で破棄されるため、
+        # 破棄済みオブジェクトに触らないよう参照リストを先に空にする。
         self.location_buttons.clear()
+        self.location_class_inputs = {}
+        for row in getattr(self, '_location_row_widgets', []):
+            row.setParent(None)
+            row.deleteLater()
+        self._location_row_widgets = []
 
         # 8つの位置情報ボタンを作成
         for i in range(num_buttons):
@@ -31183,21 +31412,15 @@ class ImageAnnotationTool(QMainWindow):
         self.location_model_container = QWidget()
         location_model_layout = QVBoxLayout(self.location_model_container)
 
-        # ヘッダー: タイトル + 展開ボタン（時系列モデルと同じ折り畳みパターン。
-        # 既定は畳んだ状態）
+        # ヘッダー: タイトルのみ（このセクションは常時展開）
         location_header_layout = QHBoxLayout()
         location_model_label = QLabel(get_text('label_location_model'))
         location_model_label.setStyleSheet("font-weight: bold")
         location_header_layout.addWidget(location_model_label)
         location_header_layout.addStretch()
-        self.location_expand_button = QPushButton("▶")
-        self.location_expand_button.setFixedSize(24, 24)
-        self.location_expand_button.setStyleSheet("font-size: 10px; padding: 0px;")
-        self.location_expand_button.clicked.connect(self._toggle_location_section)
-        location_header_layout.addWidget(self.location_expand_button)
         location_model_layout.addLayout(location_header_layout)
 
-        # 展開可能な中身コンテナ
+        # 中身コンテナ
         self.location_content_widget = QWidget()
         location_model_layout_outer = location_model_layout
         location_model_layout = QVBoxLayout(self.location_content_widget)
@@ -31282,9 +31505,8 @@ class ImageAnnotationTool(QMainWindow):
         self.location_history_source_check.stateChanged.connect(self._on_location_history_source_changed)
         location_model_layout.addWidget(self.location_history_source_check)
 
-        # 中身をコンテナへ格納し、既定は折り畳み状態
+        # 中身をコンテナへ格納（常時展開）
         location_model_layout_outer.addWidget(self.location_content_widget)
-        self.location_content_widget.setVisible(False)
 
         left_layout.addWidget(self.location_model_container)
         
@@ -31296,12 +31518,6 @@ class ImageAnnotationTool(QMainWindow):
 
         # 推論結果格納用の辞書を初期化
         self.location_inference_results = {}
-
-    def _toggle_location_section(self):
-        """位置推論モデルセクションの展開/折り畳み（時系列モデルと同パターン）。"""
-        visible = not self.location_content_widget.isVisible()
-        self.location_content_widget.setVisible(visible)
-        self.location_expand_button.setText("▼" if visible else "▶")
 
     def add_waypoint_model_section(self):
         """ウェイポイントモデルのセクションを追加する"""

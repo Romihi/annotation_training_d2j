@@ -176,11 +176,11 @@ TRANSLATIONS = {
         'label_mask_target': 'マスク:',
         'opt_mask_target_vehicle': '車両',
         'opt_mask_target_background': '背景',
-        'opt_mask_add': '＋ 新規マスクを追加…',
-        'opt_mask_delete': '− このマスクを削除',
+        'opt_mask_add': '＋追加',
+        'opt_mask_delete': 'ー削除',
         'tip_mask_target': '編集・表示切替の対象マスクを選びます。\n'
                            '車両: 画像下側の車体領域 / 背景: 背景など任意の領域\n'
-                           '「＋ 新規マスクを追加…」で任意のマスクを増やせます（車両・背景は削除できません）。\n'
+                           '「＋追加」で任意のマスクを増やせます（車両・背景は削除できません）。\n'
                            '編集中は対象を切り替えられません（「編集」を再度押して確定してください）。',
         'btn_mask_edit': '編集',
         'tip_mask_edit': '選択中のマスクのポリゴンを編集します。',
@@ -501,8 +501,21 @@ TRANSLATIONS = {
         'label_display_mode': '表示モード:',
         'label_mode_hint': '※Bキーを押すとモードが切り替わります',
         'label_location_info': 'コースの位置情報:',
-        'label_current_location': '現在の位置情報: なし',
-        'label_current_location_value': '現在の位置情報: {0}',
+        'label_current_location': '現在: なし',
+        'label_current_location_value': '現在: 位置{0}',
+        'label_new_location_id': '追加する位置ID:',
+        'tip_toggle_location_info': 'コースの位置情報パネルを展開/折り畳みします',
+        'tip_loc_mode_position': '位置ボタンを「位置 N」の通し番号で表示します',
+        'tip_loc_mode_corner': '位置ボタンをコーナー形状（ストレート/30°〜180°）で表示します',
+        'label_overlay_group': '表示オーバーレイ',
+        'label_bev_layers_only': 'BEVレイヤ:',
+        'tip_bev_layers_only': '画像ソースを BEV（真上から見た図）に切り替えたときだけ有効になります',
+        'btn_camera_geometry': '⚙ 変更',
+        'tip_camera_geometry': 'カメラ幾何（最大舵角/カメラ俯角/画角FOV/カメラ高）の設定を開きます',
+        'dlg_camera_geometry': 'カメラ幾何の設定',
+        'label_camera_geometry_info': '軌道を画像へ投影するときに使う車両・カメラの物理パラメータです。'
+                                      'セッション中はほぼ固定のため、ここでまとめて設定します。',
+        'label_camera_geometry_summary': '舵角 {0}° / 俯角 {1}°\nFOV {2}° / 高 {3}m',
         'label_gallery': 'ギャラリー:',
         'label_deleted': '削除済',
 
@@ -2267,11 +2280,11 @@ Google Cloud Console での OAuth設定手順
         'label_mask_target': 'Mask:',
         'opt_mask_target_vehicle': 'Vehicle',
         'opt_mask_target_background': 'Background',
-        'opt_mask_add': '+ Add new mask...',
-        'opt_mask_delete': '- Delete this mask',
+        'opt_mask_add': '+ Add',
+        'opt_mask_delete': '- Delete',
         'tip_mask_target': 'Choose which mask the Edit button and Show checkbox act on.\n'
                            'Vehicle: the car body area at the bottom / Background: any area such as the background\n'
-                           'Use "+ Add new mask..." to create more masks (Vehicle and Background cannot be deleted).\n'
+                           'Use "+ Add" to create more masks (Vehicle and Background cannot be deleted).\n'
                            'The target cannot be switched while editing (press "Edit" again to confirm).',
         'btn_mask_edit': 'Edit',
         'tip_mask_edit': 'Edit the polygon of the selected mask.',
@@ -2592,8 +2605,22 @@ Google Cloud Console での OAuth設定手順
         'label_display_mode': 'Display Mode:',
         'label_mode_hint': '* Press B key to switch mode',
         'label_location_info': 'Course Location Info:',
-        'label_current_location': 'Current Location: None',
-        'label_current_location_value': 'Current Location: {0}',
+        'label_current_location': 'Current: None',
+        'label_current_location_value': 'Current: Loc {0}',
+        'label_new_location_id': 'New location ID:',
+        'tip_toggle_location_info': 'Expand / collapse the course location panel',
+        'tip_loc_mode_position': 'Label location buttons by index (Loc N)',
+        'tip_loc_mode_corner': 'Label location buttons by corner shape (straight / 30-180 deg)',
+        'label_overlay_group': 'Display Overlays',
+        'label_bev_layers_only': 'BEV layers:',
+        'tip_bev_layers_only': 'Active only when the image source is switched to BEV (top-down view)',
+        'btn_camera_geometry': '⚙ Edit',
+        'tip_camera_geometry': 'Open camera geometry settings (max steering / pitch / FOV / height)',
+        'dlg_camera_geometry': 'Camera Geometry',
+        'label_camera_geometry_info': 'Physical vehicle and camera parameters used to project '
+                                      'trajectories onto the image. They stay fixed during a '
+                                      'session, so they are configured here.',
+        'label_camera_geometry_summary': 'Steer {0}° / Pitch {1}°\nFOV {2}° / H {3}m',
         'label_gallery': 'Gallery:',
         'label_deleted': 'Deleted',
 
