@@ -18,6 +18,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QPropertyAnimation, QEasingCurve
 from PyQt5.QtGui import QColor
+from styles import is_dark_mode, set_text_role
 
 
 class CollapsibleSection(QWidget):
@@ -149,19 +150,26 @@ class DataAnalysisDialog(QDialog):
         self.stats_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.stats_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.stats_table.setAlternatingRowColors(True)
-        self.stats_table.setStyleSheet("""
-            QTableWidget {
+        # 表の色はダーク/ライトで切り替える（強調行の背景も合わせる）
+        if is_dark_mode():
+            tbl_bg, tbl_fg, tbl_alt, tbl_grid = '#2b2b2b', '#e0e0e0', '#353535', '#555'
+            self._highlight_bg = QColor('#2f4a5e')
+        else:
+            tbl_bg, tbl_fg, tbl_alt, tbl_grid = '#ffffff', '#222222', '#f5f5f5', '#cccccc'
+            self._highlight_bg = QColor('#e8f4fd')
+        self.stats_table.setStyleSheet(f"""
+            QTableWidget {{
                 font-size: 10px;
-                gridline-color: #555;
-                background-color: #2b2b2b;
-                color: #e0e0e0;
-            }
-            QTableWidget::item {
+                gridline-color: {tbl_grid};
+                background-color: {tbl_bg};
+                color: {tbl_fg};
+            }}
+            QTableWidget::item {{
                 padding: 1px 2px;
-                background-color: #2b2b2b;
-                color: #e0e0e0;
-            }
-            QHeaderView::section {
+                background-color: {tbl_bg};
+                color: {tbl_fg};
+            }}
+            QHeaderView::section {{
                 background-color: #3a6ea5;
                 color: white;
                 font-weight: bold;
@@ -170,10 +178,10 @@ class DataAnalysisDialog(QDialog):
                 border: none;
                 min-height: 18px;
                 max-height: 18px;
-            }
-            QTableWidget::item:alternate {
-                background-color: #353535;
-            }
+            }}
+            QTableWidget::item:alternate {{
+                background-color: {tbl_alt};
+            }}
         """)
         self.stats_table.verticalHeader().setVisible(False)
         # 行の高さを狭める
@@ -200,7 +208,8 @@ class DataAnalysisDialog(QDialog):
 
         # ── 処理パイプライン（チェックボックス、上から順番に適用）──
         pipeline_label = QLabel("処理ステップ（上から順に適用）:")
-        pipeline_label.setStyleSheet("font-size: 10px; color: #aaa;")
+        pipeline_label.setStyleSheet("font-size: 10px;")
+        set_text_role(pipeline_label, 'faint')
         timeseries_layout.addWidget(pipeline_label)
 
         # Step 1: 移動平均
@@ -318,7 +327,7 @@ class DataAnalysisDialog(QDialog):
         # 説明ラベルとズームリセットボタン
         info_bar = QHBoxLayout()
         info_label = QLabel(get_text('label_click_to_jump') + "  |  " + get_text('label_zoom_hint'))
-        info_label.setStyleSheet("color: gray;")
+        set_text_role(info_label, 'faint')
         info_bar.addWidget(info_label)
         info_bar.addStretch()
         self.zoom_reset_btn = QPushButton(get_text('btn_zoom_reset'))
@@ -406,7 +415,7 @@ class DataAnalysisDialog(QDialog):
                 font = key_item.font()
                 font.setBold(True)
                 key_item.setFont(font)
-                key_item.setBackground(QColor('#e8f4fd'))
+                key_item.setBackground(self._highlight_bg)
             self.stats_table.setItem(row, 0, key_item)
 
             if data:
@@ -422,7 +431,7 @@ class DataAnalysisDialog(QDialog):
                     item = QTableWidgetItem(val)
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                     if is_important:
-                        item.setBackground(QColor('#e8f4fd'))
+                        item.setBackground(self._highlight_bg)
                     self.stats_table.setItem(row, col, item)
             else:
                 for col in range(1, 6):

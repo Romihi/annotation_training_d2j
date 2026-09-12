@@ -326,6 +326,27 @@ class PoseSourceManager:
                 result.add(idx)
         return result
 
+    def frame_speed(self, index: int) -> Optional[float]:
+        """フレーム index の車速 [m/s]（pose/speed → pose/v_imu の順、無ければ None）
+
+        速度は pose センサー行にしか記録されないため、表示ソースが slam/vslam/aruco
+        でも同フレームの pose サンプルから引く（色分け「速度」用）。
+        """
+        samples = self._raw.get(index)
+        if not samples:
+            return None
+        pose = samples.get("pose")
+        if pose is None:
+            return None
+        for key in ("speed", "v_imu"):
+            v = pose.extra.get(key)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
     def slip_indexes(self, min_slip: float = 1.0) -> Set[int]:
         """スリップが検知されたフレーム集合（pose/slip >= min_slip）
 

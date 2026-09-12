@@ -76,7 +76,10 @@ from model_training import train_model, create_datasets
 from model_training import train_location_model, create_location_datasets, LocationModelManager, create_waypoint_datasets
 from model_training import generate_augmentation_samples
 # TODO:ボタンのスタイルを実装、他のUIの移植については後ほど検討
-from styles import get_location_color, apply_style, set_theme, get_current_theme, PRIMARY_STYLE, MODEL_STYLE, TRAINING_STYLE, EXPORT_STYLE, SPECIAL_STYLE, DESTRUCTIVE_STYLE, NAV_STYLE
+from styles import (get_location_color, apply_style, set_theme, get_current_theme, PRIMARY_STYLE, MODEL_STYLE,
+                    TRAINING_STYLE, EXPORT_STYLE, SPECIAL_STYLE, DESTRUCTIVE_STYLE, NAV_STYLE,
+                    apply_app_theme, is_dark_mode, theme_color, set_text_role, set_panel_role,
+                    set_segmented, location_button_qss, location_text_color, tint_group_qss)
 
 
 from managers import AnnotationDataManager, MLflowManager, ModelType, SequenceTrainingManager, PoseSourceManager, TogivadTrainingManager
@@ -346,19 +349,27 @@ def _seg_annotation_to_mask(seg, img_h, img_w):
         _IDraw.Draw(img_p).polygon(pts, fill=1)
         return _np.array(img_p, dtype=bool)
 
-# 排他選択（セグメンテッドコントロール）用の共通スタイル。
-# アノテーションモード切替と位置/コーナー切替で見た目を揃えるために共有する。
-SEGMENTED_BTN_QSS = (
-    "QPushButton{border:1px solid #aaa;border-radius:3px;padding:4px 8px;background:#f0f0f0;}"
-    "QPushButton:hover{background:#e6e6e6;}"
-    "QPushButton:checked{background:#4a90d9;color:white;border-color:#2a70b9;font-weight:bold;}"
-)
+# 排他選択（セグメンテッドコントロール）の見た目は styles.set_segmented() で付ける。
+# アノテーションモード切替と位置/コーナー切替で共有し、ダーク/ライトで色が切り替わる。
 
 # タイトル無しの枠だけの群（QGroupBox）用スタイル。上マージンは不要。
 PANEL_FRAME_QSS = "QGroupBox{border:1px solid #d0d0d0;border-radius:4px;}"
 
 # 折り返した2段目の行頭インデント（親のチェックボックスにぶら下がって見せる）
 _INDENT_WIDTH = 18
+
+# バウンディングボックス四隅ハンドルの一辺（画面ピクセル）。
+# 描画と当たり判定の両方でこの値を使い、見た目と操作範囲を一致させる。
+BBOX_HANDLE_SIZE = 8
+
+# 画像ソース(cam0/cam1/…)ごとに分けて保持する辞書。フレーム番号だけをキーに
+# しているため、ソースを切り替えるときに丸ごと載せ替える必要がある。
+SOURCE_SCOPED_STORES = (
+    'bbox_annotations',
+    'segmentation_annotations',
+    'detection_inference_results',
+    'segmentation_inference_results',
+)
 
 # パネル境界のドラッグハンドル。掴める場所と分かるよう見えるグリップを出す。
 SPLITTER_HANDLE_QSS = (
@@ -400,6 +411,45 @@ def panel_group_qss(font_metrics):
         "QGroupBox::title{subcontrol-origin:margin;subcontrol-position:top left;"
         "left:8px;padding:0 4px;}"
     )
+
+
+def _available_screen_geometry(widget):
+    """ウィジェットが載っている画面の利用可能領域（タスクバー等を除く）"""
+    handle = widget.windowHandle()
+    screen = handle.screen() if handle is not None else QApplication.primaryScreen()
+    return screen.availableGeometry()
+
+
+def fit_dialog_to_scroll_content(dialog, scrolls, max_ratio=0.95):
+    """スクロール領域の中身が横に収まる大きさまでダイアログを広げる（画面内に収める）。
+
+    必要な幅はフォントやDPIで変わるので、表示後の実寸（ダイアログ全体と
+    ビューポートの差＝枠や余白の分）から求める。exec_() の直前に
+    QTimer.singleShot(0, ...) で予約して、表示直後に呼ぶ想定。
+    scrolls には非表示タブのスクロール領域も渡してよい（中身の最大幅を使う）。
+    """
+    scrolls = [s for s in scrolls if s.widget() is not None]
+    if not scrolls:
+        return
+    ref = next((s for s in scrolls if s.isVisible()), scrolls[0])
+    chrome_w = dialog.width() - ref.viewport().width()
+    chrome_h = dialog.height() - ref.viewport().height()
+    need_w = (max(s.widget().sizeHint().width() for s in scrolls)
+              + ref.verticalScrollBar().sizeHint().width() + chrome_w)
+    need_h = max(s.widget().sizeHint().height() for s in scrolls) + chrome_h
+
+    avail = _available_screen_geometry(dialog)
+    w = min(max(dialog.width(), need_w), int(avail.width() * max_ratio))
+    h = min(max(dialog.height(), need_h), int(avail.height() * max_ratio))
+    if (w, h) == (dialog.width(), dialog.height()):
+        return
+    dialog.resize(w, h)
+    # 広げた分で画面からはみ出さないよう、親の中央に置き直してから画面内に収める
+    parent = dialog.parentWidget()
+    center = parent.frameGeometry().center() if parent is not None else avail.center()
+    x = max(avail.left(), min(center.x() - w // 2, avail.right() - w))
+    y = max(avail.top(), min(center.y() - h // 2, avail.bottom() - h))
+    dialog.move(x, y)
 
 # アノテーションモードID → ステータスバー用メッセージキー
 _MODE_STATUS_KEYS = {
@@ -1385,8 +1435,8 @@ class ImageLabel(QLabel):
                     
                     # 選択されているバウンディングボックスにはリサイズ用のハンドルを表示
                     if is_selected:
-                        # ハンドルのサイズを設定（より大きく、視認性向上）
-                        handle_size = 8
+                        # ハンドルのサイズ（当たり判定と同じ定数を使う）
+                        handle_size = BBOX_HANDLE_SIZE
                         painter.setBrush(QBrush(color))
                         
                         # 四隅にハンドルを描画
@@ -1515,6 +1565,23 @@ class ImageLabel(QLabel):
         
         return None
 
+    def _bbox_handle_tolerance(self, x1, y1, x2, y2):
+        """四隅ハンドルの当たり判定の半径を元画像座標で返す。
+
+        判定は画面に描いているハンドル（BBOX_HANDLE_SIZE px 四方）に合わせる。
+        元画像座標で固定値を使うと、ズーム倍率や画像解像度によって見た目と
+        大きくズレる（160x120 の画像を 2.5 倍表示すると、従来の 10px 判定は
+        画面上 25px ＝ 描画ハンドルの 6 倍以上あった）。
+        さらに小さなボックスでは四隅の判定同士が重なって中央まで覆うため、
+        ボックス寸法の 1/4 を上限にする。
+        """
+        zoom = getattr(self, 'zoom_factor', 1.0) or 1.0
+        tolerance = (BBOX_HANDLE_SIZE / 2.0) / max(zoom, 0.01)
+        tolerance = min(tolerance,
+                        max(abs(x2 - x1) / 4.0, 1.0),
+                        max(abs(y2 - y1) / 4.0, 1.0))
+        return max(tolerance, 1.0)
+
     def get_resize_handle_at_position(self, pos, target_rect, bbox_index):
         """指定した位置にあるリサイズハンドルの種類を取得"""
         if not (self.main_window and hasattr(self.main_window, 'bbox_annotations')):
@@ -1535,8 +1602,7 @@ class ImageLabel(QLabel):
         x2 = int(target_rect.x() + bbox['x2'] * target_rect.width())
         y2 = int(target_rect.y() + bbox['y2'] * target_rect.height())
         
-        handle_size = 8
-        tolerance = handle_size // 2
+        tolerance = BBOX_HANDLE_SIZE / 2.0
         
         # 各ハンドルの位置をチェック
         handles = {
@@ -3747,6 +3813,9 @@ class ImageLabel(QLabel):
                         self.main_window.add_mask_point(rel_x, rel_y)
                 return
 
+            # 別モードから持ち越された進行中フラグを捨ててから処理を分岐する
+            self._discard_stale_interaction_state()
+
             # 現在のモードに基づいて処理
             ## 物体検知モード
             if hasattr(self.main_window, 'current_mode') and self.main_window.current_mode == 1:
@@ -3766,8 +3835,8 @@ class ImageLabel(QLabel):
                         x2 = int(bbox['x2'] * self.pix_width)
                         y2 = int(bbox['y2'] * self.pix_height)
                         
-                        # ハンドルのサイズ
-                        handle_size = 10  # ハンドルの検出範囲を大きくする
+                        # ハンドルの検出範囲（画面上の見た目に合わせて算出）
+                        handle_size = self._bbox_handle_tolerance(x1, y1, x2, y2)
                         
                         # 左上ハンドル
                         if abs(orig_x - x1) <= handle_size and abs(orig_y - y1) <= handle_size:
@@ -4171,7 +4240,63 @@ class ImageLabel(QLabel):
                 else:
                     self.main_window.skip_images(1)  # デフォルトは1枚
 
+    def _reset_interaction_state(self):
+        """進行中のドラッグ/描画状態をすべて破棄する。
+
+        マウスリリースを取りこぼしたまま（ウィジェット外で離した、モーダル
+        ダイアログに奪われた、ドラッグ中にBキーでモードを変えた等）別モードへ
+        移ると、mouseReleaseEvent 冒頭の早期 return に引っかかって新しい操作を
+        確定できなくなる。モード切替時に必ず初期化してその持ち越しを断つ。
+        """
+        self.is_painting = False
+        self.current_paint_strokes = []
+        self.is_drawing_bbox = False
+        self.bbox_start = None
+        self.bbox_end = None
+        self.is_moving_bbox = False
+        self.move_start_pos = None
+        self.is_resizing_bbox = False
+        self.resize_handle = None
+        self.resize_start_pos = None
+        self.is_drawing_waypoints = False
+        self.drawing_waypoint_path = []
+        self.drawing_start_pos = None
+        self.is_moving_waypoint = False
+        self.selected_waypoint_index = None
+        self.waypoint_move_start_pos = None
+        self._mask_drag_index = None
+        self._mask_drag_mirrored = False
+        self.setCursor(Qt.ArrowCursor)
+
+    def _discard_stale_interaction_state(self):
+        """現在のモードに属さない進行中フラグを捨てる。
+
+        リリースを取りこぼすとフラグが残り、以後のリリースが冒頭の早期 return に
+        飲み込まれて別モードのアノテーションを確定できなくなる（例: セグの
+        ペイント途中で離し損ねた後、物体検知でバウンディングボックスが作れない）。
+        """
+        mode = getattr(self.main_window, 'current_mode', 0)
+        if mode != 2 and self.is_painting:
+            self.is_painting = False
+            self.current_paint_strokes = []
+        if mode != 3:
+            if self.is_drawing_waypoints:
+                self.is_drawing_waypoints = False
+                self.drawing_waypoint_path = []
+                self.drawing_start_pos = None
+            if self.is_moving_waypoint:
+                self.is_moving_waypoint = False
+                self.selected_waypoint_index = None
+                self.waypoint_move_start_pos = None
+        if (self._mask_drag_index is not None
+                and getattr(self.main_window, 'mask_edit_index', None) is None):
+            self._mask_drag_index = None
+            self._mask_drag_mirrored = False
+
     def mouseReleaseEvent(self, event):
+        # 別モードの操作から持ち越された進行中フラグを先に捨てる
+        self._discard_stale_interaction_state()
+
         # マスク頂点のドラッグ終了
         if self._mask_drag_index is not None:
             self._mask_drag_index = None
@@ -4311,6 +4436,9 @@ class ImageLabel(QLabel):
     def mouseMoveEvent(self, event):
         """マウス移動時の処理 - ハンドルによるサイズ変更機能を追加"""
         pos = event.pos()
+
+        # 別モードから持ち越されたフラグは移動イベントも横取りするので先に捨てる
+        self._discard_stale_interaction_state()
 
         # マスク頂点のドラッグ移動
         if (getattr(self.main_window, 'mask_edit_index', None) is not None
@@ -5021,8 +5149,8 @@ class ImageLabel(QLabel):
                     x2 = int(bbox['x2'] * self.pix_width)
                     y2 = int(bbox['y2'] * self.pix_height)
                     
-                    # ハンドルのサイズ
-                    handle_size = 10  # ハンドルの検出範囲
+                    # ハンドルの検出範囲（押下時と同じ基準）
+                    handle_size = self._bbox_handle_tolerance(x1, y1, x2, y2)
                     
                     # 左上ハンドル
                     if abs(orig_x - x1) <= handle_size and abs(orig_y - y1) <= handle_size:
@@ -5725,7 +5853,8 @@ class ThumbnailWidget(QWidget):
                     break
 
                 class_label = QLabel(f"{class_name}: {count}")
-                class_label.setStyleSheet("font-size: 10px; color: #333;")
+                class_label.setStyleSheet("font-size: 10px;")
+                set_text_role(class_label, 'strong')
                 info_layout.addWidget(class_label)
 
         # セグメンテーションアノテーション情報を追加（物体検知アノテーション情報の後に）
@@ -5758,7 +5887,8 @@ class ThumbnailWidget(QWidget):
                     break
 
                 seg_class_label = QLabel(f"{class_name}: {count}")
-                seg_class_label.setStyleSheet("font-size: 10px; color: #9C27B0;")
+                seg_class_label.setStyleSheet("font-size: 10px;")
+                set_text_role(seg_class_label, 'accent')
                 info_layout.addWidget(seg_class_label)
 
         # 残りのスペースを埋めるスペーサー
@@ -5780,7 +5910,9 @@ class ThumbnailWidget(QWidget):
 
         name_label = QLabel(filename)
         name_label.setAlignment(Qt.AlignCenter)
-        name_label.setStyleSheet("font-size: 12px; color: #444444; background-color: #f8f8f8;font-weight: bold;")
+        name_label.setStyleSheet("font-size: 12px; font-weight: bold;")
+        set_text_role(name_label, 'strong')
+        set_panel_role(name_label, 'strip')
         name_label.setFixedHeight(10)  # 高さを最小限に
         image_layout.addWidget(name_label)
 
@@ -6005,6 +6137,13 @@ class ImageAnnotationTool(QMainWindow):
         self.images = []
         self.current_index = 0
         self.available_variants = {}
+        # 画像ソース(cam0/cam1/…)ごとのアノテーション・推論結果を保持する。
+        # 表示中のソース分だけを self.bbox_annotations 等に載せ替えて扱うため、
+        # 既存コードはこれまでどおり「現在のソース」を見るだけでよい。
+        self._source_stores = {}
+        self._active_source_key = None
+        # 学習時に全ソースのアノテーションを使うか（False なら表示中のソースのみ）
+        self.use_all_sources_for_training = False
         self.annotations = {}
         self.annotation_history = []
         self.annotated_count = 0
@@ -6154,6 +6293,9 @@ class ImageAnnotationTool(QMainWindow):
         
         # Load saved display settings
         self.load_display_settings()
+        # 役割ごとの文字色（set_text_role 等）はアプリ全体QSSで決まるので、
+        # 設定ファイルが無くライトモードのままでも必ず一度は貼っておく
+        self.apply_dark_mode(self.is_dark_mode)
 
         # Update UI
         self.display_current_image()
@@ -6281,7 +6423,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # 同期進捗ラベル
         self.sync_progress_label = QLabel("")
-        self.sync_progress_label.setStyleSheet("font-size: 11px; color: #4a90d9;")
+        self.sync_progress_label.setStyleSheet("font-size: 11px;")
+        set_text_role(self.sync_progress_label, 'info')
         toolbar.addWidget(self.sync_progress_label)
 
         # セパレーター
@@ -7594,7 +7737,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # 物体検知推論結果表示用ラベルを作成
         self.detection_inference_info_label = QLabel("")
-        self.detection_inference_info_label.setStyleSheet("color: #009999;")
+        set_text_role(self.detection_inference_info_label, 'teal')
         self.detection_inference_info_label.setWordWrap(True)
 
         # 推論実行ボタン
@@ -7704,6 +7847,19 @@ class ImageAnnotationTool(QMainWindow):
         self.segmentation_inference_checkbox.stateChanged.connect(self.toggle_segmentation_inference_display)
         obj_detection_layout.addWidget(self.segmentation_inference_checkbox)
 
+        # 学習に使うアノテーションの範囲（表示中のソースのみ / 全ソース）
+        self.use_all_sources_checkbox = QCheckBox(get_text('chk_use_all_sources'))
+        self.use_all_sources_checkbox.setChecked(False)
+        self.use_all_sources_checkbox.setToolTip(get_text('tip_use_all_sources'))
+        self.use_all_sources_checkbox.toggled.connect(self.toggle_use_all_sources_for_training)
+        obj_detection_layout.addWidget(self.use_all_sources_checkbox)
+
+        # ソース別のアノテーション件数（どのソースに何枚あるか一目で分かるように）
+        self.source_annotation_summary_label = QLabel("")
+        set_text_role(self.source_annotation_summary_label, 'muted')
+        self.source_annotation_summary_label.setWordWrap(True)
+        obj_detection_layout.addWidget(self.source_annotation_summary_label)
+
         # 物体検知コンテナを追加
         left_layout.addWidget(self.object_detection_container)
 
@@ -7773,7 +7929,8 @@ class ImageAnnotationTool(QMainWindow):
         
         # 情報パネルの内容
         self.current_image_info = QLabel(get_text('image_info'))
-        self.current_image_info.setStyleSheet("color: #333333; font-weight: bold;")
+        self.current_image_info.setStyleSheet("font-weight: bold;")
+        set_text_role(self.current_image_info, 'strong')
         info_layout.addWidget(self.current_image_info)
 
         self.annotation_info_label = QLabel("")
@@ -7783,7 +7940,7 @@ class ImageAnnotationTool(QMainWindow):
 
         self.inference_info_label = QLabel("")
         self.inference_info_label.setWordWrap(True)
-        self.inference_info_label.setStyleSheet("color: #009999;")
+        set_text_role(self.inference_info_label, 'teal')
         self.inference_info_label.setMinimumHeight(45)
         # 垂直は Minimum（内容に応じて伸びる）。Fixed だと sizeHint 分しか高さが
         # 確保されず、TogiVAD 予測表（見出し+複数行）の最終行（=pred_seconds の
@@ -7794,7 +7951,7 @@ class ImageAnnotationTool(QMainWindow):
         # TogiVAD の angle/throttle 推論表示（自動運転モデルの推論とは独立・濃紫）
         self.togivad_control_info_label = QLabel("")
         self.togivad_control_info_label.setWordWrap(True)
-        self.togivad_control_info_label.setStyleSheet("color: #6A1B9A;")
+        set_text_role(self.togivad_control_info_label, 'accent')
         self.togivad_control_info_label.setSizePolicy(
             QSizePolicy.Preferred, QSizePolicy.Minimum)
         info_layout.addWidget(self.togivad_control_info_label)
@@ -7806,7 +7963,7 @@ class ImageAnnotationTool(QMainWindow):
         # 位置推論結果表示ラベル（推論結果の直下）
         self.location_inference_info_label = QLabel("")
         self.location_inference_info_label.setWordWrap(True)
-        self.location_inference_info_label.setStyleSheet("color: purple;")
+        set_text_role(self.location_inference_info_label, 'accent')
         self.location_inference_info_label.setMinimumHeight(25)
         self.location_inference_info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         info_layout.addWidget(self.location_inference_info_label)
@@ -7814,7 +7971,7 @@ class ImageAnnotationTool(QMainWindow):
         # 物体検知推論結果表示ラベル（位置推論結果の下）
         self.detection_inference_info_label = QLabel("")
         self.detection_inference_info_label.setWordWrap(True)
-        self.detection_inference_info_label.setStyleSheet("color: #009999;")
+        set_text_role(self.detection_inference_info_label, 'teal')
         self.detection_inference_info_label.setMinimumHeight(40)
         self.detection_inference_info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         info_layout.addWidget(self.detection_inference_info_label)
@@ -7827,7 +7984,8 @@ class ImageAnnotationTool(QMainWindow):
         # 分布タイトルとデータ分析ボタン
         graph_title_layout = QHBoxLayout()
         self.graph_title = QLabel(get_text('data_distribution'))
-        self.graph_title.setStyleSheet("font-weight: bold; color: #333333;")
+        self.graph_title.setStyleSheet("font-weight: bold;")
+        set_text_role(self.graph_title, 'strong')
         graph_title_layout.addWidget(self.graph_title)
 
         self.data_analysis_button = QPushButton("📊")
@@ -7850,7 +8008,7 @@ class ImageAnnotationTool(QMainWindow):
         self.distribution_label = QLabel()
         self.distribution_label.setAlignment(Qt.AlignCenter)
         self.distribution_label.setFixedHeight(360)
-        self.distribution_label.setStyleSheet("background-color: #f8f8f8; border: 1px solid #dddddd; border-radius: 4px;")
+        set_panel_role(self.distribution_label, 'box')
 
         # 初期表示テキストの設定
         no_data_font = QFont()
@@ -7894,12 +8052,12 @@ class ImageAnnotationTool(QMainWindow):
 
         self.image_size_label = QLabel("---")
         self.image_size_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.image_size_label.setStyleSheet("color: #666;")
+        set_text_role(self.image_size_label, 'muted')
         resolution_row.addWidget(self.image_size_label)
 
         self.model_input_size_label = QLabel("")
         self.model_input_size_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.model_input_size_label.setStyleSheet("color: #4a9;")
+        set_text_role(self.model_input_size_label, 'teal')
         resolution_row.addWidget(self.model_input_size_label)
 
         resolution_label = QLabel(get_text('label_resolution_scale'))
@@ -8212,7 +8370,7 @@ class ImageAnnotationTool(QMainWindow):
         downsample_grid.addWidget(self.detect_downsample_button, 0, col); col += 1
 
         self.downsample_count_label = QLabel(get_text('items', 0))
-        self.downsample_count_label.setStyleSheet("color: #3366ff;")
+        set_text_role(self.downsample_count_label, 'info')
         downsample_grid.addWidget(self.downsample_count_label, 0, col); col += 1
 
         # --- Row 1: Throttle ---
@@ -8274,7 +8432,7 @@ class ImageAnnotationTool(QMainWindow):
         downsample_grid.addWidget(self.detect_throttle_downsample_button, 1, col); col += 1
 
         self.throttle_downsample_count_label = QLabel(f"({get_text('items', 0)})")
-        self.throttle_downsample_count_label.setStyleSheet("color: #3366ff;")
+        set_text_role(self.throttle_downsample_count_label, 'info')
         downsample_grid.addWidget(self.throttle_downsample_count_label, 1, col); col += 1
 
         clear_throttle_downsample_button = QPushButton(get_text('clear'))
@@ -8331,7 +8489,7 @@ class ImageAnnotationTool(QMainWindow):
                                     (1, self.detection_mode_button),
                                     (2, self.segmentation_mode_button)):
             _mode_btn.setCheckable(True)
-            _mode_btn.setStyleSheet(SEGMENTED_BTN_QSS)
+            set_segmented(_mode_btn)
             self.mode_button_group.addButton(_mode_btn, _mode_id)
             mode_layout.addWidget(_mode_btn)
         self.mode_button_group.addButton(self.waypoint_mode_button, 3)
@@ -8343,7 +8501,7 @@ class ImageAnnotationTool(QMainWindow):
         # モード切替ヒント（独立行にして見切れを防ぐ。フォントを縮めると
         # 潰れて読めなくなるので、色だけ落として本文サイズを保つ）
         self.mode_hint_label = QLabel(get_text('label_mode_hint'))
-        self.mode_hint_label.setStyleSheet("color: #777;")
+        set_text_role(self.mode_hint_label, 'muted')
         self.mode_hint_label.setWordWrap(True)
         mode_group_layout.addWidget(self.mode_hint_label)
 
@@ -8459,7 +8617,7 @@ class ImageAnnotationTool(QMainWindow):
         bev_layer_row = QHBoxLayout()
         bev_layer_row.setSpacing(6)
         bev_hint_label = QLabel(get_text('label_bev_layers_only'))
-        bev_hint_label.setStyleSheet("color: #777;")
+        set_text_role(bev_hint_label, 'muted')
         bev_hint_label.setToolTip(get_text('tip_bev_layers_only'))
         bev_hint_label.setMinimumHeight(_label_h)
         bev_layer_row.addWidget(bev_hint_label)
@@ -8559,7 +8717,7 @@ class ImageAnnotationTool(QMainWindow):
         cam_summary_row = QHBoxLayout()
         cam_summary_row.setSpacing(6)
         self.camera_geometry_summary_label = QLabel()
-        self.camera_geometry_summary_label.setStyleSheet("color: #555;")
+        set_text_role(self.camera_geometry_summary_label, 'muted')
         cam_summary_row.addWidget(self.camera_geometry_summary_label)
         cam_summary_row.addStretch()
         self.camera_geometry_button = QPushButton(get_text('btn_camera_geometry'))
@@ -8587,7 +8745,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # waypoint制御ラベル
         waypoint_label = QLabel(get_text('label_waypoint_control'))
-        waypoint_label.setStyleSheet("font-weight: bold; color: #333;")
+        waypoint_label.setStyleSheet("font-weight: bold;")
+        set_text_role(waypoint_label, 'strong')
         waypoint_control_layout.addWidget(waypoint_label)
 
         # 打点数制御
@@ -8836,7 +8995,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # セグメンテーション制御ラベル
         segmentation_label = QLabel(get_text('label_steering_direction'))
-        segmentation_label.setStyleSheet("font-weight: bold; color: #333;")
+        segmentation_label.setStyleSheet("font-weight: bold;")
+        set_text_role(segmentation_label, 'strong')
         segmentation_control_layout.addWidget(segmentation_label)
 
         # 走行方向矢印表示チェックボックス
@@ -8996,12 +9156,12 @@ class ImageAnnotationTool(QMainWindow):
         self._loc_pos_btn.setChecked(True)
         self._loc_pos_btn.setFixedHeight(24)
         self._loc_pos_btn.setToolTip(get_text('tip_loc_mode_position'))
-        self._loc_pos_btn.setStyleSheet(SEGMENTED_BTN_QSS)
+        set_segmented(self._loc_pos_btn)
         self._loc_corner_btn = QPushButton("コーナー")
         self._loc_corner_btn.setCheckable(True)
         self._loc_corner_btn.setFixedHeight(24)
         self._loc_corner_btn.setToolTip(get_text('tip_loc_mode_corner'))
-        self._loc_corner_btn.setStyleSheet(SEGMENTED_BTN_QSS)
+        set_segmented(self._loc_corner_btn)
         self._loc_mode_btn_group.addButton(self._loc_pos_btn, 0)
         self._loc_mode_btn_group.addButton(self._loc_corner_btn, 1)
         loc_mode_row.addWidget(self._loc_pos_btn)
@@ -10125,7 +10285,7 @@ class ImageAnnotationTool(QMainWindow):
 
             info_label = QLabel(get_text('label_camera_geometry_info'))
             info_label.setWordWrap(True)
-            info_label.setStyleSheet("color: #666;")
+            set_text_role(info_label, 'muted')
             dialog_layout.addWidget(info_label)
 
             self.camera_params_widget.setVisible(True)
@@ -10601,7 +10761,7 @@ class ImageAnnotationTool(QMainWindow):
                 return
             
             # 前回のセグメンテーションを適用（ディープコピーで完全に独立させる）
-            self.add_segmentation_annotation(deepcopy(self.last_segmentation))
+            self.add_segmentation_annotation(deepcopy(self.last_segmentation), advance=False)
             
     def calculate_and_store_diff_vector(self, index_or_path):
         """教師データと推論結果の差分ベクトルを計算して保存する"""
@@ -10783,36 +10943,10 @@ class ImageAnnotationTool(QMainWindow):
             color = get_location_color(loc_value)
             if count > 0:
                 # アノテーションがある場合は少し濃い色にする
-                button.setStyleSheet(f"""
-                    QPushButton {{
-                        padding: 8px;
-                        border: 1px solid {color.name()};
-                        border-radius: 4px;
-                        background-color: {color.lighter(140).name()};
-                        color: black;
-                    }}
-                    QPushButton:checked {{
-                        background-color: {color.name()};
-                        color: white;
-                        font-weight: bold;
-                    }}
-                """)
+                button.setStyleSheet(location_button_qss(color))
             else:
                 # アノテーションがない場合はグレーっぽくする
-                button.setStyleSheet(f"""
-                    QPushButton {{
-                        padding: 8px;
-                        border: 1px solid #cccccc;
-                        border-radius: 4px;
-                        background-color: #f0f0f0;
-                        color: #888888;
-                    }}
-                    QPushButton:checked {{
-                        background-color: {color.name()};
-                        color: white;
-                        font-weight: bold;
-                    }}
-                """)
+                button.setStyleSheet(location_button_qss())
 
         # テキスト・アイコンを現在のモードで更新
         self._update_location_button_display()
@@ -10845,19 +10979,7 @@ class ImageAnnotationTool(QMainWindow):
         button.clicked.connect(lambda checked, value=location_value: self.set_location(value))
         
         # スタイルシートを設定
-        button.setStyleSheet("""
-            QPushButton {
-                padding: 8px;
-                border: 1px solid #cccccc;
-                border-radius: 4px;
-                background-color: #f0f0f0;
-            }
-            QPushButton:checked {
-                background-color: #4CAF50;
-                color: white;
-                font-weight: bold;
-            }
-        """)
+        button.setStyleSheet(location_button_qss())
         
         # クラス内容入力欄付きの行としてレイアウトに追加
         self._add_location_row(button, location_value)
@@ -11012,7 +11134,7 @@ class ImageAnnotationTool(QMainWindow):
             self.location_annotations[self.current_index] = location_value
             
             # 現在の位置情報ラベルを更新
-            loc_color = get_location_color(location_value)
+            loc_color = location_text_color(location_value)
             self.current_location_label.setText(get_text('label_current_location_value', location_value))
             self.current_location_label.setStyleSheet(f"color: {loc_color.name()}; font-weight: bold;")
             
@@ -11649,6 +11771,155 @@ class ImageAnnotationTool(QMainWindow):
         variant_layout.addWidget(rb)
         self.variant_button_group.addButton(rb)
 
+    # --- 画像ソース別のアノテーション/推論結果ストア ---
+
+    def _annotation_source_key(self, variant=None):
+        """アノテーションを紐づける画像ソースキーを返す。
+
+        BEV は直前のカメラソースの画像をそのまま使うので現在のキーを維持し、
+        結合表示はベースソース（先頭バリアント）に解決する。どちらも固有の
+        アノテーションを持たない疑似ソースなので、専用ストアは作らない。
+        """
+        current = variant if variant is not None else getattr(self, 'current_variant', None)
+        if current == '__bev__':
+            return self._active_source_key or current
+        if current == '__combined__':
+            variants = getattr(self, 'available_variants', None)
+            if variants:
+                return list(variants)[0]
+        return current
+
+    def _capture_source_store(self):
+        """現在メモリ上にあるアノテーション/推論結果をひとまとめにして返す。"""
+        return {name: (getattr(self, name, None) or {})
+                for name in SOURCE_SCOPED_STORES}
+
+    def switch_annotation_source(self, variant):
+        """表示ソースの切替に合わせてアノテーション/推論結果を載せ替える。
+
+        これをしないと、cam3 で付けたバウンディングボックスや推論結果が
+        cam0 表示時にもそのまま見えてしまう（フレーム番号だけで引いているため）。
+        """
+        new_key = self._annotation_source_key(variant)
+        old_key = self._active_source_key
+        if new_key is None or old_key == new_key:
+            return
+
+        if old_key is not None:
+            self._source_stores[old_key] = self._capture_source_store()
+
+        store = self._source_stores.get(new_key, {})
+        for name in SOURCE_SCOPED_STORES:
+            setattr(self, name, store.get(name, {}))
+
+        # 「前回のアノテーションを適用」の持ち越しもソースをまたがせない
+        self.last_bbox = None
+        self.last_bboxes = []
+        self.last_segmentation = None
+        self.last_segmentations = []
+
+        self._active_source_key = new_key
+        self.update_source_annotation_summary()
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.selected_bbox_index = None
+            self.main_image_view.hovering_bbox_index = None
+            self.main_image_view.selected_segmentation_index = None
+
+    def toggle_use_all_sources_for_training(self, checked):
+        """学習・エクスポートで全画像ソースのアノテーションを使うかを切り替える。"""
+        self.use_all_sources_for_training = bool(checked)
+        self.update_source_annotation_summary()
+
+    def update_source_annotation_summary(self):
+        """ソース別のアノテーション件数を左パネルに表示する。"""
+        label = getattr(self, 'source_annotation_summary_label', None)
+        if label is None:
+            return
+        bbox_counts = self.count_annotation_sources('bbox_annotations')
+        seg_counts = self.count_annotation_sources('segmentation_annotations')
+        if not bbox_counts and not seg_counts:
+            label.setText("")
+            return
+
+        keys = sorted(set(bbox_counts) | set(seg_counts), key=lambda k: str(k))
+        current = self._annotation_source_key()
+        parts = []
+        for key in keys:
+            detail = []
+            if bbox_counts.get(key):
+                detail.append(get_text('label_source_count_bbox', bbox_counts[key]))
+            if seg_counts.get(key):
+                detail.append(get_text('label_source_count_seg', seg_counts[key]))
+            mark = '*' if key == current else ''
+            parts.append(f"{mark}{key}: {' / '.join(detail)}")
+        scope = get_text('label_scope_all_sources') if self.use_all_sources_for_training \
+            else get_text('label_scope_current_source')
+        label.setText(get_text('label_source_summary', ', '.join(parts), scope))
+
+    def reset_source_stores(self, initial_variant=None):
+        """フォルダ読み込み時などにソース別ストアを初期化する。"""
+        self._source_stores = {}
+        self._active_source_key = self._annotation_source_key(initial_variant)
+
+    def iter_source_annotation_stores(self, store_name, all_sources=None):
+        """(ソースキー, 画像リスト, アノテーション辞書) を順に返す。
+
+        all_sources が False なら表示中のソースだけ、True なら読み込み済みの
+        全ソースを対象にする（学習・エクスポートの対象範囲切替に使う）。
+        """
+        if all_sources is None:
+            all_sources = bool(getattr(self, 'use_all_sources_for_training', False))
+
+        current_key = self._annotation_source_key()
+        current_store = getattr(self, store_name, {}) or {}
+        if not all_sources:
+            yield current_key, list(self.images), current_store
+            return
+
+        variant_images = getattr(self, 'variant_images', {}) or {}
+        seen = set()
+        for key in list(variant_images.keys()):
+            if key == current_key:
+                store = current_store
+            else:
+                store = self._source_stores.get(key, {}).get(store_name, {}) or {}
+            if not store:
+                continue
+            seen.add(key)
+            yield key, list(variant_images.get(key, [])), store
+        if current_key not in seen and current_store:
+            yield current_key, list(self.images), current_store
+
+    def collect_annotation_items(self, store_name, all_sources=None):
+        """学習/エクスポート対象を (画像パス, アノテーションリスト) の一覧で返す。
+
+        削除マーク済みのフレームは除外する。ソースをまたぐと同じインデックスが
+        重複するため、以降の処理はインデックスではなく画像パスで扱う。
+        """
+        deleted = getattr(self, 'deleted_indexes', set()) or set()
+        current_key = self._annotation_source_key()
+        items = []
+        for key, images, store in self.iter_source_annotation_stores(store_name, all_sources):
+            for idx, annotations in store.items():
+                if not annotations:
+                    continue
+                # 削除マークは表示中ソースのフレーム番号に対して付けられている
+                if key == current_key and idx in deleted:
+                    continue
+                if not isinstance(idx, int) or idx >= len(images):
+                    continue
+                items.append((images[idx], annotations))
+        return items
+
+    def count_annotation_sources(self, store_name):
+        """ソース別のアノテーション枚数を {ソース: 枚数} で返す（表示用）。"""
+        counts = {}
+        for key, _images, store in self.iter_source_annotation_stores(store_name, all_sources=True):
+            n = sum(1 for annotations in store.values() if annotations)
+            if n:
+                counts[key] = n
+        return counts
+
     def on_variant_changed(self, variant):
         """
         ラジオボタンで選択された画像ソースキーが変更された時に呼ばれるメソッド
@@ -11660,6 +11931,7 @@ class ImageAnnotationTool(QMainWindow):
         if not hasattr(self, 'available_variants') or not self.available_variants:
             print("キー情報がまだ初期化されていません。load_images後に設定されます。")
             self.current_variant = variant  # キー名だけは保存しておく
+            self._active_source_key = self._annotation_source_key(variant)
             self._update_bev_layer_enabled()
             return
         
@@ -11670,6 +11942,8 @@ class ImageAnnotationTool(QMainWindow):
         # 現在のキーを更新
         self.current_variant = variant
         print(f"キーを '{variant}' に変更しました")
+        # アノテーション/推論結果を新しいソースのものに載せ替える
+        self.switch_annotation_source(variant)
         # BEVレイヤのトグルは BEV 選択時のみ有効
         self._update_bev_layer_enabled()
 
@@ -12231,7 +12505,7 @@ class ImageAnnotationTool(QMainWindow):
                 return
             
             # 前回のバウンディングボックスを適用
-            self.add_bbox_annotation(self.last_bbox.copy())
+            self.add_bbox_annotation(self.last_bbox.copy(), advance=False)
             
             # ステータスバーに表示
             self.statusBar().showMessage(get_text('status_bbox_auto_applied', self.last_bbox['class']), 3000)
@@ -12289,15 +12563,15 @@ class ImageAnnotationTool(QMainWindow):
 
                 # 推論情報のリッチテキスト
                 inference_text = f"<b>{get_text('label_driving_inference_header')}</b><br>"
-                inference_text += f"angle = <span style='color: #009999;'>{angle:.4f}</span><br>"
-                inference_text += f"throttle = <span style='color: #009999;'>{throttle:.4f}</span>"
+                inference_text += f"angle = <span style='color: {theme_color('teal')};'>{angle:.4f}</span><br>"
+                inference_text += f"throttle = <span style='color: {theme_color('teal')};'>{throttle:.4f}</span>"
 
                 # 速度推論結果（正規化値と実速度[m/s]）を表示
                 infer_speed = inference.get("pilot/speed", inference.get("speed"))
                 if infer_speed is not None:
                     _snorm = inference.get('speed_normalize') or getattr(self.main_image_view, 'max_speed', MAX_SPEED)
                     inference_text += (
-                        f"<br>speed = <span style='color: #009999;'>{infer_speed:.4f}</span>"
+                        f"<br>speed = <span style='color: {theme_color('teal')};'>{infer_speed:.4f}</span>"
                         f" ({infer_speed * _snorm:.2f} m/s)"
                     )
 
@@ -12480,6 +12754,12 @@ class ImageAnnotationTool(QMainWindow):
 
     def clear_all_selections(self):
         """全ての選択状態をクリア"""
+        # 進行中のドラッグ/描画状態も破棄する。前モードのフラグ（ペイント中・
+        # ウェイポイント描画中・マスク頂点ドラッグ中）が残ると、次モードでの
+        # マウスリリースが早期 return で飲み込まれ、アノテーションが確定できない
+        if hasattr(self.main_image_view, '_reset_interaction_state'):
+            self.main_image_view._reset_interaction_state()
+
         # バウンディングボックスの選択をクリア
         if hasattr(self.main_image_view, 'selected_bbox_index'):
             self.main_image_view.selected_bbox_index = None
@@ -12598,8 +12878,11 @@ class ImageAnnotationTool(QMainWindow):
                 slot['checkbox'].setEnabled(False)
                 slot['checkbox'].setChecked(False)
 
-    def add_segmentation_annotation(self, polygon_data):
-        """セグメンテーションアノテーションを追加"""
+    def add_segmentation_annotation(self, polygon_data, advance=True):
+        """セグメンテーションアノテーションを追加
+
+        advance=False は自動適用など、ユーザー操作でない追加に使う。
+        """
         if not self.images or not polygon_data:
             return
 
@@ -12640,9 +12923,8 @@ class ImageAnnotationTool(QMainWindow):
                         self.last_segmentations = [deepcopy(s) for s in existing_anns if s is not None]
                         self.main_image_view.update()
                         self.update_gallery()
-                        if getattr(self, '_seg_fixed_class_advance', False):
-                            skip = self.skip_count_spin.value()
-                            QTimer.singleShot(80, lambda: self.skip_images(skip))
+                        if advance and getattr(self, '_seg_fixed_class_advance', False):
+                            self._schedule_fixed_class_advance()
                         return
                 except Exception:
                     pass  # 失敗時は通常追加にフォールスルー
@@ -12657,10 +12939,11 @@ class ImageAnnotationTool(QMainWindow):
         self.main_image_view.update()
         self.update_gallery()
 
+        self.update_source_annotation_summary()
+
         # クラス固定で次に進む
-        if getattr(self, '_seg_fixed_class_advance', False):
-            skip = self.skip_count_spin.value()
-            QTimer.singleShot(80, lambda: self.skip_images(skip))
+        if advance and getattr(self, '_seg_fixed_class_advance', False):
+            self._schedule_fixed_class_advance()
             
     def clear_segmentation_annotations(self):
         """現在の画像のセグメンテーションアノテーションをすべて削除"""
@@ -12806,20 +13089,22 @@ class ImageAnnotationTool(QMainWindow):
             bbox_count = sum(len(bboxes) for bboxes in self.bbox_annotations.values())
             bbox_images = len(self.bbox_annotations)
             bbox_status = QLabel(get_text('label_bbox_status', bbox_count, bbox_images))
-            bbox_status.setStyleSheet("color: #2E7D32; font-weight: bold;")
+            bbox_status.setStyleSheet("font-weight: bold;")
+            set_text_role(bbox_status, 'success')
         else:
             bbox_status = QLabel(get_text('label_bbox_none'))
-            bbox_status.setStyleSheet("color: #D32F2F;")
+            set_text_role(bbox_status, 'error')
         status_layout.addWidget(bbox_status)
 
         if has_seg:
             seg_count = sum(len(segs) for segs in self.segmentation_annotations.values())
             seg_images = len(self.segmentation_annotations)
             seg_status = QLabel(get_text('label_seg_status', seg_count, seg_images))
-            seg_status.setStyleSheet("color: #2E7D32; font-weight: bold;")
+            seg_status.setStyleSheet("font-weight: bold;")
+            set_text_role(seg_status, 'success')
         else:
             seg_status = QLabel(get_text('label_seg_none'))
-            seg_status.setStyleSheet("color: #D32F2F;")
+            set_text_role(seg_status, 'error')
         status_layout.addWidget(seg_status)
 
         task_layout.addWidget(status_group)
@@ -13248,44 +13533,44 @@ class ImageAnnotationTool(QMainWindow):
         class_to_index = {class_name: i for i, class_name in enumerate(classes)}
         print(f"クラス-インデックスマッピング: {class_to_index}")
         
-        # セグメンテーションアノテーションがあるインデックスのみを取得
-        valid_indices = []
-        for idx, segments in self.segmentation_annotations.items():
-            if segments:
-                has_valid_segments = any(
-                    seg is not None and
-                    len(_seg_to_polygon_points(
-                        seg if isinstance(seg, dict) else {'points': getattr(seg, 'points', [])},
-                        1, 1  # img_size は validity チェックのみなので任意の値でよい
-                    )) >= 3
-                    for seg in segments
-                )
-                if has_valid_segments:
-                    valid_indices.append(idx)
-        
-        print(f"有効なセグメンテーションデータがあるインデックス: {len(valid_indices)}個")
-        
-        if len(valid_indices) == 0:
+        # 対象は (画像パス, セグメント群)。設定に応じて全画像ソースを束ねる
+        items = []
+        for img_path, segments in self.collect_annotation_items('segmentation_annotations'):
+            has_valid_segments = any(
+                seg is not None and
+                len(_seg_to_polygon_points(
+                    seg if isinstance(seg, dict) else {'points': getattr(seg, 'points', [])},
+                    1, 1  # img_size は validity チェックのみなので任意の値でよい
+                )) >= 3
+                for seg in segments
+            )
+            if has_valid_segments:
+                items.append((img_path, segments))
+
+        print(f"有効なセグメンテーションデータ: {len(items)}枚 "
+              f"ソース別={self.count_annotation_sources('segmentation_annotations')}")
+
+        if len(items) == 0:
             raise Exception("有効なセグメンテーションアノテーションが見つかりません。")
-        
+
         # データを分割
         import random
-        random.shuffle(valid_indices)
-        
-        split_point = int(len(valid_indices) * 0.8)
-        train_indices = valid_indices[:split_point]
-        val_indices = valid_indices[split_point:]
-        
-        print(f"学習用: {len(train_indices)}枚, 検証用: {len(val_indices)}枚")
-        
+        random.shuffle(items)
+
+        split_point = int(len(items) * 0.8)
+        train_items = items[:split_point]
+        val_items = items[split_point:]
+
+        print(f"学習用: {len(train_items)}枚, 検証用: {len(val_items)}枚")
+
         # 学習用データのエクスポート
-        train_success = self._export_segmentation_subset(train_indices, train_dir, class_to_index)
-        
+        train_success = self._export_segmentation_subset(train_items, train_dir, class_to_index)
+
         # 検証用データのエクスポート
-        val_success = self._export_segmentation_subset(val_indices, val_dir, class_to_index)
+        val_success = self._export_segmentation_subset(val_items, val_dir, class_to_index)
         
         print(f"セグメンテーション専用アノテーションエクスポート完了")
-        print(f"学習用成功: {train_success}/{len(train_indices)}, 検証用成功: {val_success}/{len(val_indices)}")
+        print(f"学習用成功: {train_success}/{len(train_items)}, 検証用成功: {val_success}/{len(val_items)}")
         
         if train_success == 0 or val_success == 0:
             raise Exception("セグメンテーションデータのエクスポートに失敗しました。")
@@ -13299,26 +13584,28 @@ class ImageAnnotationTool(QMainWindow):
         class_to_index = {class_name: i for i, class_name in enumerate(classes)}
         print(f"クラス-インデックスマッピング: {class_to_index}")
         
-        # バウンディングボックスアノテーションがあるインデックスのみを使用
-        valid_indices = list(self.bbox_annotations.keys())
-        
+        # 対象は (画像パス, ボックス群)。設定に応じて全画像ソースを束ねる
+        items = self.collect_annotation_items('bbox_annotations')
+        print(f"対象ソース: {self.count_annotation_sources('bbox_annotations')} "
+              f"(全ソース使用={bool(getattr(self, 'use_all_sources_for_training', False))})")
+
         import random
-        random.shuffle(valid_indices)
-        
-        split_point = int(len(valid_indices) * 0.8)
-        train_indices = valid_indices[:split_point]
-        val_indices = valid_indices[split_point:]
-        
-        print(f"学習用: {len(train_indices)}枚, 検証用: {len(val_indices)}枚")
-        
+        random.shuffle(items)
+
+        split_point = int(len(items) * 0.8)
+        train_items = items[:split_point]
+        val_items = items[split_point:]
+
+        print(f"学習用: {len(train_items)}枚, 検証用: {len(val_items)}枚")
+
         # 学習用データのエクスポート
-        train_success = self._export_bbox_subset(train_indices, train_dir, class_to_index)
-        
+        train_success = self._export_bbox_subset(train_items, train_dir, class_to_index)
+
         # 検証用データのエクスポート
-        val_success = self._export_bbox_subset(val_indices, val_dir, class_to_index)
+        val_success = self._export_bbox_subset(val_items, val_dir, class_to_index)
         
         print(f"バウンディングボックス専用アノテーションエクスポート完了")
-        print(f"学習用成功: {train_success}/{len(train_indices)}, 検証用成功: {val_success}/{len(val_indices)}")
+        print(f"学習用成功: {train_success}/{len(train_items)}, 検証用成功: {val_success}/{len(val_items)}")
 
     # def _export_bbox_subset(self, indices, output_dir, class_to_index):
     #     """バウンディングボックスサブセットのエクスポート"""
@@ -13368,29 +13655,32 @@ class ImageAnnotationTool(QMainWindow):
         
     #     return success_count
 ###
-    def _export_bbox_subset(self, indices, output_dir, class_to_index):
-        """バウンディングボックスサブセットのエクスポート（修正版）"""
-        
+    def _export_bbox_subset(self, items, output_dir, class_to_index):
+        """バウンディングボックスサブセットのエクスポート
+
+        items は (画像パス, ボックス群) の一覧。画像ソースをまたぐとフレーム
+        番号が重複するため、インデックスではなく画像パスで受け取る。
+        """
+
         success_count = 0
-        
-        for idx in indices:
-            if idx in self.bbox_annotations:
+
+        for source_image_path, bboxes in items:
+            if bboxes:
                 try:
-                    # 画像をコピー
-                    source_image_path = self.images[idx]
+                    # 画像をコピー（ファイル名に cam 名が入るのでソース間で衝突しない）
                     image_filename = os.path.basename(source_image_path)
                     dest_image_path = os.path.join(output_dir, "images", image_filename)
-                    
+
                     import shutil
                     shutil.copy2(source_image_path, dest_image_path)
-                    
+
                     # バウンディングボックスアノテーションを処理
                     label_filename = os.path.splitext(image_filename)[0] + ".txt"
                     label_path = os.path.join(output_dir, "labels", label_filename)
                     
                     # ラベルファイルを作成（バウンディングボックス形式のみ）
                     with open(label_path, 'w') as f:
-                        for bbox in self.bbox_annotations[idx]:
+                        for bbox in bboxes:
                             # クラス名の取得（辞書形式とオブジェクト形式の両方に対応）
                             class_name = None
                             if isinstance(bbox, dict):
@@ -13429,84 +13719,12 @@ class ImageAnnotationTool(QMainWindow):
                     success_count += 1
                     
                 except Exception as e:
-                    print(f"バウンディングボックス インデックス {idx} の処理中にエラー: {e}")
+                    print(f"バウンディングボックス エクスポートエラー {source_image_path}: {e}")
                     import traceback
                     traceback.print_exc()
         
         return success_count
 
-    def _export_segmentation_subset(self, indices, output_dir, class_to_index):
-        """セグメンテーションサブセットのエクスポート（修正版）"""
-        
-        success_count = 0
-        
-        for idx in indices:
-            if idx in self.segmentation_annotations:
-                try:
-                    # 画像をコピー
-                    source_image_path = self.images[idx]
-                    image_filename = os.path.basename(source_image_path)
-                    dest_image_path = os.path.join(output_dir, "images", image_filename)
-                    
-                    import shutil
-                    shutil.copy2(source_image_path, dest_image_path)
-                    
-                    # セグメンテーションアノテーションを処理
-                    label_filename = os.path.splitext(image_filename)[0] + ".txt"
-                    label_path = os.path.join(output_dir, "labels", label_filename)
-                    
-                    # 画像サイズを取得
-                    from PIL import Image
-                    with Image.open(source_image_path) as img:
-                        img_width, img_height = img.size
-                    
-                    # ラベルファイルを作成（セグメンテーション形式）
-                    with open(label_path, 'w') as f:
-                        for seg in self.segmentation_annotations[idx]:
-                            # クラス名を取得
-                            if isinstance(seg, dict):
-                                class_name = seg.get('class') or seg.get('class_name')
-                                seg_d = seg
-                            else:
-                                class_name = getattr(seg, 'class', None) or getattr(seg, 'class_name', None)
-                                seg_d = {'points': getattr(seg, 'points', [])}
-
-                            if not class_name or class_name not in class_to_index:
-                                continue
-
-                            # polygon / fill / brush すべて対応した輪郭点取得
-                            points = _seg_to_polygon_points(seg_d, img_width, img_height)
-                            if len(points) < 3:
-                                continue
-
-                            class_id = class_to_index[class_name]
-
-                            # ポイントを正規化座標に変換
-                            normalized_points = []
-                            for point in points:
-                                if isinstance(point, (list, tuple)) and len(point) >= 2:
-                                    x, y = point[0] / img_width, point[1] / img_height
-                                elif isinstance(point, dict):
-                                    x, y = point.get('x', 0) / img_width, point.get('y', 0) / img_height
-                                else:
-                                    x, y = getattr(point, 'x', 0) / img_width, getattr(point, 'y', 0) / img_height
-                                normalized_points.extend([
-                                    max(0.0, min(1.0, x)),
-                                    max(0.0, min(1.0, y))
-                                ])
-
-                            if len(normalized_points) >= 6:  # 最低3点 (6座標)
-                                points_str = ' '.join([f"{coord:.6f}" for coord in normalized_points])
-                                f.write(f"{class_id} {points_str}\n")
-                    
-                    success_count += 1
-                    
-                except Exception as e:
-                    print(f"セグメンテーション インデックス {idx} の処理中にエラー: {e}")
-                    import traceback
-                    traceback.print_exc()
-        
-        return success_count
 
 
     # セグメンテーション学習前のバリデーション強化
@@ -13744,11 +13962,12 @@ class ImageAnnotationTool(QMainWindow):
         stats_label = QLabel(f"<b>{get_text('label_training_stats')}</b><br>"
                            f"{get_text('label_total_loaded_images', total_images)}<br>"
                            f"{get_text('label_annotated_images_count', task_name, total_annotated_images)}<br>"
-                           f"<b style='color: #2E7D32; font-size: 14px;'>{get_text('label_actual_training_count', image_count)}</b><br>"
+                           f"<b style='color: {theme_color('success')}; font-size: 14px;'>{get_text('label_actual_training_count', image_count)}</b><br>"
                            f"{get_text('label_excluded_calculation', total_annotated_images, excluded_count)}<br>"
                            f"{get_text('label_total_annotations_count', task_name, total_count)}<br>"
-                           f"<span style='color: #FF6600;'>{get_text('label_deleted_excluded_note')}</span>")
-        stats_label.setStyleSheet("padding: 10px; background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 5px;")
+                           f"<span style='color: {theme_color('warning')};'>{get_text('label_deleted_excluded_note')}</span>")
+        stats_label.setStyleSheet("padding: 10px; border-radius: 5px;")
+        set_panel_role(stats_label, 'box')
         settings_layout.addWidget(stats_label)
         
         settings_layout.addWidget(QLabel(""))  # スペース追加
@@ -13833,7 +14052,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # 注意書き
         size_note = QLabel(get_text('label_size_note'))
-        size_note.setStyleSheet("color: #888; font-style: italic;")
+        size_note.setStyleSheet("font-style: italic;")
+        set_text_role(size_note, 'faint')
         basic_layout.addWidget(size_note)
 
         # Early Stopping設定
@@ -14025,7 +14245,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # プレフィックス（固定、編集不可）
         prefix_label = QLabel(yolo_prefix)
-        prefix_label.setStyleSheet("background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc; font-family: monospace;")
+        prefix_label.setStyleSheet("padding: 5px; font-family: monospace;")
+        set_panel_role(prefix_label, 'code')
         name_input_layout.addWidget(prefix_label)
 
         # サフィックス（編集可能）
@@ -14040,7 +14261,8 @@ class ImageAnnotationTool(QMainWindow):
         training_settings.model_name_prefix = yolo_prefix
 
         model_name_note = QLabel(get_text('label_model_name_note', model_type))
-        model_name_note.setStyleSheet("color: #888; font-style: italic; font-size: 10px;")
+        model_name_note.setStyleSheet("font-style: italic; font-size: 10px;")
+        set_text_role(model_name_note, 'faint')
         model_name_layout.addWidget(model_name_note)
 
         settings_layout.addWidget(model_name_group)
@@ -14692,7 +14914,8 @@ class ImageAnnotationTool(QMainWindow):
 
             # 説明ラベル
             key_note = QLabel(get_text('label_donkey_key_note'))
-            key_note.setStyleSheet("color: #666; font-style: italic;")
+            key_note.setStyleSheet("font-style: italic;")
+            set_text_role(key_note, 'muted')
             keys_layout.addWidget(key_note)
 
             layout.addWidget(keys_group)
@@ -14700,7 +14923,8 @@ class ImageAnnotationTool(QMainWindow):
         # 削除したインデックスの情報表示
         if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
             deletion_info = QLabel(get_text('label_deleted_indexes_export', len(self.deleted_indexes)))
-            deletion_info.setStyleSheet("color: #666; font-style: italic;")
+            deletion_info.setStyleSheet("font-style: italic;")
+            set_text_role(deletion_info, 'muted')
             layout.addWidget(deletion_info)
         
         # ボタン
@@ -14845,10 +15069,11 @@ class ImageAnnotationTool(QMainWindow):
             bbox_count = sum(len(bboxes) for bboxes in self.bbox_annotations.values())
             bbox_images = len(self.bbox_annotations)
             bbox_status = QLabel(get_text('label_bbox_status', bbox_count, bbox_images))
-            bbox_status.setStyleSheet("color: #2E7D32; font-weight: bold;")
+            bbox_status.setStyleSheet("font-weight: bold;")
+            set_text_role(bbox_status, 'success')
         else:
             bbox_status = QLabel(get_text('label_bbox_none'))
-            bbox_status.setStyleSheet("color: #D32F2F;")
+            set_text_role(bbox_status, 'error')
         status_layout.addWidget(bbox_status)
 
         # セグメンテーション状況
@@ -14856,10 +15081,11 @@ class ImageAnnotationTool(QMainWindow):
             seg_count = sum(len(segs) for segs in self.segmentation_annotations.values())
             seg_images = len(self.segmentation_annotations)
             seg_status = QLabel(get_text('label_seg_status', seg_count, seg_images))
-            seg_status.setStyleSheet("color: #2E7D32; font-weight: bold;")
+            seg_status.setStyleSheet("font-weight: bold;")
+            set_text_role(seg_status, 'success')
         else:
             seg_status = QLabel(get_text('label_seg_none'))
-            seg_status.setStyleSheet("color: #D32F2F;")
+            set_text_role(seg_status, 'error')
         status_layout.addWidget(seg_status)
 
         layout.addWidget(status_group)
@@ -14948,7 +15174,8 @@ class ImageAnnotationTool(QMainWindow):
         # 削除したインデックスの情報表示
         if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
             deletion_info = QLabel(get_text('label_deleted_indexes_info', len(self.deleted_indexes)))
-            deletion_info.setStyleSheet("color: #666; font-style: italic; margin-top: 10px;")
+            deletion_info.setStyleSheet("font-style: italic; margin-top: 10px;")
+            set_text_role(deletion_info, 'muted')
             layout.addWidget(deletion_info)
         
         # ボタン
@@ -15118,18 +15345,13 @@ class ImageAnnotationTool(QMainWindow):
         os.makedirs(images_dir, exist_ok=True)
         os.makedirs(labels_dir, exist_ok=True)
         
-        # 削除されたインデックスを除外
-        deleted_indexes = getattr(self, 'deleted_indexes', set())
-        
-        # アノテーションがあるインデックスのリストを作成
-        annotated_indexes = list(self.bbox_annotations.keys()) if hasattr(self, 'bbox_annotations') else []
-        
-        # 削除されたインデックスを除外
-        valid_indexes = [idx for idx in annotated_indexes if idx not in deleted_indexes]
-        
-        total_images = len(valid_indexes)
-        
-        for i, idx in enumerate(valid_indexes):
+        # 対象は (画像パス, ボックス群)。設定に応じて全画像ソースを束ねる
+        # （削除マークの除外は collect_annotation_items 側で処理済み）
+        items = self.collect_annotation_items('bbox_annotations')
+
+        total_images = len(items)
+
+        for i, (img_path, bboxes) in enumerate(items):
             if progress and progress.wasCanceled():
                 break
             
@@ -15137,11 +15359,6 @@ class ImageAnnotationTool(QMainWindow):
                 progress_value = int((i / total_images) * 100) if total_images > 0 else 100
                 progress.setValue(progress_value)
                 
-            # インデックスから画像パスを取得
-            if not hasattr(self, 'images') or idx >= len(self.images):
-                continue
-                
-            img_path = self.images[idx]
             img_filename = os.path.basename(img_path)
             
             if progress:
@@ -15170,8 +15387,8 @@ class ImageAnnotationTool(QMainWindow):
             
             # バウンディングボックスのラベルを作成
             with open(label_path, 'w') as f:
-                if idx in self.bbox_annotations:
-                    for bbox in self.bbox_annotations[idx]:
+                if bboxes:
+                    for bbox in bboxes:
                         class_name = bbox.get('class', 'unknown')
                         if class_name in classes:
                             class_id = classes.index(class_name)
@@ -15219,18 +15436,13 @@ class ImageAnnotationTool(QMainWindow):
         os.makedirs(images_dir, exist_ok=True)
         os.makedirs(labels_dir, exist_ok=True)
         
-        # 削除されたインデックスを除外
-        deleted_indexes = getattr(self, 'deleted_indexes', set())
-        
-        # アノテーションがあるインデックスのリストを作成
-        annotated_indexes = list(self.segmentation_annotations.keys()) if hasattr(self, 'segmentation_annotations') else []
-        
-        # 削除されたインデックスを除外
-        valid_indexes = [idx for idx in annotated_indexes if idx not in deleted_indexes]
-        
-        total_images = len(valid_indexes)
-        
-        for i, idx in enumerate(valid_indexes):
+        # 対象は (画像パス, セグメント群)。設定に応じて全画像ソースを束ねる
+        # （削除マークの除外は collect_annotation_items 側で処理済み）
+        items = self.collect_annotation_items('segmentation_annotations')
+
+        total_images = len(items)
+
+        for i, (img_path, segments) in enumerate(items):
             if progress and progress.wasCanceled():
                 break
             
@@ -15238,11 +15450,6 @@ class ImageAnnotationTool(QMainWindow):
                 progress_value = int((i / total_images) * 100) if total_images > 0 else 100
                 progress.setValue(progress_value)
                 
-            # インデックスから画像パスを取得
-            if not hasattr(self, 'images') or idx >= len(self.images):
-                continue
-                
-            img_path = self.images[idx]
             img_filename = os.path.basename(img_path)
             
             if progress:
@@ -15271,8 +15478,8 @@ class ImageAnnotationTool(QMainWindow):
             
             # セグメンテーションのラベルを作成
             with open(label_path, 'w') as f:
-                if idx in self.segmentation_annotations:
-                    for seg in self.segmentation_annotations[idx]:
+                if segments:
+                    for seg in segments:
                         class_name = seg.get('class', 'unknown')
                         if class_name in classes:
                             class_id = classes.index(class_name)
@@ -16184,6 +16391,10 @@ class ImageAnnotationTool(QMainWindow):
                 # 既存のアノテーションをクリア
                 self.bbox_annotations = {}
                 self.segmentation_annotations = {}
+                # 表示していない画像ソースのぶんも一緒に消す
+                for store in self._source_stores.values():
+                    store['bbox_annotations'] = {}
+                    store['segmentation_annotations'] = {}
                 # 関連する変数もクリア
                 self.last_bbox = None
                 self.last_bboxes = []
@@ -16221,17 +16432,22 @@ class ImageAnnotationTool(QMainWindow):
         print("=" * 60)
 
         # プログレスダイアログ
+        _all_images = getattr(self, 'variant_images', None) or {}
         progress = QProgressDialog(
             get_text('msg_loading_yolo_annotations'),
-            get_text('btn_cancel'), 0, len(self.images), self
+            get_text('btn_cancel'), 0,
+            sum(len(v) for v in _all_images.values()) or len(self.images), self
         )
         progress.setWindowTitle(get_text('dlg_loading'))
         progress.setWindowModality(Qt.WindowModal)
         progress.show()
 
         # 統計情報を記録
+        all_variant_images = getattr(self, 'variant_images', None) or {}
+        total_images = sum(len(v) for v in all_variant_images.values()) or len(self.images)
         loading_stats = {
-            'total_images': len(self.images),
+            'sources_with_annotations': {},
+            'total_images': total_images,
             'processed_images': 0,
             'images_with_annotations': 0,
             'total_bbox_annotations': 0,
@@ -16243,36 +16459,55 @@ class ImageAnnotationTool(QMainWindow):
         }
         
         try:
-            for i, img_path in enumerate(self.images):
+            # ラベルファイルは画像ファイル名（cam名を含む）で対応づくので、
+            # 読み込み済みの全画像ソースぶんをそれぞれのストアへ復元する
+            current_key = self._annotation_source_key()
+            variant_images = getattr(self, 'variant_images', None) or {current_key: self.images}
+            processed = 0
+            for variant, images in variant_images.items():
                 if progress.wasCanceled():
                     break
-                
-                progress.setValue(i)
-                progress.setLabelText(get_text('msg_processing_file', os.path.basename(img_path)))
-                QApplication.processEvents()
-                
-                # 画像ファイル名を基準にアノテーション読み込み
-                bbox_annotations, seg_annotations = self._load_single_image_annotations(
-                    img_path, i, labels_dir, classes, loading_stats
-                )
-                
-                # バウンディングボックスアノテーションを保存（インデックスベース）
-                if bbox_annotations:
-                    if i not in self.bbox_annotations:
-                        self.bbox_annotations[i] = []
-                    self.bbox_annotations[i].extend(bbox_annotations)
-                    loading_stats['images_with_annotations'] += 1
-                
-                # セグメンテーションアノテーションを保存（インデックスベース）
-                if seg_annotations:
-                    if i not in self.segmentation_annotations:
-                        self.segmentation_annotations[i] = []
-                    self.segmentation_annotations[i].extend(seg_annotations)
-                
-                loading_stats['processed_images'] += 1
-            
+                if variant == current_key:
+                    bbox_store = self.bbox_annotations
+                    seg_store = self.segmentation_annotations
+                else:
+                    store = self._source_stores.setdefault(variant, {})
+                    bbox_store = store.setdefault('bbox_annotations', {})
+                    seg_store = store.setdefault('segmentation_annotations', {})
+
+                for i, img_path in enumerate(images):
+                    if progress.wasCanceled():
+                        break
+
+                    processed += 1
+                    progress.setValue(min(processed, loading_stats['total_images']))
+                    progress.setLabelText(get_text('msg_processing_file', os.path.basename(img_path)))
+                    QApplication.processEvents()
+
+                    # 画像ファイル名を基準にアノテーション読み込み
+                    bbox_annotations, seg_annotations = self._load_single_image_annotations(
+                        img_path, i, labels_dir, classes, loading_stats
+                    )
+
+                    # バウンディングボックスアノテーションを保存（インデックスベース）
+                    if bbox_annotations:
+                        bbox_store.setdefault(i, []).extend(bbox_annotations)
+                        loading_stats['images_with_annotations'] += 1
+                        loading_stats['sources_with_annotations'][variant] = (
+                            loading_stats['sources_with_annotations'].get(variant, 0) + 1)
+
+                    # セグメンテーションアノテーションを保存（インデックスベース）
+                    if seg_annotations:
+                        seg_store.setdefault(i, []).extend(seg_annotations)
+                        loading_stats['sources_with_annotations'][variant] = (
+                            loading_stats['sources_with_annotations'].get(variant, 0) + 1)
+
+                    loading_stats['processed_images'] += 1
+
             progress.close()
-            
+
+            self.update_source_annotation_summary()
+
             # 結果の表示と更新
             self._finalize_yolo_annotation_loading(loading_stats, classes)
             
@@ -17761,10 +17996,9 @@ class ImageAnnotationTool(QMainWindow):
                     self.setFont(font)
                     self.apply_font_to_children(self, font)
                 
-                # ダークモード設定を適用
+                # ダークモード設定（適用は呼び出し元の __init__ でまとめて行う）
                 if "dark_mode" in settings:
                     self.is_dark_mode = settings["dark_mode"]
-                    self.apply_dark_mode(self.is_dark_mode)
                     
             except Exception as e:
                 print(f"表示設定の読み込みエラー: {e}")
@@ -17846,17 +18080,21 @@ class ImageAnnotationTool(QMainWindow):
 
         if backend_info["type"] == "databricks+local":
             self.databricks_status_label.setText(get_text('label_databricks_combined'))
-            self.databricks_status_label.setStyleSheet("color: green; font-size: 10px;")
+            self.databricks_status_label.setStyleSheet("font-size: 10px;")
+            set_text_role(self.databricks_status_label, 'success')
         elif backend_info["type"] == "databricks":
             if backend_info["status"] == get_text('status_disconnected'):
                 self.databricks_status_label.setText(get_text('label_databricks_disconnected'))
-                self.databricks_status_label.setStyleSheet("color: orange; font-size: 10px;")
+                self.databricks_status_label.setStyleSheet("font-size: 10px;")
+                set_text_role(self.databricks_status_label, 'warning')
             else:
                 self.databricks_status_label.setText(f"✓ Databricks: {backend_info['host'][:30]}...")
-                self.databricks_status_label.setStyleSheet("color: green; font-size: 10px;")
+                self.databricks_status_label.setStyleSheet("font-size: 10px;")
+                set_text_role(self.databricks_status_label, 'success')
         else:
             self.databricks_status_label.setText(get_text('label_local_mlflow'))
-            self.databricks_status_label.setStyleSheet("color: gray; font-size: 10px;")
+            self.databricks_status_label.setStyleSheet("font-size: 10px;")
+            set_text_role(self.databricks_status_label, 'faint')
 
     def _open_local_mlflow_ui(self):
         """ローカルMLflow UIを開く"""
@@ -18029,7 +18267,7 @@ class ImageAnnotationTool(QMainWindow):
         status_layout.addWidget(QLabel(get_text('label_unsynced_runs', sync_status['unsynced_runs'])))
         if orphaned_count > 0:
             orphaned_label = QLabel(get_text('label_orphaned_runs', orphaned_count))
-            orphaned_label.setStyleSheet("color: orange;")
+            set_text_role(orphaned_label, 'warning')
             status_layout.addWidget(orphaned_label)
         status_group.setLayout(status_layout)
         layout.addWidget(status_group)
@@ -18054,7 +18292,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # 警告ラベル
         warning_label = QLabel(get_text('msg_sync_delete_warning'))
-        warning_label.setStyleSheet("color: red; font-size: 10px;")
+        warning_label.setStyleSheet("font-size: 10px;")
+        set_text_role(warning_label, 'error')
         options_layout.addWidget(warning_label)
 
         options_group.setLayout(options_layout)
@@ -18561,7 +18800,8 @@ class ImageAnnotationTool(QMainWindow):
 
         hint_label = QLabel(get_text('db_monitor_hint'))
         hint_label.setWordWrap(True)
-        hint_label.setStyleSheet("color: gray; font-size: 11px;")
+        hint_label.setStyleSheet("font-size: 11px;")
+        set_text_role(hint_label, 'faint')
         v.addWidget(hint_label)
 
         btn_row = QHBoxLayout()
@@ -19011,7 +19251,8 @@ class ImageAnnotationTool(QMainWindow):
 
         oauth_hint = QLabel(get_text('db_auth_oauth_hint'))
         oauth_hint.setWordWrap(True)
-        oauth_hint.setStyleSheet("color: gray; font-size: 11px;")
+        oauth_hint.setStyleSheet("font-size: 11px;")
+        set_text_role(oauth_hint, 'faint')
         form.addRow("", oauth_hint)
 
         def _on_auth_changed():
@@ -19060,7 +19301,7 @@ class ImageAnnotationTool(QMainWindow):
 
         def set_msg(text, color="gray"):
             msg_label.setText(text)
-            msg_label.setStyleSheet(f"color: {color};")
+            set_text_role(msg_label, {'green': 'success', 'red': 'error'}.get(color, 'faint'))
             QApplication.processEvents()
 
         def gather():
@@ -19235,16 +19476,16 @@ class ImageAnnotationTool(QMainWindow):
             if status['enabled']:
                 if status.get('authenticated'):
                     self.colab_status_label.setText(get_text('label_colab_authenticated'))
-                    self.colab_status_label.setStyleSheet("color: green;")
+                    set_text_role(self.colab_status_label, 'success')
                 else:
                     self.colab_status_label.setText(get_text('label_colab_not_authenticated'))
-                    self.colab_status_label.setStyleSheet("color: orange;")
+                    set_text_role(self.colab_status_label, 'warning')
             else:
                 self.colab_status_label.setText(get_text('label_colab_disabled'))
-                self.colab_status_label.setStyleSheet("color: gray;")
+                set_text_role(self.colab_status_label, 'faint')
         except ImportError:
             self.colab_status_label.setText(get_text('label_colab_no_config'))
-            self.colab_status_label.setStyleSheet("color: red;")
+            set_text_role(self.colab_status_label, 'error')
 
     def _open_colab_ui(self):
         """Google Colabを開く"""
@@ -19334,7 +19575,8 @@ class ImageAnnotationTool(QMainWindow):
             "注意: 初回転送時はGoogleアカウントの認証が必要です。\n"
             "ブラウザが開きますので、アカウントを選択して認証してください。"
         )
-        note_label.setStyleSheet("color: gray; font-size: 10px;")
+        note_label.setStyleSheet("font-size: 10px;")
+        set_text_role(note_label, 'faint')
         note_label.setWordWrap(True)
         layout.addWidget(note_label)
 
@@ -20235,115 +20477,41 @@ class ImageAnnotationTool(QMainWindow):
             )
 
     def apply_dark_mode(self, is_dark):
-        """ダークモードのスタイルシートを適用"""
-        if is_dark:
-            # ダークモードのスタイル（色のみ変更、padding/borderはデフォルト維持）
-            dark_style = """
-            QMainWindow {
-                background-color: #2b2b2b;
-                color: #ffffff;
-            }
-            QWidget {
-                background-color: #2b2b2b;
-                color: #ffffff;
-            }
-            QPushButton {
-                background-color: #404040;
-                color: #ffffff;
-            }
-            QPushButton:hover {
-                background-color: #505050;
-            }
-            QPushButton:pressed {
-                background-color: #606060;
-            }
-            QPushButton:checked {
-                background-color: #0078d4;
-            }
-            QLabel {
-                background-color: transparent;
-                color: #ffffff;
-            }
-            QLineEdit {
-                background-color: #404040;
-                color: #ffffff;
-            }
-            QComboBox {
-                background-color: #404040;
-                color: #ffffff;
-            }
-            QComboBox QAbstractItemView {
-                background-color: #404040;
-                selection-background-color: #0078d4;
-                color: #ffffff;
-            }
-            QScrollArea {
-                background-color: #2b2b2b;
-            }
-            QGroupBox {
-                color: #ffffff;
-            }
-            QGroupBox::title {
-                color: #ffffff;
-            }
-            QSpinBox {
-                background-color: #404040;
-                color: #ffffff;
-            }
-            QDialog {
-                background-color: #2b2b2b;
-                color: #ffffff;
-            }
-            QTabWidget::pane {
-                background-color: #2b2b2b;
-            }
-            QTabBar::tab {
-                background-color: #404040;
-                color: #ffffff;
-            }
-            QTabBar::tab:selected {
-                background-color: #0078d4;
-            }
-            """
-            # 現在のウィンドウサイズを保持
-            current_size = self.size()
+        """ダーク/ライトモードをアプリ全体に適用する。
 
-            self.setStyleSheet(dark_style)
+        色は styles.apply_app_theme() のアプリ全体QSSで決まる。個々のウィジェットは
+        固定色を持たず役割（set_text_role 等）だけを持つので、貼り直すだけで追従する。
+        作成時にモードを見て色を決めている位置ボタンだけは作り直す。
+        """
+        current_size = self.size()
+        apply_app_theme(is_dark)
+        if hasattr(self, 'update_location_button_counts'):
+            self.update_location_button_counts()
+        # ウィンドウサイズを維持
+        self.resize(current_size)
 
-            # ラベルの色を明示的に更新
-            if hasattr(self, 'idx_label'):
-                self.idx_label.update()
-            if hasattr(self, 'current_image_label'):
-                self.current_image_label.update()
-            if hasattr(self, 'current_image_info'):
-                self.current_image_info.setStyleSheet("color: #ffffff; font-weight: bold;")
-            if hasattr(self, 'graph_title'):
-                self.graph_title.setStyleSheet("font-weight: bold; color: #ffffff;")
+    def _schedule_fixed_class_advance(self):
+        """「クラス固定で次に進む」の自動送りを予約する。
 
-            # ウィンドウサイズを維持
-            self.resize(current_size)
-        else:
-            # ライトモードのスタイル（デフォルト）
-            # 現在のウィンドウサイズを保持
-            current_size = self.size()
+        1フレームに複数のアノテーションを追加しても送りは1回だけにする。
+        """
+        if getattr(self, '_fixed_advance_pending', False):
+            return
+        self._fixed_advance_pending = True
+        skip = self.skip_count_spin.value()
 
-            self.setStyleSheet("")
+        def _advance():
+            self._fixed_advance_pending = False
+            self.skip_images(skip)
 
-            # ラベルの色を明示的に更新
-            if hasattr(self, 'idx_label'):
-                self.idx_label.update()
-            if hasattr(self, 'current_image_label'):
-                self.current_image_label.update()
-            if hasattr(self, 'current_image_info'):
-                self.current_image_info.setStyleSheet("color: #333333; font-weight: bold;")
-            if hasattr(self, 'graph_title'):
-                self.graph_title.setStyleSheet("font-weight: bold; color: #333333;")
+        QTimer.singleShot(80, _advance)
 
-            # ウィンドウサイズを維持
-            self.resize(current_size)
+    def add_bbox_annotation(self, bbox, advance=True):
+        """バウンディングボックスアノテーションを追加
 
-    def add_bbox_annotation(self, bbox):
-        """バウンディングボックスアノテーションを追加"""
+        advance=False は自動適用など、ユーザー操作でない追加に使う。
+        （自動適用でも送ってしまうと「送る→自動適用→また送る」で暴走する）
+        """
         if not self.images:
             return
         
@@ -20371,10 +20539,11 @@ class ImageAnnotationTool(QMainWindow):
         self.main_image_view.update()
         self.update_gallery()
 
+        self.update_source_annotation_summary()
+
         # クラス固定で次に進む
-        if getattr(self, '_bbox_fixed_class_advance', False):
-            skip = self.skip_count_spin.value()
-            QTimer.singleShot(80, lambda: self.skip_images(skip))
+        if advance and getattr(self, '_bbox_fixed_class_advance', False):
+            self._schedule_fixed_class_advance()
 
     def add_session_check_to_init_ui(self):
         """init_uiメソッドの最後に追加する初期セッション確認コード"""
@@ -21393,6 +21562,11 @@ class ImageAnnotationTool(QMainWindow):
         self.mask_target_combo.setEnabled(not checked)
         self.mask_edit_index = index if checked else None
 
+        # 編集終了時に頂点ドラッグ状態が残ると、以後のリリースを飲み込む
+        if not checked and hasattr(self, 'main_image_view'):
+            self.main_image_view._mask_drag_index = None
+            self.main_image_view._mask_drag_mirrored = False
+
         mask = self.masks[index]
         name = self.mask_display_name(mask)
         points = mask['points']
@@ -21811,9 +21985,9 @@ class ImageAnnotationTool(QMainWindow):
         view.togivad_control_point = QPoint(res['x'], res['y'])
         if label is not None:
             text = (f"<b>{get_text('label_togivad_control_infer')}</b><br>"
-                    f"angle = <span style='color: #6A1B9A;'>"
+                    f"angle = <span style='color: {theme_color('accent')};'>"
                     f"{res['angle']:.4f}</span><br>"
-                    f"throttle = <span style='color: #6A1B9A;'>"
+                    f"throttle = <span style='color: {theme_color('accent')};'>"
                     f"{res['throttle']:.4f}</span>")
             label.setText(text)
             label.setTextFormat(Qt.RichText)
@@ -22717,15 +22891,15 @@ class ImageAnnotationTool(QMainWindow):
 
             # 推論情報のリッチテキスト
             inference_text = f"<b>{get_text('label_inference_result_header')}</b><br>"
-            inference_text += f"angle = <span style='color: #009999;'>{angle:.4f}</span><br>"
-            inference_text += f"throttle = <span style='color: #009999;'>{throttle:.4f}</span>"
+            inference_text += f"angle = <span style='color: {theme_color('teal')};'>{angle:.4f}</span><br>"
+            inference_text += f"throttle = <span style='color: {theme_color('teal')};'>{throttle:.4f}</span>"
 
             # 速度推論結果（正規化値と実速度[m/s]）を表示
             infer_speed = inference.get("pilot/speed", inference.get("speed"))
             if infer_speed is not None:
                 _snorm = inference.get('speed_normalize') or getattr(self.main_image_view, 'max_speed', MAX_SPEED)
                 inference_text += (
-                    f"<br>speed = <span style='color: #009999;'>{infer_speed:.4f}</span>"
+                    f"<br>speed = <span style='color: {theme_color('teal')};'>{infer_speed:.4f}</span>"
                     f" ({infer_speed * _snorm:.2f} m/s)"
                 )
 
@@ -23094,6 +23268,9 @@ class ImageAnnotationTool(QMainWindow):
                 # camがなければ最初のキー
                 self.current_variant = self.available_variants[0]
                 print(f"[INFO] 新しいフォルダ読み込み: '{self.current_variant}' バリアントを選択 (cam なし)")
+
+        # 画像ソース別のアノテーションストアを初期化（前フォルダの残骸を持ち越さない）
+        self.reset_source_stores(self.current_variant)
 
         # 現在のキーの画像を選択
         images = self.variant_images[self.current_variant]
@@ -23637,7 +23814,8 @@ class ImageAnnotationTool(QMainWindow):
             if ms_info['selected_sources']:
                 trained_label = QLabel(get_text('label_multi_source_trained_sources',
                                                 ', '.join(ms_info['selected_sources'])))
-                trained_label.setStyleSheet("color: #888; font-style: italic;")
+                trained_label.setStyleSheet("font-style: italic;")
+                set_text_role(trained_label, 'faint')
                 ms_layout.addWidget(trained_label)
 
             # ソース選択
@@ -23657,7 +23835,7 @@ class ImageAnnotationTool(QMainWindow):
             # 選択数の表示ラベル
             count_label = QLabel(get_text('msg_multi_source_need_sources',
                                           ms_info['num_sources'], 0))
-            count_label.setStyleSheet("color: #cc6600;")
+            set_text_role(count_label, 'warning')
             ms_layout.addWidget(count_label)
 
             def update_count():
@@ -23665,9 +23843,9 @@ class ImageAnnotationTool(QMainWindow):
                 count_label.setText(get_text('msg_multi_source_need_sources',
                                              ms_info['num_sources'], checked))
                 if checked == ms_info['num_sources']:
-                    count_label.setStyleSheet("color: #00aa00;")
+                    set_text_role(count_label, 'success')
                 else:
-                    count_label.setStyleSheet("color: #cc6600;")
+                    set_text_role(count_label, 'warning')
 
             for cb in ms_checkboxes:
                 cb.toggled.connect(lambda _: update_count())
@@ -24059,13 +24237,6 @@ class ImageAnnotationTool(QMainWindow):
             self.update_variant_buttons()
             self.update_ui()
             
-            # ダークモードの状態を再適用（モデル読み込み後のスタイルリセット対策）
-            if hasattr(self, 'is_dark_mode') and self.is_dark_mode:
-                if hasattr(self, 'current_image_info'):
-                    self.current_image_info.setStyleSheet("color: #ffffff; font-weight: bold;")
-                if hasattr(self, 'graph_title'):
-                    self.graph_title.setStyleSheet("font-weight: bold; color: #ffffff;")
-
             progress.setValue(100)
             QApplication.processEvents()
             
@@ -25068,9 +25239,10 @@ class ImageAnnotationTool(QMainWindow):
 
             # 削除済みの場合は赤字で表示
             if is_deleted:
-                self.current_image_info.setStyleSheet("color: #FF5555; font-weight: bold;")
+                set_text_role(self.current_image_info, 'error')
             else:
-                self.current_image_info.setStyleSheet("color: #333333; font-weight: bold;")
+                self.current_image_info.setStyleSheet("font-weight: bold;")
+                set_text_role(self.current_image_info, 'strong')
 
         # アノテーション情報の表示
         self._update_annotation_info_display(current_index, is_deleted)
@@ -25181,7 +25353,7 @@ class ImageAnnotationTool(QMainWindow):
             self.current_location_label.setText(get_text('label_current_location_value', location_value))
 
             # 位置情報に基づいた色を取得
-            loc_color = get_location_color(location_value)
+            loc_color = location_text_color(location_value)
             self.current_location_label.setStyleSheet(f"color: {loc_color.name()}; font-weight: bold;")
 
             # ボタンの選択状態を更新
@@ -25442,14 +25614,14 @@ class ImageAnnotationTool(QMainWindow):
                 if hasattr(self, 'last_bboxes') and self.last_bboxes:
                     # すべてのボックスを適用
                     for bbox in self.last_bboxes:
-                        self.add_bbox_annotation(bbox.copy())
+                        self.add_bbox_annotation(bbox.copy(), advance=False)
                     
                     # ステータスバーに表示
                     self.statusBar().showMessage(get_text('status_bboxes_auto_applied', len(self.last_bboxes)), 3000)
                 
                 elif hasattr(self, 'last_bbox') and self.last_bbox is not None:
                     # 後方互換性のため、単一ボックスの場合も処理
-                    self.add_bbox_annotation(self.last_bbox.copy())
+                    self.add_bbox_annotation(self.last_bbox.copy(), advance=False)
                     self.statusBar().showMessage(get_text('status_bbox_auto_applied', self.last_bbox['class']), 3000)
 
         # 前回のセグメンテーションを自動適用（最後に追加）
@@ -25461,14 +25633,14 @@ class ImageAnnotationTool(QMainWindow):
                 if hasattr(self, 'last_segmentations') and self.last_segmentations:
                     # すべてのセグメンテーションを適用
                     for seg in self.last_segmentations:
-                        self.add_segmentation_annotation(seg.copy())
+                        self.add_segmentation_annotation(seg.copy(), advance=False)
                     
                     # ステータスバーに表示
                     self.statusBar().showMessage(get_text('status_segs_auto_applied', len(self.last_segmentations)), 3000)
                 
                 elif hasattr(self, 'last_segmentation') and self.last_segmentation:
                     # 後方互換性のため、単一セグメンテーションの場合も処理
-                    self.add_segmentation_annotation(self.last_segmentation.copy())
+                    self.add_segmentation_annotation(self.last_segmentation.copy(), advance=False)
                     self.statusBar().showMessage(get_text('status_seg_auto_applied', self.last_segmentation['class']), 3000)
 
         # 前回waypoint自動適用機能
@@ -26211,7 +26383,8 @@ class ImageAnnotationTool(QMainWindow):
         
         # 複数ソース選択時の説明
         multi_source_info = QLabel(get_text('label_multi_source_note'))
-        multi_source_info.setStyleSheet("color: #666; font-style: italic;")
+        multi_source_info.setStyleSheet("font-style: italic;")
+        set_text_role(multi_source_info, 'muted')
         output_mode_layout.addWidget(multi_source_info)
         
         dialog_layout.addWidget(output_mode_group)
@@ -26657,11 +26830,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # 各設定パネルを薄い色で塗り分けてスクロール中でも区別しやすくする
         def _tint_group(group, bg_color, border_color):
-            group.setStyleSheet(
-                "QGroupBox { background-color: %s; border: 1px solid %s;"
-                " border-radius: 6px; margin-top: 8px; padding-top: 6px; font-weight: bold; }"
-                " QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }"
-                % (bg_color, border_color))
+            group.setStyleSheet(tint_group_qss(bg_color, border_color))
 
         # 初期化設定グループ（モデル選択と重みの読み込み）
         init_group = QGroupBox(get_text('label_init_settings'))
@@ -26878,14 +27047,14 @@ class ImageAnnotationTool(QMainWindow):
             speed_row_layout.addWidget(speed_normalize_spin)
 
             speed_normalize_info = QLabel(get_text('label_speed_normalize_note'))
-            speed_normalize_info.setStyleSheet("color: #666;")
+            set_text_role(speed_normalize_info, 'muted')
             speed_row_layout.addWidget(speed_normalize_info)
 
             speed_row_layout.addStretch()
             output_settings_layout.addLayout(speed_row_layout)
 
             speed_info_label = QLabel(get_text('label_speed_data_info', speed_count))
-            speed_info_label.setStyleSheet("color: #666;")
+            set_text_role(speed_info_label, 'muted')
             output_settings_layout.addWidget(speed_info_label)
 
             # セクション間のスペース
@@ -26897,11 +27066,11 @@ class ImageAnnotationTool(QMainWindow):
         output_settings_layout.addWidget(future_output_check)
 
         future_info_label = QLabel(get_text('label_future_info'))
-        future_info_label.setStyleSheet("color: #666;")
+        set_text_role(future_info_label, 'muted')
         output_settings_layout.addWidget(future_info_label)
 
         future_detail_label = QLabel(get_text('label_future_detail'))
-        future_detail_label.setStyleSheet("color: #888;")
+        set_text_role(future_detail_label, 'faint')
         future_detail_label.setWordWrap(True)
         output_settings_layout.addWidget(future_detail_label)
 
@@ -26956,7 +27125,7 @@ class ImageAnnotationTool(QMainWindow):
         output_settings_layout.addLayout(future_label_row)
 
         future_label_info_label = QLabel(get_text('label_future_label_info'))
-        future_label_info_label.setStyleSheet("color: #666;")
+        set_text_role(future_label_info_label, 'muted')
         future_label_info_label.setWordWrap(True)
         output_settings_layout.addWidget(future_label_info_label)
 
@@ -26974,13 +27143,13 @@ class ImageAnnotationTool(QMainWindow):
                 _check.setToolTip(get_text('tip_use_mask'))
                 output_settings_layout.addWidget(_check)
                 _info = QLabel(get_text('label_mask_info', len(_mpolygon)))
-                _info.setStyleSheet("color: #666;")
+                set_text_role(_info, 'muted')
                 _info.setWordWrap(True)
                 output_settings_layout.addWidget(_info)
                 mask_checks.append((_check, _mname, _mpolygon))
         else:
             _no_mask_label = QLabel(get_text('label_mask_not_set'))
-            _no_mask_label.setStyleSheet("color: #666;")
+            set_text_role(_no_mask_label, 'muted')
             _no_mask_label.setWordWrap(True)
             output_settings_layout.addWidget(_no_mask_label)
 
@@ -27004,7 +27173,7 @@ class ImageAnnotationTool(QMainWindow):
         rl_layout.addWidget(rl_enable_check)
 
         rl_info_label = QLabel(get_text('label_rl_weight_info'))
-        rl_info_label.setStyleSheet("color: #666;")
+        set_text_role(rl_info_label, 'muted')
         rl_info_label.setWordWrap(True)
         rl_layout.addWidget(rl_info_label)
 
@@ -27052,7 +27221,7 @@ class ImageAnnotationTool(QMainWindow):
                                     (get_text('label_rl_target'), rl_target_combo)))
         if not has_speed_data:
             _rl_nospeed = QLabel(get_text('label_rl_no_speed'))
-            _rl_nospeed.setStyleSheet("color: #a65;")
+            set_text_role(_rl_nospeed, 'warning')
             _rl_nospeed.setWordWrap(True)
             rl_widgets.append(_rl_nospeed)
             rl_layout.addWidget(_rl_nospeed)
@@ -27093,7 +27262,7 @@ class ImageAnnotationTool(QMainWindow):
         rl_preview_btn = QPushButton(get_text('btn_rl_preview'))
         rl_widgets.append(rl_preview_btn)
         rl_stats_label = QLabel('')
-        rl_stats_label.setStyleSheet("color: #666;")
+        set_text_role(rl_stats_label, 'muted')
         rl_stats_label.setWordWrap(True)
         rl_widgets.append(rl_stats_label)
         rl_layout.addLayout(_rl_row((None, rl_preview_btn), (None, rl_stats_label)))
@@ -27149,7 +27318,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # 説明ラベル
         image_source_info = QLabel(get_text('label_training_image_sources_info'))
-        image_source_info.setStyleSheet("color: #666;")
+        set_text_role(image_source_info, 'muted')
         image_source_info.setWordWrap(True)
         image_source_layout.addWidget(image_source_info)
 
@@ -27188,7 +27357,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # 選択状況ラベル
         training_sources_count_label = QLabel("")
-        training_sources_count_label.setStyleSheet("color: #2E7D32; font-weight: bold;")
+        training_sources_count_label.setStyleSheet("font-weight: bold;")
+        set_text_role(training_sources_count_label, 'success')
         image_source_layout.addWidget(training_sources_count_label)
 
         def update_training_sources_count():
@@ -27229,7 +27399,7 @@ class ImageAnnotationTool(QMainWindow):
         fusion_layout = QVBoxLayout()
 
         fusion_info = QLabel(get_text('label_fusion_info'))
-        fusion_info.setStyleSheet("color: #666;")
+        set_text_role(fusion_info, 'muted')
         fusion_info.setWordWrap(True)
         fusion_layout.addWidget(fusion_info)
 
@@ -27244,7 +27414,8 @@ class ImageAnnotationTool(QMainWindow):
         fusion_layout.addLayout(fusion_method_layout)
 
         fusion_note = QLabel(get_text('label_multi_source_note'))
-        fusion_note.setStyleSheet("color: #E65100; font-weight: bold;")
+        fusion_note.setStyleSheet("font-weight: bold;")
+        set_text_role(fusion_note, 'warning')
         fusion_note.setWordWrap(True)
         fusion_layout.addWidget(fusion_note)
 
@@ -27303,7 +27474,8 @@ class ImageAnnotationTool(QMainWindow):
         virtual_layout.addWidget(temporal_interval_row_widget)
 
         virtual_note = QLabel(get_text('label_virtual_source_note'))
-        virtual_note.setStyleSheet("color: #1565C0; font-style: italic;")
+        virtual_note.setStyleSheet("font-style: italic;")
+        set_text_role(virtual_note, 'info')
         virtual_note.setWordWrap(True)
         virtual_layout.addWidget(virtual_note)
 
@@ -27363,7 +27535,7 @@ class ImageAnnotationTool(QMainWindow):
         pip_settings_layout.addWidget(pip_rect_row_widget)
 
         pip_note = QLabel(get_text('label_pip_note'))
-        pip_note.setStyleSheet("color: #666;")
+        set_text_role(pip_note, 'muted')
         pip_note.setWordWrap(True)
         pip_settings_layout.addWidget(pip_note)
 
@@ -27686,7 +27858,8 @@ class ImageAnnotationTool(QMainWindow):
                 if exclude_downsampled and ds_count > 0:
                     exclude_info += get_text('label_excluded_ds', ds_count)
                 data_sample_label.setText(get_text('label_data_count_all_detail', sample_count, total_annotations, exclude_info))
-                data_sample_label.setStyleSheet("color: #2E7D32; font-weight: bold; font-size: 13px;")
+                data_sample_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+                set_text_role(data_sample_label, 'success')
             elif data_radio_skip.isChecked():
                 skip = custom_skip_spin.value()
                 total_skipped = 0
@@ -27707,7 +27880,8 @@ class ImageAnnotationTool(QMainWindow):
                 if exclude_downsampled and ds_count > 0:
                     exclude_info += get_text('label_excluded_ds', ds_count)
                 data_sample_label.setText(get_text('label_data_count_skip_detail', sample_count, skip, total_skipped, exclude_info))
-                data_sample_label.setStyleSheet("color: #2E7D32; font-weight: bold; font-size: 13px;")
+                data_sample_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+                set_text_role(data_sample_label, 'success')
             elif data_radio_range.isChecked():
                 start = range_start_spin.value()
                 end = range_end_spin.value()
@@ -27729,7 +27903,8 @@ class ImageAnnotationTool(QMainWindow):
                 if exclude_downsampled and ds_count > 0:
                     exclude_info += get_text('label_excluded_ds', ds_count)
                 data_sample_label.setText(get_text('label_data_count_range_detail', sample_count, start, end, total_in_range, exclude_info))
-                data_sample_label.setStyleSheet("color: #2E7D32; font-weight: bold; font-size: 13px;")
+                data_sample_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+                set_text_role(data_sample_label, 'success')
 
         # ラジオボタンの状態変更イベントを接続
         data_radio_all.toggled.connect(update_data_selection_ui)
@@ -28157,10 +28332,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # 固定エリアコンテナ（わずかに暗い背景で視覚的に区別）
         _footer = QFrame()
-        _footer.setStyleSheet(
-            "QFrame { background-color: #e8eaed; border-radius: 0px; }"
-            "QGroupBox { background-color: transparent; }"
-        )
+        _footer.setStyleSheet("QGroupBox { background-color: transparent; }")
+        set_panel_role(_footer, 'footer')
         _footer_layout = QVBoxLayout(_footer)
         _footer_layout.setContentsMargins(8, 6, 8, 6)
         _footer_layout.setSpacing(6)
@@ -28183,7 +28356,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # プレフィックス（固定、編集不可）- 動的に更新される
         prefix_label = QLabel(f"{model_type}_")
-        prefix_label.setStyleSheet("background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc; font-family: monospace;")
+        prefix_label.setStyleSheet("padding: 5px; font-family: monospace;")
+        set_panel_role(prefix_label, 'code')
         name_input_layout.addWidget(prefix_label)
 
         # サフィックス（編集可能）
@@ -28195,7 +28369,8 @@ class ImageAnnotationTool(QMainWindow):
         model_name_layout.addLayout(name_input_layout)
 
         model_name_note = QLabel(get_text('label_model_name_note_pth', model_type))
-        model_name_note.setStyleSheet("color: #888; font-style: italic;")
+        model_name_note.setStyleSheet("font-style: italic;")
+        set_text_role(model_name_note, 'faint')
         model_name_layout.addWidget(model_name_note)
 
         # モデルタイプ・ソース数・融合方法が変わったらプレフィックスと注釈を更新
@@ -28243,7 +28418,9 @@ class ImageAnnotationTool(QMainWindow):
 
         settings_layout.addWidget(_footer)
 
-        # ダイアログを表示
+        # ダイアログを表示（中身が横スクロール無しで収まる大きさに広げる）
+        QTimer.singleShot(0, lambda: fit_dialog_to_scroll_content(
+            training_settings, [basic_scroll, aug_scroll]))
         if not training_settings.exec_():
             return
         
@@ -28816,7 +28993,13 @@ class ImageAnnotationTool(QMainWindow):
             header = get_text('label_togivad_inference_result')
         else:
             header = get_text('label_traj_inference_result')
-        header_color = '#00A0A0' if is_togivad else '#00C800'
+        if is_dark_mode():
+            cyan_cols = ('#4DD0E1', '#26C6DA', '#80DEEA')
+            green_cols = ('#69F0AE', '#81C784')
+        else:
+            cyan_cols = ('#00A0A0', '#008C8C', '#006A6A')
+            green_cols = ('#00C800', '#008000')
+        header_color = cyan_cols[0] if is_togivad else green_cols[0]
         gru_text = f"<b style='color:{header_color};'>{header}</b>"
         gru_text += "<table style='margin:0; padding:0; border-spacing:0;'>"
         if is_togivad:
@@ -28833,16 +29016,16 @@ class ImageAnnotationTool(QMainWindow):
             for step in steps:
                 x, y = trajectory[step]
                 gru_text += (
-                    f"<tr><td style='color:#00A0A0;'>{(step+1)*dt:.2f}&nbsp;</td>"
-                    f"<td style='color:#008C8C;'>{x:+.2f}&nbsp;</td>"
-                    f"<td style='color:#006A6A;'>{y:+.2f}</td></tr>"
+                    f"<tr><td style='color:{cyan_cols[0]};'>{(step+1)*dt:.2f}&nbsp;</td>"
+                    f"<td style='color:{cyan_cols[1]};'>{x:+.2f}&nbsp;</td>"
+                    f"<td style='color:{cyan_cols[2]};'>{y:+.2f}</td></tr>"
                 )
         else:
             for step, (s, t) in enumerate(trajectory):
                 gru_text += (
                     f"<tr><td>t+{step+1}:&nbsp;</td>"
-                    f"<td style='color:#00C800;'>{s:+.3f},&nbsp;</td>"
-                    f"<td style='color:#008000;'>{t:+.3f}</td></tr>"
+                    f"<td style='color:{green_cols[0]};'>{s:+.3f},&nbsp;</td>"
+                    f"<td style='color:{green_cols[1]};'>{t:+.3f}</td></tr>"
                 )
         gru_text += "</table>"
 
@@ -29068,7 +29251,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # dt と MPPI互換の目安を動的表示
         togivad_dt_label = QLabel("")
-        togivad_dt_label.setStyleSheet("color: #666;")
+        set_text_role(togivad_dt_label, 'muted')
         horizon_layout.addWidget(togivad_dt_label)
         horizon_layout.addStretch()
         togivad_layout.addLayout(horizon_layout)
@@ -29170,7 +29353,7 @@ class ImageAnnotationTool(QMainWindow):
         temporal_check.toggled.connect(_sync_track_enable)
 
         togivad_info_label = QLabel(get_text('label_togivad_info'))
-        togivad_info_label.setStyleSheet("color: #666;")
+        set_text_role(togivad_info_label, 'muted')
         togivad_info_label.setWordWrap(True)
         togivad_layout.addWidget(togivad_info_label)
 
@@ -29198,7 +29381,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # シーケンス情報ラベル
         seq_info_label = QLabel(get_text('label_traj_seq_info', SEQ_DEFAULT_SEQ_LEN, SEQ_DEFAULT_PRED_HORIZON))
-        seq_info_label.setStyleSheet("color: #666;")
+        set_text_role(seq_info_label, 'muted')
         arch_layout.addWidget(seq_info_label)
 
         def update_seq_info():
@@ -29245,11 +29428,11 @@ class ImageAnnotationTool(QMainWindow):
             count = len(checked)
             if count > MAX_IMAGE_SOURCES:
                 sources_label.setText(get_text('label_sources_max_exceeded', MAX_IMAGE_SOURCES))
-                sources_label.setStyleSheet("color: red;")
+                set_text_role(sources_label, 'error')
                 start_button.setEnabled(False)
             else:
                 sources_label.setText(get_text('label_sources_selected', count))
-                sources_label.setStyleSheet("")
+                set_text_role(sources_label, None)
                 start_button.setEnabled(count > 0)
 
         for cb in source_checkboxes.values():
@@ -29398,7 +29581,8 @@ class ImageAnnotationTool(QMainWindow):
                 deleted = sum(1 for idx in self.annotations if start <= idx <= end and hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes)
                 sample_count = total_in_range - deleted
                 data_sample_label.setText(get_text('label_data_count_range_detail', sample_count, start, end, total_in_range, get_text('label_excluded_deleted', deleted)))
-            data_sample_label.setStyleSheet("color: #2E7D32; font-weight: bold; font-size: 13px;")
+            data_sample_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+            set_text_role(data_sample_label, 'success')
 
         data_radio_all.toggled.connect(update_data_selection_ui)
         data_radio_skip.toggled.connect(update_data_selection_ui)
@@ -31358,20 +31542,7 @@ class ImageAnnotationTool(QMainWindow):
             color = get_location_color(i)
 
             # ボタンのスタイルを設定
-            button.setStyleSheet(f"""
-                QPushButton {{
-                    padding: 8px;
-                    border: 1px solid #cccccc;
-                    border-radius: 4px;
-                    background-color: #f0f0f0;
-                    color: #888888;
-                }}
-                QPushButton:checked {{
-                    background-color: {color.name()};
-                    color: white;
-                    font-weight: bold;
-                }}
-            """)
+            button.setStyleSheet(location_button_qss())
 
             # カウントをプロパティとして保持（表示更新用）
             button.setProperty("location_count", 0)
@@ -31709,7 +31880,7 @@ class ImageAnnotationTool(QMainWindow):
         # 表示自体は自動運転モデルの推論表示（inference_checkbox → 情報パネル＋
         # シアン推論点）と同じ経路を使うため、状態を双方向に同期する。
         gru_infer_label = QLabel(get_text('label_togivad_control_infer'))
-        gru_infer_label.setStyleSheet("color: #666;")
+        set_text_role(gru_infer_label, 'muted')
         gru_content_layout.addWidget(gru_infer_label)
         self.togivad_control_infer_checkbox = QCheckBox(
             get_text('chk_show_togivad_control_infer'))
@@ -32563,18 +32734,15 @@ class ImageAnnotationTool(QMainWindow):
 
         # 各設定パネルを薄い色で塗り分けて区別しやすくする（自動運転ダイアログと同じ）
         def _tint_group(group, bg_color, border_color):
-            group.setStyleSheet(
-                "QGroupBox { background-color: %s; border: 1px solid %s;"
-                " border-radius: 6px; margin-top: 8px; padding-top: 6px; font-weight: bold; }"
-                " QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }"
-                % (bg_color, border_color))
+            group.setStyleSheet(tint_group_qss(bg_color, border_color))
 
         # 左カラム: データ統計 / 入力画像ソース / 出力（教師データ）
         settings_layout = left_column
 
         # アノテーション統計情報を表示（削除済みマークを考慮）
         stats_label = QLabel(get_text('label_location_stats', total_images, annotated_images, valid_location_annotations, deleted_count, get_text('label_deleted_excluded_note')))
-        stats_label.setStyleSheet("padding: 10px; background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 5px;")
+        stats_label.setStyleSheet("padding: 10px; border-radius: 5px;")
+        set_panel_role(stats_label, 'box')
         settings_layout.addWidget(stats_label)
         
         settings_layout.addWidget(QLabel(""))  # スペース追加
@@ -32585,7 +32753,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # 固定クラス数の情報表示
         fixed_class_label = QLabel(get_text('label_fixed_class_note', num_classes))
-        fixed_class_label.setStyleSheet("color: #666666; font-style: italic;")
+        fixed_class_label.setStyleSheet("font-style: italic;")
+        set_text_role(fixed_class_label, 'muted')
         settings_layout.addWidget(fixed_class_label)
 
         # ---------------------------------------------------------------
@@ -32595,7 +32764,7 @@ class ImageAnnotationTool(QMainWindow):
         _tint_group(source_group, "#EEF6EE", "#BFDABF")
         source_layout = QVBoxLayout(source_group)
         source_info = QLabel(get_text('label_location_input_sources_info'))
-        source_info.setStyleSheet("color: #666;")
+        set_text_role(source_info, 'muted')
         source_info.setWordWrap(True)
         source_layout.addWidget(source_info)
 
@@ -32719,7 +32888,8 @@ class ImageAnnotationTool(QMainWindow):
         hist_row2.addStretch()
         history_opts.addLayout(hist_row2)
         history_note = QLabel(get_text('label_location_history_note'))
-        history_note.setStyleSheet("color: #1565C0; font-style: italic;")
+        history_note.setStyleSheet("font-style: italic;")
+        set_text_role(history_note, 'info')
         history_note.setWordWrap(True)
         history_opts.addWidget(history_note)
         source_layout.addWidget(history_opts_widget)
@@ -32728,7 +32898,8 @@ class ImageAnnotationTool(QMainWindow):
             lambda s: history_opts_widget.setVisible(training_settings.history_check.isChecked()))
 
         training_settings.source_count_label = QLabel("")
-        training_settings.source_count_label.setStyleSheet("color: #2E7D32; font-weight: bold;")
+        training_settings.source_count_label.setStyleSheet("font-weight: bold;")
+        set_text_role(training_settings.source_count_label, 'success')
         source_layout.addWidget(training_settings.source_count_label)
         settings_layout.addWidget(source_group)
 
@@ -32761,7 +32932,7 @@ class ImageAnnotationTool(QMainWindow):
         _tint_group(output_group, "#FBF7EE", "#E3D6B8")
         output_layout = QVBoxLayout(output_group)
         output_info = QLabel(get_text('label_location_output_info'))
-        output_info.setStyleSheet("color: #666;")
+        set_text_role(output_info, 'muted')
         output_info.setWordWrap(True)
         output_layout.addWidget(output_info)
 
@@ -32873,12 +33044,13 @@ class ImageAnnotationTool(QMainWindow):
         grid_row2.addStretch()
         grid_opts.addLayout(grid_row2)
         training_settings.grid_size_label = QLabel("")
-        training_settings.grid_size_label.setStyleSheet("color: #2E7D32;")
+        set_text_role(training_settings.grid_size_label, 'success')
         grid_opts.addWidget(training_settings.grid_size_label)
         output_layout.addWidget(grid_opts_widget)
 
         pose_note = QLabel(get_text('label_location_pose_note'))
-        pose_note.setStyleSheet("color: #1565C0; font-style: italic;")
+        pose_note.setStyleSheet("font-style: italic;")
+        set_text_role(pose_note, 'info')
         pose_note.setWordWrap(True)
         output_layout.addWidget(pose_note)
         settings_layout.addWidget(output_group)
@@ -32942,7 +33114,7 @@ class ImageAnnotationTool(QMainWindow):
         _tint_group(resolution_group, "#FBF0F4", "#E8C6D4")
         resolution_layout = QVBoxLayout(resolution_group)
         res_info = QLabel(get_text('label_location_resolution_info'))
-        res_info.setStyleSheet("color: #666;")
+        set_text_role(res_info, 'muted')
         res_info.setWordWrap(True)
         resolution_layout.addWidget(res_info)
 
@@ -32974,7 +33146,7 @@ class ImageAnnotationTool(QMainWindow):
         resolution_layout.addWidget(training_settings.resize_radio)
 
         training_settings.res_size_label = QLabel("")
-        training_settings.res_size_label.setStyleSheet("color: #2E7D32;")
+        set_text_role(training_settings.res_size_label, 'success')
         resolution_layout.addWidget(training_settings.res_size_label)
         settings_layout.addWidget(resolution_group)
 
@@ -33066,7 +33238,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # プレフィックス（固定、編集不可）
         prefix_label = QLabel(location_prefix)
-        prefix_label.setStyleSheet("background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc; font-family: monospace;")
+        prefix_label.setStyleSheet("padding: 5px; font-family: monospace;")
+        set_panel_role(prefix_label, 'code')
         name_input_layout.addWidget(prefix_label)
 
         # サフィックス（編集可能）
@@ -33081,7 +33254,8 @@ class ImageAnnotationTool(QMainWindow):
         training_settings.model_name_prefix = location_prefix
 
         model_name_note = QLabel(get_text('label_model_name_note_pth', model_type))
-        model_name_note.setStyleSheet("color: #888; font-style: italic; font-size: 10px;")
+        model_name_note.setStyleSheet("font-style: italic; font-size: 10px;")
+        set_text_role(model_name_note, 'faint')
         model_name_layout.addWidget(model_name_note)
 
         settings_layout.addWidget(model_name_group)
@@ -33114,6 +33288,9 @@ class ImageAnnotationTool(QMainWindow):
         _update_source_ui()
         _update_output_ui()
 
+        # 表示直後に中身が横スクロール無しで収まる大きさへ広げる
+        QTimer.singleShot(0, lambda: fit_dialog_to_scroll_content(training_settings, [body_scroll]))
+
         return training_settings
 
     def _create_waypoint_training_dialog(self, model_type, most_common_waypoint_count, total_images, annotated_images, valid_waypoint_count, deleted_count):
@@ -33127,7 +33304,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # アノテーション統計情報を表示
         stats_label = QLabel(get_text('label_waypoint_stats', total_images, annotated_images, valid_waypoint_count, deleted_count, get_text('label_deleted_excluded_note')))
-        stats_label.setStyleSheet("padding: 10px; background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 5px;")
+        stats_label.setStyleSheet("padding: 10px; border-radius: 5px;")
+        set_panel_role(stats_label, 'box')
         settings_layout.addWidget(stats_label)
 
         settings_layout.addWidget(QLabel(""))  # スペース追加
@@ -33205,7 +33383,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # プレフィックス（固定、編集不可）
         prefix_label = QLabel(waypoint_prefix)
-        prefix_label.setStyleSheet("background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc; font-family: monospace;")
+        prefix_label.setStyleSheet("padding: 5px; font-family: monospace;")
+        set_panel_role(prefix_label, 'code')
         name_input_layout.addWidget(prefix_label)
 
         # サフィックス（編集可能）
@@ -33220,7 +33399,8 @@ class ImageAnnotationTool(QMainWindow):
         training_settings.model_name_prefix = waypoint_prefix
 
         model_name_note = QLabel(get_text('label_model_name_note_pth', model_type))
-        model_name_note.setStyleSheet("color: #888; font-style: italic; font-size: 10px;")
+        model_name_note.setStyleSheet("font-style: italic; font-size: 10px;")
+        set_text_role(model_name_note, 'faint')
         model_name_layout.addWidget(model_name_note)
 
         settings_layout.addWidget(model_name_group)
@@ -34477,7 +34657,7 @@ class ImageAnnotationTool(QMainWindow):
                                 err_text = get_text('label_location_pose_error', f'{pos_err:.2f}', f'{abs(math.degrees(d)):.1f}')
                             else:
                                 err_text = get_text('label_location_pose_error_pos_only', f'{pos_err:.2f}')
-                            inference_text += f"<span style='color: #444;'>{err_text}</span><br>"
+                            inference_text += f"<span style='color: {theme_color('strong')};'>{err_text}</span><br>"
 
                 # 履歴入力ありのモデル: 履歴のソースと有効ステップ数
                 if 'history_valid_steps' in result:
@@ -34485,7 +34665,7 @@ class ImageAnnotationTool(QMainWindow):
                     src_text = (get_text('label_location_history_src_inference')
                                 if getattr(self, 'location_history_from_inference', False)
                                 else get_text('label_location_history_src_measured'))
-                    inference_text += (f"<span style='color: #444;'>"
+                    inference_text += (f"<span style='color: {theme_color('strong')};'>"
                                        f"{get_text('label_location_history_info', src_text, result['history_valid_steps'], cfg.get('pose_history_steps', 0))}"
                                        f"</span><br>")
 
@@ -34504,7 +34684,7 @@ class ImageAnnotationTool(QMainWindow):
                     inference_text += (f"<span style='font-weight: bold;'>"
                                        f"{get_text('label_location_grid_result', mode_text, f'{ex:.2f}', f'{ey:.2f}')}"
                                        f"</span><br>")
-                    inference_text += (f"<span style='color: #444;'>"
+                    inference_text += (f"<span style='color: {theme_color('strong')};'>"
                                        f"{get_text('label_location_grid_top1', t1['ix'], t1['iy'], f'{t1['prob']:.3f}', f'{t1['x']:.2f}', f'{t1['y']:.2f}')}"
                                        f"</span><br>")
                     # 実測との誤差
@@ -34515,12 +34695,12 @@ class ImageAnnotationTool(QMainWindow):
                         if gt is not None:
                             e_top1 = math.hypot(t1['x'] - gt.x, t1['y'] - gt.y)
                             e_w = math.hypot(wx - gt.x, wy - gt.y)
-                            inference_text += (f"<span style='color: #444;'>"
+                            inference_text += (f"<span style='color: {theme_color('strong')};'>"
                                                f"{get_text('label_location_grid_error', f'{e_top1:.2f}', top_n, f'{e_w:.2f}')}"
                                                f"</span><br>")
                     # Top-N 一覧（確率降順）
                     for rank, it in enumerate(top[:top_n], start=1):
-                        inference_text += (f"<span style='color: #555;'>"
+                        inference_text += (f"<span style='color: {theme_color('muted')};'>"
                                            f"{get_text('label_location_grid_rank', rank, it['ix'], it['iy'], f'{it['prob']:.3f}')}"
                                            f"</span><br>")
 
@@ -34605,16 +34785,19 @@ class ImageAnnotationTool(QMainWindow):
             self.image_slider.setDownsampledIndexes(self.downsampled_indexes, len(self.images))
 
     ###
-    def _export_segmentation_subset(self, indices, output_dir, class_to_index):
-        """セグメンテーションサブセットのエクスポート - クラス名修正版"""
+    def _export_segmentation_subset(self, items, output_dir, class_to_index):
+        """セグメンテーションサブセットのエクスポート - クラス名修正版
+
+        items は (画像パス, セグメント群) の一覧。画像ソースをまたぐとフレーム
+        番号が重複するため、インデックスではなく画像パスで受け取る。
+        """
         
         success_count = 0
         
-        for idx in indices:
-            if idx in self.segmentation_annotations:
+        for source_image_path, segments in items:
+            if segments:
                 try:
                     # 画像をコピー
-                    source_image_path = self.images[idx]
                     image_filename = os.path.basename(source_image_path)
                     dest_image_path = os.path.join(output_dir, "images", image_filename)
                     
@@ -34636,7 +34819,7 @@ class ImageAnnotationTool(QMainWindow):
                     label_lines = []
                     valid_segments = 0
                     
-                    for seg_idx, seg in enumerate(self.segmentation_annotations[idx]):
+                    for seg_idx, seg in enumerate(segments):
                         # クラス名を取得 - 複数のキーを試す
                         class_name = None
                         if isinstance(seg, dict):
@@ -34719,7 +34902,7 @@ class ImageAnnotationTool(QMainWindow):
                     success_count += 1
                     
                 except Exception as e:
-                    print(f"セグメンテーション インデックス {idx} の処理中にエラー: {e}")
+                    print(f"セグメンテーション エクスポートエラー {source_image_path}: {e}")
                     import traceback
                     traceback.print_exc()
         
@@ -34771,31 +34954,29 @@ class ImageAnnotationTool(QMainWindow):
         """YOLOアノテーションの検証 - クラス名確認強化版（削除マーク除外対応）"""
         
         if task_type == "detect":
-            if not hasattr(self, 'bbox_annotations') or not self.bbox_annotations:
+            # 学習対象は設定に応じて「表示中のソースのみ」か「全画像ソース」。
+            # ソースをまたぐとフレーム番号が重複するので画像パスをキーにする。
+            items = self.collect_annotation_items('bbox_annotations')
+            source_counts = self.count_annotation_sources('bbox_annotations')
+            all_images = sum(
+                1 for _key, _imgs, store in self.iter_source_annotation_stores(
+                    'bbox_annotations', all_sources=None)
+                for boxes in store.values() if boxes)
+            excluded_count = max(all_images - len(items), 0)
+
+            if not items:
                 QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_no_detection_annotations'))
                 return None, None
-            
-            # 削除マークされていないアノテーションのみ抽出
-            valid_annotations = {}
-            excluded_count = 0
-            
-            for idx, boxes in self.bbox_annotations.items():
-                # 削除マークされていないかチェック（actual_indexで判定）
-                if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
-                    excluded_count += 1
-                    continue
-                
-                # 有効なアノテーションのみ追加
-                if boxes:
-                    valid_annotations[idx] = boxes
-            
-            if not valid_annotations:
-                QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_valid_bbox_annotations', excluded_count))
-                return None, None
-            
-            annotations = valid_annotations
+
+            annotations = {img_path: boxes for img_path, boxes in items}
             total_boxes = sum(len(boxes) for boxes in annotations.values())
-            return annotations, {"total_count": total_boxes, "image_count": len(annotations), "excluded_count": excluded_count}
+            return annotations, {
+                "total_count": total_boxes,
+                "image_count": len(annotations),
+                "excluded_count": excluded_count,
+                "source_counts": source_counts,
+                "all_sources": bool(getattr(self, 'use_all_sources_for_training', False)),
+            }
         
         if task_type == "segment":
             if not self.segmentation_annotations:

@@ -9,11 +9,12 @@ PoseSourceManagerが読み取ったpose/slam/vslam/arucoの軌跡を2Dプロッ�
 import math
 import os
 import yaml
+from typing import Optional
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
                               QFileDialog, QDialog, QSpinBox, QDoubleSpinBox, QMessageBox, QFrame,
                               QCheckBox, QSplitter, QTableWidget, QTableWidgetItem,
                               QAbstractItemView, QHeaderView, QStyledItemDelegate,
-                              QInputDialog)
+                              QInputDialog, QTabWidget)
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QPen, QColor, QBrush, QCursor
 import matplotlib.pyplot as plt
@@ -25,7 +26,7 @@ from matplotlib.patches import RegularPolygon, Rectangle, Polygon as MplPolygon
 from matplotlib.path import Path as MplPath
 
 from translations import get_text
-from styles import get_location_color   # 位置クラス色（位置ボタン・バッジと共通）
+from styles import get_location_color, set_text_role   # 位置クラス色（位置ボタン・バッジと共通）
 
 # 日本語フォントの設定（data_analysis.pyと同じ設定。"MS Gothic"はこの環境の
 # matplotlib(FreeType)でテキストが完全に不可視になる既知の不具合があるため使用しない）
@@ -151,6 +152,9 @@ class MapViewWidget(QWidget):
         self._data_dir = None              # 走行データフォルダ（地図なし時の保存先）
         # 色分け「位置」用: index -> loc（メインウィンドウのアノテーションを参照）
         self.loc_provider = None
+        # 色分け「速度」用: index -> speed[m/s]（メインウィンドウの speed アノテーション
+        # を参照。pose 行に速度が無い記録・slam 等の他ソース表示時のフォールバック）
+        self.speed_provider = None
         # 位置推論結果: index -> {'pred_class', 'pose': {'x','y','theta'}, ...}（メイン
         # ウィンドウの location_inference_results を参照）。推定座標のマーカー描画と
         # 色分け「推論クラス」に使う
@@ -296,18 +300,28 @@ class MapViewWidget(QWidget):
         layout.addWidget(self.lap_table)
 
         self.status_label = QLabel("")
-        self.status_label.setStyleSheet("color: #888888; font-size: 11px;")
+        self.status_label.setStyleSheet("font-size: 11px;")
+        set_text_role(self.status_label, 'faint')
         layout.addWidget(self.status_label)
 
         self.figure = Figure(figsize=(5, 5))
         self.canvas = FigureCanvas(self.figure)
         self.ax = self.figure.add_subplot(111)
+        # 色分けのカラーバー用軸（地図の右側に固定配置）。地図軸の位置を refresh の
+        # たびに動かさないよう、subplot 領域を右に少し空けて専用軸を置く
+        self.figure.subplots_adjust(right=0.84)
+        self.cax = self.figure.add_axes([0.86, 0.11, 0.025, 0.77])
+        self.cax.set_visible(False)
 
         # matplotlib 標準のナビゲーションツールバー（ホーム/平行移動(pan)/
         # ズーム矩形/保存）。pan・zoom はボタンで切替、Home で全体表示に戻る。
         self.nav_toolbar = NavigationToolbar(self.canvas, self)
         layout.addWidget(self.nav_toolbar)
-        layout.addWidget(self.canvas)
+        # 余った縦スペースはキャンバスだけが取る（FigureCanvas は既定で figsize 固定の
+        # sizeHint を持ち、ストレッチ無しだと余白がコントロール行の間に分配される）
+        from PyQt5.QtWidgets import QSizePolicy
+        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(self.canvas, 1)
 
         self.canvas.mpl_connect('pick_event', self._on_pick)
         # マウスホイールでカーソル位置を中心にズーム（pan/zoomモード不要）
@@ -1106,6 +1120,10 @@ class MapViewWidget(QWidget):
         # 格子分類モデルの格子線（読み込み中のモデルが格子出力を持つときのみ）
         self._draw_grid_lines()
 
+        # カラーバーは軌跡を描けたときだけ表示（以降で作り直す）
+        self.cax.clear()
+        self.cax.set_visible(False)
+
         if self.pose_manager is None or not self.pose_manager.has_any_pose():
             self._plotted_indexes = []
             self.status_label.setText(get_text('map_view_no_pose_data'))
@@ -1183,8 +1201,11 @@ class MapViewWidget(QWidget):
         # 情報量ゼロのまま再描画だけ重くなる（実測1.6倍）ため表示機能は廃止。
         labeled = self.pose_manager.future_traj_indexes()
 
-        self.ax.scatter(xs, ys, c=colors, cmap=cmap, s=8, picker=5, zorder=2,
-                        edgecolors='none', linewidths=0.0)
+        traj_scatter = self.ax.scatter(xs, ys, c=colors, cmap=cmap, s=8, picker=5, zorder=2,
+                                       edgecolors='none', linewidths=0.0)
+        # 色分けモードごとのカラーバー（地図右側）。連続値は scatter の mappable、
+        # カテゴリ値は凡例代わりの離散カラーバー
+        self._draw_colorbar(color_mode, poses, laps, traj_scatter, cmap)
 
         # ラップ色分け時はラップごとの凡例（点数付き・最大12項目）
         legend_handles = []
@@ -1425,7 +1446,8 @@ class MapViewWidget(QWidget):
         if self._lap_delegate.current_col == col:
             return
         self._lap_delegate.current_col = col
-        red, black = QBrush(QColor(220, 0, 0)), QBrush(QColor(0, 0, 0))
+        # 通常色はパレット由来にしてダークモードでも見えるようにする
+        red, black = QBrush(QColor(220, 0, 0)), QBrush(self.palette().windowText().color())
         for c in range(self.lap_table.columnCount()):
             it = self.lap_table.horizontalHeaderItem(c)
             if it is not None:
@@ -1474,10 +1496,19 @@ class MapViewWidget(QWidget):
 
     def _compute_colors(self, poses, mode: str):
         if mode == 'time':
-            return list(range(len(poses))), 'viridis'
+            # フレーム番号をそのまま値にする（カラーバーの目盛りがフレーム番号になる）
+            return [p.index for p in poses], 'viridis'
         if mode == 'speed':
-            values = [p.extra.get('speed', p.extra.get('v_imu', 0.0)) for p in poses]
-            return values, 'viridis'
+            # 速度は pose 行にしか無いので、表示ソースが slam 等でも同フレームの
+            # pose から引き、さらにメイン画面の speed アノテーションへフォールバック
+            # する（従来は p.extra のみ参照していたため slam 表示時に全点 0 → 単色）
+            values = []
+            for p in poses:
+                v = self._frame_speed(p)
+                values.append(v)
+            known = [v for v in values if v is not None]
+            fill = min(known) if known else 0.0
+            return [fill if v is None else v for v in values], 'viridis'
         if mode == 'source':
             return [SOURCE_COLORS.get(p.source, 'black') for p in poses], None
         if mode == 'status':
@@ -1500,6 +1531,107 @@ class MapViewWidget(QWidget):
                               if pred is not None else '#d0d0d0')
             return colors, None
         return ['tab:blue' for _ in poses], None
+
+    def _draw_colorbar(self, mode: str, poses, laps, scatter, cmap) -> None:
+        """色分けモードに応じたカラーバーを self.cax に描く。
+
+        time/speed: scatter の連続カラーマップをそのまま使う。
+        lap/source/status/loc/pred_loc: 出現したカテゴリだけを並べた離散カラーバー
+        （ListedColormap + BoundaryNorm、目盛りにカテゴリ名）。
+        """
+        from matplotlib.colors import ListedColormap, BoundaryNorm
+        from matplotlib.cm import ScalarMappable
+
+        self.cax.clear()
+        try:
+            if cmap is not None and mode in ('time', 'speed'):
+                cb = self.figure.colorbar(scatter, cax=self.cax)
+                label = get_text('map_view_colorby_' + mode)
+                if mode == 'speed':
+                    label += ' [m/s]'
+                cb.set_label(label, fontsize=8)
+                cb.ax.tick_params(labelsize=7)
+                self.cax.set_visible(True)
+                return
+
+            # --- カテゴリ色分け: (ラベル, 色) の並びを作る ---
+            entries = []
+            if mode == 'lap':
+                for l in sorted(set(laps)):
+                    entries.append((str(l + 1), self._lap_color(l)))
+            elif mode == 'source':
+                present = {p.source for p in poses}
+                for src in list(SOURCE_COLORS) + sorted(present - set(SOURCE_COLORS)):
+                    if src in present:
+                        entries.append((src, SOURCE_COLORS.get(src, 'black')))
+            elif mode == 'status':
+                present = {p.status for p in poses}
+                for st in list(STATUS_COLORS) + sorted(present - set(STATUS_COLORS)):
+                    if st in present:
+                        entries.append((st, STATUS_COLORS.get(st, 'black')))
+            elif mode in ('loc', 'pred_loc'):
+                classes = set()
+                has_none = False
+                for p in poses:
+                    if mode == 'loc':
+                        v = self.loc_provider(p.index) if self.loc_provider else None
+                    else:
+                        res = self._inference_result(p.index)
+                        v = res.get('pred_class') if res else None
+                    if v is None:
+                        has_none = True
+                    else:
+                        classes.add(v)
+                for c in sorted(classes):
+                    entries.append((str(c), get_location_color(c).name()))
+                if has_none:
+                    entries.append((get_text('map_view_colorbar_unlabeled'), '#d0d0d0'))
+            if not entries:
+                self.cax.set_visible(False)
+                return
+
+            n = len(entries)
+            lcmap = ListedColormap([c for _, c in entries])
+            norm = BoundaryNorm(list(range(n + 1)), n)
+            sm = ScalarMappable(norm=norm, cmap=lcmap)
+            sm.set_array([])
+            cb = self.figure.colorbar(sm, cax=self.cax,
+                                      ticks=[i + 0.5 for i in range(n)])
+            cb.set_ticklabels([lbl for lbl, _ in entries])
+            cb.set_label(get_text('map_view_colorby_' + mode), fontsize=8)
+            cb.ax.tick_params(labelsize=7, length=0)
+            self.cax.set_visible(True)
+        except Exception:
+            # カラーバーは補助表示なので失敗しても地図描画は止めない
+            self.cax.clear()
+            self.cax.set_visible(False)
+
+    def _frame_speed(self, p) -> Optional[float]:
+        """PoseSample p の車速 [m/s]（無ければ None）
+
+        優先順: 表示中サンプルの extra（pose ソース時）→ 同フレームの pose 行
+        （pose_manager.frame_speed）→ メイン画面の speed アノテーション。
+        """
+        for key in ('speed', 'v_imu'):
+            v = p.extra.get(key)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    pass
+        if self.pose_manager is not None:
+            fn = getattr(self.pose_manager, 'frame_speed', None)
+            if callable(fn):
+                v = fn(p.index)
+                if v is not None:
+                    return v
+        if self.speed_provider is not None:
+            try:
+                v = self.speed_provider(p.index)
+                return None if v is None else float(v)
+            except Exception:
+                return None
+        return None
 
     # --- 位置推論結果の重ね描き ----------------------------------------------
 
@@ -1725,7 +1857,7 @@ class MapViewDialog(QDialog):
         self._last_quality_flags = set()
 
         self.setWindowTitle(get_text('map_view_dock_title'))
-        self.setMinimumSize(700, 750)
+        self.setMinimumSize(700, 600)
         self.resize(900, 900)
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
 
@@ -1739,11 +1871,13 @@ class MapViewDialog(QDialog):
         self.map_widget = MapViewWidget(on_frame_selected=self._on_frame_selected)
         splitter.addWidget(self.map_widget)
 
-        panel = QWidget()
-        panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(0, 0, 0, 0)
-        panel_layout.setSpacing(2)         # 下側パネル各行の行間をコンパクトに
-        self._build_edit_panel(panel_layout)
+        # 操作パネルはタブ化（自己位置の補正 / 学習ラベル / 位置領域）。以前は
+        # 全機能を縦に積んで 11 行＋長文ヒント 3 本を常時表示していたため、
+        # 地図が画面の 1/3 程度しか取れなかった。タブなら常時見えるのは
+        # 選択中の 1〜3 行だけで済み、長文ヒントはツールチップへ移す。
+        panel = QTabWidget()
+        panel.setDocumentMode(True)
+        self._build_edit_panel(panel)
         splitter.addWidget(panel)
         splitter.setStretchFactor(0, 1)    # 余白はマップが取る
         splitter.setStretchFactor(1, 0)
@@ -1753,10 +1887,29 @@ class MapViewDialog(QDialog):
         # 領域の追加・削除・読込をステータス行へ反映する
         self.map_widget.on_regions_changed = self._update_region_status
 
-    def _build_edit_panel(self, parent_layout):
-        separator = QFrame()
-        separator.setFrameShape(QFrame.HLine)
-        parent_layout.addWidget(separator)
+    def _build_edit_panel(self, tabs: QTabWidget):
+        """下側の操作パネルを 3 タブに分けて構築する。
+
+        各タブは 1〜3 行のコンパクトな横並び。長い説明文はラベル・ボタンの
+        ツールチップに置き、常時表示するのは結果・件数の 1 行だけにする。
+        """
+
+        def _new_tab(title_key):
+            page = QWidget()
+            lay = QVBoxLayout(page)
+            lay.setContentsMargins(4, 2, 4, 2)
+            lay.setSpacing(2)
+            tabs.addTab(page, get_text(title_key))
+            return lay
+
+        def _result_label():
+            lbl = QLabel("")
+            lbl.setStyleSheet("font-size: 11px;")
+            set_text_role(lbl, 'faint')
+            return lbl
+
+        # ===== タブ1: 自己位置の補正（品質フィルタ / 区間ソース上書き / 欠損補間）=====
+        pose_layout = _new_tab('map_view_tab_pose_edit')
 
         # --- 品質フィルタ ---
         quality_row = QHBoxLayout()
@@ -1775,12 +1928,10 @@ class MapViewDialog(QDialog):
         self.quality_mark_deleted_button = QPushButton(get_text('map_view_quality_mark_deleted_btn'))
         self.quality_mark_deleted_button.clicked.connect(self._on_quality_mark_deleted_clicked)
         quality_row.addWidget(self.quality_mark_deleted_button)
+        self.quality_result_label = _result_label()
+        quality_row.addWidget(self.quality_result_label)
         quality_row.addStretch()
-        parent_layout.addLayout(quality_row)
-
-        self.quality_result_label = QLabel("")
-        self.quality_result_label.setStyleSheet("color: #888888; font-size: 11px;")
-        parent_layout.addWidget(self.quality_result_label)
+        pose_layout.addLayout(quality_row)
 
         # --- 区間ソース上書き ---
         segment_row = QHBoxLayout()
@@ -1803,7 +1954,7 @@ class MapViewDialog(QDialog):
         self.segment_clear_button.clicked.connect(self._on_segment_clear_clicked)
         segment_row.addWidget(self.segment_clear_button)
         segment_row.addStretch()
-        parent_layout.addLayout(segment_row)
+        pose_layout.addLayout(segment_row)
 
         # --- 欠損補間 ---
         interp_row = QHBoxLayout()
@@ -1819,14 +1970,14 @@ class MapViewDialog(QDialog):
         self.interp_clear_button = QPushButton(get_text('map_view_interp_clear_btn'))
         self.interp_clear_button.clicked.connect(self._on_interp_clear_clicked)
         interp_row.addWidget(self.interp_clear_button)
+        self.interp_result_label = _result_label()
+        interp_row.addWidget(self.interp_result_label)
         interp_row.addStretch()
-        parent_layout.addLayout(interp_row)
+        pose_layout.addLayout(interp_row)
 
-        self.interp_result_label = QLabel("")
-        self.interp_result_label.setStyleSheet("color: #888888; font-size: 11px;")
-        parent_layout.addWidget(self.interp_result_label)
+        # ===== タブ2: 学習用ラベル（togivad/future_traj・agents の計算・保存）=====
+        label_layout = _new_tab('map_view_tab_labels')
 
-        # --- 学習用軌道ラベル（togivad/future_traj）の計算・保存 ---
         writeback_row = QHBoxLayout()
         writeback_label = QLabel(get_text('map_view_writeback_label'))
         writeback_label.setToolTip(get_text('map_view_writeback_tooltip'))
@@ -1846,7 +1997,7 @@ class MapViewDialog(QDialog):
         self.writeback_dt_spin.setToolTip(get_text('map_view_writeback_dt_tooltip'))
         writeback_row.addWidget(self.writeback_dt_spin)
         writeback_row.addStretch()
-        parent_layout.addLayout(writeback_row)
+        label_layout.addLayout(writeback_row)
 
         # ボタンは 2 行目へ（コンパクト幅でも文言が見切れないように改行）
         writeback_btn_row = QHBoxLayout()
@@ -1863,17 +2014,16 @@ class MapViewDialog(QDialog):
             self._on_agent_writeback_clicked)
         writeback_btn_row.addWidget(self.agent_writeback_button)
         writeback_btn_row.addStretch()
-        parent_layout.addLayout(writeback_btn_row)
+        label_layout.addLayout(writeback_btn_row)
 
-        self.writeback_hint_label = QLabel(get_text('map_view_writeback_hint'))
-        self.writeback_hint_label.setStyleSheet("color: #888888; font-size: 11px;")
-        self.writeback_hint_label.setWordWrap(True)
-        parent_layout.addWidget(self.writeback_hint_label)
+        # 補足説明は常時表示せずツールチップに（ラベル・ボタンにも同内容を設定済み）
+        self.writeback_hint_label = _result_label()
+        self.writeback_hint_label.setText(get_text('map_view_hint_hover'))
+        self.writeback_hint_label.setToolTip(get_text('map_view_writeback_hint'))
+        label_layout.addWidget(self.writeback_hint_label)
 
-        # --- 位置領域（軌跡区間指定）＋ 位置自動アノテーション（Phase 1） ---
-        region_sep = QFrame()
-        region_sep.setFrameShape(QFrame.HLine)
-        parent_layout.addWidget(region_sep)
+        # ===== タブ3: 位置領域（軌跡区間指定）＋ 位置自動アノテーション（Phase 1）=====
+        region_layout = _new_tab('map_view_tab_regions')
 
         region_row = QHBoxLayout()
         region_row.addWidget(QLabel(get_text('map_view_region_label')))
@@ -1898,7 +2048,7 @@ class MapViewDialog(QDialog):
         self.region_save_button.clicked.connect(self._on_region_save_clicked)
         region_row.addWidget(self.region_save_button)
         region_row.addStretch()
-        parent_layout.addLayout(region_row)
+        region_layout.addLayout(region_row)
 
         autoloc_row = QHBoxLayout()
         self.autoloc_button = QPushButton(get_text('map_view_autoloc_btn'))
@@ -1912,12 +2062,13 @@ class MapViewDialog(QDialog):
             get_text('map_view_autoloc_keep_manual_tooltip'))
         autoloc_row.addWidget(self.autoloc_keep_manual_checkbox)
         autoloc_row.addStretch()
-        parent_layout.addLayout(autoloc_row)
+        region_layout.addLayout(autoloc_row)
 
-        self.region_status_label = QLabel(get_text('map_view_region_hint'))
-        self.region_status_label.setStyleSheet("color: #888888; font-size: 11px;")
-        self.region_status_label.setWordWrap(True)
-        parent_layout.addWidget(self.region_status_label)
+        # 領域数＋直近の操作結果を 1 行で表示。操作説明の長文はツールチップへ
+        self.region_status_label = _result_label()
+        self.region_status_label.setToolTip(get_text('map_view_region_hint'))
+        region_layout.addWidget(self.region_status_label)
+        self._update_region_status()
 
     def _on_frame_selected(self, index):
         self.jump_to_image.emit(index)
@@ -1930,6 +2081,11 @@ class MapViewDialog(QDialog):
             self.map_widget.loc_provider = (
                 lambda idx: getattr(self.main_window, 'location_annotations',
                                     {}).get(idx))
+            # 色分け「速度」用: メイン画面の speed アノテーション（enc/speed 等から
+            # 読込・補間済み）を参照する
+            self.map_widget.speed_provider = (
+                lambda idx: (getattr(self.main_window, 'annotations', {})
+                             .get(idx) or {}).get('speed'))
             # 位置推論結果（推定座標・予測クラス）の参照。メイン側で更新される dict を
             # 呼び出し時に引き直す
             self.map_widget.inference_provider = (
