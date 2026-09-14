@@ -6462,7 +6462,31 @@ class ImageAnnotationTool(QMainWindow):
             self.map_view_dialog.auto_load_background(self.folder_path)
         self.map_view_dialog.jump_to_image.connect(self.jump_to_index_from_map_view)
         self.map_view_dialog.highlight_frame(self.current_index)
-        self.map_view_dialog.show()
+        # 既定は右パネル（コースの位置情報の下の空きスペース）に重ねるコンパクト表示。
+        # 空きスペースが取れない（未表示等）場合は通常のウィンドウとして開く
+        rect = self._map_view_dock_rect()
+        if rect is not None:
+            self.map_view_dialog.show_docked(rect)
+        else:
+            self.map_view_dialog.show()
+
+    def _map_view_dock_rect(self):
+        """右パネルの「コースの位置情報」群の下〜パネル下端の空きスペース（グローバル座標）
+
+        走行軌跡マップの既定配置に使う。右パネルが無い／見えていない場合は None。
+        """
+        group = getattr(self, 'location_info_group', None)
+        if group is None or not group.isVisible():
+            return None
+        panel = group.parentWidget()
+        if panel is None or panel.width() <= 0:
+            return None
+        top_local = group.geometry().bottom() + 6
+        height = panel.height() - top_local
+        if height < 200:
+            return None
+        top_left = panel.mapToGlobal(QPoint(0, top_local))
+        return QRect(top_left.x(), top_left.y(), panel.width(), height)
 
     def jump_to_index_from_map_view(self, index):
         """マップビューでの軌跡クリックからのジャンプ要求を処理"""

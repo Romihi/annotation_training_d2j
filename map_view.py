@@ -14,7 +14,8 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBo
                               QFileDialog, QDialog, QSpinBox, QDoubleSpinBox, QMessageBox, QFrame,
                               QCheckBox, QSplitter, QTableWidget, QTableWidgetItem,
                               QAbstractItemView, QHeaderView, QStyledItemDelegate,
-                              QInputDialog, QTabWidget)
+                              QInputDialog, QTabWidget, QToolButton, QScrollArea,
+                              QSizePolicy, QGridLayout, QMenu)
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QPen, QColor, QBrush, QCursor
 import matplotlib.pyplot as plt
@@ -102,8 +103,41 @@ class _CurrentLapDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+class _CollapsibleSection(QWidget):
+    """見出しボタン（▼/▶）で中身を折り畳めるセクション（サイドパネル用）"""
+
+    def __init__(self, title: str, content: QWidget, expanded: bool = True, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        self.toggle = QToolButton()
+        self.toggle.setText(title)
+        self.toggle.setCheckable(True)
+        self.toggle.setChecked(expanded)
+        self.toggle.setAutoRaise(True)
+        self.toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.toggle.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.toggle.setStyleSheet("text-align: left; font-weight: bold;")
+        self.toggle.toggled.connect(self._on_toggled)
+        self.content = content
+        self.content.setVisible(expanded)
+        lay.addWidget(self.toggle)
+        lay.addWidget(self.content)
+
+    def _on_toggled(self, checked: bool) -> None:
+        self.content.setVisible(checked)
+        self.toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+
+
 class MapViewWidget(QWidget):
-    """走行軌跡マップビュー。on_frame_selected(index:int) で親にフレームジャンプを通知する"""
+    """走行軌跡マップビュー。on_frame_selected(index:int) で親にフレームジャンプを通知する
+
+    レイアウトは「左: サイドパネル（表示設定＋親が追加する編集セクション）｜右: 地図」。
+    地図はウィンドウの縦幅をすべて使う。親（MapViewDialog）は side_layout に
+    自前のセクションを追加できる。
+    """
 
     def __init__(self, parent=None, on_frame_selected=None):
         super().__init__(parent)
@@ -126,6 +160,7 @@ class MapViewWidget(QWidget):
         self._lap_first_index = []         # 各ラップ先頭のフレーム index
         self._session_start_ts = None
         self._current_index = None         # highlight_frame で更新
+        self._plotted_lap = None           # 直近の refresh で絞り込んだラップ（None=全）
 
         # 位置領域（閉ポリゴン）: [{"loc": int, "polygon": [(x,y), ...]}, ...]
         # polygon は map 座標系 [m] の頂点列（3点以上・閉路は暗黙）。
@@ -174,26 +209,62 @@ class MapViewWidget(QWidget):
 
         self._build_ui()
 
+    # ソース選択「全ソース」（有効な全ソースの軌跡を重ね描き）の currentData 値
+    ALL_SOURCES = '__all__'
+
+    # サイドパネルの最小幅[px]。実際の幅は中身の最小幅（フォント依存）で広がる
+    # （fit_side_panel_width）
+    SIDE_PANEL_WIDTH = 240
+
     # 推論位置の色: メイン画面の「位置推論結果」表示（紫）と揃える
     PRED_COLOR = 'purple'
     PRED_EDGE_COLOR = '#4B0082'
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setSpacing(2)
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(2)
 
-        # 1段目: プルダウン類＋地図ボタン（コンパクト表示でも潰れないよう、
-        # チェックボックス類は2段目へ分離。コンボは内容幅に自動調整）
-        controls = QHBoxLayout()
+        # 左右スプリッタ: サイドパネル（表示設定・編集）｜地図キャンバス。
+        # 従来はコントロール行を地図の上（ヘッダー）に置いていたが、地図の縦幅を
+        # 最大化するため左側へ寄せた。境界ドラッグで幅を調整できる。
+        self._splitter = QSplitter(Qt.Horizontal)
+        root.addWidget(self._splitter)
 
-        controls.addWidget(QLabel(get_text('map_view_source_label')))
+        # --- サイドパネル（縦に長くなっても収まるようスクロール可） ---
+        side = QWidget()
+        self.side_layout = QVBoxLayout(side)
+        self.side_layout.setContentsMargins(2, 2, 2, 2)
+        self.side_layout.setSpacing(4)
+
+        self._side_scroll = QScrollArea()
+        self._side_scroll.setWidget(side)
+        self._side_scroll.setWidgetResizable(True)
+        self._side_scroll.setFrameShape(QFrame.NoFrame)
+        self._side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._splitter.addWidget(self._side_scroll)
+
+        # ===== 表示設定セクション（折り畳み可） =====
+        display = QWidget()
+        disp = QVBoxLayout(display)
+        disp.setContentsMargins(0, 0, 0, 0)
+        disp.setSpacing(2)
+
+        # プルダウン類は「ラベル｜コンボ」のグリッド（サイドパネル幅で潰れないよう縦積み）
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(4)
+        grid.setVerticalSpacing(2)
+        grid.setColumnStretch(1, 1)
+
+        grid.addWidget(QLabel(get_text('map_view_source_label')), 0, 0)
         self.source_combo = QComboBox()
         self.source_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.source_combo.addItem(get_text('map_view_source_auto'), None)
-        self.source_combo.currentIndexChanged.connect(self.refresh)
-        controls.addWidget(self.source_combo)
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+        grid.addWidget(self.source_combo, 0, 1)
 
-        controls.addWidget(QLabel(get_text('map_view_colorby_label')))
+        grid.addWidget(QLabel(get_text('map_view_colorby_label')), 1, 0)
         self.color_by_combo = QComboBox()
         self.color_by_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.color_by_combo.addItem(get_text('map_view_colorby_time'), 'time')
@@ -203,75 +274,61 @@ class MapViewWidget(QWidget):
         self.color_by_combo.addItem(get_text('map_view_colorby_status'), 'status')
         self.color_by_combo.addItem(get_text('map_view_colorby_loc'), 'loc')
         self.color_by_combo.addItem(get_text('map_view_colorby_pred_loc'), 'pred_loc')
+        self.color_by_combo.setCurrentIndex(self.color_by_combo.findData('speed'))   # 既定: 速度
         self.color_by_combo.currentIndexChanged.connect(self.refresh)
-        controls.addWidget(self.color_by_combo)
+        grid.addWidget(self.color_by_combo, 1, 1)
 
-        # ラップ切替（全 / 1..N）。ラップは開始点への再接近で自動分割。
-        # 項目は数字のみの簡素表示（凡例側は「ラップN」のまま）
-        controls.addWidget(QLabel(get_text('map_view_lap_label')))
-        self.lap_combo = QComboBox()
-        self.lap_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
-        self.lap_combo.addItem(get_text('map_view_lap_all_short'), None)
-        self.lap_combo.currentIndexChanged.connect(self.refresh)
-        controls.addWidget(self.lap_combo)
+        disp.addLayout(grid)
 
-        self.load_map_button = QPushButton(get_text('map_view_load_background'))
-        self.load_map_button.clicked.connect(self._on_load_background_clicked)
-        controls.addWidget(self.load_map_button)
+        # 背景地図は走行データから自動読込（auto_load_background）。手動の
+        # 読込/クリアボタンはサイドパネルを狭く保つため廃止した
 
-        self.clear_map_button = QPushButton(get_text('map_view_clear_background'))
-        self.clear_map_button.clicked.connect(self._on_clear_background_clicked)
-        controls.addWidget(self.clear_map_button)
+        # 表示トグル（線表示・ジャンプ・スリップ・悪路・推論位置）は 2 列グリッド
+        toggles = QGridLayout()
+        toggles.setContentsMargins(0, 0, 0, 0)
+        toggles.setHorizontalSpacing(8)
+        toggles.setVerticalSpacing(0)
 
-        controls.addStretch()
-        layout.addLayout(controls)
-
-        # 2段目: 表示トグル（線表示・ジャンプ・スリップ・悪路）
-        toggles = QHBoxLayout()
+        # 全ラップ表示 ⇔ 現在フレームのラップだけ表示。ラップは開始点への
+        # 再接近で自動分割。現在ラップ表示中はフレーム移動でラップに追従する
+        self.all_laps_checkbox = QCheckBox(get_text('map_view_all_laps'))
+        self.all_laps_checkbox.setChecked(False)   # 表示トグルは既定オフ
+        self.all_laps_checkbox.setToolTip(get_text('map_view_all_laps_tip'))
+        self.all_laps_checkbox.stateChanged.connect(self.refresh)
+        toggles.addWidget(self.all_laps_checkbox, 0, 0)
 
         # 軌跡を点だけでなく連続線でも描く（ラップ・テレポートで分割）
         self.show_line_checkbox = QCheckBox(get_text('map_view_show_line'))
-        self.show_line_checkbox.setChecked(True)
+        self.show_line_checkbox.setChecked(False)   # 表示トグルは既定オフ
         self.show_line_checkbox.stateChanged.connect(self.refresh)
-        toggles.addWidget(self.show_line_checkbox)
+        toggles.addWidget(self.show_line_checkbox, 0, 1)
 
         self.show_jumps_checkbox = QCheckBox(get_text('map_view_legend_jump'))
-        self.show_jumps_checkbox.setChecked(True)
+        self.show_jumps_checkbox.setChecked(False)   # 表示トグルは既定オフ
         self.show_jumps_checkbox.stateChanged.connect(self.refresh)
-        toggles.addWidget(self.show_jumps_checkbox)
+        toggles.addWidget(self.show_jumps_checkbox, 1, 0)
 
         self.show_slip_checkbox = QCheckBox(get_text('map_view_legend_slip'))
-        self.show_slip_checkbox.setChecked(True)
+        self.show_slip_checkbox.setChecked(False)   # 表示トグルは既定オフ
         self.show_slip_checkbox.stateChanged.connect(self.refresh)
-        toggles.addWidget(self.show_slip_checkbox)
+        toggles.addWidget(self.show_slip_checkbox, 1, 1)
 
         self.show_rough_checkbox = QCheckBox(get_text('map_view_legend_rough'))
-        self.show_rough_checkbox.setChecked(True)
+        self.show_rough_checkbox.setChecked(False)   # 表示トグルは既定オフ
         self.show_rough_checkbox.stateChanged.connect(self.refresh)
-        toggles.addWidget(self.show_rough_checkbox)
+        toggles.addWidget(self.show_rough_checkbox, 2, 0)
 
         # 位置推論モデルの推定座標（座標・姿勢回帰）を青で重ねて表示する
         self.show_inference_checkbox = QCheckBox(get_text('map_view_show_inference'))
-        self.show_inference_checkbox.setChecked(True)
+        self.show_inference_checkbox.setChecked(False)   # 表示トグルは既定オフ
         self.show_inference_checkbox.setToolTip(get_text('map_view_show_inference_tip'))
         self.show_inference_checkbox.stateChanged.connect(self._on_inference_toggle)
-        toggles.addWidget(self.show_inference_checkbox)
+        toggles.addWidget(self.show_inference_checkbox, 2, 1)
 
-        # ラップタイム一覧（折り畳み式。行クリックでそのラップ先頭へジャンプ）
-        self.lap_table_button = QPushButton(get_text('map_view_lap_table_btn'))
-        self.lap_table_button.setCheckable(True)
-        self.lap_table_button.toggled.connect(self._toggle_lap_table)
-        toggles.addWidget(self.lap_table_button)
+        disp.addLayout(toggles)
 
-        # ラップタイム表示（選択中ラップの所要＋ラップ内経過 / 全=ベスト＋総経過）
-        # 他のボタン・チェックボックスと同じ既定フォントサイズで表示する
-        self.lap_time_label = QLabel("")
-        toggles.addWidget(self.lap_time_label)
 
-        toggles.addStretch()
-        layout.addLayout(toggles)
-
-        # 折り畳み式ラップ一覧テーブル（トグル行の直下・既定は畳んだ状態）。
+        # 折り畳み式ラップ一覧テーブル（トグルの直下・既定は畳んだ状態）。
         # **転置レイアウト**: 行見出し=項目（タイム/開始/備考）・列=ラップ番号。
         # 高さがラップ数に依存せず一定でコンパクト（多周回は横スクロール）。
         self.lap_table = QTableWidget(3, 0)
@@ -287,7 +344,7 @@ class MapViewWidget(QWidget):
         self.lap_table.verticalHeader().setSectionResizeMode(
             QHeaderView.ResizeToContents)
         self.lap_table.setStyleSheet("font-size: 11px;")
-        self.lap_table.setMaximumHeight(110)
+        self.lap_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.lap_table.setVisible(False)
         # 列クリック（セル・列ヘッダのどちらでも）でそのラップ先頭へジャンプ
         self.lap_table.cellClicked.connect(
@@ -297,12 +354,13 @@ class MapViewWidget(QWidget):
         # 現在フレームが属するラップの列に赤枠（全/各ラップ表示の両方で連動）
         self._lap_delegate = _CurrentLapDelegate(self.lap_table)
         self.lap_table.setItemDelegate(self._lap_delegate)
-        layout.addWidget(self.lap_table)
+        # （テーブル自体は地図側ヘッダー直下に置く。サイドパネル折り畳み中でも開ける）
 
         self.status_label = QLabel("")
         self.status_label.setStyleSheet("font-size: 11px;")
+        self.status_label.setWordWrap(True)
         set_text_role(self.status_label, 'faint')
-        layout.addWidget(self.status_label)
+        disp.addWidget(self.status_label)
 
         self.figure = Figure(figsize=(5, 5))
         self.canvas = FigureCanvas(self.figure)
@@ -315,13 +373,127 @@ class MapViewWidget(QWidget):
 
         # matplotlib 標準のナビゲーションツールバー（ホーム/平行移動(pan)/
         # ズーム矩形/保存）。pan・zoom はボタンで切替、Home で全体表示に戻る。
+        # グラフ操作なので地図キャンバスの直上に置く（サイドパネルだと幅が足りず
+        # 「»」に畳まれる）
         self.nav_toolbar = NavigationToolbar(self.canvas, self)
-        layout.addWidget(self.nav_toolbar)
-        # 余った縦スペースはキャンバスだけが取る（FigureCanvas は既定で figsize 固定の
-        # sizeHint を持ち、ストレッチ無しだと余白がコントロール行の間に分配される）
-        from PyQt5.QtWidgets import QSizePolicy
+        # ツールバーに常時見せるのは Home（全体表示）だけ。残り（戻る/進む/移動/
+        # ズーム/設定/保存）は「»」ボタンのポップアップメニューへ移して幅を節約
+        # する（コンパクトなドック表示でも欠けない）。
+        home_action = self.nav_toolbar._actions.get('home')
+        self._nav_more_menu = QMenu(self)
+        for action in list(self.nav_toolbar.actions()):
+            if action is home_action:
+                continue
+            self.nav_toolbar.removeAction(action)
+            if action.text() and not action.isSeparator():
+                self._nav_more_menu.addAction(action)
+        self.nav_more_button = QToolButton()
+        self.nav_more_button.setText("»")
+        self.nav_more_button.setAutoRaise(True)
+        self.nav_more_button.setPopupMode(QToolButton.InstantPopup)
+        self.nav_more_button.setMenu(self._nav_more_menu)
+        self.nav_more_button.setToolTip(get_text('map_view_nav_more_tip'))
+        self.nav_toolbar.addWidget(self.nav_more_button)
+        # Home は matplotlib の履歴スタック（ツールバー操作しか積まれない）ではなく
+        # 自前の全体表示（ホイールズーム後も確実に戻る）に差し替える
+        if home_action is not None:
+            home_action.triggered.disconnect()
+            home_action.triggered.connect(self.home_view)
+
+        self.display_section = _CollapsibleSection(
+            get_text('map_view_section_display'), display, expanded=True)
+        self.side_layout.addWidget(self.display_section)
+        # 親が追加する編集セクションはこのストレッチの下（＝サイドパネル下部）に並ぶ
+        self.side_layout.addStretch(1)
+
+        # --- 地図側: ツールバー＋キャンバス（余った縦横スペースはキャンバスが取る） ---
+        map_area = QWidget()
+        map_layout = QVBoxLayout(map_area)
+        map_layout.setContentsMargins(0, 0, 0, 0)
+        map_layout.setSpacing(0)
+        # ツールバー行の左端: サイドパネル全体の折り畳み／展開（◀/▶）。
+        # 畳むと地図がウィンドウ幅いっぱいになる
+        toolbar_row = QHBoxLayout()
+        toolbar_row.setContentsMargins(0, 0, 0, 0)
+        toolbar_row.setSpacing(2)
+        self.side_toggle_button = QToolButton()
+        self.side_toggle_button.setCheckable(True)
+        self.side_toggle_button.setChecked(True)
+        self.side_toggle_button.setAutoRaise(True)
+        self.side_toggle_button.setArrowType(Qt.LeftArrow)
+        self.side_toggle_button.setMinimumSize(24, 28)   # 矢印だけでも押しやすい大きさに
+        self.side_toggle_button.setToolTip(get_text('map_view_side_panel_toggle_tip'))
+        self.side_toggle_button.toggled.connect(self._on_side_panel_toggled)
+        toolbar_row.addWidget(self.side_toggle_button)
+        toolbar_row.addWidget(self.nav_toolbar, 1)
+        # ラップタイム「ラップN: ラップ内/ラップタイム」（ツールチップにベスト・総経過）
+        self.lap_time_label = QLabel("")
+        self.lap_time_label.setStyleSheet("font-weight: bold;")
+        toolbar_row.addWidget(self.lap_time_label)
+        # ラップタイム一覧の展開ボタン（サイドパネル側のテーブルを開閉。
+        # 列クリックでそのラップ先頭へジャンプ）
+        self.lap_table_button = QToolButton()
+        self.lap_table_button.setText(get_text('map_view_lap_table_btn_short'))
+        self.lap_table_button.setCheckable(True)
+        self.lap_table_button.setAutoRaise(True)
+        # ラップタイム表示と同じフォント（太字）で、余白だけ詰める
+        self.lap_table_button.setFont(self.lap_time_label.font())
+        self.lap_table_button.setStyleSheet("font-weight: bold; padding: 1px 6px;")
+        self.lap_table_button.setToolTip(get_text('map_view_lap_table_btn'))
+        self.lap_table_button.toggled.connect(self._toggle_lap_table)
+        toolbar_row.addWidget(self.lap_table_button)
+        map_layout.addLayout(toolbar_row)
+        map_layout.addWidget(self.lap_table)     # 「一覧」で開閉（既定は畳んだ状態）
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        layout.addWidget(self.canvas, 1)
+        map_layout.addWidget(self.canvas, 1)
+        self._splitter.addWidget(map_area)
+        self._splitter.setStretchFactor(0, 0)
+        self._splitter.setStretchFactor(1, 1)
+        self._splitter.setCollapsible(1, False)
+        self.fit_side_panel_width()
+
+    def _on_side_panel_toggled(self, shown: bool) -> None:
+        """サイドパネルの表示／非表示（非表示中は地図が全幅を使う）。
+
+        畳む直前の実幅を _last_side_width に残す（親ウィンドウが地図の位置を
+        保ったまま幅を戻すのに使う）。
+        """
+        if not shown:
+            self._last_side_width = self._side_scroll.width() + self._splitter.handleWidth()
+        self._side_scroll.setVisible(shown)
+        self.side_toggle_button.setArrowType(Qt.LeftArrow if shown else Qt.RightArrow)
+        if shown:
+            self.fit_side_panel_width()
+
+    def side_panel_span(self) -> int:
+        """サイドパネル（＋スプリッタ境界）が占める横幅[px]。非表示中は畳む直前の幅"""
+        if self._side_scroll.isVisible():
+            return self._side_scroll.width() + self._splitter.handleWidth()
+        return getattr(self, '_last_side_width',
+                       self._side_scroll.minimumWidth() + self._splitter.handleWidth())
+
+    def _selected_lap(self):
+        """表示対象のラップ番号（全ラップ表示なら None、現在ラップが不明でも None）"""
+        if self.all_laps_checkbox.isChecked():
+            return None
+        return self._lap_by_index.get(self._current_index)
+
+    def fit_side_panel_width(self) -> None:
+        """サイドパネルの幅を中身の最小幅に合わせる。
+
+        固定幅だとアプリのフォントサイズ（DPI・テーマ）によってボタン文言や
+        タブ名が見切れるため、全セクション・全タブを含むレイアウトの
+        minimumSizeHint から必要幅を求める（横スクロールは出さない方針）。
+        親がセクションを追加した後にも呼び直すこと。
+        """
+        side = self.side_layout.parentWidget()
+        # 縦スクロールバーが出ても中身が欠けないよう、その幅も見込む
+        need = (side.minimumSizeHint().width() + 8
+                + self._side_scroll.verticalScrollBar().sizeHint().width())
+        width = max(self.SIDE_PANEL_WIDTH, need)
+        self._side_scroll.setMinimumWidth(width)
+        self._side_scroll.setMaximumWidth(width + 160)
+        self._splitter.setSizes([width, max(400, self.width() - width)])
 
         self.canvas.mpl_connect('pick_event', self._on_pick)
         # マウスホイールでカーソル位置を中心にズーム（pan/zoomモード不要）
@@ -350,6 +522,31 @@ class MapViewWidget(QWidget):
         self._populate_source_combo()
         self.refresh()
 
+    def preferred_source(self):
+        """優先ソース（ソース選択の値。自動選択・全ソース時は None）"""
+        src = self.source_combo.currentData()
+        return None if src == self.ALL_SOURCES else src
+
+    def _on_source_changed(self, _index=None) -> None:
+        """ソース切替。「全ソース」ではソース別の色分けに自動で切り替え、
+        単一ソースへ戻したときは直前の色分けを復元する。"""
+        is_all = self.source_combo.currentData() == self.ALL_SOURCES
+        color_combo = self.color_by_combo
+        if is_all:
+            if color_combo.currentData() != 'source':
+                self._color_mode_before_all = color_combo.currentData()
+                color_combo.blockSignals(True)
+                color_combo.setCurrentIndex(color_combo.findData('source'))
+                color_combo.blockSignals(False)
+        else:
+            prev = getattr(self, '_color_mode_before_all', None)
+            if prev is not None and color_combo.currentData() == 'source':
+                color_combo.blockSignals(True)
+                color_combo.setCurrentIndex(color_combo.findData(prev))
+                color_combo.blockSignals(False)
+            self._color_mode_before_all = None
+        self.refresh()
+
     def _populate_source_combo(self) -> None:
         """有効な（縮退していない）ソースのみをプルダウンに表示する"""
         available = self.pose_manager.available_sources() if self.pose_manager else []
@@ -358,6 +555,9 @@ class MapViewWidget(QWidget):
         self.source_combo.addItem(get_text('map_view_source_auto'), None)
         for src in available:
             self.source_combo.addItem(src, src)
+        # 全ソース重ね表示（2 つ以上有効なときだけ意味がある）
+        if len(available) >= 2:
+            self.source_combo.addItem(get_text('map_view_source_all'), self.ALL_SOURCES)
         self.source_combo.blockSignals(False)
 
     def set_background_map(self, yaml_path: str) -> None:
@@ -985,16 +1185,12 @@ class MapViewWidget(QWidget):
         self._current_index = index
         self._update_lap_time_label()
         self._update_lap_table_current()
-        # ラップ絞り込み中に現在フレームが別ラップへ移った場合は、そのラップへ
-        # 表示を自動で切り替える（再生追従。setCurrentIndex が refresh を起動し、
-        # ズーム・パンは refresh 側で保持される）
-        sel = self.lap_combo.currentData()
-        if sel is not None:
+        # 現在ラップ表示中に現在フレームが別ラップへ移った場合は、そのラップへ
+        # 表示を自動で切り替える（再生追従。ズーム・パンは refresh 側で保持される）
+        if not self.all_laps_checkbox.isChecked():
             lap = self._lap_by_index.get(index)
-            if lap is not None and lap != sel:
-                pos = self.lap_combo.findData(lap)
-                if pos >= 0:
-                    self.lap_combo.setCurrentIndex(pos)
+            if lap is not None and lap != self._plotted_lap:
+                self.refresh()
         self._build_current_markers(index)
         # blitting: 背景キャッシュがあれば「背景復元＋マーカーだけ描画」で済ませ、
         # 図全体の再描画（数十〜百ms超）を避ける。キャッシュが無い初回や
@@ -1013,7 +1209,7 @@ class MapViewWidget(QWidget):
         ここでマーカーを作っておくことで、トグル切替・色分け変更・ラップ切替の直後に
         現在フレームの三角が消えず、次のフレーム移動を待たずに表示される。
         """
-        pose = self.pose_manager.get_pose(index, prefer=self.source_combo.currentData())
+        pose = self.pose_manager.get_pose(index, prefer=self.preferred_source())
         if self._current_marker is not None:
             try:
                 self._current_marker.remove()
@@ -1067,10 +1263,26 @@ class MapViewWidget(QWidget):
             self._draw_animated_artists()
             self.canvas.blit(self.ax.bbox)
 
+    def home_view(self, *_args) -> None:
+        """全体表示に戻す（ツールバーの Home）。
+
+        matplotlib 標準の home は履歴スタック（ツールバーの pan/zoom 操作でしか
+        積まれない）の先頭へ戻るだけなので、ホイールズーム後は効かなかった。
+        ズーム・パン保持フラグを落として再描画し、データ全体へ自動スケールする。
+        """
+        self._view_initialized = False
+        self.nav_toolbar.update()        # 履歴スタックもクリア（戻る/進むの整合）
+        self.refresh()
+
     def _on_scroll(self, event):
         """マウスホイールでカーソル位置を中心にズームする。"""
         if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
             return
+        # ツールバーの「戻る/進む」がホイールズームも辿れるよう履歴に積む
+        try:
+            self.nav_toolbar.push_current()
+        except Exception:
+            pass
         scale = 0.8 if event.button == 'up' else 1.25   # up=拡大 / down=縮小
         xlim = self.ax.get_xlim()
         ylim = self.ax.get_ylim()
@@ -1131,24 +1343,36 @@ class MapViewWidget(QWidget):
             return
 
         source = self.source_combo.currentData()
-        poses = self.pose_manager.get_trajectory(source=source)
-        if not poses:
+        all_sources = (source == self.ALL_SOURCES)
+        # 全ソース: ラップ分割・ラップタイムは自動選択軌跡で決め、描画は有効な
+        # 全ソースの軌跡を連結（ソース別に色分け）。ラップ絞り込みは index で共通
+        base = self.pose_manager.get_trajectory(source=None if all_sources else source)
+        if not base:
             self._plotted_indexes = []
             self.status_label.setText(get_text('map_view_no_pose_data'))
             _finish_draw()
             return
 
         # ラップ分割（開始点への再接近で境界検出）と切替フィルタ
-        laps = self._compute_laps(poses)
-        n_laps = (max(laps) + 1) if laps else 0
+        base_laps = self._compute_laps(base)
+        n_laps = (max(base_laps) + 1) if base_laps else 0
         # フィルタ前の対応を保存（再生時のラップ自動追従が参照）
-        self._lap_by_index = {p.index: l for p, l in zip(poses, laps)}
-        self._compute_lap_times(poses, laps, n_laps)
-        self._update_lap_combo(n_laps)
+        self._lap_by_index = {p.index: l for p, l in zip(base, base_laps)}
+        self._compute_lap_times(base, base_laps, n_laps)
         self._update_lap_time_label()
         if self.lap_table.isVisible():     # 展開中はラップ再計算に追従して更新
             self._populate_lap_table()
-        lap_sel = self.lap_combo.currentData()
+
+        if all_sources:
+            poses = []
+            for src in self.pose_manager.available_sources():
+                poses.extend(self.pose_manager.get_trajectory(source=src))
+            laps = [self._lap_by_index.get(p.index, 0) for p in poses]
+        else:
+            poses, laps = base, base_laps
+
+        lap_sel = self._selected_lap()
+        self._plotted_lap = lap_sel
         if lap_sel is not None:
             keep = [i for i, l in enumerate(laps) if l == lap_sel]
             poses = [poses[i] for i in keep]
@@ -1175,25 +1399,33 @@ class MapViewWidget(QWidget):
         if self.show_line_checkbox.isChecked() and len(xs) >= 2:
             gap_r = max(self.jump_threshold, 0.5)
 
-            def _line_color(lap):
-                return (self._lap_color(lap) if color_mode == 'lap'
-                        else '#1f77b4')
+            def _line_color(lap, src):
+                if color_mode == 'lap':
+                    return self._lap_color(lap)
+                if color_mode == 'source':      # 全ソース重ね表示では線もソース色
+                    return SOURCE_COLORS.get(src, 'black')
+                return '#1f77b4'
 
             seg_x, seg_y = [xs[0]], [ys[0]]
             seg_lap = laps[0] if laps else 0
+            seg_src = poses[0].source
             for i in range(1, len(xs)):
                 l = laps[i] if laps else 0
                 gap = math.hypot(xs[i] - xs[i - 1], ys[i] - ys[i - 1]) > gap_r
+                # 全ソース重ね表示ではソースの切れ目（連結境界）も繋がない
+                if poses[i].source != seg_src:
+                    gap = True
                 if l != seg_lap or gap:
                     if len(seg_x) >= 2:
-                        self.ax.plot(seg_x, seg_y, '-', color=_line_color(seg_lap),
+                        self.ax.plot(seg_x, seg_y, '-', color=_line_color(seg_lap, seg_src),
                                      linewidth=1.3, alpha=0.85, zorder=1.5)
                     seg_x, seg_y = [], []
                     seg_lap = l
+                    seg_src = poses[i].source
                 seg_x.append(xs[i])
                 seg_y.append(ys[i])
             if len(seg_x) >= 2:
-                self.ax.plot(seg_x, seg_y, '-', color=_line_color(seg_lap),
+                self.ax.plot(seg_x, seg_y, '-', color=_line_color(seg_lap, seg_src),
                              linewidth=1.3, alpha=0.85, zorder=1.5)
 
         # 学習用軌道ラベル保存済みフレーム数（ステータス表示用のみ）。
@@ -1218,7 +1450,14 @@ class MapViewWidget(QWidget):
                           + f" ({laps.count(l)})"))
 
         # ジャンプ（テレポート）が発生した位置は赤い×マーカーで形状を変えて可視化
-        jump_indexes = self.pose_manager.flag_jumps(poses, max_jump_m=self.jump_threshold)
+        if all_sources:
+            # 連結境界を誤検出しないようソースごとに検出して合算
+            jump_indexes = set()
+            for src in {p.source for p in poses}:
+                jump_indexes |= self.pose_manager.flag_jumps(
+                    [p for p in poses if p.source == src], max_jump_m=self.jump_threshold)
+        else:
+            jump_indexes = self.pose_manager.flag_jumps(poses, max_jump_m=self.jump_threshold)
         if self.show_jumps_checkbox.isChecked():
             if jump_indexes:
                 jump_poses = [p for p in poses if p.index in jump_indexes]
@@ -1360,43 +1599,39 @@ class MapViewWidget(QWidget):
             self._lap_times.append(max(0.0, (end - first_ts[l]) / 1000.0))
 
     def _update_lap_time_label(self) -> None:
-        """チェックボックス右のラップタイム表示を更新する。
+        """地図ヘッダー右端のラップタイム表示を更新する。
 
-        - ラップ選択時: 「ラップN: 所要s｜ラップ内 経過s」
-        - 全選択時   : 「ベスト: ラップk 所要s｜経過 総経過s」
-          （ベストは完了ラップ=最終ラップ以外から。完了ラップが無ければ経過のみ）
+        本文は現在フレームのラップについて「ラップN: ラップ内/ラップタイム s」
+        （最終ラップは走行中なのでラップタイムは暫定）。ベストラップと総経過は
+        ツールチップに出す。
         """
         label = getattr(self, 'lap_time_label', None)
         if label is None:
             return
         ts = self._timestamps()
-        if not self._lap_times or not ts:
+        cur_lap = self._lap_by_index.get(self._current_index)
+        if not self._lap_times or not ts or cur_lap is None                 or cur_lap >= len(self._lap_times):
             label.setText("")
+            label.setToolTip("")
             return
-        cur_ts = ts.get(self._current_index) if self._current_index is not None \
-            else None
-        sel = self.lap_combo.currentData()
-        if sel is not None and sel < len(self._lap_times):
-            in_lap = ""
-            cur_lap = self._lap_by_index.get(self._current_index)
-            if cur_ts is not None and cur_lap is not None \
-                    and cur_lap < len(self._lap_start_ts):
-                in_lap = f"{(cur_ts - self._lap_start_ts[cur_lap]) / 1000.0:.2f}"
-            label.setText(get_text('map_view_laptime_current',
-                                   sel + 1, f"{self._lap_times[sel]:.2f}",
-                                   in_lap or "-"))
-            return
-        # 全ラップ表示: 完了ラップ（最終ラップ以外）からベストを選ぶ
-        total = ""
+        cur_ts = ts.get(self._current_index)
+        in_lap = "-"
+        if cur_ts is not None and cur_lap < len(self._lap_start_ts):
+            in_lap = f"{(cur_ts - self._lap_start_ts[cur_lap]) / 1000.0:.2f}"
+        label.setText(get_text('map_view_laptime_header', cur_lap + 1, in_lap,
+                               f"{self._lap_times[cur_lap]:.2f}"))
+
+        # ツールチップ: ベスト（完了ラップ=最終ラップ以外から）＋総経過
+        total = "-"
         if cur_ts is not None and self._session_start_ts is not None:
             total = f"{(cur_ts - self._session_start_ts) / 1000.0:.2f}"
         complete = self._lap_times[:-1]
         if complete:
             k = int(min(range(len(complete)), key=lambda i: complete[i]))
-            label.setText(get_text('map_view_laptime_best',
-                                   k + 1, f"{complete[k]:.2f}", total or "-"))
+            label.setToolTip(get_text('map_view_laptime_best',
+                                      k + 1, f"{complete[k]:.2f}", total))
         else:
-            label.setText(get_text('map_view_laptime_total', total or "-"))
+            label.setToolTip(get_text('map_view_laptime_total', total))
 
     def _toggle_lap_table(self, checked: bool) -> None:
         """折り畳み式ラップ一覧の展開/収納。展開時に内容を再構築する。"""
@@ -1431,6 +1666,23 @@ class MapViewWidget(QWidget):
                 self.lap_table.setItem(row, l, item)
         self._lap_delegate.current_col = -1        # 再構築後に赤枠を再適用
         self._update_lap_table_current()
+        self._fit_lap_table_height()
+
+    def _fit_lap_table_height(self) -> None:
+        """ラップ一覧の高さを中身（ヘッダー＋3行＋必要なら横スクロールバー）に合わせる。
+
+        以前は固定 110px だったため、フォントが大きい環境で 3 行目が見切れていた。
+        """
+        t = self.lap_table
+        t.resizeRowsToContents()
+        h = t.horizontalHeader().height() + 2 * t.frameWidth()
+        h += sum(t.rowHeight(r) for r in range(t.rowCount()))
+        # 列が表示幅に収まらない（多周回）ときは横スクロールバーの分も確保
+        need_w = t.verticalHeader().width() + sum(
+            t.columnWidth(c) for c in range(t.columnCount()))
+        if need_w > t.viewport().width():
+            h += t.horizontalScrollBar().sizeHint().height()
+        t.setFixedHeight(h + 2)
 
     def _update_lap_table_current(self) -> None:
         """現在フレームが属するラップの列へ赤枠＋ヘッダー赤字を同期する。
@@ -1458,35 +1710,21 @@ class MapViewWidget(QWidget):
         self.lap_table.viewport().update()
 
     def _jump_to_lap_start(self, lap: int) -> None:
-        """ラップ一覧の列クリック: そのラップだけの表示に切替＋先頭へジャンプ。
+        """ラップ一覧の列クリック: 現在ラップ表示に切替＋そのラップ先頭へジャンプ。
 
-        プルダウン選択と同じ絞り込み（lap_combo 切替 → refresh。ズームは保持）
-        を行ってから先頭フレームへ飛ぶ。全ラップ表示へ戻すにはプルダウンで
-        「全」を選ぶ。
+        「全ラップ」を外して現在ラップ表示にし、先頭フレームへ飛ぶ（親の
+        highlight_frame 経由でそのラップに絞った再描画になる）。全ラップ表示へ
+        戻すには「全ラップ」を再チェック。
         """
         if not (0 <= lap < len(self._lap_first_index)):
             return
-        pos = self.lap_combo.findData(lap)
-        if pos >= 0 and self.lap_combo.currentIndex() != pos:
-            self.lap_combo.setCurrentIndex(pos)      # → refresh（絞り込み表示）
         idx = self._lap_first_index[lap]
-        if idx is not None and self.on_frame_selected:
+        if idx is None:
+            return
+        self._current_index = int(idx)
+        self.all_laps_checkbox.setChecked(False)     # → refresh（現在ラップに絞る）
+        if self.on_frame_selected:
             self.on_frame_selected(int(idx))
-
-    def _update_lap_combo(self, n_laps: int) -> None:
-        """ラップ切替コンボを件数に合わせて再構築する（選択は維持）。
-
-        コンパクト表示でも潰れないよう項目は簡素表示（「全」と数字のみ）。
-        """
-        current = self.lap_combo.currentData()
-        self.lap_combo.blockSignals(True)
-        self.lap_combo.clear()
-        self.lap_combo.addItem(get_text('map_view_lap_all_short'), None)
-        for l in range(n_laps):
-            self.lap_combo.addItem(str(l + 1), l)
-        if current is not None and 0 <= current < n_laps:
-            self.lap_combo.setCurrentIndex(1 + current)
-        self.lap_combo.blockSignals(False)
 
     @staticmethod
     def _lap_color(lap: int):
@@ -1857,154 +2095,169 @@ class MapViewDialog(QDialog):
         self._last_quality_flags = set()
 
         self.setWindowTitle(get_text('map_view_dock_title'))
-        self.setMinimumSize(700, 600)
-        self.resize(900, 900)
+        self.setMinimumHeight(400)
+        self.resize(1250, 850)
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(2)
-        # マップ⇔操作パネルは縦スプリッタ。余白は**マップ側だけ**が吸収する
-        # ため、下側パネルの行間が間延びしない（従来は余った縦スペースが
-        # 全行へ分配されて行間が開いていた）。境界ドラッグで高さ配分を調整可。
-        splitter = QSplitter(Qt.Vertical)
+        # 地図はウィンドウ全高。操作パネル（編集タブ）は MapViewWidget の左サイド
+        # パネル下部へ折り畳み式セクションとして差し込む
         self.map_widget = MapViewWidget(on_frame_selected=self._on_frame_selected)
-        splitter.addWidget(self.map_widget)
+        layout.addWidget(self.map_widget)
 
         # 操作パネルはタブ化（自己位置の補正 / 学習ラベル / 位置領域）。以前は
-        # 全機能を縦に積んで 11 行＋長文ヒント 3 本を常時表示していたため、
-        # 地図が画面の 1/3 程度しか取れなかった。タブなら常時見えるのは
-        # 選択中の 1〜3 行だけで済み、長文ヒントはツールチップへ移す。
+        # 全機能を地図の下に縦積みしていたため地図が画面の 1/3 程度しか取れな
+        # かった。サイドパネル幅に合わせて各タブは縦積み、長文ヒントはツールチップ。
         panel = QTabWidget()
         panel.setDocumentMode(True)
         self._build_edit_panel(panel)
-        splitter.addWidget(panel)
-        splitter.setStretchFactor(0, 1)    # 余白はマップが取る
-        splitter.setStretchFactor(1, 0)
-        splitter.setCollapsible(0, False)
-        layout.addWidget(splitter)
+        self.edit_section = _CollapsibleSection(
+            get_text('map_view_section_edit'), panel, expanded=True)
+        self.map_widget.side_layout.addWidget(self.edit_section)
+        # 編集タブを含めた必要幅でサイドパネル幅を確定し、地図側が残りを取る。
+        # 既定ウィンドウ幅もサイドパネル幅＋地図 800px 以上を確保する
+        self.map_widget.fit_side_panel_width()
+        side_w = self.map_widget._side_scroll.minimumWidth()
+        self.resize(max(self.width(), side_w + 820), self.height())
+        # 最小幅はサイドパネルの表示状態で変える（畳めば地図だけの幅まで縮められる）
+        self._update_min_width()
+        self.map_widget.side_toggle_button.toggled.connect(self._on_side_panel_toggled)
 
         # 領域の追加・削除・読込をステータス行へ反映する
         self.map_widget.on_regions_changed = self._update_region_status
 
     def _build_edit_panel(self, tabs: QTabWidget):
-        """下側の操作パネルを 3 タブに分けて構築する。
+        """サイドパネル下部の操作パネルを 3 タブに分けて構築する。
 
-        各タブは 1〜3 行のコンパクトな横並び。長い説明文はラベル・ボタンの
-        ツールチップに置き、常時表示するのは結果・件数の 1 行だけにする。
+        サイドパネルは幅 240px 程度の 1 列構成。各機能は「見出し → ラベル｜入力
+        のフォーム行 → ボタン（1〜2 個/行）」の縦積みで、横に 3 つ以上並べない。
+        長い説明文はラベル・ボタンのツールチップに置き、常時表示するのは
+        結果・件数の 1 行だけにする。
         """
 
         def _new_tab(title_key):
             page = QWidget()
             lay = QVBoxLayout(page)
-            lay.setContentsMargins(4, 2, 4, 2)
-            lay.setSpacing(2)
+            lay.setContentsMargins(4, 4, 4, 4)
+            lay.setSpacing(3)
             tabs.addTab(page, get_text(title_key))
             return lay
 
         def _result_label():
             lbl = QLabel("")
             lbl.setStyleSheet("font-size: 11px;")
+            lbl.setWordWrap(True)
             set_text_role(lbl, 'faint')
             return lbl
+
+        def _caption(text_key, tooltip_key=None):
+            lbl = QLabel(get_text(text_key))
+            set_text_role(lbl, 'strong')
+            if tooltip_key:
+                lbl.setToolTip(get_text(tooltip_key))
+            return lbl
+
+        def _form(*pairs):
+            """(ラベル文字列 or None, ウィジェット) の並びを「ラベル｜入力」のグリッドに"""
+            g = QGridLayout()
+            g.setContentsMargins(0, 0, 0, 0)
+            g.setHorizontalSpacing(4)
+            g.setVerticalSpacing(2)
+            g.setColumnStretch(1, 1)
+            for r, (label, w) in enumerate(pairs):
+                if label:
+                    g.addWidget(QLabel(label), r, 0)
+                g.addWidget(w, r, 1)
+            return g
+
+        def _buttons(*widgets):
+            h = QHBoxLayout()
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(4)
+            for w in widgets:
+                h.addWidget(w)
+            return h
 
         # ===== タブ1: 自己位置の補正（品質フィルタ / 区間ソース上書き / 欠損補間）=====
         pose_layout = _new_tab('map_view_tab_pose_edit')
 
         # --- 品質フィルタ ---
-        quality_row = QHBoxLayout()
-        quality_row.addWidget(QLabel(get_text('map_view_quality_label')))
-        quality_row.addWidget(QLabel(get_text('map_view_quality_threshold_label')))
+        pose_layout.addWidget(_caption('map_view_quality_label'))
         self.quality_threshold_spin = QDoubleSpinBox()
         self.quality_threshold_spin.setRange(0.05, 10.0)
         self.quality_threshold_spin.setSingleStep(0.05)
         self.quality_threshold_spin.setValue(1.0)
         # マップ上のジャンプ×マーカー表示と同じ閾値を共有する
         self.quality_threshold_spin.valueChanged.connect(self._on_jump_threshold_changed)
-        quality_row.addWidget(self.quality_threshold_spin)
+        pose_layout.addLayout(_form(
+            (get_text('map_view_quality_threshold_label'), self.quality_threshold_spin)))
         self.quality_detect_button = QPushButton(get_text('map_view_quality_detect_btn'))
         self.quality_detect_button.clicked.connect(self._on_quality_detect_clicked)
-        quality_row.addWidget(self.quality_detect_button)
         self.quality_mark_deleted_button = QPushButton(get_text('map_view_quality_mark_deleted_btn'))
         self.quality_mark_deleted_button.clicked.connect(self._on_quality_mark_deleted_clicked)
-        quality_row.addWidget(self.quality_mark_deleted_button)
+        pose_layout.addLayout(_buttons(self.quality_detect_button,
+                                       self.quality_mark_deleted_button))
         self.quality_result_label = _result_label()
-        quality_row.addWidget(self.quality_result_label)
-        quality_row.addStretch()
-        pose_layout.addLayout(quality_row)
+        pose_layout.addWidget(self.quality_result_label)
 
         # --- 区間ソース上書き ---
-        segment_row = QHBoxLayout()
-        segment_row.addWidget(QLabel(get_text('map_view_segment_label')))
-        segment_row.addWidget(QLabel(get_text('map_view_segment_start_label')))
+        pose_layout.addWidget(_caption('map_view_segment_label'))
         self.segment_start_spin = QSpinBox()
         self.segment_start_spin.setRange(0, 0)
-        segment_row.addWidget(self.segment_start_spin)
-        segment_row.addWidget(QLabel(get_text('map_view_segment_end_label')))
         self.segment_end_spin = QSpinBox()
         self.segment_end_spin.setRange(0, 0)
-        segment_row.addWidget(self.segment_end_spin)
-        segment_row.addWidget(QLabel(get_text('map_view_segment_source_label')))
         self.segment_source_combo = QComboBox()
-        segment_row.addWidget(self.segment_source_combo)
+        pose_layout.addLayout(_form(
+            (get_text('map_view_segment_start_label'), self.segment_start_spin),
+            (get_text('map_view_segment_end_label'), self.segment_end_spin),
+            (get_text('map_view_segment_source_label'), self.segment_source_combo)))
         self.segment_apply_button = QPushButton(get_text('map_view_segment_apply_btn'))
         self.segment_apply_button.clicked.connect(self._on_segment_apply_clicked)
-        segment_row.addWidget(self.segment_apply_button)
         self.segment_clear_button = QPushButton(get_text('map_view_segment_clear_btn'))
         self.segment_clear_button.clicked.connect(self._on_segment_clear_clicked)
-        segment_row.addWidget(self.segment_clear_button)
-        segment_row.addStretch()
-        pose_layout.addLayout(segment_row)
+        pose_layout.addLayout(_buttons(self.segment_apply_button, self.segment_clear_button))
 
         # --- 欠損補間 ---
-        interp_row = QHBoxLayout()
-        interp_row.addWidget(QLabel(get_text('map_view_interp_label')))
-        interp_row.addWidget(QLabel(get_text('map_view_interp_maxgap_label')))
+        pose_layout.addWidget(_caption('map_view_interp_label'))
         self.interp_maxgap_spin = QSpinBox()
         self.interp_maxgap_spin.setRange(1, 200)
         self.interp_maxgap_spin.setValue(10)
-        interp_row.addWidget(self.interp_maxgap_spin)
+        pose_layout.addLayout(_form(
+            (get_text('map_view_interp_maxgap_label'), self.interp_maxgap_spin)))
         self.interp_run_button = QPushButton(get_text('map_view_interp_run_btn'))
         self.interp_run_button.clicked.connect(self._on_interp_run_clicked)
-        interp_row.addWidget(self.interp_run_button)
         self.interp_clear_button = QPushButton(get_text('map_view_interp_clear_btn'))
         self.interp_clear_button.clicked.connect(self._on_interp_clear_clicked)
-        interp_row.addWidget(self.interp_clear_button)
+        pose_layout.addLayout(_buttons(self.interp_run_button, self.interp_clear_button))
         self.interp_result_label = _result_label()
-        interp_row.addWidget(self.interp_result_label)
-        interp_row.addStretch()
-        pose_layout.addLayout(interp_row)
+        pose_layout.addWidget(self.interp_result_label)
+        pose_layout.addStretch()
 
         # ===== タブ2: 学習用ラベル（togivad/future_traj・agents の計算・保存）=====
         label_layout = _new_tab('map_view_tab_labels')
 
-        writeback_row = QHBoxLayout()
-        writeback_label = QLabel(get_text('map_view_writeback_label'))
-        writeback_label.setToolTip(get_text('map_view_writeback_tooltip'))
-        writeback_row.addWidget(writeback_label)
-        writeback_row.addWidget(QLabel(get_text('map_view_writeback_horizon_label')))
+        label_layout.addWidget(_caption('map_view_writeback_label', 'map_view_writeback_tooltip'))
         self.writeback_horizon_spin = QSpinBox()
         self.writeback_horizon_spin.setRange(1, 200)
         self.writeback_horizon_spin.setValue(20)
         self.writeback_horizon_spin.setToolTip(get_text('map_view_writeback_horizon_tooltip'))
-        writeback_row.addWidget(self.writeback_horizon_spin)
-        writeback_row.addWidget(QLabel(get_text('map_view_writeback_dt_label')))
         self.writeback_dt_spin = QDoubleSpinBox()
         self.writeback_dt_spin.setRange(0.01, 2.0)
         self.writeback_dt_spin.setSingleStep(0.01)
         self.writeback_dt_spin.setDecimals(2)
         self.writeback_dt_spin.setValue(0.05)
         self.writeback_dt_spin.setToolTip(get_text('map_view_writeback_dt_tooltip'))
-        writeback_row.addWidget(self.writeback_dt_spin)
-        writeback_row.addStretch()
-        label_layout.addLayout(writeback_row)
+        label_layout.addLayout(_form(
+            (get_text('map_view_writeback_horizon_label'), self.writeback_horizon_spin),
+            (get_text('map_view_writeback_dt_label'), self.writeback_dt_spin)))
 
-        # ボタンは 2 行目へ（コンパクト幅でも文言が見切れないように改行）
-        writeback_btn_row = QHBoxLayout()
+        # ボタンは文言が長いので 1 行ずつ（幅いっぱい）
         self.writeback_button = QPushButton(get_text('map_view_writeback_btn'))
         self.writeback_button.setToolTip(get_text('map_view_writeback_tooltip'))
         self.writeback_button.clicked.connect(self._on_writeback_clicked)
-        writeback_btn_row.addWidget(self.writeback_button)
+        label_layout.addWidget(self.writeback_button)
         # ②: 相手車矩形（opponent）→ togivad/agents 書き戻し
         self.agent_writeback_button = QPushButton(
             get_text('map_view_agent_writeback_btn'))
@@ -2012,63 +2265,108 @@ class MapViewDialog(QDialog):
             get_text('map_view_agent_writeback_tooltip'))
         self.agent_writeback_button.clicked.connect(
             self._on_agent_writeback_clicked)
-        writeback_btn_row.addWidget(self.agent_writeback_button)
-        writeback_btn_row.addStretch()
-        label_layout.addLayout(writeback_btn_row)
+        label_layout.addWidget(self.agent_writeback_button)
 
         # 補足説明は常時表示せずツールチップに（ラベル・ボタンにも同内容を設定済み）
         self.writeback_hint_label = _result_label()
         self.writeback_hint_label.setText(get_text('map_view_hint_hover'))
         self.writeback_hint_label.setToolTip(get_text('map_view_writeback_hint'))
         label_layout.addWidget(self.writeback_hint_label)
+        label_layout.addStretch()
 
         # ===== タブ3: 位置領域（軌跡区間指定）＋ 位置自動アノテーション（Phase 1）=====
         region_layout = _new_tab('map_view_tab_regions')
 
-        region_row = QHBoxLayout()
-        region_row.addWidget(QLabel(get_text('map_view_region_label')))
+        region_layout.addWidget(_caption('map_view_region_label'))
         self.region_edit_button = QPushButton(get_text('map_view_region_edit_btn'))
         self.region_edit_button.setCheckable(True)
         self.region_edit_button.setToolTip(get_text('map_view_region_edit_tooltip'))
         self.region_edit_button.toggled.connect(self._on_region_edit_toggled)
-        region_row.addWidget(self.region_edit_button)
-        region_row.addWidget(QLabel(get_text('map_view_region_class_label')))
         self.region_class_spin = QSpinBox()
         self.region_class_spin.setRange(0, 99)
         self.region_class_spin.valueChanged.connect(self._on_region_class_changed)
-        region_row.addWidget(self.region_class_spin)
+        region_layout.addWidget(self.region_edit_button)
+        region_layout.addLayout(_form(
+            (get_text('map_view_region_class_label'), self.region_class_spin)))
         self.region_undo_button = QPushButton(get_text('map_view_region_undo_btn'))
         self.region_undo_button.clicked.connect(self._on_region_undo_clicked)
-        region_row.addWidget(self.region_undo_button)
         self.region_clear_button = QPushButton(get_text('map_view_region_clear_btn'))
         self.region_clear_button.clicked.connect(self._on_region_clear_clicked)
-        region_row.addWidget(self.region_clear_button)
+        region_layout.addLayout(_buttons(self.region_undo_button, self.region_clear_button))
         self.region_save_button = QPushButton(get_text('map_view_region_save_btn'))
         self.region_save_button.setToolTip(get_text('map_view_region_save_tooltip'))
         self.region_save_button.clicked.connect(self._on_region_save_clicked)
-        region_row.addWidget(self.region_save_button)
-        region_row.addStretch()
-        region_layout.addLayout(region_row)
+        region_layout.addWidget(self.region_save_button)
 
-        autoloc_row = QHBoxLayout()
         self.autoloc_button = QPushButton(get_text('map_view_autoloc_btn'))
         self.autoloc_button.setToolTip(get_text('map_view_autoloc_tooltip'))
         self.autoloc_button.clicked.connect(self._on_autoloc_clicked)
-        autoloc_row.addWidget(self.autoloc_button)
+        region_layout.addWidget(self.autoloc_button)
         self.autoloc_keep_manual_checkbox = QCheckBox(
             get_text('map_view_autoloc_keep_manual'))
         self.autoloc_keep_manual_checkbox.setChecked(True)
         self.autoloc_keep_manual_checkbox.setToolTip(
             get_text('map_view_autoloc_keep_manual_tooltip'))
-        autoloc_row.addWidget(self.autoloc_keep_manual_checkbox)
-        autoloc_row.addStretch()
-        region_layout.addLayout(autoloc_row)
+        region_layout.addWidget(self.autoloc_keep_manual_checkbox)
 
-        # 領域数＋直近の操作結果を 1 行で表示。操作説明の長文はツールチップへ
+        # 領域数＋直近の操作結果を表示。操作説明の長文はツールチップへ
         self.region_status_label = _result_label()
         self.region_status_label.setToolTip(get_text('map_view_region_hint'))
         region_layout.addWidget(self.region_status_label)
+        region_layout.addStretch()
         self._update_region_status()
+
+    # 地図側の最小幅[px]（ナビゲーションツールバー＋カラーバー付きの図が読める幅）
+    MAP_MIN_WIDTH = 420
+
+    def _on_side_panel_toggled(self, shown: bool) -> None:
+        """サイドパネルの展開/折り畳みで、地図の位置・大きさを変えずにウィンドウ幅
+        だけを左へ伸ばす／縮める（右パネルに重ねた配置を崩さない）。"""
+        if not self.isVisible():
+            self._update_min_width()
+            return
+        # 最小幅を上げると即座にウィンドウが広がるため、変更前の矩形を先に取る
+        g = self.geometry()
+        span = self.map_widget.side_panel_span()
+        self._update_min_width()
+        if shown:
+            self.setGeometry(g.x() - span, g.y(), g.width() + span, g.height())
+        else:
+            self.setGeometry(g.x() + span, g.y(), max(self.minimumWidth(), g.width() - span),
+                             g.height())
+
+    def _update_min_width(self) -> None:
+        """サイドパネル表示中は「パネル幅＋地図」、折り畳み中は地図だけの最小幅にする"""
+        mw = self.map_widget
+        if mw.side_toggle_button.isChecked():
+            self.setMinimumWidth(mw._side_scroll.minimumWidth() + self.MAP_MIN_WIDTH)
+        else:
+            self.setMinimumWidth(self.MAP_MIN_WIDTH)
+
+    def show_docked(self, rect) -> None:
+        """サイドパネルを畳んだコンパクト表示で、画面上の rect（グローバル座標）に
+        ウィンドウ枠ごと収まるように表示する。
+
+        メイン画面の右パネル下部（コースの位置情報の下の空きスペース）に地図を
+        重ねて出すための既定配置。rect が最小サイズより小さい場合は最小サイズ。
+        ユーザーは ▶ でサイドパネルを開いたり、自由に移動・リサイズできる。
+        """
+        self.map_widget.side_toggle_button.setChecked(False)
+        self.show()
+        # 枠（タイトルバー・境界）の分を差し引いてクライアント領域の大きさを決める
+        frame = self.frameGeometry()
+        client = self.geometry()
+        frame_w = max(0, frame.width() - client.width())
+        frame_h = max(0, frame.height() - client.height())
+        w = max(self.minimumWidth(), rect.width() - frame_w)
+        h = max(self.minimumHeight(), rect.height() - frame_h)
+        self.resize(w, h)
+        # move はトップレベルでは枠の左上を指定する。最小幅で rect より広がる場合は
+        # 右端を揃える（画面右端の空きスペースからはみ出さない）
+        x = rect.x() + rect.width() - (w + frame_w) if w + frame_w > rect.width() else rect.x()
+        self.move(x, rect.y())
+        self.raise_()
+        self.activateWindow()
 
     def _on_frame_selected(self, index):
         self.jump_to_image.emit(index)
@@ -2285,7 +2583,7 @@ class MapViewDialog(QDialog):
             self.main_window.auto_annotate_locations_from_regions(
                 regions,
                 keep_manual=self.autoloc_keep_manual_checkbox.isChecked(),
-                prefer_source=self.map_widget.source_combo.currentData(),
+                prefer_source=self.map_widget.preferred_source(),
                 parent_widget=self)
         finally:
             self.autoloc_button.setEnabled(True)
