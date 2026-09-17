@@ -208,6 +208,18 @@ class PoseSourceManager:
             return int(self._source_ok_counts.get(source, 0))
         return int(self._source_total_counts.get(source, 0))
 
+    def has_extra_field(self, source: str, field: str) -> bool:
+        """指定ソースの extra に field を持つサンプルが1つでもあるか
+
+        pose（IMU デッドレコニング）センサーのみが roll/pitch（車体姿勢角）を持つため、
+        姿勢角度を教師データに使えるかどうかの判定に使う。
+        """
+        for samples in self._raw.values():
+            sample = samples.get(source)
+            if sample is not None and field in sample.extra:
+                return True
+        return False
+
     def get_source_pose(self, index: int, source: str, require_ok: bool = True,
                         allow_interp: bool = True) -> Optional[PoseSample]:
         """指定ソースのサンプルだけを返す（他ソースへはフォールバックしない）

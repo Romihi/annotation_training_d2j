@@ -48,7 +48,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                             QListView, QTreeView, QAbstractItemView,QStyleOptionSlider,QStyle, QTextEdit, QPlainTextEdit,
                             QGraphicsOpacityEffect, QListWidget, QListWidgetItem)
 from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont, QPolygon, QPolygonF, QCursor, QIcon, QPainterPath
-from PyQt5.QtCore import Qt, QRect, QPoint, QPointF, QSize, QTimer, QEvent, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QRect, QRectF, QPoint, QPointF, QSize, QTimer, QEvent, QThread, pyqtSignal
 
 from PIL import Image, ImageDraw
 
@@ -82,7 +82,7 @@ from styles import (get_location_color, apply_style, set_theme, get_current_them
                     set_segmented, location_button_qss, location_text_color, tint_group_qss)
 
 
-from managers import AnnotationDataManager, MLflowManager, ModelType, SequenceTrainingManager, PoseSourceManager, TogivadTrainingManager
+from managers import AnnotationDataManager, MLflowManager, ModelType, SequenceTrainingManager, PoseSourceManager, TogivadTrainingManager, LidarPolicyTrainingManager
 from map_view import MapViewDialog
 from utils.yolo_utils import (train_yolo_with_ui, TrainingOutputDialog,
                               dets_to_bboxes, masks_to_segments,
@@ -548,7 +548,10 @@ class ImageLabel(QLabel):
         self.sequence_prediction_points = []  # 時系列予測軌道 [(QPoint, ...)]
         self.show_gru_prediction = False  # 時系列予測表示フラグ
         self.bev_mode = False  # BEV(真上から見た図)表示モード（画像ソース='__bev__'）
+        self.lidar_mode = False  # LiDAR 生スキャン表示モード（画像ソース='__lidar__'）
         self.zoom_factor = DEFAULT_ZOOM_FACTOR
+        # キャンバス表示倍率（フィット=1.0 に対する割合。表示設定ダイアログで変更・保存）
+        self.canvas_scale = 1.0
         self.resolution_scale = 1.0          # 1.0=フル解像度, 0.1=10%
         self.crop_overlay_config = None      # 仮想ソース表示用
         self.virtual_overlay_mode = 'fill'   # 'none', 'border', 'fill'
@@ -978,6 +981,18 @@ class ImageLabel(QLabel):
             painter.end()
             return
 
+        # LiDAR モード: 生スキャン（極座標/距離プロファイル）を描き、その上に
+        # 画像ソースと同じ angle/throttle 平面のアノテーション点・推論点・差分
+        # ベクトルを重ねる（クリックによるアノテーションも画像と同じ座標系で動く）。
+        if getattr(self, 'lidar_mode', False):
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            self.draw_lidar_view(painter, self.target_rect)
+            self.draw_grid(painter, self.target_rect)
+            self.draw_control_points(painter, self.target_rect,
+                                     self.pix_width, self.pix_height)
+            painter.end()
+            return
+
         self.draw_virtual_overlay(painter, self.target_rect)
 
         # CAMオーバーレイを描画（ベース画像の上、他のアノテーションの下）
@@ -1035,18 +1050,43 @@ class ImageLabel(QLabel):
 
         painter.end()
 
+    # グリッドの軸ラベル（左: "-1"〜"1" を x-50、上: y-5、右: x+w+5）が切れない
+    # ようにキャンバス内で確保する余白 [px]
+    FIT_MARGIN_LEFT = 56
+    FIT_MARGIN_RIGHT = 22
+    FIT_MARGIN_TOP = 22
+    FIT_MARGIN_BOTTOM = 8
+
+    def fit_zoom_factor(self, pix_width=None, pix_height=None):
+        """画像（結合画像含む）を余白付きでキャンバスに収める倍率。
+
+        手動ズームは廃止し、常にこの倍率で表示する（zoom_factor には最後に
+        使った値を入れ、マウス判定など既存コードの座標計算と一致させる）。
+        """
+        pw = pix_width or (self.pixmap().width() if self.pixmap() else 0)
+        ph = pix_height or (self.pixmap().height() if self.pixmap() else 0)
+        if pw <= 0 or ph <= 0:
+            return 1.0
+        avail_w = max(1, self.width() - self.FIT_MARGIN_LEFT - self.FIT_MARGIN_RIGHT)
+        avail_h = max(1, self.height() - self.FIT_MARGIN_TOP - self.FIT_MARGIN_BOTTOM)
+        scale = float(getattr(self, 'canvas_scale', 1.0) or 1.0)
+        return max(0.05, min(avail_w / pw, avail_h / ph) * scale)
+
     def draw_initial_frame(self, painter):
         # 元の画像のサイズ
         self.pix_width = self.pixmap().width()
         self.pix_height = self.pixmap().height()
-        
-        # ズーム係数を使用して拡大後のサイズを計算
+
+        # 常にキャンバスへフィット（余白は軸ラベル用）
+        self.zoom_factor = self.fit_zoom_factor(self.pix_width, self.pix_height)
         self.scaled_width = int(self.pix_width * self.zoom_factor)
         self.scaled_height = int(self.pix_height * self.zoom_factor)
-        
-        # 中央に配置するための座標計算
-        self.x = (self.width() - self.scaled_width) // 2
-        self.y = (self.height() - self.scaled_height) // 2
+
+        # 余白を除いた領域の中央に配置
+        avail_w = self.width() - self.FIT_MARGIN_LEFT - self.FIT_MARGIN_RIGHT
+        avail_h = self.height() - self.FIT_MARGIN_TOP - self.FIT_MARGIN_BOTTOM
+        self.x = self.FIT_MARGIN_LEFT + (avail_w - self.scaled_width) // 2
+        self.y = self.FIT_MARGIN_TOP + (avail_h - self.scaled_height) // 2
 
         # 画像を拡大して描画
         self.target_rect = QRect(self.x, self.y, self.scaled_width, self.scaled_height)
@@ -1765,7 +1805,7 @@ class ImageLabel(QLabel):
                 # 推論対象未指定なら最初のカメラソース（BEV以外）のセルを既定に
                 # する。全キャンバスを返すと軌道がセル境界をまたいで描画されたり、
                 # _cell_specific 判定で走行/予測軌道がスキップされてしまう。
-                cam_srcs = [s for s in combined_sources if s != 'BEV']
+                cam_srcs = [s for s in combined_sources if s not in ('BEV', 'LIDAR')]
                 if not cam_srcs:
                     return target_rect, self.pix_width, self.pix_height
                 slot_idx = combined_sources.index(cam_srcs[0])
@@ -2562,7 +2602,11 @@ class ImageLabel(QLabel):
         ann = mw.annotations.get(idx, {}) if getattr(mw, 'annotations', None) else {}
         if 'angle' not in ann:
             return None
-        angle_val = float(ann['angle'])
+        return self._bev_arc_from_angle(float(ann['angle']), max_fwd, n)
+
+    def _bev_arc_from_angle(self, angle_val, max_fwd, n=24):
+        """angle∈[-1,1]（+1=右）→ 定曲率アーク ego座標 (n,2)[m]（_bev_steering_arc の本体）"""
+        mw = self.main_window
         max_steer = math.radians(getattr(mw, 'auto_max_steering_angle', 25.0))
         wheelbase = 0.25  # RC カーの代表値[m]（BEVの向き指標なので厳密さは不要）
         delta = angle_val * max_steer
@@ -2581,6 +2625,482 @@ class ImageLabel(QLabel):
             x = np.sin(kappa * s) / kappa
             y = (1.0 - np.cos(kappa * s)) / kappa
         return np.stack([x, y], axis=1)
+
+    # ------------------------------------------------------------ LiDAR ビュー
+    def _lidar_frame_data(self, mw, idx):
+        """現フレームの LiDAR スキャン（K積層）・統計・モデル入力ビンを idx キャッシュで返す。"""
+        cfg = mw._lidar_view_cfg()
+        key = (idx, mw.images[idx] if (mw.images and 0 <= idx < len(mw.images)) else None,
+               cfg.stack_frames, cfg.num_bins, cfg.downsample_mode, cfg.max_range_mm,
+               cfg.use_valid_ch)
+        if getattr(mw, '_lidar_frame_key', None) == key:
+            return mw._lidar_frame_cache
+        data = None
+        try:
+            from utils.lidar_view_utils import (collect_lidar_frame, scan_stats,
+                                                model_input_bins, zone_readings,
+                                                zone_geometry)
+            fr = collect_lidar_frame(mw.images, idx, cfg.stack_frames)
+            if fr is not None:
+                cfg.num_beams_raw = int(fr["meta"]["data_points"])
+                fr["stats"] = scan_stats(fr["scans"][-1], fr["meta"],
+                                         cfg.min_range_mm, cfg.max_range_mm)
+                try:
+                    fr["model_bins"] = model_input_bins(fr["scans"], cfg)
+                except Exception as e:
+                    print(f"lidar model input: {e}")
+                    fr["model_bins"] = None
+            # 測距ゾーン（catalog の lidar/{zone} or ultrasonic/{zone}）。
+            # 点群 npy が無いセッション（超音波のみ等）でもゾーンだけで描く。
+            ann = (getattr(mw, 'annotations', {}) or {}).get(idx)
+            prefix, zones = zone_readings(ann)
+            if fr is None and zones:
+                fr = {"scans": [], "duplicated": 0, "stats": {}, "model_bins": None,
+                      "meta": {"angle_start": -135.0, "angle_end": 135.0,
+                               "clockwise": False, "data_points": None}}
+            if fr is not None:
+                fr["cfg"] = cfg
+                fr["zone_prefix"] = prefix
+                fr["zones"] = zones
+                fr["zone_geom"] = zone_geometry(prefix, fr["meta"]) if zones else {}
+                data = fr
+        except Exception as e:
+            print(f"lidar frame load: {e}")
+        mw._lidar_frame_key = key
+        mw._lidar_frame_cache = data
+        return data
+
+    @staticmethod
+    def _lidar_range_color(frac, is_dark, alpha=255):
+        """距離比 0(近)→1(遠) を 橙→青 に補間した色"""
+        f = max(0.0, min(1.0, float(frac)))
+        near = (255, 130, 30) if not is_dark else (255, 150, 60)
+        far = (40, 110, 240) if not is_dark else (90, 160, 255)
+        return QColor(int(near[0] + (far[0] - near[0]) * f),
+                      int(near[1] + (far[1] - near[1]) * f),
+                      int(near[2] + (far[2] - near[2]) * f), alpha)
+
+    def draw_lidar_view(self, painter, rect):
+        """LiDAR 生スキャンを描く（画像ソース '__lidar__'）。
+
+        極座標（自車=中心・前方=上・左=左）または距離プロファイル（角度×距離）。
+        レイヤ: 生点群（距離で着色、無効ビームは灰のマーク）/ 過去 K-1 フレーム /
+        モデル入力（学習と同じ ScanPreprocessor 通過後のビン列）/ ego 軌道
+        （操舵アーク(赤)・推論アーク(シアン)・TogiVAD/LiDAR制御(濃紫)・走行(緑)・予測(紫)）。
+        """
+        mw = self.main_window
+        if mw is None:
+            return
+        idx = getattr(mw, 'current_index', None)
+        if idx is None:
+            return
+        is_dark = getattr(mw, 'is_dark_mode', False)
+        bg = QColor(24, 27, 32) if is_dark else QColor(244, 246, 248)
+        grid_col = QColor(70, 76, 84) if is_dark else QColor(205, 210, 216)
+        axis_col = QColor(110, 118, 128) if is_dark else QColor(160, 166, 174)
+        txt_col = QColor(190, 196, 204) if is_dark else QColor(80, 86, 94)
+
+        painter.save()
+        painter.setClipRect(rect)
+        painter.fillRect(rect, bg)
+        # 目盛・凡例のフォントは描画解像度に比例させる（結合表示の小セルでも収まる）。
+        # BEV(0.045) の半分程度にして点群やゾーンの邪魔にならないようにする
+        fs = max(6, int(round(rect.height() * 0.022)))
+        label_font = QFont("Arial")
+        label_font.setPixelSize(fs)
+        painter.setFont(label_font)
+        self._lidar_fs = fs
+
+        data = self._lidar_frame_data(mw, idx)
+        if data is None:
+            painter.setPen(QPen(txt_col))
+            painter.drawText(rect, Qt.AlignCenter, get_text('lidar_view_no_scan'))
+            painter.restore()
+            return
+
+        mode = getattr(mw, 'lidar_view_mode', 'polar')
+        if mode == 'profile':
+            self._draw_lidar_profile(painter, rect, mw, data, is_dark,
+                                     grid_col, axis_col, txt_col)
+        else:
+            self._draw_lidar_polar(painter, rect, mw, idx, data, is_dark,
+                                   grid_col, axis_col, txt_col)
+        painter.restore()
+
+    def _draw_lidar_polar(self, painter, rect, mw, idx, data, is_dark,
+                          grid_col, axis_col, txt_col):
+        from utils.lidar_view_utils import scan_to_xy
+        cfg = data["cfg"]
+        meta = data["meta"]
+        R = float(getattr(mw, 'lidar_view_range_m', 10.0)) / float(getattr(mw, 'lidar_view_zoom', 1.0) or 1.0)
+        fs = self._lidar_fs
+        pw = max(1, fs // 4)                     # 点の太さ
+        margin = max(6, fs)
+        avail_w = rect.width() - 2 * margin
+        avail_h = rect.height() - 2 * margin
+        # 後方は FOV(±135°) の到達 R·cos45° ぶんだけ確保して自車を下寄りに置く
+        a_max = max(abs(meta["angle_start"]), abs(meta["angle_end"]))
+        rear = R * max(0.0, -math.cos(math.radians(min(a_max, 180.0)))) if a_max > 90 else 0.0
+        rear = max(rear, 0.15 * R)
+        scale = min(avail_w / (2.0 * R), avail_h / (R + rear))
+        ox = rect.x() + rect.width() / 2.0
+        oy = rect.y() + margin + R * scale
+
+        def to_screen(x_fwd, y_left):
+            return (ox - y_left * scale, oy - x_fwd * scale)
+
+        # --- リング・軸・FOV ---
+        step = 0.5 if R <= 3 else (1.0 if R <= 12 else (2.0 if R <= 25 else 5.0))
+        painter.setBrush(Qt.NoBrush)
+        r = step
+        while r <= R + 1e-6:
+            painter.setPen(QPen(grid_col if abs(r - R) > 1e-6 else axis_col, 1))
+            painter.drawEllipse(QPointF(ox, oy), r * scale, r * scale)
+            painter.setPen(QPen(txt_col))
+            painter.drawText(int(ox + 4), int(oy - r * scale - 2), f"{r:g}m")
+            r += step
+        painter.setPen(QPen(axis_col, 1, Qt.DashLine))
+        painter.drawLine(int(ox), int(oy - R * scale), int(ox), int(oy + rear * scale))
+        painter.drawLine(int(ox - R * scale), int(oy), int(ox + R * scale), int(oy))
+        # FOV 境界と死角（後方の扇形を薄く塗る）
+        a0 = math.radians(meta["angle_start"]); a1 = math.radians(meta["angle_end"])
+        for a in (a0, a1):
+            ex, ey = to_screen(R * math.cos(a), R * math.sin(a))
+            painter.setPen(QPen(axis_col, 1))
+            painter.drawLine(int(ox), int(oy), int(ex), int(ey))
+        blind = QColor(0, 0, 0, 14) if not is_dark else QColor(255, 255, 255, 10)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(blind))
+        span_deg = 360.0 - (meta["angle_end"] - meta["angle_start"])
+        if span_deg > 0.5:
+            # Qt の角度は 1/16°, 0=3時, CCW 正。画面では前方=上(90°)、左=左。
+            start_qt = int((90.0 + meta["angle_end"]) * 16)
+            painter.drawPie(QRectF(ox - R * scale, oy - R * scale, 2 * R * scale, 2 * R * scale),
+                            start_qt, int(span_deg * 16))
+
+        # --- 測距ゾーン（monitor.py の drawSensorFan と同じ扇形。点群の下） ---
+        if getattr(mw, 'show_lidar_zones', True) and data.get("zones"):
+            self._draw_lidar_zone_fans(painter, rect, data, R, scale, ox, oy, is_dark, txt_col)
+
+        # --- 点群（過去フレーム → 現フレーム） ---
+        scans = data["scans"]
+        show_hist = getattr(mw, 'show_lidar_history', True)
+        show_pts = getattr(mw, 'show_lidar_points', True)
+        frames = scans if show_hist else scans[-1:]
+        n_fr = len(frames)
+        for fi, scan in enumerate(frames):
+            is_cur = (fi == n_fr - 1)
+            if not show_pts and is_cur:
+                continue
+            X, Y, valid, rm, ang = scan_to_xy(scan, meta, cfg.min_range_mm, cfg.max_range_mm)
+            inrange = valid & (rm <= R)
+            if is_cur:
+                # 距離で着色（drawPoints をレンジ帯ごとにまとめて高速化）
+                frac = np.clip(rm / R, 0, 1)
+                bands = np.minimum((frac * 8).astype(int), 7)
+                for b in range(8):
+                    m = inrange & (bands == b)
+                    if not m.any():
+                        continue
+                    painter.setPen(QPen(self._lidar_range_color((b + 0.5) / 8, is_dark), pw))
+                    pts = [QPointF(*to_screen(x, y)) for x, y in zip(X[m], Y[m])]
+                    painter.drawPoints(QPolygonF(pts))
+                # 無効ビーム: 外周に灰のマーク（角度の欠けが見える）
+                inv = ~valid
+                if inv.any():
+                    painter.setPen(QPen(QColor(150, 150, 150, 170), 1))
+                    for a in ang[inv]:
+                        x0, y0 = to_screen(0.965 * R * math.cos(a), 0.965 * R * math.sin(a))
+                        x1, y1 = to_screen(R * math.cos(a), R * math.sin(a))
+                        painter.drawLine(int(x0), int(y0), int(x1), int(y1))
+            else:
+                alpha = int(40 + 60 * (fi + 1) / max(1, n_fr - 1))
+                painter.setPen(QPen(QColor(120, 130, 140, alpha) if not is_dark
+                                    else QColor(170, 180, 190, alpha), max(1, pw - 1)))
+                pts = [QPointF(*to_screen(x, y)) for x, y in zip(X[inrange], Y[inrange])]
+                if pts:
+                    painter.drawPoints(QPolygonF(pts))
+
+        # --- モデル入力（前処理後ビン）: 黄の折れ線 ---
+        if getattr(mw, 'show_lidar_model_input', True) and data.get("model_bins") is not None:
+            r_m, valid_b, ang_b = data["model_bins"]
+            painter.setPen(QPen(QColor(235, 190, 0) if not is_dark else QColor(255, 215, 60), max(1, pw - 1)))
+            prev = None
+            prev_r = None
+            for rr, ok, a in zip(r_m, valid_b, ang_b):
+                if not ok or rr > R:
+                    prev = None
+                    continue
+                cur = to_screen(rr * math.cos(a), rr * math.sin(a))
+                # 隣接ビン間の距離ジャンプ（壁の縁→遠方）は面ではないので線を切る
+                if prev is not None and abs(rr - prev_r) <= max(0.3, 0.3 * min(rr, prev_r)):
+                    painter.drawLine(int(prev[0]), int(prev[1]), int(cur[0]), int(cur[1]))
+                else:
+                    painter.drawPoint(int(cur[0]), int(cur[1]))
+                prev, prev_r = cur, rr
+
+        # --- ego 軌道（操舵/推論/制御/走行/予測。各表示チェックボックスに連動） ---
+        self._draw_lidar_ego_overlays(painter, mw, idx, to_screen, min(R, 3.0), is_dark)
+
+        # --- 自車 ---
+        painter.setPen(QPen(axis_col, 1))
+        painter.setBrush(QBrush(QColor(60, 70, 80) if not is_dark else QColor(200, 210, 220)))
+        tw = max(3, fs * 0.5)
+        tri = QPolygonF([QPointF(ox, oy - 1.5 * tw), QPointF(ox - tw, oy + tw), QPointF(ox + tw, oy + tw)])
+        painter.drawPolygon(tri)
+
+        # --- 凡例 + 統計 ---
+        self._draw_lidar_legend(painter, rect, mw, data, is_dark, txt_col, bottom=True)
+
+    def _draw_lidar_profile(self, painter, rect, mw, data, is_dark,
+                            grid_col, axis_col, txt_col):
+        """距離プロファイル: 横=ビーム角度[deg]（左端=angle_start）、縦=距離[m]。"""
+        from utils.lidar_view_utils import scan_to_xy
+        cfg = data["cfg"]
+        meta = data["meta"]
+        R = float(getattr(mw, 'lidar_view_range_m', 10.0)) / float(getattr(mw, 'lidar_view_zoom', 1.0) or 1.0)
+        fs = self._lidar_fs
+        pw = max(1, fs // 4)
+        left, right, top, bottom = fs * 3, fs, int(fs * 3.2), int(fs * 2.8)
+        px0 = rect.x() + left; px1 = rect.x() + rect.width() - right
+        py0 = rect.y() + top; py1 = rect.y() + rect.height() - bottom
+        if px1 - px0 < 20 or py1 - py0 < 20:
+            return
+        a_lo, a_hi = float(meta["angle_start"]), float(meta["angle_end"])
+
+        def to_screen(a_deg, r_m):
+            fx = (a_deg - a_lo) / max(1e-6, (a_hi - a_lo))
+            fy = min(1.0, max(0.0, r_m / R))
+            return (px0 + fx * (px1 - px0), py1 - fy * (py1 - py0))
+
+        # グリッド
+        step = 0.5 if R <= 3 else (1.0 if R <= 12 else (2.0 if R <= 25 else 5.0))
+        r = 0.0
+        while r <= R + 1e-6:
+            y = to_screen(a_lo, r)[1]
+            painter.setPen(QPen(grid_col, 1))
+            painter.drawLine(int(px0), int(y), int(px1), int(y))
+            painter.setPen(QPen(txt_col))
+            painter.drawText(int(rect.x() + 3), int(y + fs // 3), f"{r:g}")
+            r += step
+        for a in range(int(math.ceil(a_lo / 45.0)) * 45, int(a_hi) + 1, 45):
+            x = to_screen(a, 0)[0]
+            painter.setPen(QPen(axis_col if a == 0 else grid_col, 2 if a == 0 else 1))
+            painter.drawLine(int(x), int(py0), int(x), int(py1))
+            painter.setPen(QPen(txt_col))
+            lab = f"{a:+d}°" if a else "0°"
+            lw = painter.fontMetrics().horizontalAdvance(lab)
+            lx = min(max(int(x - lw / 2), rect.x() + 2), rect.x() + rect.width() - lw - 2)
+            painter.drawText(lx, int(py1 + fs + 2), lab)
+        painter.setPen(QPen(txt_col))
+        cap = get_text('lidar_view_profile_axis')
+        cw = painter.fontMetrics().horizontalAdvance(cap)
+        painter.drawText(int((px0 + px1) / 2 - cw / 2), int(py1 + 2 * fs + 6), cap)
+
+        sweep_sign = -1.0 if meta.get("clockwise") else 1.0
+        # 測距ゾーン: 角度幅の帯を測距値の高さに描く（点群の下）
+        if getattr(mw, 'show_lidar_zones', True) and data.get("zones"):
+            from utils.lidar_view_utils import zone_color_rgb
+            for z, mm in data["zones"].items():
+                g = data["zone_geom"].get(z)
+                if g is None or mm <= 0:
+                    continue
+                c_rad, w_rad = g
+                d0 = math.degrees(c_rad - w_rad / 2) * sweep_sign
+                d1 = math.degrees(c_rad + w_rad / 2) * sweep_sign
+                x0, yb = to_screen(min(d0, d1), min(mm / 1000.0, R))
+                x1, _ = to_screen(max(d0, d1), 0)
+                rr, gg, bb = zone_color_rgb(mm)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(QColor(rr, gg, bb, 70)))
+                painter.drawRect(QRectF(x0, yb, x1 - x0, py1 - yb))
+                painter.setPen(QPen(QColor(rr, gg, bb, 230), max(2, pw)))
+                painter.drawLine(int(x0), int(yb), int(x1), int(yb))
+                painter.setPen(QPen(txt_col))
+                painter.drawText(int((x0 + x1) / 2 - fs), int(yb - 3), f"{z}")
+
+        scans = data["scans"]
+        show_hist = getattr(mw, 'show_lidar_history', True)
+        show_pts = getattr(mw, 'show_lidar_points', True)
+        frames = scans if show_hist else scans[-1:]
+        n_fr = len(frames)
+        for fi, scan in enumerate(frames):
+            is_cur = (fi == n_fr - 1)
+            if not show_pts and is_cur:
+                continue
+            _, _, valid, rm, ang = scan_to_xy(scan, meta, cfg.min_range_mm, cfg.max_range_mm)
+            deg = np.degrees(ang) * sweep_sign
+            if is_cur:
+                frac = np.clip(rm / R, 0, 1)
+                bands = np.minimum((frac * 8).astype(int), 7)
+                for b in range(8):
+                    m = valid & (bands == b)
+                    if not m.any():
+                        continue
+                    painter.setPen(QPen(self._lidar_range_color((b + 0.5) / 8, is_dark), pw))
+                    pts = [QPointF(*to_screen(d, rr)) for d, rr in zip(deg[m], rm[m])]
+                    painter.drawPoints(QPolygonF(pts))
+                inv = ~valid
+                if inv.any():
+                    painter.setPen(QPen(QColor(150, 150, 150, 200), 1))
+                    for d in deg[inv]:
+                        x = to_screen(d, 0)[0]
+                        painter.drawLine(int(x), int(py1), int(x), int(py1 - 6))
+            else:
+                alpha = int(40 + 60 * (fi + 1) / max(1, n_fr - 1))
+                painter.setPen(QPen(QColor(120, 130, 140, alpha) if not is_dark
+                                    else QColor(170, 180, 190, alpha), max(1, pw - 1)))
+                pts = [QPointF(*to_screen(d, rr)) for d, rr in zip(deg[valid], rm[valid])]
+                if pts:
+                    painter.drawPoints(QPolygonF(pts))
+
+        if getattr(mw, 'show_lidar_model_input', True) and data.get("model_bins") is not None:
+            r_m, valid_b, ang_b = data["model_bins"]
+            deg_b = np.degrees(ang_b) * sweep_sign
+            painter.setPen(QPen(QColor(235, 190, 0) if not is_dark else QColor(255, 215, 60), max(1, pw - 1)))
+            prev = None
+            for rr, ok, d in zip(r_m, valid_b, deg_b):
+                if not ok:
+                    prev = None
+                    continue
+                cur = to_screen(d, min(rr, R))
+                if prev is not None:
+                    painter.drawLine(int(prev[0]), int(prev[1]), int(cur[0]), int(cur[1]))
+                prev = cur
+
+        self._draw_lidar_legend(painter, rect, mw, data, is_dark, txt_col)
+
+    def _draw_lidar_ego_overlays(self, painter, mw, idx, to_screen, max_fwd, is_dark):
+        """LiDAR 極座標図に ego 軌道を重ねる（BEV と同じ配色）。"""
+        items = []  # (points(N,2), QColor, width)
+        # 操舵アーク(赤): 「操舵軌道を表示（赤）」に連動（BEV と同じ）
+        if getattr(mw, 'show_auto_driving_direction', False):
+            arc = self._bev_steering_arc(idx, max_fwd)
+            if arc is not None:
+                items.append((arc, QColor(230, 40, 40), 3))
+        # 推論アーク(シアン): 推論点の表示フラグに連動
+        inf = (getattr(mw, 'inference_results', {}) or {}).get(idx)
+        if inf is not None and 'angle' in inf and getattr(self, 'show_inference', False):
+            arc = self._bev_arc_from_angle(float(inf['angle']), max_fwd)
+            if arc is not None:
+                items.append((arc, QColor(0, 170, 170), 3))
+        # TogiVAD / LiDAR Policy の制御(濃紫): 専用トグルに連動
+        ctl = (getattr(mw, 'togivad_control_results', {}) or {}).get(idx)
+        if ctl is not None and getattr(self, 'show_togivad_control', False):
+            arc = self._bev_arc_from_angle(float(ctl['angle']), max_fwd)
+            if arc is not None:
+                items.append((arc, QColor(120, 40, 170), 3))
+        pm = getattr(mw, 'pose_manager', None)
+        if getattr(mw, 'show_recorded_trajectory', False) and pm and pm.has_any_pose():
+            g = pm.compute_future_trajectory(
+                idx, horizon=max(1, int(getattr(mw, 'recorded_traj_points', 20))),
+                dt=float(getattr(mw, 'recorded_traj_dt', 0.05)),
+                prefer=getattr(mw, 'recorded_traj_source', None))
+            if g is not None and len(g) >= 1:
+                items.append((np.asarray(g, dtype=float), QColor(0, 200, 0), 2))
+        if getattr(mw, 'show_gru_predictions', False) and getattr(mw, '_gru_is_togivad', False):
+            pred_raw = (getattr(mw, 'gru_predictions', {}) or {}).get(idx)
+            if pred_raw:
+                items.append((np.asarray(pred_raw, dtype=float), QColor(190, 80, 230), 2))
+        for pts, col, w in items:
+            painter.setPen(QPen(col, w))
+            painter.setBrush(Qt.NoBrush)
+            sp = [to_screen(float(x), float(y)) for x, y in pts]
+            for k in range(len(sp) - 1):
+                painter.drawLine(int(sp[k][0]), int(sp[k][1]), int(sp[k + 1][0]), int(sp[k + 1][1]))
+
+    def _draw_lidar_zone_fans(self, painter, rect, data, R, scale, ox, oy, is_dark, txt_col):
+        """測距ゾーン（lidar/ultrasonic の RrLH/FrLH/FrFR/FrRH/RrRH）を扇形で描く。
+
+        monitor.py の drawSensorFan と同じ: 自車から測距値までの扇（幅はゾーンの
+        角度範囲）、色は距離閾値（<300mm 赤 / <600mm 黄 / 緑）、外側に距離テキスト。
+        """
+        from utils.lidar_view_utils import zone_color_rgb
+        fs = self._lidar_fs
+        for z, mm in data["zones"].items():
+            g = data["zone_geom"].get(z)
+            if g is None:
+                continue
+            c_rad, w_rad = g
+            rr, gg, bb = zone_color_rgb(mm)
+            if mm <= 0:
+                # 測距なし: 輪郭だけ灰で
+                col_fill, col_line = QColor(0, 0, 0, 0), QColor(140, 140, 140, 160)
+                rad_px = 0.12 * R * scale
+            else:
+                col_fill = QColor(rr, gg, bb, 110 if not is_dark else 130)
+                col_line = QColor(rr, gg, bb, 230)
+                rad_px = min(mm / 1000.0, R) * scale
+            # Qt の角度は 1/16°, 0=3時, CCW 正。画面は前方=上(90°)・左=左なので
+            # ロボット角 a → Qt 角 90°+a
+            start_qt = int((90.0 + math.degrees(c_rad - w_rad / 2)) * 16)
+            span_qt = int(math.degrees(w_rad) * 16)
+            box = QRectF(ox - rad_px, oy - rad_px, 2 * rad_px, 2 * rad_px)
+            painter.setPen(QPen(col_line, max(1, fs // 8)))
+            painter.setBrush(QBrush(col_fill))
+            painter.drawPie(box, start_qt, span_qt)
+            # 距離テキスト（扇の外側）
+            label = f"{z} {mm:.0f}mm" if mm > 0 else f"{z} --"
+            # 近距離ゾーン同士のラベル衝突を避けるため最小半径を確保する
+            lab_r = max(rad_px + fs * 1.2, 0.4 * R * scale)
+            tx = ox - math.sin(c_rad) * lab_r
+            ty = oy - math.cos(c_rad) * lab_r
+            tw = painter.fontMetrics().horizontalAdvance(label)
+            # ラベルは描画矩形内に収める（レンジ外の遠いゾーンは外周に寄る）
+            tx = min(max(tx, rect.x() + tw / 2 + 2), rect.x() + rect.width() - tw / 2 - 2)
+            ty = min(max(ty, rect.y() + fs + 2), rect.y() + rect.height() - 4)
+            painter.setPen(QPen(txt_col))
+            painter.drawText(int(tx - tw / 2), int(ty + fs / 3), label)
+
+    def _draw_lidar_legend(self, painter, rect, mw, data, is_dark, txt_col, bottom=False):
+        st = data.get("stats", {})
+        cfg = data["cfg"]
+        lines = []
+        if data.get("scans"):
+            lines += [
+                (self._lidar_range_color(0.15, is_dark), get_text('lidar_legend_points')),
+                (QColor(150, 150, 150), get_text('lidar_legend_invalid')),
+            ]
+        if getattr(mw, 'show_lidar_zones', True) and data.get("zones"):
+            lines.append((QColor(51, 200, 90), get_text('lidar_legend_zones',
+                                                       data.get("zone_prefix") or "")))
+        if data.get("scans") and getattr(mw, 'show_lidar_history', True) and cfg.stack_frames > 1:
+            lines.append((QColor(140, 150, 160), get_text('lidar_legend_history', cfg.stack_frames - 1)))
+        if getattr(mw, 'show_lidar_model_input', True) and data.get("model_bins") is not None:
+            lines.append((QColor(235, 190, 0), get_text('lidar_legend_model', cfg.num_bins)))
+        if getattr(mw, 'lidar_view_mode', 'polar') != 'profile':
+            if getattr(mw, 'show_auto_driving_direction', False):
+                lines.append((QColor(230, 40, 40), get_text('bev_legend_steering')))
+            if getattr(self, 'show_inference', False):
+                lines.append((QColor(0, 170, 170), get_text('lidar_legend_inference')))
+        fs = self._lidar_fs
+        row_h = fs + 3
+        x = rect.x() + 4
+        y = (rect.y() + rect.height() - 6 - row_h * (len(lines) - 1)) if bottom else (rect.y() + fs + 3)
+        for col, text in lines:
+            painter.setPen(QPen(col, max(2, fs // 5)))
+            painter.drawLine(x, y - fs // 3, x + fs, y - fs // 3)
+            painter.setPen(QPen(txt_col))
+            painter.drawText(x + fs + 4, y, text)
+            y += row_h
+        # 統計（右上）
+        def _fmt(v):
+            return "--" if (v is None or (isinstance(v, float) and math.isnan(v))) else f"{v:.2f}m"
+        stat_lines = []
+        if st:
+            stat_lines = [
+                get_text('lidar_stat_beams', st.get('n_beams', 0), int(st.get('valid_ratio', 0) * 100)),
+                get_text('lidar_stat_min', _fmt(st.get('front_min_m')), _fmt(st.get('left_min_m')),
+                         _fmt(st.get('right_min_m'))),
+            ]
+        if st and cfg.stack_frames > 1:
+            stat_lines.append(get_text('lidar_stat_stack', cfg.stack_frames, data.get('duplicated', 0)))
+        painter.setPen(QPen(txt_col))
+        fm = painter.fontMetrics()
+        y = (rect.y() + rect.height() - 6 - row_h * (max(0, len(stat_lines) - 1))) if bottom else (rect.y() + fs + 3)
+        for text in stat_lines:
+            painter.drawText(int(rect.x() + rect.width() - 4 - fm.horizontalAdvance(text)), y, text)
+            y += row_h
 
     def draw_bev(self, painter, rect):
         """真上から見た図(BEV)を描画する。
@@ -4508,12 +5028,14 @@ class ImageLabel(QLabel):
             pix_height = self.pixmap().height()
             
             # ズーム係数を使用して拡大後のサイズを計算
-            scaled_width = int(pix_width * self.zoom_factor)
-            scaled_height = int(pix_height * self.zoom_factor)
-            
-            # 表示領域の計算
-            x = (self.width() - scaled_width) // 2
-            y = (self.height() - scaled_height) // 2
+            zoom = self.fit_zoom_factor(pix_width, pix_height)
+            scaled_width = int(pix_width * zoom)
+            scaled_height = int(pix_height * zoom)
+            # 描画と同じフィット倍率・余白付き配置
+            avail_w = self.width() - self.FIT_MARGIN_LEFT - self.FIT_MARGIN_RIGHT
+            avail_h = self.height() - self.FIT_MARGIN_TOP - self.FIT_MARGIN_BOTTOM
+            x = self.FIT_MARGIN_LEFT + (avail_w - scaled_width) // 2
+            y = self.FIT_MARGIN_TOP + (avail_h - scaled_height) // 2
             target_rect = QRect(x, y, scaled_width, scaled_height)
             
             # クリック位置が画像内かチェック
@@ -4652,11 +5174,14 @@ class ImageLabel(QLabel):
             pos = event.pos()
             pix_width = self.pixmap().width()
             pix_height = self.pixmap().height()
-            scaled_width = int(pix_width * self.zoom_factor)
-            scaled_height = int(pix_height * self.zoom_factor)
-            
-            x = (self.width() - scaled_width) // 2
-            y = (self.height() - scaled_height) // 2
+            zoom = self.fit_zoom_factor(pix_width, pix_height)
+            scaled_width = int(pix_width * zoom)
+            scaled_height = int(pix_height * zoom)
+            # 描画と同じフィット倍率・余白付き配置
+            avail_w = self.width() - self.FIT_MARGIN_LEFT - self.FIT_MARGIN_RIGHT
+            avail_h = self.height() - self.FIT_MARGIN_TOP - self.FIT_MARGIN_BOTTOM
+            x = self.FIT_MARGIN_LEFT + (avail_w - scaled_width) // 2
+            y = self.FIT_MARGIN_TOP + (avail_h - scaled_height) // 2
             target_rect = QRect(x, y, scaled_width, scaled_height)
             
             if not target_rect.contains(pos):
@@ -4737,11 +5262,14 @@ class ImageLabel(QLabel):
             pos = event.pos()
             pix_width = self.pixmap().width()
             pix_height = self.pixmap().height()
-            scaled_width = int(pix_width * self.zoom_factor)
-            scaled_height = int(pix_height * self.zoom_factor)
-            
-            x = (self.width() - scaled_width) // 2
-            y = (self.height() - scaled_height) // 2
+            zoom = self.fit_zoom_factor(pix_width, pix_height)
+            scaled_width = int(pix_width * zoom)
+            scaled_height = int(pix_height * zoom)
+            # 描画と同じフィット倍率・余白付き配置
+            avail_w = self.width() - self.FIT_MARGIN_LEFT - self.FIT_MARGIN_RIGHT
+            avail_h = self.height() - self.FIT_MARGIN_TOP - self.FIT_MARGIN_BOTTOM
+            x = self.FIT_MARGIN_LEFT + (avail_w - scaled_width) // 2
+            y = self.FIT_MARGIN_TOP + (avail_h - scaled_height) // 2
             target_rect = QRect(x, y, scaled_width, scaled_height)
             
             if not target_rect.contains(pos):
@@ -4790,11 +5318,14 @@ class ImageLabel(QLabel):
             pos = event.pos()
             pix_width = self.pixmap().width()
             pix_height = self.pixmap().height()
-            scaled_width = int(pix_width * self.zoom_factor)
-            scaled_height = int(pix_height * self.zoom_factor)
-            
-            x = (self.width() - scaled_width) // 2
-            y = (self.height() - scaled_height) // 2
+            zoom = self.fit_zoom_factor(pix_width, pix_height)
+            scaled_width = int(pix_width * zoom)
+            scaled_height = int(pix_height * zoom)
+            # 描画と同じフィット倍率・余白付き配置
+            avail_w = self.width() - self.FIT_MARGIN_LEFT - self.FIT_MARGIN_RIGHT
+            avail_h = self.height() - self.FIT_MARGIN_TOP - self.FIT_MARGIN_BOTTOM
+            x = self.FIT_MARGIN_LEFT + (avail_w - scaled_width) // 2
+            y = self.FIT_MARGIN_TOP + (avail_h - scaled_height) // 2
             target_rect = QRect(x, y, scaled_width, scaled_height)
             
             if not target_rect.contains(pos):
@@ -5640,7 +6171,7 @@ class SpeedGaugeWidget(QWidget):
         # ── "SPEED X.XX" を1行でトラック直上に描画（ズームラベルと高さを合わせる）──
         painter.setFont(QFont("Arial", 7))
         fm = painter.fontMetrics()
-        gap = 8  # トラック上端からのクリアランス
+        gap = 14  # トラック上端からのクリアランス（レンジラベルと高さを揃える）
         label_baseline = max(fm.ascent() + 2, ty - fm.descent() - gap)
         painter.setPen(QPen(text_color, 1))
         painter.drawText(2, label_baseline, f"speed {speed:.2f}")
@@ -6381,6 +6912,7 @@ class ImageAnnotationTool(QMainWindow):
             rb.toggled.connect(lambda checked, v=var: self.on_variant_changed(v) if checked else None)
         # pose/slam があるとき BEV(真上から見た図) ソースを追加
         self._add_bev_variant_button(variant_layout)
+        self._add_lidar_variant_button(variant_layout)
         # 複数ソースがある場合は結合表示ボタンを追加
         if len(self.available_variants) >= 2:
             combined_button = QPushButton(get_text('label_combined_view'))
@@ -7610,8 +8142,8 @@ class ImageAnnotationTool(QMainWindow):
         method_layout.addWidget(QLabel(get_text('pilot_model_select')))
         self.auto_method_combo = QComboBox()
 
-        # 利用可能なモデルのリストを取得
-        available_models = list_available_models()
+        # 利用可能なモデルのリストを取得（画像 CNN + LiDAR Policy）
+        available_models = self._driving_model_types()
 
         # コンボボックスのアイテムをモデルリストで初期化
         self.auto_method_combo.addItems(available_models)
@@ -8130,11 +8662,21 @@ class ImageAnnotationTool(QMainWindow):
         self.mask_visible_checkbox.toggled.connect(self.toggle_mask_visible)
         resolution_row.addWidget(self.mask_visible_checkbox)
 
+        # グリッド（angle/throttle 平面の目盛り）表示。画像ソースと測距ソースの両方に効く
+        self.grid_visible_checkbox = QCheckBox(get_text('chk_grid_visible'))
+        self.grid_visible_checkbox.setChecked(True)
+        self.grid_visible_checkbox.setToolTip(get_text('tip_grid_visible'))
+        self.grid_visible_checkbox.toggled.connect(self.toggle_grid_visible)
+        resolution_row.addWidget(self.grid_visible_checkbox)
+
         self._rebuild_mask_target_combo()
 
         image_column.addLayout(resolution_row)
 
         self.main_image_view = ImageLabel(main_window=self)
+        # 表示設定（display_settings.json）のキャンバス表示倍率を反映
+        if getattr(self, '_pending_canvas_scale', None):
+            self.main_image_view.canvas_scale = self._pending_canvas_scale
         self.main_image_view.setMinimumSize(800, 600)
         self.main_image_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         image_column.addWidget(self.main_image_view, 1)
@@ -8150,22 +8692,37 @@ class ImageAnnotationTool(QMainWindow):
         zoom_slider_container.setContentsMargins(0, 0, 0, 0)
         zoom_slider_container.setSpacing(1)
 
-        zoom_slider_container.addStretch(1)  # 上パディング（スライダーと同比率）
-
-        zoom_label = QLabel(get_text('canvas_zoom_label'))
+        # 画像は常にキャンバスへフィット表示するため手動ズームは無い。
+        # このスライダーは測距ソース（'__lidar__'）でのレンジ拡大縮小専用で、
+        # それ以外のソースでは非表示にする（_update_zoom_slider_visibility）。
+        zoom_label = QLabel(get_text('canvas_range_label'))
         zoom_label.setAlignment(Qt.AlignCenter)
-        zoom_slider_container.addWidget(zoom_label)  # ラベルをスライダー直上に配置
+        # スピードゲージのラベル（Arial 7pt）と同じ見た目。apply_font_to_children が
+        # QLabel の setFont を上書きするため、スタイルシートでサイズを固定する
+        zoom_label.setStyleSheet("font-family: Arial; font-size: 7pt;")
+        # 上パディング（スライダーと同比率 1/8）の中にラベルを置き、ラベルの下端が
+        # スピードゲージのラベルと同じ高さ（トラック上端 −14px。QSlider の端マージン
+        # ぶんを加える）になるようにする
+        zoom_top_box = QVBoxLayout()
+        zoom_top_box.setContentsMargins(0, 0, 0, 0)
+        zoom_top_box.setSpacing(0)
+        zoom_top_box.addStretch(1)
+        zoom_top_box.addWidget(zoom_label)
+        zoom_top_box.addSpacing(14)
+        zoom_slider_container.addLayout(zoom_top_box, 1)
+        self.zoom_slider_label = zoom_label
 
         self.canvas_zoom_slider = QSlider(Qt.Vertical)
-        self.canvas_zoom_slider.setMinimum(10)   # zoom_factor 1.0
-        self.canvas_zoom_slider.setMaximum(50)   # zoom_factor 5.0
-        self.canvas_zoom_slider.setValue(int(DEFAULT_ZOOM_FACTOR * 10))  # デフォルト値
+        self.canvas_zoom_slider.setMinimum(10)   # レンジ ×1.0
+        self.canvas_zoom_slider.setMaximum(50)   # レンジ ×1/5
+        self.canvas_zoom_slider.setValue(10)
         self.canvas_zoom_slider.setTickPosition(QSlider.TicksLeft)
         self.canvas_zoom_slider.setTickInterval(5)
         self.canvas_zoom_slider.setFixedWidth(30)
-        self.canvas_zoom_slider.setToolTip(get_text('canvas_zoom_tooltip'))
+        self.canvas_zoom_slider.setToolTip(get_text('canvas_range_tooltip'))
         self.canvas_zoom_slider.valueChanged.connect(self._on_canvas_zoom_changed)
         zoom_slider_container.addWidget(self.canvas_zoom_slider, 6)  # 75% 高さ
+        self._update_zoom_slider_visibility()
 
         zoom_slider_container.addStretch(1)  # 下パディング
 
@@ -8668,6 +9225,59 @@ class ImageAnnotationTool(QMainWindow):
         auto_driving_control_layout.addLayout(bev_layer_row)
         auto_driving_control_layout.addLayout(bev_layer_row2)
         self._update_bev_layer_enabled()
+
+        # 行1d: LiDAR ビュー（画像ソース '__lidar__'）のレイヤ/表示設定。
+        #       BEV と同様、LiDAR ソース選択時のみ操作可能にする。
+        self._lidar_layer_widgets = []
+        self.lidar_view_range_m = 5.0
+        self.lidar_view_mode = 'polar'
+        lidar_layer_row = QHBoxLayout()
+        lidar_layer_row.setSpacing(6)
+        lidar_hint_label = QLabel(get_text('label_lidar_layers_only'))
+        set_text_role(lidar_hint_label, 'muted')
+        lidar_hint_label.setToolTip(get_text('tip_lidar_layers_only'))
+        lidar_hint_label.setMinimumHeight(_label_h)
+        lidar_layer_row.addWidget(lidar_hint_label)
+        self._lidar_layer_widgets.append(lidar_hint_label)
+        self.lidar_view_mode_combo = QComboBox()
+        self.lidar_view_mode_combo.addItem(get_text('opt_lidar_view_polar'), 'polar')
+        self.lidar_view_mode_combo.addItem(get_text('opt_lidar_view_profile'), 'profile')
+        self.lidar_view_mode_combo.currentIndexChanged.connect(self._on_lidar_view_mode_changed)
+        lidar_layer_row.addWidget(self.lidar_view_mode_combo)
+        self._lidar_layer_widgets.append(self.lidar_view_mode_combo)
+        lidar_range_label = QLabel(get_text('label_lidar_view_range'))
+        lidar_range_label.setMinimumHeight(_label_h)
+        lidar_layer_row.addWidget(lidar_range_label)
+        self._lidar_layer_widgets.append(lidar_range_label)
+        self.lidar_view_range_combo = QComboBox()
+        for rng in (3, 5, 10, 20, 30):
+            self.lidar_view_range_combo.addItem(f"{rng}m", float(rng))
+        self.lidar_view_range_combo.setCurrentIndex(1)
+        self.lidar_view_range_combo.currentIndexChanged.connect(self._on_lidar_view_range_changed)
+        lidar_layer_row.addWidget(self.lidar_view_range_combo)
+        self._lidar_layer_widgets.append(self.lidar_view_range_combo)
+        lidar_layer_row.addStretch()
+
+        lidar_layer_row2 = QHBoxLayout()
+        lidar_layer_row2.setSpacing(6)
+        lidar_layer_row2.addSpacing(_INDENT_WIDTH)
+        for attr, key, default in (
+                ('show_lidar_zones', 'chk_lidar_zones', True),
+                ('show_lidar_points', 'chk_lidar_points', True),
+                ('show_lidar_history', 'chk_lidar_history', True),
+                ('show_lidar_model_input', 'chk_lidar_model_input', True)):
+            setattr(self, attr, default)
+            cb = QCheckBox(get_text(key))
+            cb.setChecked(default)
+            cb.setMinimumHeight(_label_h)
+            cb.setToolTip(get_text('tip_' + key))
+            cb.stateChanged.connect(self._make_bev_layer_toggle(attr))
+            lidar_layer_row2.addWidget(cb)
+            self._lidar_layer_widgets.append(cb)
+        lidar_layer_row2.addStretch()
+        auto_driving_control_layout.addLayout(lidar_layer_row)
+        auto_driving_control_layout.addLayout(lidar_layer_row2)
+        self._update_lidar_layer_enabled()
 
         # 行2: カメラ幾何（最大舵角/俯角/FOV/カメラ高）
         #   車両とカメラの物理定数でセッション中はほぼ固定のため、パネルには
@@ -10342,6 +10952,81 @@ class ImageAnnotationTool(QMainWindow):
             group.setStyleSheet(qss)
             group.updateGeometry()
 
+    def _update_lidar_layer_enabled(self):
+        """LiDAR ビューの設定は画像ソースが LiDAR のときだけ操作可能にする。"""
+        widgets = getattr(self, '_lidar_layer_widgets', None)
+        if not widgets:
+            return
+        enabled = (getattr(self, 'current_variant', None) == '__lidar__')
+        for widget in widgets:
+            widget.setEnabled(enabled)
+
+    def _on_lidar_view_mode_changed(self, _i=None):
+        self.lidar_view_mode = self.lidar_view_mode_combo.currentData() or 'polar'
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def _on_lidar_view_range_changed(self, _i=None):
+        self.lidar_view_range_m = float(self.lidar_view_range_combo.currentData() or 10.0)
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def _lidar_view_cfg(self):
+        """LiDAR ビューの「モデル入力」表示に使う設定。LiDAR Policy モデル読込中は
+        その学習設定（ビン数・積層・レンジ）、それ以外は config の既定値。"""
+        from managers.lidar_policy_models import LidarPolicyConfig
+        lp = getattr(self, '_lidar_policy', None)
+        if lp and isinstance(lp[1], LidarPolicyConfig):
+            return LidarPolicyConfig.from_dict(lp[1].to_dict())
+        cfg = getattr(self, '_gru_cfg', None)
+        if isinstance(cfg, LidarPolicyConfig):
+            return LidarPolicyConfig.from_dict(cfg.to_dict())
+        return LidarPolicyConfig(
+            num_bins=LIDAR_POLICY_DEFAULT_NUM_BINS,
+            stack_frames=LIDAR_POLICY_DEFAULT_STACK_FRAMES,
+            max_range_mm=LIDAR_POLICY_DEFAULT_MAX_RANGE_MM,
+            max_speed=LIDAR_POLICY_DEFAULT_MAX_SPEED, use_traj=False)
+
+    def _has_lidar_data(self):
+        """測距ソースを出せるか: lidar/*.npy がある、または catalog に測距ゾーン値
+        （lidar/{zone} / ultrasonic/{zone}）がある（先頭画像のセッションで判定・キャッシュ）。"""
+        images = getattr(self, 'images', None)
+        if not images:
+            return False
+        keys = getattr(self, 'available_sensor_keys', None) or ()
+        if any(k.startswith(('lidar/', 'ultrasonic/')) for k in keys):
+            return True
+        session = os.path.dirname(os.path.dirname(images[0]))
+        cache = getattr(self, '_lidar_data_cache', None)
+        if cache is None:
+            cache = self._lidar_data_cache = {}
+        if session not in cache:
+            d = os.path.join(session, 'lidar')
+            try:
+                cache[session] = os.path.isdir(d) and any(
+                    f.endswith('.npy') for f in os.listdir(d))
+            except OSError:
+                cache[session] = False
+        return cache[session]
+
+    def _add_lidar_variant_button(self, variant_layout):
+        """lidar/*.npy があるとき LiDAR（生スキャン）ラジオを画像ソース欄に追加する。
+
+        値は '__lidar__'。選択すると on_variant_changed が lidar_mode を立て、
+        画像の代わりに生スキャンを描き、その上に画像ソースと同じアノテーション点・
+        推論点を重ねる（クリックによるアノテーションも同じ座標系）。
+        """
+        if not self._has_lidar_data():
+            return
+        rb = QRadioButton(get_text('image_source_lidar'))
+        rb.setToolTip(get_text('tip_image_source_lidar'))
+        if getattr(self, 'current_variant', None) == '__lidar__':
+            rb.setChecked(True)
+        rb.toggled.connect(
+            lambda checked: self.on_variant_changed('__lidar__') if checked else None)
+        variant_layout.addWidget(rb)
+        self.variant_button_group.addButton(rb)
+
     def _update_bev_layer_enabled(self):
         """BEVレイヤのトグルは画像ソースが BEV のときだけ操作可能にする。"""
         widgets = getattr(self, '_bev_layer_widgets', None)
@@ -11805,7 +12490,7 @@ class ImageAnnotationTool(QMainWindow):
         アノテーションを持たない疑似ソースなので、専用ストアは作らない。
         """
         current = variant if variant is not None else getattr(self, 'current_variant', None)
-        if current == '__bev__':
+        if current in ('__bev__', '__lidar__'):
             return self._active_source_key or current
         if current == '__combined__':
             variants = getattr(self, 'available_variants', None)
@@ -11957,6 +12642,7 @@ class ImageAnnotationTool(QMainWindow):
             self.current_variant = variant  # キー名だけは保存しておく
             self._active_source_key = self._annotation_source_key(variant)
             self._update_bev_layer_enabled()
+            self._update_lidar_layer_enabled()
             return
         
         # 以前と同じキーが選択された場合は何もしない（結合表示は設定変更があるため常に更新）
@@ -11968,14 +12654,24 @@ class ImageAnnotationTool(QMainWindow):
         print(f"キーを '{variant}' に変更しました")
         # アノテーション/推論結果を新しいソースのものに載せ替える
         self.switch_annotation_source(variant)
-        # BEVレイヤのトグルは BEV 選択時のみ有効
+        # BEV/LiDAR レイヤのトグルは各ソース選択時のみ有効
         self._update_bev_layer_enabled()
+        self._update_lidar_layer_enabled()
 
-        # BEV(真上から見た図)モードの切替。カメラ画像リスト(self.images)は
-        # そのまま保持し、paintEvent が BEV を描く（軌道は ego座標で自己完結）。
+        # BEV(真上から見た図)/LiDAR モードの切替。カメラ画像リスト(self.images)は
+        # そのまま保持し、paintEvent が BEV/LiDAR を描く（軌道は ego座標で自己完結）。
         if hasattr(self, 'main_image_view'):
             self.main_image_view.bev_mode = (variant == '__bev__')
-        if variant == '__bev__':
+            self.main_image_view.lidar_mode = (variant == '__lidar__')
+        # レンジスライダー（測距ソース専用）: 入るたびに ×1.0 へ戻し、他ソースでは隠す
+        if hasattr(self, 'canvas_zoom_slider'):
+            if variant == '__lidar__':
+                self.canvas_zoom_slider.blockSignals(True)
+                self.canvas_zoom_slider.setValue(10)
+                self.canvas_zoom_slider.blockSignals(False)
+            self.lidar_view_zoom = 1.0
+            self._update_zoom_slider_visibility()
+        if variant in ('__bev__', '__lidar__'):
             # 現在フレームの pixmap を保持したまま再描画（BEVはその上に描く）
             self.display_current_image()
             self.update_variant_buttons()
@@ -11987,39 +12683,25 @@ class ImageAnnotationTool(QMainWindow):
             base_variant = self.available_variants[0]
             self.images = self.variant_images[base_variant]
             print(f"結合表示モード: ベースキー '{base_variant}' の画像数: {len(self.images)}")
-            # ズーム自動調整: 列数に応じてスケールダウンしてキャンバス幅に収める
-            if hasattr(self, 'canvas_zoom_slider') and hasattr(self, 'main_image_view'):
+            # 表示はキャンバスへ自動フィットする。合成画像は表示に必要な拡大率ぶん
+            # 高解像度(スーパーサンプル)で焼いて、BEV/測距セルの文字・線が拡大で
+            # ぼやけないようにする（フィット倍率は draw_initial_frame が毎回計算）。
+            if hasattr(self, 'main_image_view'):
+                view = self.main_image_view
                 grid = getattr(self, '_combined_grid', '2x1')
-                cols = {'2x1': 2, '1x2': 1, '3x1': 3, '2x2': 2, '3x3': 3}.get(grid, 2)
-                canvas_w = self.main_image_view.width()
+                cols, rows = {'2x1': (2, 1), '1x2': (1, 2), '3x1': (3, 1),
+                              '2x2': (2, 2), '3x3': (3, 3)}.get(grid, (2, 1))
                 orig_w = getattr(self, 'original_image_width', None)
-                if orig_w and orig_w > 0 and canvas_w > 0:
-                    # combined画像幅 = orig_w * cols。表示に必要な拡大率ぶん
-                    # 高解像度(スーパーサンプル)で焼き、ズームを1/SSに補正する。
-                    # これで BEV セルの文字・線が拡大でぼやけず鮮明になる。
-                    fit_zoom_raw = canvas_w / (orig_w * cols)
-                    # 切り捨て（int）で SS を決めると fit_zoom=raw/SS>=1 が保証され、
-                    # ズーム下限クランプ(1.0)による表示はみ出しを避けられる。
-                    ss = max(1, min(3, int(fit_zoom_raw)))  # 1〜3倍
-                    self._combined_supersample = ss
-                    fit_zoom = fit_zoom_raw / ss
-                    slider_val = max(10, min(50, round(fit_zoom * 10)))
+                orig_h = getattr(self, 'original_image_height', None)
+                if orig_w and orig_h:
+                    fit_zoom_raw = view.fit_zoom_factor(orig_w * cols, orig_h * rows)
+                    self._combined_supersample = max(1, min(3, int(fit_zoom_raw)))
                 else:
-                    # フォールバック: 列数で割るだけ
                     self._combined_supersample = 1
-                    slider_val = max(10, self.canvas_zoom_slider.value() // cols)
-                # 結合表示→結合表示のグリッド変更時は上書きしない
-                if not hasattr(self, '_pre_combined_zoom'):
-                    self._pre_combined_zoom = self.canvas_zoom_slider.value()
-                self.canvas_zoom_slider.setValue(slider_val)
         elif hasattr(self, 'variant_images') and variant in self.variant_images:
             # キー別の画像リストを設定
             self.images = self.variant_images[variant]
             print(f"キー '{variant}' の画像数: {len(self.images)}")
-            # 結合表示から戻る場合はズームを復元
-            if hasattr(self, '_pre_combined_zoom') and hasattr(self, 'canvas_zoom_slider'):
-                self.canvas_zoom_slider.setValue(self._pre_combined_zoom)
-                del self._pre_combined_zoom
         else:
             return
 
@@ -12171,6 +12853,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # pose/slam があるとき BEV(真上から見た図) ソースを追加
         self._add_bev_variant_button(variant_layout)
+        self._add_lidar_variant_button(variant_layout)
 
         # 複数ソースがある場合は結合表示ボタンを追加
         if len(self.available_variants) >= 2:
@@ -12318,6 +13001,9 @@ class ImageAnnotationTool(QMainWindow):
         # （軌道を俯瞰した合成画像を1セルとして焼き込む。キー名は 'BEV'）
         if self._has_pose_data() and 'BEV' not in all_vars_ordered:
             all_vars_ordered.append('BEV')
+        # lidar/*.npy があるとき LiDAR 生スキャン図もセル候補に加える（キー名 'LIDAR'）
+        if self._has_lidar_data() and 'LIDAR' not in all_vars_ordered:
+            all_vars_ordered.append('LIDAR')
 
         # ---- ヘッダー行 ----
         _COL1_W = 60
@@ -12369,7 +13055,7 @@ class ImageAnnotationTool(QMainWindow):
             row_l.setContentsMargins(6, 2, 6, 2)
             row_l.setSpacing(4)
 
-            chk = QCheckBox(var)
+            chk = QCheckBox(get_text('image_source_lidar') if var == 'LIDAR' else var)
             chk.setChecked(var in current_order)
 
             rb = QRadioButton()
@@ -17899,6 +18585,31 @@ class ImageAnnotationTool(QMainWindow):
         
         layout.addWidget(font_group)
 
+        # キャンバス表示倍率（画像/結合画像/測距図をキャンバスにフィットさせた
+        # 大きさに対する割合。100% = キャンバスいっぱい）
+        scale_group = QGroupBox(get_text('section_canvas_scale'))
+        scale_layout = QVBoxLayout(scale_group)
+        scale_row = QHBoxLayout()
+        scale_row.addWidget(QLabel(get_text('label_canvas_scale')))
+        self.canvas_scale_slider = QSlider(Qt.Horizontal)
+        self.canvas_scale_slider.setRange(30, 100)
+        self.canvas_scale_slider.setSingleStep(5)
+        self.canvas_scale_slider.setTickPosition(QSlider.TicksBelow)
+        self.canvas_scale_slider.setTickInterval(10)
+        cur_pct = int(round(float(getattr(self.main_image_view, 'canvas_scale', 1.0)) * 100))
+        self.canvas_scale_slider.setValue(max(30, min(100, cur_pct)))
+        self.canvas_scale_value_label = QLabel(f"{self.canvas_scale_slider.value()}%")
+        self.canvas_scale_slider.valueChanged.connect(
+            lambda v: self.canvas_scale_value_label.setText(f"{v}%"))
+        scale_row.addWidget(self.canvas_scale_slider)
+        scale_row.addWidget(self.canvas_scale_value_label)
+        scale_layout.addLayout(scale_row)
+        scale_hint = QLabel(get_text('tip_canvas_scale'))
+        set_text_role(scale_hint, 'muted')
+        scale_hint.setWordWrap(True)
+        scale_layout.addWidget(scale_hint)
+        layout.addWidget(scale_group)
+
         # ダークモード設定
         self.dark_mode_check = QCheckBox(get_text('dark_mode'))
         self.dark_mode_check.setChecked(getattr(self, 'is_dark_mode', False))
@@ -17958,6 +18669,11 @@ class ImageAnnotationTool(QMainWindow):
         # 群のタイトル余白はフォント高依存なので貼り直す
         self._refresh_panel_group_styles()
 
+        # キャンバス表示倍率
+        if hasattr(self, 'canvas_scale_slider') and hasattr(self, 'main_image_view'):
+            self.main_image_view.canvas_scale = self.canvas_scale_slider.value() / 100.0
+            self.main_image_view.update()
+
         # 設定を保存
         if self.save_settings_check.isChecked():
             self.save_display_settings(new_width, new_height, new_font_size, self.is_dark_mode)
@@ -17993,6 +18709,9 @@ class ImageAnnotationTool(QMainWindow):
             settings["dark_mode"] = dark_mode
         elif hasattr(self, 'is_dark_mode'):
             settings["dark_mode"] = self.is_dark_mode
+        if hasattr(self, 'main_image_view'):
+            settings["canvas_scale"] = int(round(
+                float(getattr(self.main_image_view, 'canvas_scale', 1.0)) * 100))
             
         try:
             with open(settings_path, 'w', encoding='utf-8') as f:
@@ -18023,6 +18742,13 @@ class ImageAnnotationTool(QMainWindow):
                 # ダークモード設定（適用は呼び出し元の __init__ でまとめて行う）
                 if "dark_mode" in settings:
                     self.is_dark_mode = settings["dark_mode"]
+
+                # キャンバス表示倍率（%）。main_image_view 生成前なら保留して後で適用
+                if "canvas_scale" in settings:
+                    pct = max(30, min(100, int(settings["canvas_scale"])))
+                    self._pending_canvas_scale = pct / 100.0
+                    if hasattr(self, 'main_image_view'):
+                        self.main_image_view.canvas_scale = pct / 100.0
                     
             except Exception as e:
                 print(f"表示設定の読み込みエラー: {e}")
@@ -21301,30 +22027,28 @@ class ImageAnnotationTool(QMainWindow):
                     button.setText("⏵")
 
     def _update_canvas_zoom_slider_max(self):
-        """画像がキャンバスからはみ出ない最大ズーム値を計算してスライダーに設定"""
-        if not hasattr(self, 'main_image_view') or not self.main_image_view.pixmap():
-            return
-        pix_w = self.main_image_view.pixmap().width()
-        pix_h = self.main_image_view.pixmap().height()
-        canvas_w = self.main_image_view.width()
-        canvas_h = self.main_image_view.height()
-        if pix_w <= 0 or pix_h <= 0:
-            return
-        max_zoom = min(canvas_w / pix_w, canvas_h / pix_h)
-        max_slider = max(10, int(max_zoom * 10))  # 最低1.0x
-        self.canvas_zoom_slider.blockSignals(True)
-        self.canvas_zoom_slider.setMaximum(max_slider)
-        # 現在値が最大値を超えている場合はクランプ
-        if self.canvas_zoom_slider.value() > max_slider:
-            self.canvas_zoom_slider.setValue(max_slider)
-            self.main_image_view.zoom_factor = max_slider / 10.0
-        self.canvas_zoom_slider.blockSignals(False)
+        """（互換のため残置）画像は常にフィット表示なのでズーム上限の調整は不要。"""
+        return
+
+    def toggle_grid_visible(self, checked):
+        """グリッド表示の ON/OFF（画像ソース・測距ソース共通）"""
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.show_grid = bool(checked)
+            self.main_image_view.update()
+
+    def _update_zoom_slider_visibility(self):
+        """レンジスライダーは測距ソースのときだけ表示する。"""
+        show = (getattr(self, 'current_variant', None) == '__lidar__')
+        for w in (getattr(self, 'zoom_slider_label', None),
+                  getattr(self, 'canvas_zoom_slider', None)):
+            if w is not None:
+                w.setVisible(show)
 
     def _on_canvas_zoom_changed(self, value):
-        """キャンバスズームスライダーの値が変更されたときの処理"""
-        zoom = value / 10.0
-        self.main_image_view.zoom_factor = zoom
-        self.main_image_view.update()
+        """レンジスライダー（測距ソース専用）: 上=拡大=レンジ縮小（×1.0〜×1/5）。"""
+        self.lidar_view_zoom = max(0.2, value / 10.0)
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
 
     # ------------------------------------------------------------------
     # マスク（指定領域を学習・推論入力から無視するポリゴン）
@@ -22143,7 +22867,32 @@ class ImageAnnotationTool(QMainWindow):
             ms_config = getattr(self, '_multi_source_config', None)
             vs_config = getattr(self, '_virtual_source_config', None)
 
-            if vs_config and model_path:
+            if model_type == self.LIDAR_POLICY_MODEL_TYPE and model_path:
+                # LiDAR Policy: 点群 + 車速で推論（キーはインデックス）
+                if force_reload or getattr(self, '_lidar_policy_path', None) != model_path \
+                        or not getattr(self, '_lidar_policy', None):
+                    self._load_lidar_policy_model(model_path)
+                target_indices = (list(range(len(self.images))) if all_images
+                                  else [self.current_index])
+                inference_results = {}
+                total = len(target_indices)
+                progress = None
+                if all_images:
+                    progress = QProgressDialog(progress_title, "キャンセル", 0, 100, self)
+                    progress.setWindowModality(Qt.WindowModal)
+                    progress.show()
+                for i, idx in enumerate(target_indices):
+                    if progress is not None and i % 20 == 0:
+                        progress.setValue(int(i * 100 / max(total, 1)))
+                        QApplication.processEvents()
+                        if progress.wasCanceled():
+                            break
+                    res = self._lidar_policy_result(idx)
+                    if res is not None:
+                        inference_results[idx] = res
+                if progress is not None:
+                    progress.close()
+            elif vs_config and model_path:
                 # 仮想ソース推論 (crop/scale/temporal)
                 if all_images:
                     target_indices = list(range(len(self.images)))
@@ -23804,6 +24553,41 @@ class ImageAnnotationTool(QMainWindow):
             QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_selected_model_not_found', selected_model))
             return
 
+        # LiDAR Policy: 点群入力モデル。画像系の読込経路（マルチソース検出・
+        # 入力サイズ検出・batch_inference）は通らず、専用ローダで読み込んで
+        # 現フレームを推論する。
+        if model_type == self.LIDAR_POLICY_MODEL_TYPE:
+            try:
+                if self.inference_results:
+                    reply = QMessageBox.question(
+                        self, get_text('dlg_clear_inference_confirm'),
+                        get_text('msg_clear_inference_prompt', len(self.inference_results)),
+                        QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel, QMessageBox.Yes)
+                    if reply == QMessageBox.Cancel:
+                        return
+                    if reply == QMessageBox.Yes:
+                        self.inference_results = {}
+                model, cfg, meta = self._load_lidar_policy_model(model_path)
+                res = self._lidar_policy_result(self.current_index)
+                if res is not None:
+                    self.inference_results[self.current_index] = res
+                    self.calculate_and_store_diff_vector(self.current_index)
+                self._last_model_info = (model_type, model_path)
+                self.inference_checkbox.setChecked(True)
+                self.update_inference_display()
+                self.main_image_view.update()
+                self.update_gallery()
+                self.save_session_info()
+                self.statusBar().showMessage(
+                    f"LiDAR Policy を読み込みました: {os.path.basename(model_path)} "
+                    f"(preset={cfg.preset}, bins={cfg.num_bins}, K={cfg.stack_frames})", 5000)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                QMessageBox.critical(self, get_text('dlg_error'),
+                                     get_text('msg_inference_processing_error', str(e)))
+            return
+
         # マルチソースモデル検出
         from model_catalog import detect_multi_source_from_checkpoint
         ms_info = detect_multi_source_from_checkpoint(model_path, verbose=True)
@@ -24848,6 +25632,32 @@ class ImageAnnotationTool(QMainWindow):
 
         return bbox_info
 
+    def _render_lidar_to_pil(self, w, h):
+        """LiDAR 生スキャン図を (w,h) の PIL.Image として描画する（結合表示セル用）。"""
+        view = getattr(self, 'main_image_view', None)
+        if view is None or not hasattr(view, 'draw_lidar_view'):
+            return None
+        try:
+            w, h = int(w), int(h)
+            qimg = QImage(w, h, QImage.Format_RGB888)
+            qimg.fill(QColor(244, 246, 248))
+            painter = QPainter(qimg)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            try:
+                view.draw_lidar_view(painter, QRect(0, 0, w, h))
+            finally:
+                painter.end()
+            qimg = qimg.convertToFormat(QImage.Format_RGB888)
+            bpl = qimg.bytesPerLine()
+            ptr = qimg.constBits()
+            ptr.setsize(qimg.height() * bpl)
+            arr = np.frombuffer(ptr, np.uint8)[:qimg.height() * bpl].reshape(qimg.height(), bpl)
+            arr = arr[:, :w * 3].reshape(h, w, 3)
+            return Image.fromarray(arr.copy(), 'RGB')
+        except Exception as e:
+            print(f"LiDAR 合成画像の描画に失敗: {e}")
+            return None
+
     def _render_bev_to_pil(self, w, h):
         """BEV(真上から見た図)を (w,h) の PIL.Image として描画する（結合表示セル用）。
 
@@ -24916,6 +25726,8 @@ class ImageAnnotationTool(QMainWindow):
                 # 真上から見た図を PIL 画像として焼き込む（1セル）。セルの実解像度
                 # (base × SS) で直接描くことで、paste 時の再拡大を避け鮮明に保つ。
                 cell_slots.append((var, self._render_bev_to_pil(base_w * ss, base_h * ss)))
+            elif var == 'LIDAR':
+                cell_slots.append((var, self._render_lidar_to_pil(base_w * ss, base_h * ss)))
             elif var in group:
                 img = load_image_safely(group[var])
                 if img is not None:
@@ -25776,12 +26588,15 @@ class ImageAnnotationTool(QMainWindow):
         current_timestamp = int(time.time() * 1000)
         self.annotation_timestamps[self.current_index] = current_timestamp
 
-        self.annotations[self.current_index] = {
-            "angle": angle,
-            "throttle": throttle,
-            "x": x,
-            "y": y
-        }
+        # 既存のアノテーション辞書を丸ごと置き換えると、catalog 由来のセンサ値
+        # （speed, lidar/*, ultrasonic/*, pose/*, original_index 等）が消え、
+        # 測距ソースの扇形や速度表示・学習用の車速がそのフレームだけ欠落する。
+        # angle/throttle/x/y だけを更新して他のキーは保持する。
+        ann = self.annotations.get(self.current_index)
+        if not isinstance(ann, dict):
+            ann = {}
+            self.annotations[self.current_index] = ann
+        ann.update({"angle": angle, "throttle": throttle, "x": x, "y": y})
 
         # 位置情報があれば追加
         if self.current_location is not None:
@@ -26867,8 +27682,8 @@ class ImageAnnotationTool(QMainWindow):
         model_type_combo = QComboBox()
         model_type_combo.setMinimumWidth(200)
 
-        # 利用可能なモデルアーキテクチャのリストを取得
-        available_architectures = list_available_models()
+        # 利用可能なモデルアーキテクチャのリストを取得（画像 CNN + LiDAR Policy）
+        available_architectures = self._driving_model_types()
         model_type_combo.addItems(available_architectures)
 
         # 現在選択されているモデルタイプをデフォルトにする
@@ -27040,6 +27855,13 @@ class ImageAnnotationTool(QMainWindow):
 
         init_group.setLayout(init_layout)
         left_column.addWidget(init_group)
+
+        # LiDAR Policy 入力設定（モデル種別が lidar_policy のときだけ表示。
+        # 入力は画像ではなく lidar/*.npy の点群 + 車速）
+        lidar_group, lidar_read_config = self._build_lidar_policy_group()
+        _tint_group(lidar_group, "#EEF7EE", "#B9DEB9")
+        left_column.addWidget(lidar_group)
+        lidar_group.setVisible(False)
 
         # 出力設定グループ（Speed出力と将来予測を統合）
         output_settings_group = QGroupBox(get_text('label_output_settings'))
@@ -28345,6 +29167,23 @@ class ImageAnnotationTool(QMainWindow):
         tabs.addTab(aug_tab, get_text('tab_data_augmentation'))
 
         # タブをレイアウトに追加（残りスペースを全て使う）
+        # LiDAR Policy 選択時: 画像入力にしか意味のない設定群を無効化し、
+        # LiDAR 入力設定を表示する（学習パラメータ・データ選択・モデル名は共通）
+        _image_only_groups = (output_settings_group, rl_group, image_source_group,
+                              fusion_group, virtual_group, resolution_mode_group)
+
+        def update_lidar_mode(_i=None):
+            is_lidar = (model_type_combo.currentText() == self.LIDAR_POLICY_MODEL_TYPE)
+            lidar_group.setVisible(is_lidar)
+            for g in _image_only_groups:
+                g.setEnabled(not is_lidar)
+            for rb in (weights_radio_pretrained, weights_radio_random, weights_radio_finetune):
+                rb.setEnabled(not is_lidar)
+            tabs.setTabEnabled(1, not is_lidar)
+
+        model_type_combo.currentIndexChanged.connect(update_lidar_mode)
+        update_lidar_mode()
+
         settings_layout.addWidget(tabs, 1)
 
         # ===== 固定フッターエリア（モデル名・コメント・ボタン）=====
@@ -28451,6 +29290,83 @@ class ImageAnnotationTool(QMainWindow):
         # 設定値の取得
         # ダイアログで選択されたモデルタイプを使用
         model_type = model_type_combo.currentText()
+
+        if model_type == self.LIDAR_POLICY_MODEL_TYPE:
+            # LiDAR Policy: 入力は lidar/*.npy 点群 + 車速（画像ソース設定は使わない）。
+            # 共通の学習パラメータ・データ選択・モデル名をそのまま渡す。
+            use_all = data_radio_all.isChecked()
+            use_skip = data_radio_skip.isChecked()
+            use_range = data_radio_range.isChecked()
+            skip_count = custom_skip_spin.value() if use_skip else 1
+            range_start = range_start_spin.value() if use_range else 0
+            range_end = range_end_spin.value() if use_range else (len(self.images) - 1)
+            downsampled_set = (set(getattr(self, 'downsampled_indexes', []))
+                               if exclude_downsampled_check.isChecked() else set())
+            deleted_set = set(getattr(self, 'deleted_indexes', []))
+            valid_indexes = []
+            for idx in self.annotations.keys():
+                if not isinstance(idx, int) or idx < 0 or idx >= len(self.images):
+                    continue
+                if idx in deleted_set or idx in downsampled_set:
+                    continue
+                if use_all or (use_skip and idx % skip_count == 0) \
+                        or (use_range and range_start <= idx <= range_end):
+                    valid_indexes.append(idx)
+            if not valid_indexes:
+                QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_training_data'))
+                return
+            lidar_cfg = dict(lidar_read_config())
+            lidar_cfg.update({
+                'epochs': epoch_spin.value(),
+                'batch_size': int(batch_size_combo.currentText()),
+                'learning_rate': float(lr_combo.currentText()),
+                'val_split': val_split_spin.value(),
+                'use_early_stopping': early_stopping_check.isChecked(),
+                'patience': patience_spin.value() if early_stopping_check.isChecked() else 0,
+                'augment': True,
+                'model_name': f"{model_type}_" + model_name_suffix_input.text().strip(),
+                'comment': comment_input.toPlainText().strip(),
+            })
+            try:
+                result = self._train_lidar_policy(
+                    valid_indexes, lidar_cfg, f"モデル '{model_type}' の学習中...")
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                QMessageBox.critical(self, get_text('dlg_error'),
+                                     get_text('msg_inference_processing_error', str(e)))
+                return
+            if result.get('status') == 'cancelled':
+                self.statusBar().showMessage(get_text('status_training_cancelled'), 5000)
+                return
+            if result.get('status') != 'completed':
+                err = result.get('message') or 'Unknown error'
+                QMessageBox.warning(self, get_text('dlg_warning'),
+                                    get_text(f'msg_{err}') if err in ('lidar_no_scans', 'no_sequences',
+                                                                      'togivad_bad_horizon') else err)
+                return
+            ade_txt = (f" | Val ADE: {result.get('val_ade_m', 0):.3f} m"
+                       if result.get('use_traj') else "")
+            QMessageBox.information(
+                self, get_text('dlg_model_training'),
+                f"{get_text('msg_traj_training_complete')}\n\n"
+                f"Model type: {model_type}\n"
+                f"Preset: {lidar_cfg.get('preset')} | bins: {lidar_cfg.get('num_bins')} | "
+                f"K: {lidar_cfg.get('stack_frames')}\n"
+                f"Best Val Loss: {result.get('best_val_loss', 0):.6f} | "
+                f"Epochs: {result.get('epochs_trained', 0)}\n"
+                f"Val steer MAE: {result.get('val_steer_mae', 0):.4f} | "
+                f"Val throttle MAE: {result.get('val_speed_mae', 0):.4f}{ade_txt}\n"
+                f"Samples: {result.get('total_sequences', 0)} "
+                f"(Train: {result.get('train_samples', 0)}, Val: {result.get('val_samples', 0)})\n"
+                f"Skipped (no scan / mode): {result.get('n_no_scan', 0)} / "
+                f"{result.get('n_mode_skipped', 0)}\n"
+                f"Time: {result.get('total_time', 0):.1f}s\n"
+                f"Model: {os.path.basename(result.get('model_path', ''))}\n"
+                f"ONNX: {os.path.basename(result.get('onnx_path') or '-')}")
+            self.refresh_model_list()
+            return
+
         # マルチソース時はソース数と融合方法をプレフィックスに含める
         _checked_sources = [n for n, cb in training_source_checkboxes.items() if cb.isChecked()]
         if len(_checked_sources) > 1:
@@ -29100,6 +30016,226 @@ class ImageAnnotationTool(QMainWindow):
 
         self.main_image_view.update()
 
+    LIDAR_POLICY_MODEL_TYPE = 'lidar_policy'
+
+    def _driving_model_types(self):
+        """自動運転モデル種別の一覧（画像 CNN + LiDAR Policy）。"""
+        return list(list_available_models()) + [self.LIDAR_POLICY_MODEL_TYPE]
+
+    def _build_lidar_policy_group(self):
+        """LiDAR Policy の学習パラメータ群（時系列ダイアログ・自動運転ダイアログ共通）。
+
+        Returns:
+            (QGroupBox, read_config) — read_config() は config 辞書に入れるキーを返す
+        """
+        lidar_group = QGroupBox(get_text('label_lidar_policy_params'))
+        lidar_layout = QVBoxLayout()
+
+        lidar_row1 = QHBoxLayout()
+        lidar_row1.addWidget(QLabel(get_text('label_lidar_preset')))
+        lidar_preset_combo = QComboBox()
+        lidar_preset_combo.addItem(get_text('opt_lidar_preset_base'), 'base')
+        lidar_preset_combo.addItem(get_text('opt_lidar_preset_tiny'), 'tiny')
+        j = lidar_preset_combo.findData(LIDAR_POLICY_DEFAULT_PRESET)
+        lidar_preset_combo.setCurrentIndex(max(j, 0))
+        lidar_row1.addWidget(lidar_preset_combo)
+        lidar_row1.addWidget(QLabel(get_text('label_lidar_num_bins')))
+        lidar_bins_combo = QComboBox()
+        for b in (1081, 541, 271, 108):
+            lidar_bins_combo.addItem(str(b), b)
+        j = lidar_bins_combo.findData(LIDAR_POLICY_DEFAULT_NUM_BINS)
+        lidar_bins_combo.setCurrentIndex(max(j, 0))
+        lidar_row1.addWidget(lidar_bins_combo)
+        lidar_row1.addStretch()
+        lidar_layout.addLayout(lidar_row1)
+
+        lidar_row2 = QHBoxLayout()
+        lidar_row2.addWidget(QLabel(get_text('label_lidar_downsample')))
+        lidar_ds_combo = QComboBox()
+        lidar_ds_combo.addItem(get_text('opt_lidar_ds_minpool'), 'minpool')
+        lidar_ds_combo.addItem(get_text('opt_lidar_ds_index'), 'index')
+        lidar_row2.addWidget(lidar_ds_combo)
+        lidar_row2.addWidget(QLabel(get_text('label_lidar_stack')))
+        lidar_stack_spin = QSpinBox()
+        lidar_stack_spin.setRange(1, 8)
+        lidar_stack_spin.setValue(LIDAR_POLICY_DEFAULT_STACK_FRAMES)
+        lidar_row2.addWidget(lidar_stack_spin)
+        lidar_row2.addStretch()
+        lidar_layout.addLayout(lidar_row2)
+
+        lidar_row3 = QHBoxLayout()
+        lidar_row3.addWidget(QLabel(get_text('label_lidar_max_range')))
+        lidar_range_spin = QSpinBox()
+        lidar_range_spin.setRange(1000, 60000)
+        lidar_range_spin.setSingleStep(500)
+        lidar_range_spin.setValue(int(LIDAR_POLICY_DEFAULT_MAX_RANGE_MM))
+        lidar_row3.addWidget(lidar_range_spin)
+        lidar_row3.addWidget(QLabel(get_text('label_lidar_max_speed')))
+        lidar_speed_spin = QDoubleSpinBox()
+        lidar_speed_spin.setRange(0.5, 20.0)
+        lidar_speed_spin.setSingleStep(0.5)
+        lidar_speed_spin.setValue(LIDAR_POLICY_DEFAULT_MAX_SPEED)
+        lidar_row3.addWidget(lidar_speed_spin)
+        lidar_row3.addStretch()
+        lidar_layout.addLayout(lidar_row3)
+
+        # 補助軌道ヘッド: pred_seconds / pred_points（togivad と同じ意味論）
+        lidar_row4 = QHBoxLayout()
+        lidar_traj_check = QCheckBox(get_text('chk_lidar_traj'))
+        lidar_traj_check.setChecked(True)
+        lidar_traj_check.setToolTip(get_text('tip_lidar_traj'))
+        lidar_row4.addWidget(lidar_traj_check)
+        lidar_row4.addWidget(QLabel(get_text('label_togivad_pred_seconds')))
+        lidar_seconds_spin = QDoubleSpinBox()
+        lidar_seconds_spin.setRange(0.1, 5.0)
+        lidar_seconds_spin.setSingleStep(0.1)
+        lidar_seconds_spin.setDecimals(2)
+        lidar_seconds_spin.setValue(LIDAR_POLICY_DEFAULT_PRED_SECONDS)
+        lidar_row4.addWidget(lidar_seconds_spin)
+        lidar_row4.addWidget(QLabel(get_text('label_togivad_pred_points')))
+        lidar_points_spin = QSpinBox()
+        lidar_points_spin.setRange(1, 100)
+        lidar_points_spin.setValue(LIDAR_POLICY_DEFAULT_PRED_POINTS)
+        lidar_row4.addWidget(lidar_points_spin)
+        lidar_row4.addStretch()
+        lidar_layout.addLayout(lidar_row4)
+
+        def _sync_lidar_traj_enable(on):
+            for w in (lidar_seconds_spin, lidar_points_spin, lidar_pose_combo):
+                w.setEnabled(bool(on))
+
+        lidar_traj_check.toggled.connect(_sync_lidar_traj_enable)
+
+        lidar_row5 = QHBoxLayout()
+        lidar_row5.addWidget(QLabel(get_text('label_lidar_pose_source')))
+        lidar_pose_combo = QComboBox()
+        lidar_pose_combo.addItem(get_text('opt_pose_source_pose'), 'pose')
+        lidar_pose_combo.addItem(get_text('opt_pose_source_slam'), 'slam')
+        lidar_row5.addWidget(lidar_pose_combo)
+        lidar_row5.addWidget(QLabel(get_text('label_lidar_mode_filter')))
+        lidar_mode_combo = QComboBox()
+        lidar_mode_combo.addItem(get_text('opt_lidar_mode_all'), 'all')
+        lidar_mode_combo.addItem(get_text('opt_lidar_mode_auto'), 'auto')
+        lidar_mode_combo.addItem(get_text('opt_lidar_mode_user'), 'user')
+        lidar_row5.addWidget(lidar_mode_combo)
+        lidar_row5.addStretch()
+        lidar_layout.addLayout(lidar_row5)
+
+        lidar_row6 = QHBoxLayout()
+        lidar_row6.addWidget(QLabel(get_text('label_lidar_split')))
+        lidar_split_combo = QComboBox()
+        lidar_split_combo.addItem(get_text('opt_lidar_split_block'), 'block')
+        lidar_split_combo.addItem(get_text('opt_lidar_split_random'), 'random')
+        lidar_split_combo.setToolTip(get_text('tip_lidar_split'))
+        lidar_row6.addWidget(lidar_split_combo)
+        lidar_valid_check = QCheckBox(get_text('chk_lidar_valid_ch'))
+        lidar_valid_check.setChecked(True)
+        lidar_valid_check.setToolTip(get_text('tip_lidar_valid_ch'))
+        lidar_row6.addWidget(lidar_valid_check)
+        lidar_row6.addStretch()
+        lidar_layout.addLayout(lidar_row6)
+
+        lidar_mirror_check = QCheckBox(get_text('chk_lidar_mirror'))
+        lidar_mirror_check.setChecked(False)
+        lidar_mirror_check.setToolTip(get_text('tip_lidar_mirror'))
+        lidar_layout.addWidget(lidar_mirror_check)
+        lidar_balance_check = QCheckBox(get_text('chk_lidar_steer_balance'))
+        lidar_balance_check.setChecked(True)
+        lidar_layout.addWidget(lidar_balance_check)
+
+        lidar_info_label = QLabel(get_text('label_lidar_info'))
+        set_text_role(lidar_info_label, 'muted')
+        lidar_info_label.setWordWrap(True)
+        lidar_layout.addWidget(lidar_info_label)
+
+        lidar_group.setLayout(lidar_layout)
+
+        def read_config():
+            return {
+                'preset': lidar_preset_combo.currentData(),
+                'num_bins': int(lidar_bins_combo.currentData()),
+                'downsample_mode': lidar_ds_combo.currentData(),
+                'stack_frames': lidar_stack_spin.value(),
+                'use_valid_ch': lidar_valid_check.isChecked(),
+                'max_range_mm': float(lidar_range_spin.value()),
+                'max_speed': lidar_speed_spin.value(),
+                'use_traj': lidar_traj_check.isChecked(),
+                'pred_seconds': lidar_seconds_spin.value(),
+                'pred_points': lidar_points_spin.value(),
+                'pose_source': lidar_pose_combo.currentData(),
+                'mode_filter': lidar_mode_combo.currentData(),
+                'split_mode': lidar_split_combo.currentData(),
+                'mirror': lidar_mirror_check.isChecked(),
+                'steer_balance': lidar_balance_check.isChecked(),
+            }
+
+        return lidar_group, read_config
+
+    def _train_lidar_policy(self, valid_indexes, config, progress_title):
+        """LiDAR Policy を学習し結果辞書を返す（進捗ダイアログ付き。共通）。"""
+        progress = QProgressDialog(progress_title, "キャンセル", 0, 100, self)
+        progress.setWindowTitle(get_text('dlg_model_training'))
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+
+        def update_progress(current, total, message=None):
+            progress.setValue(int(current * 100 / total) if total > 0 else 0)
+            if message:
+                progress.setLabelText(message)
+            QApplication.processEvents()
+            return not progress.wasCanceled()
+
+        try:
+            manager = LidarPolicyTrainingManager(
+                models_dir, mlflow_manager=getattr(self, 'mlflow_manager', None))
+            result = manager.train(
+                valid_indexes=valid_indexes, annotations=self.annotations,
+                images=self.images, pose_manager=self.pose_manager,
+                config=config, progress_callback=update_progress)
+        finally:
+            progress.close()
+        return result
+
+    def _lidar_policy_result(self, idx):
+        """読込済み LiDAR Policy で 1 フレーム推論し、自動運転モデルと同じ結果辞書を返す。"""
+        lp = getattr(self, '_lidar_policy', None)
+        if not lp:
+            return None
+        model, cfg, manager = lp
+        out = manager.predict_current(model, cfg, None, [], idx, self.images, None,
+                                      self.annotations, pose_manager=self.pose_manager,
+                                      pose_source='pose')
+        if out is None:
+            return None
+        a, t = out["control"]
+        W = int(getattr(self, 'original_image_width', 0) or 160)
+        H = int(getattr(self, 'original_image_height', 0) or 120)
+        x = max(0, min(int((a + 1) / 2 * W), W - 1))
+        y = max(0, min(int((1 - t) / 2 * H), H - 1))
+        res = {"angle": float(a), "throttle": float(t), "x": x, "y": y}
+        if out.get("best") is not None:
+            res["traj"] = out["best"].tolist()
+        return res
+
+    def _load_lidar_policy_model(self, model_path):
+        """LiDAR Policy チェックポイントを読み込んで self._lidar_policy に保持する。"""
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model, cfg, meta = LidarPolicyTrainingManager.load_model(model_path, device)
+        manager = LidarPolicyTrainingManager(models_dir)
+        self._lidar_policy = (model, cfg, manager)
+        self._lidar_policy_path = model_path
+        self.model = model
+        self._multi_source_config = None
+        self._virtual_source_config = None
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.crop_overlay_config = None
+        # 測距ビューの「モデル入力」表示をこのモデルの前処理設定に合わせる
+        self._lidar_frame_key = None
+        if hasattr(self, 'model_input_size_label'):
+            self.model_input_size_label.setText(
+                f"入力:{cfg.num_bins}bin×K{cfg.stack_frames}")
+        return model, cfg, meta
+
     def train_sequence_model(self):
         """時系列モデルの学習設定ダイアログを表示し学習を実行"""
         if not self.annotations:
@@ -29133,6 +30269,7 @@ class ImageAnnotationTool(QMainWindow):
         arch_combo.addItem("TCN", "tcn")
         arch_combo.addItem("CausalCNN", "causal_cnn")
         arch_combo.addItem("TogiVAD", "togivad")
+        arch_combo.addItem("LiDAR Policy", "lidar_policy")
 
         # パネルで選択中のモデルタイプを初期値に連動
         if hasattr(self, 'traj_arch_combo'):
@@ -29384,6 +30521,10 @@ class ImageAnnotationTool(QMainWindow):
         togivad_group.setLayout(togivad_layout)
         arch_layout.addWidget(togivad_group)
 
+        # --- LiDAR Policy 固有パラメータ（arch=lidar_policy のときのみ表示。共通ビルダー） ---
+        lidar_group, lidar_read_config = self._build_lidar_policy_group()
+        arch_layout.addWidget(lidar_group)
+
         def update_arch_widgets():
             arch = arch_combo.currentData()
             gru_layers_spin.setVisible(arch == "gru")
@@ -29395,11 +30536,16 @@ class ImageAnnotationTool(QMainWindow):
             # TogiVAD: 単一フレーム入力・軌道語彙分類のため
             # シーケンス/隠れ層/融合の設定は使わない（無効化して明示）
             is_togivad = (arch == "togivad")
+            is_lidar = (arch == "lidar_policy")
             togivad_group.setVisible(is_togivad)
+            lidar_group.setVisible(is_lidar)
             for w in (seq_len_spin, pred_horizon_spin, stride_spin,
-                      hidden_dim_combo, dropout_spin, fusion_combo,
-                      attn_heads_spin, aug_check):
-                w.setEnabled(not is_togivad)
+                      hidden_dim_combo, fusion_combo, attn_heads_spin):
+                w.setEnabled(not (is_togivad or is_lidar))
+            # LiDAR Policy は dropout / 拡張を使う（画像ソースは使わない）
+            dropout_spin.setEnabled(not is_togivad)
+            aug_check.setEnabled(not is_togivad)
+            source_group.setEnabled(not is_lidar)
 
         arch_combo.currentIndexChanged.connect(update_arch_widgets)
 
@@ -29640,7 +30786,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # === 設定値の取得 ===
         selected_sources = [name for name, cb in source_checkboxes.items() if cb.isChecked()]
-        if not selected_sources:
+        if not selected_sources and arch_combo.currentData() != 'lidar_policy':
             QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_select_at_least_one_source'))
             return
 
@@ -29722,6 +30868,8 @@ class ImageAnnotationTool(QMainWindow):
                 QMessageBox.warning(self, get_text('dlg_warning'),
                                     get_text('msg_togivad_no_pose'))
                 return
+        elif selected_arch == 'lidar_policy':
+            config.update(lidar_read_config())
 
         # マルチカメラ融合パラメータ
         config['fusion_method'] = fusion_combo.currentData()
@@ -29749,7 +30897,17 @@ class ImageAnnotationTool(QMainWindow):
             if hasattr(self, 'mlflow_manager'):
                 mlflow_mgr = self.mlflow_manager
 
-            if selected_arch == 'togivad':
+            if selected_arch == 'lidar_policy':
+                manager = LidarPolicyTrainingManager(models_dir, mlflow_manager=mlflow_mgr)
+                result = manager.train(
+                    valid_indexes=valid_indexes,
+                    annotations=self.annotations,
+                    images=self.images,
+                    pose_manager=self.pose_manager,
+                    config=config,
+                    progress_callback=update_progress
+                )
+            elif selected_arch == 'togivad':
                 manager = TogivadTrainingManager(models_dir, mlflow_manager=mlflow_mgr)
                 result = manager.train(
                     valid_indexes=valid_indexes,
@@ -29781,7 +30939,7 @@ class ImageAnnotationTool(QMainWindow):
                     QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_traj_no_sequences'))
                 elif err in ('togivad_bad_source_count', 'togivad_no_pose',
                              'togivad_bad_horizon', 'togivad_track_prereq',
-                             'togivad_no_agents'):
+                             'togivad_no_agents', 'lidar_no_scans'):
                     QMessageBox.warning(self, get_text('dlg_warning'), get_text(f'msg_{err}'))
                 else:
                     QMessageBox.warning(self, get_text('dlg_warning'), err or 'Unknown error')
@@ -29793,7 +30951,7 @@ class ImageAnnotationTool(QMainWindow):
 
             # 学習曲線グラフを保存
             # （togivad はマネージャ側で ADE 付き曲線を保存済みのためスキップ）
-            if selected_arch != 'togivad' and result.get('model_path') \
+            if selected_arch not in ('togivad', 'lidar_policy') and result.get('model_path') \
                     and result.get('train_losses') and result.get('val_losses'):
                 self._save_traj_training_curve(
                     result['model_path'],
@@ -29809,6 +30967,18 @@ class ImageAnnotationTool(QMainWindow):
                     f"Pose Source: {config.get('pose_source', 'pose')}\n"
                     f"Val top1: {result.get('val_top1', 0):.1%} | "
                     f"Val ADE: {result.get('val_ade_m', 0):.3f} m\n"
+                )
+            elif selected_arch == 'lidar_policy':
+                ade_txt = (f" | Val ADE: {result.get('val_ade_m', 0):.3f} m"
+                           if result.get('use_traj') else "")
+                togivad_line = (
+                    f"Preset: {config.get('preset')} | bins: {config.get('num_bins')} | "
+                    f"K: {config.get('stack_frames')}\n"
+                    f"Val steer MAE: {result.get('val_steer_mae', 0):.4f} | "
+                    f"Val throttle MAE: {result.get('val_speed_mae', 0):.4f}{ade_txt}\n"
+                    f"Skipped (no scan / mode): {result.get('n_no_scan', 0)} / "
+                    f"{result.get('n_mode_skipped', 0)}\n"
+                    f"ONNX: {os.path.basename(result.get('onnx_path') or '-')}\n"
                 )
             msg = (
                 f"{get_text('msg_traj_training_complete')}\n\n"
@@ -29900,7 +31070,33 @@ class ImageAnnotationTool(QMainWindow):
             # togivad モデルは別マネージャ・別チェックポイント形式
             # （state_dict/config(TogiVADConfig)/vocab、単一フレーム軌道分類）
             is_togivad = os.path.basename(selected_model_path).startswith("togivad_")
-            if is_togivad:
+            # LiDAR Policy は入出力が togivad と同型（ego 軌道 + angle/throttle）なので
+            # 表示系は togivad 経路を共用する（_gru_is_togivad=True, vocab=None）
+            is_lidar = os.path.basename(selected_model_path).startswith(
+                LidarPolicyTrainingManager.MODEL_PREFIX)
+            if is_lidar:
+                model, cfg, meta = LidarPolicyTrainingManager.load_model(
+                    selected_model_path, device)
+                self._gru_vocab = None
+                self._gru_pose_source = meta.get('pose_source') or 'pose'
+                self._gru_sources = []
+                self._gru_manager = LidarPolicyTrainingManager(models_dir)
+                if cfg.use_traj:
+                    total_seconds = float(cfg.horizon) * float(cfg.dt)
+                    self.recorded_traj_points = int(cfg.horizon)
+                    self.recorded_traj_seconds = total_seconds
+                    self.recorded_traj_dt = float(cfg.dt)
+                    self.recorded_traj_source = self._gru_pose_source
+                    if hasattr(self, 'recorded_traj_seconds_input'):
+                        self.recorded_traj_seconds_input.blockSignals(True)
+                        self.recorded_traj_seconds_input.setValue(total_seconds)
+                        self.recorded_traj_seconds_input.blockSignals(False)
+                    if hasattr(self, 'recorded_traj_points_input'):
+                        self.recorded_traj_points_input.blockSignals(True)
+                        self.recorded_traj_points_input.setText(str(int(cfg.horizon)))
+                        self.recorded_traj_points_input.blockSignals(False)
+                is_togivad = True
+            elif is_togivad:
                 model, cfg, vocab, meta = TogivadTrainingManager.load_model(
                     selected_model_path, device)
                 self._gru_vocab = vocab
@@ -29983,7 +31179,8 @@ class ImageAnnotationTool(QMainWindow):
                     pose_manager=getattr(self, 'pose_manager', None),
                     pose_source=self._gru_pose_source, device=self._gru_device)
                 if out is not None:
-                    self.gru_predictions[current_index] = out["best"].tolist()
+                    if out.get("best") is not None:
+                        self.gru_predictions[current_index] = out["best"].tolist()
                     self._store_togivad_control_result(current_index, out)
             else:
                 deleted = getattr(self, 'deleted_indexes', set())
@@ -30101,7 +31298,8 @@ class ImageAnnotationTool(QMainWindow):
                         pose_source=self._gru_pose_source,
                         device=self._gru_device)
                     if out is not None:
-                        predictions[idx] = out["best"].tolist()
+                        if out.get("best") is not None:
+                            predictions[idx] = out["best"].tolist()
                         self._store_togivad_control_result(idx, out)
                 # config は完了メッセージ側が dict(.get) 前提のため表示用 dict に
                 # 変換して渡す（TogiVADConfig を生で入れると .get が無く例外）
@@ -31860,7 +33058,7 @@ class ImageAnnotationTool(QMainWindow):
         traj_method_layout = QHBoxLayout()
         traj_method_layout.addWidget(QLabel(get_text('label_model_arch')))
         self.traj_arch_combo = QComboBox()
-        self.traj_arch_combo.addItems(["GRU", "TCN", "CausalCNN", "TogiVAD"])
+        self.traj_arch_combo.addItems(["GRU", "TCN", "CausalCNN", "TogiVAD", "LiDAR Policy"])
         self.traj_arch_combo.setCurrentIndex(0)  # デフォルト: GRU
         self.traj_arch_combo.currentIndexChanged.connect(self.refresh_traj_model_list)
         traj_method_layout.addWidget(self.traj_arch_combo)
@@ -31957,6 +33155,7 @@ class ImageAnnotationTool(QMainWindow):
             "tcn": "tcn_",
             "causalcnn": "causal_cnn_",
             "togivad": "togivad_",
+            "lidar policy": "lidar_policy_",
         }
         filter_prefix = arch_to_prefix.get(arch_filter, "")
 
@@ -32354,6 +33553,54 @@ class ImageAnnotationTool(QMainWindow):
             history.append([float(pose.x), float(pose.y), float(pose.theta)] if pose is not None else None)
         return history
 
+    def _location_lidar_npy_path(self, index):
+        """フレーム index の画像パスから同セッションの LiDAR npy パスを返す（無ければ None）
+
+        画像パス <session>/images/{_index}_..jpg からセッションと _index を導出する規約は
+        BEV プレビュー（_bev_gt_data）と同じ。
+        """
+        if not (0 <= index < len(self.images)):
+            return None
+        img_path = self.images[index]
+        session = os.path.dirname(os.path.dirname(img_path))
+        prefix = os.path.basename(img_path).split('_')[0]
+        npy = os.path.join(session, 'lidar', f'{prefix}_lidar_distance_array_.npy')
+        return npy if os.path.exists(npy) else None
+
+    def _location_lidar_scan(self, index, cache=None):
+        """フレーム index の生距離スキャン[mm]（np.ndarray）を返す（無ければ None）。
+
+        cache は npy パス→配列の辞書。積層で同じファイルを繰り返し読むため
+        呼び出し側（データ準備ループ）で使い回すと高速化できる。
+        """
+        npy = self._location_lidar_npy_path(index)
+        if npy is None:
+            return None
+        if cache is not None and npy in cache:
+            return cache[npy]
+        try:
+            arr = np.load(npy)
+        except Exception:
+            arr = None
+        if cache is not None:
+            cache[npy] = arr
+        return arr
+
+    def _location_lidar_scans_for_index(self, index, stack_frames, interval, cache=None):
+        """フレーム index の LiDAR 積層（新しい順: t, t-interval, t-2*interval, ...）を返す。
+
+        現フレーム(k=0)にスキャンが無ければ None（学習ではサンプル自体を除外する用途）。
+        過去ステップ(k>=1)の欠損は None のまま返す（stack_lidar_scans が 0 埋め=無効値にする）。
+        """
+        current = self._location_lidar_scan(index, cache)
+        if current is None:
+            return None
+        scans = [current]
+        for k in range(1, int(stack_frames)):
+            prev = max(0, index - k * int(interval))
+            scans.append(self._location_lidar_scan(prev, cache))
+        return scans
+
     def _location_result_position(self, result):
         """推論結果から推定座標・姿勢 [x, y, theta] を取り出す（pose ヘッド → 格子の順。無ければ None）"""
         if not result:
@@ -32396,6 +33643,21 @@ class ImageAnnotationTool(QMainWindow):
             history.append(est if est is not None else measured[k - 1])
         return history
 
+    def _location_inference_lidar_scans(self, index):
+        """LiDAR入力ありのモデル向けに、フレーム index の積層スキャンを組み立てる（無ければ None）"""
+        manager = self.location_model_manager
+        cfg = getattr(manager, 'location_config', None) or {}
+        lidar_cfg = cfg.get('lidar_config')
+        if not lidar_cfg:
+            return None
+        stack_frames = int(lidar_cfg.get('stack_frames', 1) or 1)
+        interval = int(cfg.get('lidar_interval', 10) or 10)
+        if not hasattr(self, '_location_lidar_inference_cache'):
+            # npy パス→配列のキャッシュ（記録内容は不変なのでセッション中はクリア不要）
+            self._location_lidar_inference_cache = {}
+        return self._location_lidar_scans_for_index(
+            index, stack_frames, interval, self._location_lidar_inference_cache)
+
     def _location_inference_inputs(self, index):
         """位置モデルの入力構成（学習時に保存）に従って、フレーム index の入力画像パスを返す"""
         manager = self.location_model_manager
@@ -32423,7 +33685,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # マネージャーを使用して推論を実行
         result = self.location_model_manager.run_inference(
-            current_img_path, pose_history=self._location_inference_history(current_index))
+            current_img_path, pose_history=self._location_inference_history(current_index),
+            lidar_scan=self._location_inference_lidar_scans(current_index))
 
         if result:
             # 推論結果を保存（インデックスベース）
@@ -32509,7 +33772,8 @@ class ImageAnnotationTool(QMainWindow):
                     cancelled = True
                     break
             result = manager.run_inference(self._location_inference_inputs(idx),
-                                           pose_history=self._location_inference_history(idx))
+                                           pose_history=self._location_inference_history(idx),
+                                           lidar_scan=self._location_inference_lidar_scans(idx))
             if result:
                 self.location_inference_results[idx] = result
                 done += 1
@@ -32583,6 +33847,7 @@ class ImageAnnotationTool(QMainWindow):
         use_pose = 'pose' in heads
         use_grid = 'grid' in heads
         use_history = bool(training_config.get('use_pose_history'))
+        use_lidar = bool(training_config.get('use_lidar'))
         needs_pose = use_pose or use_grid or use_history
 
         if use_class and actual_classes < 2:
@@ -32613,6 +33878,18 @@ class ImageAnnotationTool(QMainWindow):
             progress.show()
             QApplication.processEvents()
 
+            # LiDAR 点群の入出力構成（推論時にも同じ前処理設定でスキャンを組み立てるため保持）
+            lidar_config = None
+            if use_lidar:
+                lidar_config = {
+                    'num_beams_raw': image_data.get('lidar_num_beams_raw') or 1081,
+                    'num_bins': training_config.get('lidar_num_bins') or LIDAR_POLICY_DEFAULT_NUM_BINS,
+                    'stack_frames': training_config.get('lidar_stack_frames', 1),
+                    'downsample_mode': training_config.get('lidar_downsample_mode') or 'minpool',
+                    'max_range_mm': training_config.get('lidar_max_range_mm') or LIDAR_POLICY_DEFAULT_MAX_RANGE_MM,
+                    'min_range_mm': 50.0,
+                }
+
             # データセット作成
             train_loader, val_loader, dataset_info = create_location_datasets(
                 image_paths=image_data['image_paths'],
@@ -32627,11 +33904,14 @@ class ImageAnnotationTool(QMainWindow):
                 num_sources=training_config['num_sources'],
                 virtual_source_type=training_config['virtual_source_type'],
                 include_heading=training_config['include_heading'],
+                include_attitude=training_config.get('include_attitude', False),
                 downscale_factor=training_config.get('downscale_factor', 1.0),
                 downscale_mode=training_config.get('downscale_mode', 'resize'),
                 grid_cell_size=training_config.get('grid_cell_size') or 0.5,
                 pose_history=image_data.get('pose_history') if use_history else None,
                 pose_history_steps=training_config.get('pose_history_steps', 0) if use_history else 0,
+                lidar_scans=image_data.get('lidar_scans') if use_lidar else None,
+                lidar_config=lidar_config,
             )
 
             progress.setValue(20)
@@ -32701,6 +33981,12 @@ class ImageAnnotationTool(QMainWindow):
                     "pose_history_interval": training_config.get('pose_history_interval') if use_history else None,
                     "skipped_no_pose": image_data.get('skipped_no_pose', 0),
                     "skipped_no_source": image_data.get('skipped_no_source', 0),
+                    "skipped_no_attitude": image_data.get('skipped_no_attitude', 0),
+                    "heading_from_pose": training_config.get('heading_from_pose', False),
+                    "skipped_no_pose_heading": image_data.get('skipped_no_pose_heading', 0),
+                    "lidar_config": dataset_info.get('lidar_config') if use_lidar else None,
+                    "lidar_interval": training_config.get('lidar_interval') if use_lidar else None,
+                    "skipped_no_lidar": image_data.get('skipped_no_lidar', 0),
                 }
             )
 
@@ -32721,6 +34007,9 @@ class ImageAnnotationTool(QMainWindow):
                     "actual_classes": actual_classes,
                     "skipped_no_pose": image_data.get('skipped_no_pose', 0),
                     "skipped_no_source": image_data.get('skipped_no_source', 0),
+                    "skipped_no_attitude": image_data.get('skipped_no_attitude', 0),
+                    "skipped_no_pose_heading": image_data.get('skipped_no_pose_heading', 0),
+                    "skipped_no_lidar": image_data.get('skipped_no_lidar', 0),
                     "input_size": dataset_info.get('actual_image_size'),
                     "raw_image_size": dataset_info.get('raw_image_size'),
                 },
@@ -32921,6 +34210,69 @@ class ImageAnnotationTool(QMainWindow):
         training_settings.history_check.stateChanged.connect(
             lambda s: history_opts_widget.setVisible(training_settings.history_check.isChecked()))
 
+        # LiDAR 点群（距離スキャン）を追加入力にする（記録に lidar/*.npy があるセッションのみ）
+        has_lidar_data = self._has_lidar_data()
+        training_settings.lidar_check = QCheckBox(get_text('chk_location_lidar'))
+        training_settings.lidar_check.setChecked(False)
+        training_settings.lidar_check.setEnabled(has_lidar_data)
+        training_settings.lidar_check.setToolTip(
+            get_text('tip_location_lidar') if has_lidar_data else get_text('tip_location_lidar_disabled'))
+        source_layout.addWidget(training_settings.lidar_check)
+
+        lidar_opts_widget = QWidget()
+        lidar_opts = QVBoxLayout(lidar_opts_widget)
+        lidar_opts.setContentsMargins(20, 0, 0, 0)
+        lidar_row1 = QHBoxLayout()
+        lidar_row1.addWidget(QLabel(get_text('label_lidar_num_bins')))
+        training_settings.lidar_bins_combo = QComboBox()
+        for b in (1081, 541, 271, 108):
+            training_settings.lidar_bins_combo.addItem(str(b), b)
+        j = training_settings.lidar_bins_combo.findData(LIDAR_POLICY_DEFAULT_NUM_BINS)
+        training_settings.lidar_bins_combo.setCurrentIndex(max(j, 0))
+        lidar_row1.addWidget(training_settings.lidar_bins_combo)
+        lidar_row1.addWidget(QLabel(get_text('label_lidar_downsample')))
+        training_settings.lidar_ds_combo = QComboBox()
+        training_settings.lidar_ds_combo.addItem(get_text('opt_lidar_ds_minpool'), 'minpool')
+        training_settings.lidar_ds_combo.addItem(get_text('opt_lidar_ds_index'), 'index')
+        lidar_row1.addWidget(training_settings.lidar_ds_combo)
+        lidar_row1.addStretch()
+        lidar_opts.addLayout(lidar_row1)
+
+        lidar_row2 = QHBoxLayout()
+        lidar_row2.addWidget(QLabel(get_text('label_lidar_stack')))
+        training_settings.lidar_stack_spin = QSpinBox()
+        training_settings.lidar_stack_spin.setRange(1, 8)
+        training_settings.lidar_stack_spin.setValue(1)
+        lidar_row2.addWidget(training_settings.lidar_stack_spin)
+        lidar_row2.addWidget(QLabel(get_text('label_location_history_interval')))
+        training_settings.lidar_interval_spin = QSpinBox()
+        training_settings.lidar_interval_spin.setRange(1, 300)
+        training_settings.lidar_interval_spin.setValue(10)
+        training_settings.lidar_interval_spin.setSuffix(' frames')
+        lidar_row2.addWidget(training_settings.lidar_interval_spin)
+        lidar_row2.addWidget(QLabel(get_text('label_lidar_max_range')))
+        training_settings.lidar_range_spin = QSpinBox()
+        training_settings.lidar_range_spin.setRange(1000, 60000)
+        training_settings.lidar_range_spin.setSingleStep(500)
+        training_settings.lidar_range_spin.setValue(int(LIDAR_POLICY_DEFAULT_MAX_RANGE_MM))
+        lidar_row2.addWidget(training_settings.lidar_range_spin)
+        lidar_row2.addStretch()
+        lidar_opts.addLayout(lidar_row2)
+
+        def _update_lidar_stack_enabled(_i=None):
+            training_settings.lidar_interval_spin.setEnabled(training_settings.lidar_stack_spin.value() > 1)
+        training_settings.lidar_stack_spin.valueChanged.connect(_update_lidar_stack_enabled)
+        _update_lidar_stack_enabled()
+
+        lidar_note = QLabel(get_text('label_location_lidar_note'))
+        set_text_role(lidar_note, 'info')
+        lidar_note.setWordWrap(True)
+        lidar_opts.addWidget(lidar_note)
+        source_layout.addWidget(lidar_opts_widget)
+        lidar_opts_widget.setVisible(False)
+        training_settings.lidar_check.stateChanged.connect(
+            lambda s: lidar_opts_widget.setVisible(training_settings.lidar_check.isChecked()))
+
         training_settings.source_count_label = QLabel("")
         training_settings.source_count_label.setStyleSheet("font-weight: bold;")
         set_text_role(training_settings.source_count_label, 'success')
@@ -33010,6 +34362,40 @@ class ImageAnnotationTool(QMainWindow):
         training_settings.heading_check.setChecked(True)
         training_settings.heading_check.setToolTip(get_text('tip_location_include_heading'))
         pose_opts.addWidget(training_settings.heading_check)
+
+        # 方位(θ)の教師データソース: 既定は座標(x,y)と同じ自己位置ソース（例 slam）だが、
+        # pose（デッドレコニング＋IMU）は再ローカライズのテレポートが無く連続的なため、
+        # 座標は slam、方位だけ pose から取りたい場合に上書きできるようにする
+        has_pose_sensor_data = has_pose and self.pose_manager.source_frame_count('pose', ok_only=False) > 0
+        heading_src_row = QHBoxLayout()
+        heading_src_row.setContentsMargins(20, 0, 0, 0)
+        training_settings.heading_from_pose_check = QCheckBox(get_text('chk_location_heading_from_pose'))
+        training_settings.heading_from_pose_check.setChecked(False)
+        training_settings.heading_from_pose_check.setEnabled(has_pose_sensor_data)
+        training_settings.heading_from_pose_check.setToolTip(
+            get_text('tip_location_heading_from_pose') if has_pose_sensor_data
+            else get_text('tip_location_heading_from_pose_disabled'))
+        heading_src_row.addWidget(training_settings.heading_from_pose_check)
+        pose_opts.addLayout(heading_src_row)
+
+        def _update_heading_source_enabled():
+            training_settings.heading_from_pose_check.setEnabled(
+                has_pose_sensor_data and training_settings.heading_check.isChecked()
+                and training_settings.heading_check.isEnabled())
+        training_settings.heading_check.stateChanged.connect(lambda _s: _update_heading_source_enabled())
+        _update_heading_source_enabled()
+
+        # 車体姿勢角（roll, pitch）: pose センサー（IMU デッドレコニング）特有のデータ。
+        # slam/vslam/aruco には無いため、有効かどうかは pose ソースの記録内容で判定する
+        has_attitude_data = has_pose and self.pose_manager.has_extra_field('pose', 'roll') \
+            and self.pose_manager.has_extra_field('pose', 'pitch')
+        training_settings.attitude_check = QCheckBox(get_text('chk_location_include_attitude'))
+        training_settings.attitude_check.setChecked(False)
+        training_settings.attitude_check.setEnabled(has_attitude_data)
+        training_settings.attitude_check.setToolTip(
+            get_text('tip_location_include_attitude') if has_attitude_data
+            else get_text('tip_location_include_attitude_disabled'))
+        pose_opts.addWidget(training_settings.attitude_check)
 
         pose_w_row = QHBoxLayout()
         pose_w_row.addWidget(QLabel(get_text('label_location_pose_loss_weight')))
@@ -33117,6 +34503,7 @@ class ImageAnnotationTool(QMainWindow):
                 training_settings.pose_weight_spin.setEnabled(False)
             else:
                 training_settings.heading_check.setEnabled(True)
+            _update_heading_source_enabled()
             # 出力が1つも選ばれていない場合は学習を開始できない
             ok_btn = button_box.button(QDialogButtonBox.Ok)
             if ok_btn is not None:
@@ -33534,6 +34921,7 @@ class ImageAnnotationTool(QMainWindow):
         from model_catalog import make_output_mode
         output_mode = make_output_mode(use_class=use_class, use_pose=use_pose, use_grid=use_grid)
         use_history = dialog.history_check.isChecked() and dialog.history_check.isEnabled()
+        use_lidar = dialog.lidar_check.isChecked() and dialog.lidar_check.isEnabled()
         needs_pose = use_pose or use_grid or use_history   # 自己位置を教師データ / 入力に使うか
 
         return {
@@ -33555,6 +34943,10 @@ class ImageAnnotationTool(QMainWindow):
             'output_mode': output_mode,
             'pose_source': dialog.pose_source_combo.currentData() if needs_pose else None,
             'include_heading': dialog.heading_check.isChecked() if use_pose else False,
+            'heading_from_pose': (dialog.heading_from_pose_check.isChecked()
+                                  if (use_pose and dialog.heading_check.isChecked()
+                                      and dialog.heading_from_pose_check.isEnabled()) else False),
+            'include_attitude': dialog.attitude_check.isChecked() if (use_pose and dialog.attitude_check.isEnabled()) else False,
             'pose_loss_weight': dialog.pose_weight_spin.value() if use_pose else 1.0,
             # 格子分類
             'grid_cell_size': dialog.grid_cell_spin.value() if use_grid else None,
@@ -33568,6 +34960,13 @@ class ImageAnnotationTool(QMainWindow):
             'history_noise_xy_m': dialog.history_noise_xy_spin.value() if use_history else 0.0,
             'history_noise_theta_deg': dialog.history_noise_th_spin.value() if use_history else 0.0,
             'history_drop_prob': dialog.history_drop_spin.value() if use_history else 0.0,
+            # LiDAR 点群（距離スキャン）の追加入力
+            'use_lidar': use_lidar,
+            'lidar_num_bins': dialog.lidar_bins_combo.currentData() if use_lidar else None,
+            'lidar_downsample_mode': dialog.lidar_ds_combo.currentData() if use_lidar else None,
+            'lidar_stack_frames': dialog.lidar_stack_spin.value() if use_lidar else 1,
+            'lidar_interval': dialog.lidar_interval_spin.value() if use_lidar else 10,
+            'lidar_max_range_mm': float(dialog.lidar_range_spin.value()) if use_lidar else None,
             # 解像度（自動運転モデルと同じ: 実画像サイズ × 係数 / ピクセレーション）
             'downscale_factor': dialog.res_slider.value() / 100.0,
             'downscale_mode': 'resize' if dialog.resize_radio.isChecked() else 'pixelate',
@@ -33625,11 +35024,21 @@ class ImageAnnotationTool(QMainWindow):
         history_interval = int(cfg.get('pose_history_interval', 10) or 10)
         # 格子分類・履歴入力も自己位置（教師データ / 正規化）を使う
         use_pose = 'pose' in heads or 'grid' in heads or use_history
+        # 車体姿勢角（roll, pitch）: 座標・姿勢回帰ヘッドのみで有効。pose センサー（IMU）
+        # 特有のデータのため、選択中の pose_source に関わらず 'pose' ソースから別途取得する
+        include_attitude = 'pose' in heads and bool(cfg.get('include_attitude'))
+        # 方位(θ)の教師データソース上書き: 既定は x,y と同じ選択ソース（例 slam）だが、
+        # ON のときは pose（デッドレコニング）の theta を使う（テレポートが無く連続的なため）
+        heading_from_pose = 'pose' in heads and bool(cfg.get('include_heading')) and bool(cfg.get('heading_from_pose'))
         selected_sources = cfg.get('selected_sources') or [getattr(self, 'current_variant', None)]
         virtual_type = cfg.get('virtual_source_type')
         num_sources = cfg.get('num_sources', 1)
         temporal_interval = cfg.get('temporal_interval', 10)
         pose_source = cfg.get('pose_source')
+        use_lidar = bool(cfg.get('use_lidar'))
+        lidar_stack_frames = int(cfg.get('lidar_stack_frames', 1) or 1) if use_lidar else 0
+        lidar_interval = int(cfg.get('lidar_interval', 10) or 10)
+        lidar_cache = {} if use_lidar else None
         deleted = set(getattr(self, 'deleted_indexes', []) or [])
 
         # 位置ラベルのマッピングを作成（実際の位置値をインデックスに変換）
@@ -33647,8 +35056,12 @@ class ImageAnnotationTool(QMainWindow):
         location_indices = []
         pose_targets = []
         pose_history = []
+        lidar_scans = []
         skipped_no_pose = 0
         skipped_no_source = 0
+        skipped_no_attitude = 0
+        skipped_no_pose_heading = 0
+        skipped_no_lidar = 0
 
         for idx in candidate_indexes:
             if not (0 <= idx < len(self.images)) or idx in deleted:
@@ -33659,6 +35072,13 @@ class ImageAnnotationTool(QMainWindow):
             if not paths:
                 skipped_no_source += 1
                 continue
+
+            scans = None
+            if use_lidar:
+                scans = self._location_lidar_scans_for_index(idx, lidar_stack_frames, lidar_interval, lidar_cache)
+                if scans is None:
+                    skipped_no_lidar += 1
+                    continue
 
             pose_value = None
             if use_pose:
@@ -33673,6 +35093,27 @@ class ImageAnnotationTool(QMainWindow):
                     continue
                 pose_value = [float(pose.x), float(pose.y), float(pose.theta)]
 
+                # roll/pitch（姿勢角度）・方位(θ)上書きはどちらも選択中の pose_source に
+                # 関わらず 'pose'（IMU デッドレコニング）センサーから取得するため、
+                # どちらか一方でも必要なら一度だけ取得して使い回す
+                pose_sensor_sample = None
+                if include_attitude or heading_from_pose:
+                    pose_sensor_sample = self.pose_manager.get_source_pose(idx, 'pose', require_ok=True)
+
+                if heading_from_pose:
+                    if pose_sensor_sample is None:
+                        skipped_no_pose_heading += 1
+                        continue
+                    pose_value[2] = float(pose_sensor_sample.theta)
+
+                if include_attitude:
+                    roll = pose_sensor_sample.extra.get('roll') if pose_sensor_sample is not None else None
+                    pitch = pose_sensor_sample.extra.get('pitch') if pose_sensor_sample is not None else None
+                    if roll is None or pitch is None:
+                        skipped_no_attitude += 1
+                        continue
+                    pose_value.extend([float(roll), float(pitch)])
+
             if use_class:
                 location = self.location_annotations[idx]
                 location_labels.append(location)
@@ -33682,6 +35123,8 @@ class ImageAnnotationTool(QMainWindow):
             if use_history:
                 pose_history.append(self._location_pose_history_measured(
                     idx, history_steps, history_interval, pose_source))
+            if use_lidar:
+                lidar_scans.append(scans)
             image_paths.append(paths[0])
             grouped_paths.append(paths)
 
@@ -33690,11 +35133,16 @@ class ImageAnnotationTool(QMainWindow):
             'grouped_paths': grouped_paths,
             'location_labels': location_labels,
             'location_indices': location_indices,
+            'lidar_scans': lidar_scans,
+            'lidar_num_beams_raw': int(len(lidar_scans[0][0])) if lidar_scans else None,
+            'skipped_no_lidar': skipped_no_lidar,
             'location_to_index': location_to_index,
             'pose_targets': pose_targets,
             'pose_history': pose_history,
             'skipped_no_pose': skipped_no_pose,
             'skipped_no_source': skipped_no_source,
+            'skipped_no_attitude': skipped_no_attitude,
+            'skipped_no_pose_heading': skipped_no_pose_heading,
         }
 
     def _train_location_model_internal(self, model_type, train_loader, val_loader, num_classes,
@@ -33709,6 +35157,7 @@ class ImageAnnotationTool(QMainWindow):
         use_pose = 'pose' in heads
         use_grid = 'grid' in heads
         use_history = bool(training_config.get('use_pose_history'))
+        use_lidar = bool(training_config.get('use_lidar'))
         needs_pose = use_pose or use_grid or use_history
 
         # 保存ディレクトリとファイル名（モデルタイプを必ず含める）
@@ -33730,6 +35179,8 @@ class ImageAnnotationTool(QMainWindow):
             'pose_source': training_config.get('pose_source') if needs_pose else None,
             'pose_norm': dataset_info.get('pose_norm') if use_pose else None,
             'include_heading': bool(dataset_info.get('include_heading')) if use_pose else False,
+            'heading_from_pose': bool(training_config.get('heading_from_pose')) if use_pose else False,
+            'include_attitude': bool(dataset_info.get('include_attitude')) if use_pose else False,
             'downscale_factor': float(training_config.get('downscale_factor', 1.0)),
             'downscale_mode': training_config.get('downscale_mode', 'resize'),
             'grid_config': dataset_info.get('grid_config') if use_grid else None,
@@ -33737,6 +35188,10 @@ class ImageAnnotationTool(QMainWindow):
             # 過去の座標・姿勢の履歴入力（推論時に同じ間隔で履歴を組み立てる）
             'pose_history_steps': int(training_config.get('pose_history_steps', 0) or 0) if use_history else 0,
             'pose_history_interval': int(training_config.get('pose_history_interval', 10) or 10),
+            # LiDAR 点群入力（推論時に同じ前処理設定・積層間隔でスキャンを組み立てるための情報。
+            # interval は ScanPreprocessor が扱わないため lidar_config とは別に保持する）
+            'lidar_config': dataset_info.get('lidar_config') if use_lidar else None,
+            'lidar_interval': int(training_config.get('lidar_interval', 10) or 10) if use_lidar else None,
         }
         if use_history:
             # pose ヘッドが無くても履歴の正規化に pose_norm が必要
@@ -33772,6 +35227,7 @@ class ImageAnnotationTool(QMainWindow):
             history_noise_xy_m=float(training_config.get('history_noise_xy_m', 0.1)),
             history_noise_theta_deg=float(training_config.get('history_noise_theta_deg', 5.0)),
             history_drop_prob=float(training_config.get('history_drop_prob', 0.1)),
+            lidar_drop_prob=0.1 if use_lidar else 0.0,
         )
 
     def _initialize_location_model(self, model_type, num_classes, device):
@@ -33830,6 +35286,8 @@ class ImageAnnotationTool(QMainWindow):
                 metrics["position_error_mean"] = training_results.get('best_val_pos_error') or 0.0
                 metrics["train_pos_errors"] = training_results.get('train_pos_errors', [])
                 metrics["val_pos_errors"] = training_results.get('val_pos_errors', [])
+                if training_config.get('include_attitude'):
+                    metrics["best_val_attitude_error_deg"] = training_results.get('best_val_attitude_error') or 0.0
             if 'grid' in heads:
                 metrics["best_val_grid_acc"] = training_results.get('best_val_grid_acc') or 0.0
                 metrics["best_val_grid_top1_error_m"] = training_results.get('best_val_grid_error') or 0.0
@@ -33867,6 +35325,8 @@ class ImageAnnotationTool(QMainWindow):
                 "temporal_interval": training_config.get('temporal_interval', 10),
                 "pose_source": training_config.get('pose_source') or "none",
                 "include_heading": training_config.get('include_heading', False),
+                "heading_from_pose": training_config.get('heading_from_pose', False),
+                "include_attitude": training_config.get('include_attitude', False),
                 "pose_loss_weight": training_config.get('pose_loss_weight', 1.0),
                 "grid_cell_size": training_config.get('grid_cell_size') if 'grid' in heads else None,
                 "num_grid_classes": dataset_info.get('num_grid_classes') if 'grid' in heads else None,
@@ -33878,6 +35338,12 @@ class ImageAnnotationTool(QMainWindow):
                 "history_noise_xy_m": training_config.get('history_noise_xy_m') if training_config.get('use_pose_history') else None,
                 "history_noise_theta_deg": training_config.get('history_noise_theta_deg') if training_config.get('use_pose_history') else None,
                 "history_drop_prob": training_config.get('history_drop_prob') if training_config.get('use_pose_history') else None,
+                "use_lidar": training_config.get('use_lidar', False),
+                "lidar_num_bins": training_config.get('lidar_num_bins') if training_config.get('use_lidar') else None,
+                "lidar_downsample_mode": training_config.get('lidar_downsample_mode') if training_config.get('use_lidar') else None,
+                "lidar_stack_frames": training_config.get('lidar_stack_frames') if training_config.get('use_lidar') else None,
+                "lidar_interval": training_config.get('lidar_interval') if training_config.get('use_lidar') else None,
+                "lidar_max_range_mm": training_config.get('lidar_max_range_mm') if training_config.get('use_lidar') else None,
                 "data_folder": self.folder_path if hasattr(self, 'folder_path') and self.folder_path else "unknown"
             }
 
@@ -33950,6 +35416,9 @@ class ImageAnnotationTool(QMainWindow):
             head_err = training_results.get('best_val_heading_error')
             if head_err is not None and training_config.get('include_heading'):
                 left_layout.addWidget(QLabel(get_text('label_location_result_heading_error', f"{head_err:.1f}")))
+            att_err = training_results.get('best_val_attitude_error')
+            if att_err is not None and training_config.get('include_attitude'):
+                left_layout.addWidget(QLabel(get_text('label_location_result_attitude_error', f"{att_err:.1f}")))
         if use_grid:
             g_acc = training_results.get('best_val_grid_acc')
             g_err = training_results.get('best_val_grid_error')
@@ -33971,6 +35440,15 @@ class ImageAnnotationTool(QMainWindow):
             left_layout.addWidget(QLabel(get_text('label_location_result_skipped',
                                                   dataset_info.get('skipped_no_pose', 0),
                                                   dataset_info.get('skipped_no_source', 0))))
+        if dataset_info.get('skipped_no_attitude'):
+            left_layout.addWidget(QLabel(get_text('label_location_result_skipped_attitude',
+                                                  dataset_info['skipped_no_attitude'])))
+        if dataset_info.get('skipped_no_pose_heading'):
+            left_layout.addWidget(QLabel(get_text('label_location_result_skipped_heading',
+                                                  dataset_info['skipped_no_pose_heading'])))
+        if dataset_info.get('skipped_no_lidar'):
+            left_layout.addWidget(QLabel(get_text('label_location_result_skipped_lidar',
+                                                  dataset_info['skipped_no_lidar'])))
         left_layout.addStretch()
 
         # 右カラム: 学習設定
@@ -33990,6 +35468,10 @@ class ImageAnnotationTool(QMainWindow):
             right_layout.addWidget(QLabel(get_text('label_location_result_pose_source',
                                                    training_config.get('pose_source') or '-',
                                                    'ON' if training_config.get('include_heading') else 'OFF')))
+            if training_config.get('include_heading') and training_config.get('heading_from_pose'):
+                right_layout.addWidget(QLabel(get_text('label_location_result_heading_from_pose')))
+            if training_config.get('include_attitude'):
+                right_layout.addWidget(QLabel(get_text('label_location_result_attitude_on')))
         n_src = training_config.get('num_sources', 1)
         src_desc = ", ".join(training_config.get('selected_sources') or [])
         if training_config.get('virtual_source_type'):
@@ -34004,6 +35486,11 @@ class ImageAnnotationTool(QMainWindow):
                                                    training_config.get('history_noise_xy_m', 0.0),
                                                    training_config.get('history_noise_theta_deg', 0.0),
                                                    training_config.get('history_drop_prob', 0.0))))
+        if training_config.get('use_lidar'):
+            right_layout.addWidget(QLabel(get_text('label_location_result_lidar',
+                                                   training_config.get('lidar_num_bins', '-'),
+                                                   training_config.get('lidar_stack_frames', 1),
+                                                   training_config.get('lidar_interval', 10))))
         in_size = dataset_info.get('input_size')
         if in_size:
             mode = training_config.get('downscale_mode', 'resize')
@@ -34669,7 +36156,8 @@ class ImageAnnotationTool(QMainWindow):
                     y_text = f"{pose_result['y']:.2f}"
                     pose_text = get_text('label_location_pose_result', x_text, y_text, theta_text)
                     inference_text += f"<span style='font-weight: bold;'>{pose_text}</span><br>"
-                    # 実測の自己位置があれば誤差も表示
+                    # 実測の自己位置があれば誤差も表示（方位は heading_from_pose のとき
+                    # 座標(x,y)のソースとは別に 'pose' センサーの実測 theta と比較する）
                     pm = getattr(self, 'pose_manager', None)
                     if pm is not None and pm.has_any_pose():
                         cfg = getattr(self.location_model_manager, 'location_config', {}) or {}
@@ -34677,11 +36165,33 @@ class ImageAnnotationTool(QMainWindow):
                         if gt is not None:
                             pos_err = math.hypot(pose_result['x'] - gt.x, pose_result['y'] - gt.y)
                             if theta is not None:
-                                d = (theta - gt.theta + math.pi) % (2 * math.pi) - math.pi
+                                gt_theta = gt.theta
+                                if cfg.get('heading_from_pose'):
+                                    gt_pose_sensor = pm.get_source_pose(current_index, 'pose')
+                                    if gt_pose_sensor is not None:
+                                        gt_theta = gt_pose_sensor.theta
+                                d = (theta - gt_theta + math.pi) % (2 * math.pi) - math.pi
                                 err_text = get_text('label_location_pose_error', f'{pos_err:.2f}', f'{abs(math.degrees(d)):.1f}')
                             else:
                                 err_text = get_text('label_location_pose_error_pos_only', f'{pos_err:.2f}')
                             inference_text += f"<span style='color: {theme_color('strong')};'>{err_text}</span><br>"
+
+                    # 車体姿勢角（roll, pitch）: pose センサー特有。実測は選択ソースに関わらず
+                    # 'pose'（IMU）から取得し、推定との誤差もそちらと比較する
+                    roll = pose_result.get('roll')
+                    pitch = pose_result.get('pitch')
+                    if roll is not None and pitch is not None:
+                        att_text = get_text('label_location_attitude_result',
+                                            f'{math.degrees(roll):.1f}', f'{math.degrees(pitch):.1f}')
+                        inference_text += f"<span style='font-weight: bold;'>{att_text}</span><br>"
+                        pm2 = getattr(self, 'pose_manager', None)
+                        att_gt = pm2.get_source_pose(current_index, 'pose', require_ok=True) if pm2 is not None else None
+                        if att_gt is not None and 'roll' in att_gt.extra and 'pitch' in att_gt.extra:
+                            roll_err = abs(math.degrees(roll - att_gt.extra['roll']))
+                            pitch_err = abs(math.degrees(pitch - att_gt.extra['pitch']))
+                            att_err_text = get_text('label_location_attitude_error',
+                                                    f'{roll_err:.1f}', f'{pitch_err:.1f}')
+                            inference_text += f"<span style='color: {theme_color('strong')};'>{att_err_text}</span><br>"
 
                 # 履歴入力ありのモデル: 履歴のソースと有効ステップ数
                 if 'history_valid_steps' in result:
@@ -34691,6 +36201,13 @@ class ImageAnnotationTool(QMainWindow):
                                 else get_text('label_location_history_src_measured'))
                     inference_text += (f"<span style='color: {theme_color('strong')};'>"
                                        f"{get_text('label_location_history_info', src_text, result['history_valid_steps'], cfg.get('pose_history_steps', 0))}"
+                                       f"</span><br>")
+
+                # LiDAR入力ありのモデル: 積層フレームのうち実際にスキャンがあった数
+                if 'lidar_valid_frames' in result:
+                    lidar_cfg = (getattr(self.location_model_manager, 'location_config', {}) or {}).get('lidar_config') or {}
+                    inference_text += (f"<span style='color: {theme_color('strong')};'>"
+                                       f"{get_text('label_location_lidar_info', result['lidar_valid_frames'], lidar_cfg.get('stack_frames', 1))}"
                                        f"</span><br>")
 
                 # 格子分類の結果: Top1 セル / Top1〜N の重み付き位置と Top-N 一覧

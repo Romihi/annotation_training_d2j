@@ -1785,6 +1785,8 @@ class LocationModelManager:
             'num_classes': num_classes,
             'pose_dim': 0,
             'include_heading': False,
+            'heading_from_pose': False,
+            'include_attitude': False,
             'pose_norm': None,
             'pose_source': None,
             'input_size': None,
@@ -1794,6 +1796,8 @@ class LocationModelManager:
             'num_grid_classes': 0,
             'pose_history_steps': 0,
             'pose_history_interval': 10,
+            'lidar_config': None,
+            'lidar_interval': 10,
         }
 
     # 格子分類の推論結果に保持する上位セル数（表示側の Top-N はこの範囲で選択）
@@ -1818,6 +1822,14 @@ class LocationModelManager:
     @property
     def has_grid_output(self):
         return 'grid' in self.output_mode.split('_')
+
+    @property
+    def has_attitude_output(self):
+        return self.has_pose_output and bool(self.location_config.get('include_attitude'))
+
+    @property
+    def has_lidar_input(self):
+        return bool(self.location_config.get('lidar_config'))
 
     @property
     def grid_config(self):
@@ -1889,6 +1901,7 @@ class LocationModelManager:
                     input_size=tuple(cfg['input_size']) if cfg.get('input_size') else None,
                     num_grid_classes=int(cfg.get('num_grid_classes') or 0),
                     pose_history_steps=int(cfg.get('pose_history_steps') or 0),
+                    lidar_config=cfg.get('lidar_config'),
                 )
                 if progress_callback:
                     progress_callback(70, "モデルの重みをロード中...")
@@ -1989,13 +2002,16 @@ class LocationModelManager:
     def has_history_input(self):
         return self.pose_history_steps > 0
 
-    def run_inference(self, img_path, pose_history=None):
+    def run_inference(self, img_path, pose_history=None, lidar_scan=None):
         """指定された画像（または画像パスのリスト）に対して位置推論を実行
 
         Args:
             img_path: 画像パス、または複数画像入力モデル用のパスリスト
                       （selected_sources / 時間差スタックの順）。仮想ソース
                       crop/scale モデルは1枚から内部で生成する。
+            pose_history: 過去の座標・姿勢（履歴入力ありのモデルのみ）。None なら全ステップ欠損
+            lidar_scan: LiDAR 生距離スキャン[mm] の積層（新しい順のリスト、または (K,N) 配列。
+                      LiDAR入力ありのモデルのみ）。None なら全ビーム欠損（無効）として推論
 
         Returns:
             dict: クラス出力があれば 'pred_class', 'confidence', 'all_probs'、
@@ -2045,15 +2061,25 @@ class LocationModelManager:
 
             result = {}
             with torch.no_grad():
+                fwd_kwargs = {}
                 if isinstance(self.model, MultiSourceLocationModel) and self.has_history_input:
                     # 過去の座標・姿勢の履歴入力（None なら全ステップ欠損として推論）
                     from model_catalog import encode_pose_history
                     hvec = encode_pose_history(pose_history, cfg.get('pose_norm'), self.pose_history_steps)
-                    history = torch.as_tensor(hvec).reshape(1, -1).to(device)
-                    outputs = self.model(tensor_image, history)
+                    fwd_kwargs['history'] = torch.as_tensor(hvec).reshape(1, -1).to(device)
                     result['history_valid_steps'] = int(round(float(hvec[::5].sum())))
-                else:
-                    outputs = self.model(tensor_image)
+                if isinstance(self.model, MultiSourceLocationModel) and self.has_lidar_input:
+                    # LiDAR 点群入力（None なら全ビーム欠損として推論）
+                    from model_catalog import stack_lidar_scans
+                    lidar_cfg = cfg.get('lidar_config') or {}
+                    stack_frames = int(lidar_cfg.get('stack_frames', 1))
+                    num_beams_raw = int(lidar_cfg.get('num_beams_raw', 1081))
+                    scans = list(lidar_scan) if isinstance(lidar_scan, (list, tuple)) else (
+                        [lidar_scan] if lidar_scan is not None else None)
+                    lvec = stack_lidar_scans(scans, stack_frames, num_beams_raw)
+                    fwd_kwargs['lidar_scan'] = torch.as_tensor(lvec).unsqueeze(0).to(device)
+                    result['lidar_valid_frames'] = int((lvec.reshape(stack_frames, -1).max(axis=1) > 0).sum())
+                outputs = self.model(tensor_image, **fwd_kwargs)
                 logits, pose, grid = split_location_outputs(outputs, self.output_mode)
 
                 if logits is not None:
@@ -2065,9 +2091,10 @@ class LocationModelManager:
 
                 if pose is not None and cfg.get('pose_norm'):
                     vec = pose[0].float().cpu().numpy()
-                    x, y, theta = denormalize_pose_output(
-                        vec, cfg['pose_norm'], include_heading=bool(cfg.get('include_heading')))
-                    result['pose'] = {'x': x, 'y': y, 'theta': theta}
+                    x, y, theta, roll, pitch = denormalize_pose_output(
+                        vec, cfg['pose_norm'], include_heading=bool(cfg.get('include_heading')),
+                        include_attitude=bool(cfg.get('include_attitude')))
+                    result['pose'] = {'x': x, 'y': y, 'theta': theta, 'roll': roll, 'pitch': pitch}
                     result['pose_vec'] = vec.tolist()
 
                 if grid is not None and cfg.get('grid_config'):
@@ -2161,13 +2188,14 @@ class LocationMultiSourceDataset(torch.utils.data.Dataset):
     def __init__(self, grouped_image_paths, class_labels=None, pose_vectors=None,
                  num_sources=1, virtual_source_type=None, transform=None, mask_polygon=None,
                  pixelate_factor=None, grid_labels=None, grid_xy=None,
-                 history_vectors=None):
+                 history_vectors=None, lidar_scans=None):
         self.grouped_paths = grouped_image_paths
         self.class_labels = class_labels
         self.pose_vectors = pose_vectors
         self.grid_labels = grid_labels     # 格子セル index（格子分類時）
         self.grid_xy = grid_xy             # 格子分類の真値座標 [x, y]（位置誤差の評価用）
         self.history_vectors = history_vectors   # 過去の座標・姿勢の履歴入力（encode_pose_history 済み）
+        self.lidar_scans = lidar_scans     # LiDAR 距離スキャン積層（stack_lidar_scans 済み）
         self.num_sources = num_sources
         self.virtual_source_type = virtual_source_type
         self.transform = transform
@@ -2215,7 +2243,11 @@ class LocationMultiSourceDataset(torch.utils.data.Dataset):
             history = torch.tensor(self.history_vectors[idx], dtype=torch.float)
         else:
             history = torch.zeros(0, dtype=torch.float)
-        return stacked, class_target, pose_target, grid_target, grid_xy, history
+        if self.lidar_scans is not None:
+            lidar = torch.tensor(self.lidar_scans[idx], dtype=torch.float)
+        else:
+            lidar = torch.zeros(0, dtype=torch.float)
+        return stacked, class_target, pose_target, grid_target, grid_xy, history, lidar
 
 
 def resolve_location_input_size(raw_size, downscale_factor=1.0, downscale_mode='resize',
@@ -2238,15 +2270,25 @@ def resolve_location_input_size(raw_size, downscale_factor=1.0, downscale_mode='
     return size, pixelate_factor
 
 
-def compute_pose_norm(pose_targets, margin_ratio=0.05):
-    """[x, y, theta] リストから座標正規化の min/max を求める（少し余白を持たせる）"""
-    arr = np.asarray(pose_targets, dtype=np.float64).reshape(-1, 3)
+def compute_pose_norm(pose_targets, margin_ratio=0.05, include_attitude=False):
+    """[x, y, theta] または [x, y, theta, roll, pitch] リストから座標正規化の min/max を求める
+    （少し余白を持たせる）。include_attitude=True なら roll/pitch の min/max も含める。
+    """
+    arr = np.asarray(pose_targets, dtype=np.float64).reshape(-1, 5 if include_attitude else 3)
     x_min, x_max = float(arr[:, 0].min()), float(arr[:, 0].max())
     y_min, y_max = float(arr[:, 1].min()), float(arr[:, 1].max())
     x_margin = max((x_max - x_min) * margin_ratio, 0.05)
     y_margin = max((y_max - y_min) * margin_ratio, 0.05)
-    return {'x_min': x_min - x_margin, 'x_max': x_max + x_margin,
+    norm = {'x_min': x_min - x_margin, 'x_max': x_max + x_margin,
             'y_min': y_min - y_margin, 'y_max': y_max + y_margin}
+    if include_attitude:
+        roll_min, roll_max = float(arr[:, 3].min()), float(arr[:, 3].max())
+        pitch_min, pitch_max = float(arr[:, 4].min()), float(arr[:, 4].max())
+        roll_margin = max((roll_max - roll_min) * margin_ratio, math.radians(1.0))
+        pitch_margin = max((pitch_max - pitch_min) * margin_ratio, math.radians(1.0))
+        norm.update({'roll_min': roll_min - roll_margin, 'roll_max': roll_max + roll_margin,
+                     'pitch_min': pitch_min - pitch_margin, 'pitch_max': pitch_max + pitch_margin})
+    return norm
 
 
 def create_location_datasets(
@@ -2263,6 +2305,7 @@ def create_location_datasets(
     num_sources: int = 1,
     virtual_source_type: Optional[str] = None,
     include_heading: bool = True,
+    include_attitude: bool = False,
     mask_polygon=None,
     pose_norm: Optional[Dict[str, float]] = None,
     downscale_factor: float = 1.0,
@@ -2272,6 +2315,8 @@ def create_location_datasets(
     grid_config: Optional[Dict[str, Any]] = None,
     pose_history: Optional[List[List[Optional[List[float]]]]] = None,
     pose_history_steps: int = 0,
+    lidar_scans: Optional[List[Optional[List[Optional['np.ndarray']]]]] = None,
+    lidar_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[DataLoader, DataLoader, Dict[str, Any]]:
     """位置推論用のデータセットを作成する
 
@@ -2296,6 +2341,9 @@ def create_location_datasets(
         num_sources: 入力画像枚数
         virtual_source_type: None / 'crop' / 'scale' / 'temporal'
         include_heading: 姿勢(theta)をターゲットに含めるか
+        include_attitude: 車体姿勢角（roll, pitch）をターゲットに含めるか。pose センサー
+                          （IMU デッドレコニング）特有のデータで、pose_targets は
+                          [x, y, theta, roll, pitch] の5要素にする必要がある
         mask_polygon: 車両マスク（正規化座標ポリゴン）
         pose_norm: 座標正規化の min/max（None のとき pose_targets から算出）
         downscale_factor: 解像度スライダーの係数（1.0 = フル解像度）
@@ -2367,6 +2415,8 @@ def create_location_datasets(
             'pose_dim': 0,
             'pose_norm': None,
             'include_heading': False,
+            'include_attitude': False,
+            'lidar_config': None,
         }
         return train_loader, val_loader, dataset_info
 
@@ -2415,24 +2465,31 @@ def create_location_datasets(
     use_history = bool(pose_history_steps) and pose_history is not None
     if use_history and len(pose_history) != len(grouped_image_paths):
         raise ValueError("履歴入力には全サンプル分の pose_history が必要です。")
+    if include_attitude and (not use_pose or pose_targets is None
+                             or len(pose_targets) != len(grouped_image_paths)):
+        raise ValueError("姿勢角度（roll/pitch）には全サンプル分の pose_targets"
+                         "（[x, y, theta, roll, pitch]）が必要です。")
 
     pose_vectors = None
     pose_dim = 0
     if use_pose or use_history:
-        # 座標の正規化パラメータ（座標・姿勢出力と履歴入力で共通）
+        # 座標の正規化パラメータ（座標・姿勢出力と履歴入力で共通。履歴は姿勢角度を持たないため
+        # pose_targets が無い場合の履歴フォールバックでは include_attitude を使わない）
         if pose_norm is None:
             if pose_targets is not None and len(pose_targets) == len(grouped_image_paths):
-                pose_norm = compute_pose_norm(pose_targets)
+                pose_norm = compute_pose_norm(pose_targets, include_attitude=include_attitude)
             else:
                 hist_poses = [p for h in pose_history for p in (h or []) if p is not None]
                 if not hist_poses:
                     raise ValueError("履歴入力の正規化には pose_targets または有効な pose_history が必要です。")
                 pose_norm = compute_pose_norm(hist_poses)
     if use_pose:
-        pose_vectors = normalize_pose_targets(pose_targets, pose_norm, include_heading=include_heading)
+        pose_vectors = normalize_pose_targets(pose_targets, pose_norm, include_heading=include_heading,
+                                              include_attitude=include_attitude)
         pose_dim = int(pose_vectors.shape[1])
     else:
         include_heading = False
+        include_attitude = False
         if not use_history:
             pose_norm = None
 
@@ -2442,6 +2499,21 @@ def create_location_datasets(
         history_vectors = [encode_pose_history(h, pose_norm, pose_history_steps) for h in pose_history]
         n_valid = sum(1 for h in pose_history if h and any(p is not None for p in h))
         print(f"履歴入力: {pose_history_steps}ステップ（履歴のあるサンプル: {n_valid}/{len(pose_history)}）")
+
+    # LiDAR 点群（距離スキャン）の追加入力: 各サンプルの積層フレーム（新しい順）を
+    # 固定長 (stack_frames, num_beams_raw) へ整形する（欠損ステップは 0 埋め＝無効値）
+    use_lidar = bool(lidar_config) and lidar_scans is not None
+    if use_lidar and len(lidar_scans) != len(grouped_image_paths):
+        raise ValueError("LiDAR入力には全サンプル分の lidar_scans が必要です。")
+    lidar_arrays = None
+    if use_lidar:
+        from model_catalog import stack_lidar_scans, LOCATION_LIDAR_DEFAULT_NUM_BEAMS
+        stack_frames = int(lidar_config.get('stack_frames', 1))
+        num_beams_raw = int(lidar_config.get('num_beams_raw', LOCATION_LIDAR_DEFAULT_NUM_BEAMS))
+        lidar_arrays = [stack_lidar_scans(s, stack_frames, num_beams_raw) for s in lidar_scans]
+        n_valid = sum(1 for s in lidar_scans if s and s[0] is not None)
+        print(f"LiDAR入力: {stack_frames}フレーム積層 x {num_beams_raw}点"
+              f"（現フレームにスキャンのあるサンプル: {n_valid}/{len(lidar_scans)}）")
 
     # 格子分類: x, y を格子セル index に離散化（格子定義は学習データの範囲から作る）
     grid_labels = None
@@ -2468,6 +2540,7 @@ def create_location_datasets(
         grid_labels=grid_labels,
         grid_xy=grid_xy,
         history_vectors=history_vectors,
+        lidar_scans=lidar_arrays,
     )
 
     val_size = int(len(dataset) * val_split)
@@ -2493,22 +2566,25 @@ def create_location_datasets(
         'pose_dim': pose_dim,
         'pose_norm': pose_norm,
         'include_heading': include_heading,
+        'include_attitude': include_attitude,
         'grid_config': grid_config,
         'num_grid_classes': int(grid_config['num_cells']) if grid_config else 0,
         'pose_history_steps': int(pose_history_steps) if use_history else 0,
+        'lidar_config': dict(lidar_config) if use_lidar else None,
     }
     return train_loader, val_loader, dataset_info
 
 
 def _unpack_location_batch(batch):
-    """位置データセットのバッチを
-    (inputs, class_targets|None, pose_targets|None, grid_targets|None, grid_xy|None, history|None) に分解"""
+    """位置データセットのバッチを (inputs, class_targets|None, pose_targets|None,
+    grid_targets|None, grid_xy|None, history|None, lidar|None) に分解"""
     if len(batch) == 2:
-        return batch[0], batch[1], None, None, None, None
+        return batch[0], batch[1], None, None, None, None, None
     inputs, cls_t, pose_t = batch[0], batch[1], batch[2]
     grid_t = batch[3] if len(batch) > 3 else None
     grid_xy = batch[4] if len(batch) > 4 else None
     history = batch[5] if len(batch) > 5 else None
+    lidar = batch[6] if len(batch) > 6 else None
     if pose_t is not None and pose_t.dim() == 2 and pose_t.shape[1] == 0:
         pose_t = None
     if cls_t is not None and (cls_t < 0).all():
@@ -2519,7 +2595,9 @@ def _unpack_location_batch(batch):
         grid_xy = None
     if history is not None and history.dim() == 2 and history.shape[1] == 0:
         history = None
-    return inputs, cls_t, pose_t, grid_t, grid_xy, history
+    if lidar is not None and lidar.dim() == 2 and lidar.shape[1] == 0:
+        lidar = None
+    return inputs, cls_t, pose_t, grid_t, grid_xy, history, lidar
 
 
 def augment_pose_history(history, pose_norm, steps, sigma_xy_m=0.1, sigma_theta_deg=5.0,
@@ -2590,6 +2668,7 @@ def train_location_model(
     history_noise_xy_m: float = 0.1,
     history_noise_theta_deg: float = 5.0,
     history_drop_prob: float = 0.1,
+    lidar_drop_prob: float = 0.1,
 ) -> Dict[str, Any]:
     """位置推論モデルをトレーニングする（クラス分類 / 座標・姿勢回帰 / 両方）
 
@@ -2633,6 +2712,9 @@ def train_location_model(
                             location_config['pose_norm'] が必要）
         history_noise_xy_m / history_noise_theta_deg / history_drop_prob:
                             学習時の履歴ノイズ（座標[m]・方位[deg]の標準偏差、履歴全体の欠損確率）
+        lidar_drop_prob: 学習時、確率的に LiDAR スキャン全体を欠損（0）にする
+                         （画像への依存を保つための正則化。location_config['lidar_config']
+                         が必要）
 
     Returns:
         トレーニング結果の辞書
@@ -2652,12 +2734,15 @@ def train_location_model(
     location_config = dict(location_config or {})
     pose_norm = location_config.get('pose_norm')
     include_heading = bool(location_config.get('include_heading', pose_dim >= 4))
+    include_attitude = bool(location_config.get('include_attitude', False))
     grid_config = location_config.get('grid_config')
     if use_pose and not pose_norm:
         raise ValueError("座標・姿勢回帰には location_config['pose_norm'] が必要です。")
     use_history = int(pose_history_steps or 0) > 0
     if use_history and not pose_norm:
         raise ValueError("履歴入力には location_config['pose_norm'] が必要です。")
+    lidar_config = location_config.get('lidar_config')
+    use_lidar = bool(lidar_config)
     if use_grid:
         if not grid_config:
             raise ValueError("格子分類には location_config['grid_config'] が必要です。")
@@ -2676,7 +2761,7 @@ def train_location_model(
         except Exception as e:
             print(f"入力サイズの推定に失敗（既定サイズを使用）: {e}")
 
-    legacy_model = (output_mode == 'class' and num_sources == 1 and not use_history)
+    legacy_model = (output_mode == 'class' and num_sources == 1 and not use_history and not use_lidar)
     if legacy_model:
         # 従来どおりの単一画像・クラス分類モデル（チェックポイント形式も従来互換）。
         # input_size を渡して実画像サイズ（縮小サイズ）で構築する
@@ -2689,7 +2774,8 @@ def train_location_model(
             num_classes=num_classes, output_mode=output_mode, pose_dim=pose_dim,
             pretrained=pretrained, input_size=input_size,
             num_grid_classes=num_grid_classes if use_grid else 0,
-            pose_history_steps=int(pose_history_steps) if use_history else 0)
+            pose_history_steps=int(pose_history_steps) if use_history else 0,
+            lidar_config=lidar_config if use_lidar else None)
 
     # 特定のモデルファイルから重みをロードする場合
     loaded_weights = False
@@ -2778,13 +2864,14 @@ def train_location_model(
         n_class = 0
         pos_err_sum = 0.0
         head_err_sum = 0.0
+        attitude_err_sum = 0.0
         n_pose = 0
         grid_correct = 0
         grid_err1_sum = 0.0
         grid_errw_sum = 0.0
         n_grid = 0
         for i, batch in enumerate(loader):
-            inputs, cls_t, pose_t, grid_t, grid_xy, history = _unpack_location_batch(batch)
+            inputs, cls_t, pose_t, grid_t, grid_xy, history, lidar = _unpack_location_batch(batch)
             inputs = inputs.to(device)
             if cls_t is not None:
                 cls_t = cls_t.to(device)
@@ -2801,9 +2888,21 @@ def train_location_model(
                         drop_prob=history_drop_prob)
             else:
                 history = None
+            if lidar is not None and use_lidar:
+                lidar = lidar.to(device)
+                if train and lidar_drop_prob > 0:
+                    keep = (torch.rand(lidar.shape[0], 1, 1, device=device) >= lidar_drop_prob).to(lidar.dtype)
+                    lidar = lidar * keep
+            else:
+                lidar = None
 
             with torch.set_grad_enabled(train):
-                outputs = model(inputs, history) if use_history else model(inputs)
+                fwd_kwargs = {}
+                if use_history:
+                    fwd_kwargs['history'] = history
+                if use_lidar:
+                    fwd_kwargs['lidar_scan'] = lidar
+                outputs = model(inputs, **fwd_kwargs)
                 logits, pose_out, grid_out = split_location_outputs(outputs, output_mode)
                 loss = torch.zeros((), device=device)
                 if logits is not None and cls_t is not None:
@@ -2825,11 +2924,14 @@ def train_location_model(
                 correct += (predicted == cls_t).sum().item()
                 n_class += bs
             if pose_out is not None and pose_t is not None:
-                p_err, h_err = pose_errors(pose_out.detach().cpu().numpy(), pose_t.cpu().numpy(),
-                                           pose_norm, include_heading=include_heading)
+                p_err, h_err, a_err = pose_errors(pose_out.detach().cpu().numpy(), pose_t.cpu().numpy(),
+                                                  pose_norm, include_heading=include_heading,
+                                                  include_attitude=include_attitude)
                 pos_err_sum += float(p_err.sum())
                 if h_err is not None:
                     head_err_sum += float(np.degrees(h_err).sum())
+                if a_err is not None:
+                    attitude_err_sum += float(np.degrees(a_err).sum())
                 n_pose += bs
             if grid_out is not None and grid_t is not None:
                 _, g_pred = torch.max(grid_out, 1)
@@ -2860,6 +2962,7 @@ def train_location_model(
             'accuracy': 100.0 * correct / n_class if n_class else 0.0,
             'pos_error': pos_err_sum / n_pose if n_pose else 0.0,
             'heading_error': head_err_sum / n_pose if (n_pose and include_heading) else 0.0,
+            'attitude_error': attitude_err_sum / n_pose if (n_pose and include_attitude) else 0.0,
             'grid_accuracy': 100.0 * grid_correct / n_grid if n_grid else 0.0,
             'grid_error': grid_err1_sum / n_grid if n_grid else 0.0,          # Top1 セル中心の位置誤差[m]
             'grid_weighted_error': grid_errw_sum / n_grid if n_grid else 0.0, # Top-N 重み付き位置誤差[m]
@@ -2870,6 +2973,7 @@ def train_location_model(
     train_accuracies, val_accuracies = [], []
     train_pos_errors, val_pos_errors = [], []
     train_heading_errors, val_heading_errors = [], []
+    train_attitude_errors, val_attitude_errors = [], []
     train_grid_accuracies, val_grid_accuracies = [], []
     train_grid_errors, val_grid_errors = [], []
     val_grid_weighted_errors = []
@@ -2877,6 +2981,7 @@ def train_location_model(
     best_val_acc = 0.0
     best_val_pos_error = None
     best_val_heading_error = None
+    best_val_attitude_error = None
     best_val_grid_acc = None
     best_val_grid_error = None
     best_val_grid_weighted_error = None
@@ -2904,6 +3009,7 @@ def train_location_model(
             'num_classes': num_classes,
             'pose_dim': pose_dim if use_pose else 0,
             'include_heading': include_heading if use_pose else False,
+            'include_attitude': include_attitude if use_pose else False,
             'pose_norm': pose_norm if use_pose else None,
             'input_size': list(model.input_size),
             'grid_config': grid_config if use_grid else None,
@@ -2915,6 +3021,9 @@ def train_location_model(
             'history_noise_xy_m': float(history_noise_xy_m) if use_history else None,
             'history_noise_theta_deg': float(history_noise_theta_deg) if use_history else None,
             'history_drop_prob': float(history_drop_prob) if use_history else None,
+            # LiDAR 点群入力（推論時に同じ前処理設定でスキャンを組み立てるための情報）
+            'lidar_config': dict(lidar_config) if use_lidar else None,
+            'lidar_drop_prob': float(lidar_drop_prob) if use_lidar else None,
         })
         if use_history:
             checkpoint_config['pose_norm'] = pose_norm   # pose ヘッドが無くても履歴正規化に必要
@@ -2966,6 +3075,8 @@ def train_location_model(
         val_pos_errors.append(val_stats['pos_error'])
         train_heading_errors.append(train_stats['heading_error'])
         val_heading_errors.append(val_stats['heading_error'])
+        train_attitude_errors.append(train_stats['attitude_error'])
+        val_attitude_errors.append(val_stats['attitude_error'])
         train_grid_accuracies.append(train_stats['grid_accuracy'])
         val_grid_accuracies.append(val_stats['grid_accuracy'])
         train_grid_errors.append(train_stats['grid_error'])
@@ -2991,6 +3102,8 @@ def train_location_model(
                 message += f", 検証位置誤差: {val_stats['pos_error']:.3f}m"
                 if include_heading:
                     message += f", 検証方位誤差: {val_stats['heading_error']:.1f}°"
+                if include_attitude:
+                    message += f", 検証姿勢角誤差: {val_stats['attitude_error']:.1f}°"
             if use_grid:
                 message += (f", 格子精度: {val_stats['grid_accuracy']:.1f}%"
                             f", 格子Top1誤差: {val_stats['grid_error']:.3f}m"
@@ -3012,12 +3125,14 @@ def train_location_model(
                 best_val_acc = val_accuracy
             best_val_pos_error = val_stats['pos_error'] if use_pose else None
             best_val_heading_error = val_stats['heading_error'] if (use_pose and include_heading) else None
+            best_val_attitude_error = val_stats['attitude_error'] if (use_pose and include_attitude) else None
             best_val_grid_acc = val_stats['grid_accuracy'] if use_grid else None
             best_val_grid_error = val_stats['grid_error'] if use_grid else None
             best_val_grid_weighted_error = val_stats['grid_weighted_error'] if use_grid else None
             torch.save(build_checkpoint(epoch, {
                 'loss': best_val_loss, 'accuracy': best_val_acc,
                 'pos_error': best_val_pos_error, 'heading_error': best_val_heading_error,
+                'attitude_error': best_val_attitude_error,
             }), best_model_path)
             if progress_callback:
                 progress_callback(epoch + 1, num_epochs,
@@ -3031,6 +3146,7 @@ def train_location_model(
                 'loss': val_loss, 'accuracy': best_val_acc,
                 'pos_error': val_stats['pos_error'] if use_pose else None,
                 'heading_error': val_stats['heading_error'] if (use_pose and include_heading) else None,
+                'attitude_error': val_stats['attitude_error'] if (use_pose and include_attitude) else None,
             }), best_model_path)
             if progress_callback:
                 progress_callback(epoch + 1, num_epochs,
@@ -3068,10 +3184,13 @@ def train_location_model(
         'val_pos_errors': val_pos_errors,
         'train_heading_errors': train_heading_errors,
         'val_heading_errors': val_heading_errors,
+        'train_attitude_errors': train_attitude_errors,
+        'val_attitude_errors': val_attitude_errors,
         'best_val_loss': best_val_loss,
         'best_val_acc': best_val_acc,
         'best_val_pos_error': best_val_pos_error,
         'best_val_heading_error': best_val_heading_error,
+        'best_val_attitude_error': best_val_attitude_error,
         'train_grid_accuracies': train_grid_accuracies,
         'val_grid_accuracies': val_grid_accuracies,
         'train_grid_errors': train_grid_errors,
@@ -3150,8 +3269,9 @@ def plot_location_training_results(results, save_dir, timestamp):
     use_pose = 'pose' in heads
     use_grid = 'grid' in heads and bool(results.get('val_grid_accuracies'))
     has_heading = use_pose and any(v > 0 for v in results.get('val_heading_errors', []))
+    has_attitude = use_pose and any(v > 0 for v in results.get('val_attitude_errors', []))
 
-    panels = 1 + int(use_class) + int(use_pose) + int(has_heading) + 2 * int(use_grid)
+    panels = 1 + int(use_class) + int(use_pose) + int(has_heading) + int(has_attitude) + 2 * int(use_grid)
     fig, axes = plt.subplots(panels, 1, figsize=(10, 4.5 * panels))
     if panels == 1:
         axes = [axes]
@@ -3196,6 +3316,17 @@ def plot_location_training_results(results, save_dir, timestamp):
         ax.set_xlabel('Epoch')
         ax.set_ylabel('Heading Error (deg)')
         ax.set_title(f"Heading Error: {results['model_name']}")
+        ax.legend()
+        ax.grid(True)
+
+    # 姿勢角誤差（roll・pitch の平均絶対誤差。pose センサー[IMU]特有）
+    if has_attitude:
+        ax = next(ax_iter)
+        ax.plot(results.get('train_attitude_errors', []), label='Training Attitude Error')
+        ax.plot(results.get('val_attitude_errors', []), label='Validation Attitude Error')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Attitude Error (deg)')
+        ax.set_title(f"Attitude Error (roll/pitch): {results['model_name']}")
         ax.legend()
         ax.grid(True)
 

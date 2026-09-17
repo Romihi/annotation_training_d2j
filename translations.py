@@ -189,6 +189,14 @@ TRANSLATIONS = {
                                '左クリック: 頂点追加 / 頂点をドラッグ: 移動 / 頂点を右クリック: その頂点を削除\n'
                                '右クリック: 直前の頂点を削除 / Ctrl+右クリック: 全消去\n'
                                'もう一度「編集」を押すと確定します（学習ダイアログの「マスクを適用」で使用されます）。',
+        'chk_grid_visible': 'グリッド',
+        'section_canvas_scale': 'キャンバス表示倍率',
+        'label_canvas_scale': '表示倍率:',
+        'tip_canvas_scale': ('画像・結合画像・測距図をキャンバスに収めた大きさ（100%）に対する割合。'
+                             '小さくすると周囲に余白ができ、軸ラベルやゲージを広く取れます'),
+        'canvas_range_label': 'レンジ',
+        'canvas_range_tooltip': '測距ソースの表示レンジを拡大/縮小（上=拡大）。画像は常にキャンバスへ自動フィット',
+        'tip_grid_visible': 'angle/throttle 平面のグリッドと目盛りを表示する（画像ソース・測距ソース共通）',
         'chk_mask_visible': '表示',
         'tip_mask_visible': '選択中のマスクのオーバーレイ表示をON/OFFします（学習・推論での適用には影響しません）。\n'
                             '結合表示中は表示位置が合わないため、設定に関わらず自動的に非表示になります。',
@@ -262,6 +270,40 @@ TRANSLATIONS = {
         'label_image_count': '画像 {0} of {1}:{2}',
         'label_deleted_suffix': '[削除済み]',
         'label_image_source': '画像ソース',
+        'image_source_lidar': '測距',
+        'tip_image_source_lidar': ('測距データを表示する: LiDAR 生スキャン（極座標: 自車=中心・前方=上、'
+                                   'または角度×距離のプロファイル）。無効ビーム・過去フレーム積層・'
+                                   'モデル入力（前処理後）と、catalog の測距ゾーン値（lidar/ または '
+                                   'ultrasonic/ の RrLH,FrLH,FrFR,FrRH,RrRH）を monitor と同じ扇形で確認できる。'
+                                   '運転アノテーション点・推論点は画像ソースと同じ angle/throttle 平面で'
+                                   '重ねて表示・クリック編集できる。lidar/*.npy か測距ゾーン値がある時のみ選択可'),
+        'label_lidar_layers_only': '測距表示:',
+        'tip_lidar_layers_only': '画像ソースで 測距 を選択しているときのみ有効',
+        'opt_lidar_view_polar': '極座標',
+        'opt_lidar_view_profile': '距離プロファイル',
+        'label_lidar_view_range': 'レンジ',
+        'chk_lidar_zones': '測距ゾーン',
+        'tip_chk_lidar_zones': ('catalog の lidar/ または ultrasonic/ の RrLH,FrLH,FrFR,FrRH,RrRH を'
+                                'togikaidrive monitor と同じ扇形で描く（<300mm 赤 / <600mm 黄 / 緑）。'
+                                'UST20 は config の ZONE_INDEX と同じ角度範囲'),
+        'chk_lidar_points': '生点群',
+        'tip_chk_lidar_points': '現フレームの全ビームを距離で着色して描く（橙=近, 青=遠）。無効ビームは灰のマーク',
+        'chk_lidar_history': '過去フレーム',
+        'tip_chk_lidar_history': 'LiDAR Policy の積層フレーム数 K に合わせて過去 K-1 フレームを薄く重ねる',
+        'chk_lidar_model_input': 'モデル入力',
+        'tip_chk_lidar_model_input': ('学習と同じ前処理（min-pool間引き・レンジ・無効マスク）を通した'
+                                      'ビン列を黄の折れ線で描く。LiDAR Policy モデル読込中はその設定を使う'),
+        'lidar_view_no_scan': 'このフレームの測距データ（lidar/*.npy・測距ゾーン値）がありません',
+        'lidar_legend_zones': '測距ゾーン（{}/）',
+        'lidar_view_profile_axis': '角度（0°=前方, +=左）',
+        'lidar_legend_points': '生点群（橙=近 → 青=遠）',
+        'lidar_legend_invalid': '無効ビーム',
+        'lidar_legend_history': '過去 {} フレーム',
+        'lidar_legend_model': 'モデル入力（{} bin）',
+        'lidar_legend_inference': '推論アーク',
+        'lidar_stat_beams': '{} beams / 有効 {}%',
+        'lidar_stat_min': '最小 前{} 左{} 右{}',
+        'lidar_stat_stack': '積層 K={}（複製 {}）',
         'image_source_bev': 'BEV',
         'tip_image_source_bev': '真上から見た図（BEV）。操舵軌道(赤)・走行軌道(緑)・予測軌道(シアン)をego座標のまま俯瞰表示する。各軌道の表示ON/OFFは既存のチェックボックスに連動。pose/slam がある時のみ選択可',
         'bev_legend_steering': '操舵軌道',
@@ -1210,6 +1252,18 @@ TRANSLATIONS = {
                                     '欠損が多い場合はマップビューの「欠損補間」で埋めてから学習できます。',
         'chk_location_include_heading': '姿勢（方位 θ）も出力に含める',
         'tip_location_include_heading': 'ONの場合、出力は x, y, cosθ, sinθ の4次元。OFFの場合は x, y の2次元',
+        'chk_location_heading_from_pose': '方位(θ)は pose センサーから取得する（自己位置ソースの代わりに）',
+        'tip_location_heading_from_pose': 'OFF（既定）: 方位(θ)の教師データは座標(x, y)と同じ自己位置ソース（上の「自己位置ソース」欄で選択中、例 slam）の値を使います。\n'
+                                         'ON: 方位(θ)だけは選択中のソースに関わらず pose（デッドレコニング＋IMU）センサーの値を使います。\n'
+                                         'pose は再ローカライズのテレポートが無く連続的なため、座標は slam 等の絶対位置、方位は pose の滑らかな値を使いたい場合に有効にします。',
+        'tip_location_heading_from_pose_disabled': 'このセッションに pose センサーの記録がないため選択できません。',
+        'chk_location_include_attitude': '車体姿勢角（roll, pitch）も出力に含める',
+        'tip_location_include_attitude': 'pose センサー（IMU デッドレコニング）が記録した車体の傾き（roll, pitch）を'
+                                         '教師データに追加します。自己位置ソースに slam 等を選んでいても、'
+                                         'roll/pitch は常に pose センサーの記録から取得します。\n'
+                                         'ONの場合、座標・姿勢出力にさらに roll, pitch の2次元が加わります。',
+        'tip_location_include_attitude_disabled': 'このセッションの pose センサー記録に roll/pitch（車体姿勢角）が'
+                                                  '含まれていないため選択できません。',
         'label_location_pose_loss_weight': '座標・姿勢損失の重み:',
         'tip_location_pose_loss_weight': 'マルチタスク学習時の損失 = クラス分類損失 + 重み × 座標・姿勢損失',
         'label_location_pose_note': '※ 座標は map 座標系[m]、方位は rad で学習し、正規化パラメータはモデルに保存されます。座標・姿勢回帰では左右反転オーグメンテーションは無効になります。',
@@ -1240,6 +1294,16 @@ TRANSLATIONS = {
         'label_location_history_src_measured': '実測',
         'label_location_history_src_inference': '推論結果',
         'label_location_result_history': '履歴入力: {0}ステップ x {1}フレーム間隔（学習ノイズ σ={2} m / {3}°, 欠損率 {4}）',
+        # LiDAR 点群（距離スキャン）の追加入力
+        'chk_location_lidar': 'LiDAR点群データを入力に追加する',
+        'tip_location_lidar': '同セッションの LiDAR 距離スキャン（lidar/*.npy）を、軽量な1D-CNNで符号化して'
+                              '画像特徴と一緒にモデルへ入力します。前処理（間引き・正規化・無効値マスク）は'
+                              'LiDAR Policy モデルと同じコードを使用します。',
+        'tip_location_lidar_disabled': 'このセッションには LiDAR 記録（lidar/*.npy）がないため選択できません。',
+        'label_location_lidar_note': '※ LiDAR に頼りすぎて画像を見なくなるのを防ぐため、学習時は一定確率でスキャン全体を欠損させます。積層フレーム数を1にすると現フレームのみを使用します。',
+        'label_location_lidar_info': 'LiDAR入力: 積層 {1}フレーム中 {0}フレームにスキャンあり',
+        'label_location_result_lidar': 'LiDAR入力: {0}ビン x {1}フレーム積層（間隔 {2}フレーム）',
+        'label_location_result_skipped_lidar': '除外: LiDARスキャンなし {0}件',
         'label_location_grid_sigma': 'ラベル平滑化 σ (セル):',
         'tip_location_grid_sigma': '真値座標を中心とするガウス分布で近傍セルにも確率を配って学習します（0 = one-hot）。\n空間的な近さを学びやすくなり、Top-N の重み付き平均が意味を持ちます。',
         'chk_location_grid_balance': 'セル頻度で重み付け',
@@ -1259,8 +1323,13 @@ TRANSLATIONS = {
         'label_location_result_grid': '格子: セル {0} m, {1} x {2} = {3} セル',
         'label_location_result_pos_error': '最良検証位置誤差: {0} m',
         'label_location_result_heading_error': '最良検証方位誤差: {0}°',
+        'label_location_result_attitude_error': '最良検証姿勢角誤差: {0}°',
         'label_location_result_skipped': '除外: 自己位置なし {0}件 / 入力画像不足 {1}件',
+        'label_location_result_skipped_attitude': '除外: 姿勢角度（roll/pitch）データなし {0}件',
+        'label_location_result_skipped_heading': '除外: pose センサーの方位(θ)データなし {0}件',
         'label_location_result_pose_source': '自己位置ソース: {0} (方位: {1})',
+        'label_location_result_heading_from_pose': '方位(θ): 自己位置ソースではなく pose センサーから取得して学習',
+        'label_location_result_attitude_on': '姿勢角度（roll/pitch）: pose センサーから取得して学習',
         'label_location_result_inputs': '入力画像枚数: {0} ({1})',
         'label_location_resolution_info': '自動運転モデルと同様に実画像サイズで学習します。スライダーで入力サイズを縮小（サイズ縮小）またはサイズを維持したまま画質を劣化（ピクセレーション）できます。',
         'label_location_resolution_size': '元画像 {0}x{1} → 学習入力サイズ {2}x{3}',
@@ -1268,6 +1337,8 @@ TRANSLATIONS = {
         'label_location_pose_result': '推定座標: x={0} m, y={1} m, θ={2}',
         'label_location_pose_error': '実測との誤差: 位置 {0} m / 方位 {1}°',
         'label_location_pose_error_pos_only': '実測との誤差: 位置 {0} m',
+        'label_location_attitude_result': '推定姿勢角: roll={0}°, pitch={1}°',
+        'label_location_attitude_error': '実測(poseセンサー)との誤差: roll {0}° / pitch {1}°',
         'msg_need_at_least_2_locations': '位置モデルを学習するには少なくとも2つの異なる位置ラベルが必要です。現在: {0}種類',
         'msg_no_valid_location_annotations': '有効な位置アノテーションがありません。',
         'msg_preparing_location_training': "位置モデル '{0}' の学習データを準備中...",
@@ -1930,6 +2001,45 @@ Google Cloud Console での OAuth設定手順
         'msg_togivad_track_prereq': ('agent追跡強化（T2-b）には「他車動き予測（②）」'
                                      'と「時系列BEV融合（T1-a）」の両方を有効に'
                                      'してください'),
+        # --- LiDAR Policy（2D LiDAR → angle/throttle） ---
+        'label_lidar_policy_params': 'LiDAR Policy パラメータ',
+        'label_lidar_preset': 'プリセット',
+        'opt_lidar_preset_base': 'base（ResNet1D-lite）',
+        'opt_lidar_preset_tiny': 'tiny（TinyLidarNet相当）',
+        'label_lidar_num_bins': 'ビン数',
+        'label_lidar_downsample': '間引き',
+        'opt_lidar_ds_minpool': 'min-pool',
+        'opt_lidar_ds_index': '等間隔（RL互換）',
+        'label_lidar_stack': '積層フレーム K',
+        'chk_lidar_valid_ch': '無効ビームchを追加',
+        'tip_lidar_valid_ch': ('0/範囲外のビームを有効=1/無効=0 の別chとして入力する。'
+                               '黒色物体や反射抜けを「最遠」と誤認しにくくなる'),
+        'label_lidar_max_range': '最大距離 [mm]',
+        'label_lidar_max_speed': '最大速度 [m/s]',
+        'chk_lidar_traj': '補助軌道ヘッド',
+        'tip_lidar_traj': ('将来軌道を回帰する補助タスク（推論では未使用）。'
+                           '自己位置（pose/slam）から作った将来軌道を補助タスクとして'
+                           '回帰し表現学習を正則化する。自己位置の無い記録では自動OFF。'
+                           'ONNXに traj 出力が付く（実機では無視）'),
+        'label_lidar_mode_filter': '教師データ',
+        'label_lidar_pose_source': '軌道ラベル',
+        'opt_lidar_mode_all': 'すべて',
+        'opt_lidar_mode_auto': '自動運転のみ（auto_*）',
+        'opt_lidar_mode_user': '手動運転のみ（user）',
+        'label_lidar_split': '分割',
+        'opt_lidar_split_block': '連続ブロック',
+        'opt_lidar_split_random': 'ランダム',
+        'tip_lidar_split': ('連続ブロック（推奨）: 時系列で隣接するフレームが train/val に'
+                            '跨らないよう約200フレーム単位で分割する。ランダム分割は'
+                            '検証精度が過大評価されやすい'),
+        'chk_lidar_mirror': '左右反転拡張（スキャン反転 + 操舵符号反転）',
+        'tip_lidar_mirror': ('コースの左右寄り（path_variant）と矛盾しうるため既定OFF。'
+                             '左右対称に走らせたいときのみ有効化'),
+        'chk_lidar_steer_balance': '大舵角サンプルを逆頻度で重み付け',
+        'label_lidar_info': '入力: lidar/*.npy（Kフレーム積層）+ 車速 → angle/throttle。画像ソース不使用・ONNX自動書き出し',
+        'msg_lidar_no_scans': ('LiDAR データ（lidar/*_lidar_distance_array_.npy）が'
+                               '見つかりません。LiDAR記録のあるセッションを読み込んで'
+                               'ください'),
         'msg_togivad_no_agents': ('他車ラベル（togivad/agents）が見つかりません。'
                                   'マップビューの「他車ラベルを計算して保存」で'
                                   '書き戻してから学習してください'),
@@ -2315,6 +2425,14 @@ Google Cloud Console での OAuth設定手順
                                'Left click: add vertex / Drag vertex: move / Right click on vertex: remove it\n'
                                'Right click: remove last vertex / Ctrl+Right click: clear all\n'
                                'Press "Edit" again to confirm (used via "Apply mask" in the training dialog).',
+        'chk_grid_visible': 'Grid',
+        'section_canvas_scale': 'Canvas display scale',
+        'label_canvas_scale': 'Scale:',
+        'tip_canvas_scale': ('Percentage of the size that fits the image / combined image / ranging view '
+                             'to the canvas (100%). Smaller values leave more room around the view'),
+        'canvas_range_label': 'Range',
+        'canvas_range_tooltip': 'Zoom the ranging view range (up = zoom in). Images always auto-fit the canvas',
+        'tip_grid_visible': 'Show the angle/throttle grid and scale (applies to image and ranging sources)',
         'chk_mask_visible': 'Show',
         'tip_mask_visible': 'Toggle the overlay display of the selected mask (does not affect training/inference masking).\n'
                             'Automatically hidden in combined view because positions do not align.',
@@ -2388,6 +2506,43 @@ Google Cloud Console での OAuth設定手順
         'label_image_count': 'Image {0} of {1}:{2}',
         'label_deleted_suffix': '[Deleted]',
         'label_image_source': 'Image Source',
+        'image_source_lidar': 'Ranging',
+        'tip_image_source_lidar': ('Show ranging data: the raw LiDAR scan (polar: ego at center, forward up; '
+                                   'or an angle-vs-range profile). Inspect invalid beams, stacked '
+                                   'past frames and the model input after preprocessing, plus the catalog '
+                                   'zone ranges (lidar/ or ultrasonic/ RrLH,FrLH,FrFR,FrRH,RrRH) drawn as '
+                                   'fans like the vehicle monitor. Driving '
+                                   'annotation and inference points are overlaid in the same '
+                                   'angle/throttle plane as image sources and can be edited by '
+                                   'clicking. Available when lidar/*.npy or zone ranges exist'),
+        'label_lidar_layers_only': 'Ranging view:',
+        'tip_lidar_layers_only': 'Enabled only while the Ranging image source is selected',
+        'opt_lidar_view_polar': 'Polar',
+        'opt_lidar_view_profile': 'Range profile',
+        'label_lidar_view_range': 'Range',
+        'chk_lidar_zones': 'Zones',
+        'tip_chk_lidar_zones': ('Catalog zone ranges (lidar/ or ultrasonic/ RrLH,FrLH,FrFR,FrRH,RrRH) '
+                                'drawn as fans like the togikaidrive monitor (<300mm red / <600mm yellow / green). '
+                                'UST20 uses the same angular ranges as config ZONE_INDEX'),
+        'chk_lidar_points': 'Points',
+        'tip_chk_lidar_points': 'All beams of the current frame colored by range (orange=near, blue=far). Invalid beams as gray marks',
+        'chk_lidar_history': 'Past frames',
+        'tip_chk_lidar_history': 'Overlay the past K-1 frames (K = LiDAR Policy stacked frames) faintly',
+        'chk_lidar_model_input': 'Model input',
+        'tip_chk_lidar_model_input': ('Yellow polyline of the bins after the same preprocessing as '
+                                      'training (min-pool, range clip, invalid mask). Uses the loaded '
+                                      'LiDAR Policy settings when one is loaded'),
+        'lidar_view_no_scan': 'No ranging data (lidar/*.npy or zone ranges) for this frame',
+        'lidar_legend_zones': 'Zones ({}/)',
+        'lidar_view_profile_axis': 'angle (0°=front, +=left)',
+        'lidar_legend_points': 'Points (orange=near, blue=far)',
+        'lidar_legend_invalid': 'Invalid beams',
+        'lidar_legend_history': 'Past {} frames',
+        'lidar_legend_model': 'Model input ({} bins)',
+        'lidar_legend_inference': 'Inference arc',
+        'lidar_stat_beams': '{} beams / valid {}%',
+        'lidar_stat_min': 'min F{} L{} R{}',
+        'lidar_stat_stack': 'stack K={} (dup {})',
         'image_source_bev': 'BEV',
         'tip_image_source_bev': "Bird's-eye (top-down) view. Shows steering (red), driven (green) and predicted (cyan) trajectories in ego coordinates. Each trajectory's visibility follows its existing checkbox. Available only when pose/slam data exists.",
         'bev_legend_steering': 'Steering',
@@ -3337,6 +3492,19 @@ Google Cloud Console での OAuth設定手順
                                     'If many frames are missing, fill gaps with the map view interpolation before training.',
         'chk_location_include_heading': 'Include heading (θ) in the output',
         'tip_location_include_heading': 'ON: 4-dim output (x, y, cosθ, sinθ). OFF: 2-dim output (x, y)',
+        'chk_location_heading_from_pose': 'Take heading (θ) from the pose sensor (instead of the ego-pose source)',
+        'tip_location_heading_from_pose': "OFF (default): heading (θ) targets come from the same ego-pose source as x, y (selected above in \"Ego-pose source\", e.g. slam).\n"
+                                          "ON: heading (θ) alone always comes from the pose (dead-reckoning + IMU) sensor, regardless of the selected source.\n"
+                                          "pose has no relocalization teleports and stays continuous, so enable this when you want absolute x, y from slam etc. but a smooth heading from pose.",
+        'tip_location_heading_from_pose_disabled': 'Unavailable: this session has no pose sensor records.',
+        'chk_location_include_attitude': 'Include vehicle attitude (roll, pitch) in the output',
+        'tip_location_include_attitude': "Add the vehicle body tilt (roll, pitch) recorded by the pose sensor "
+                                         "(IMU dead reckoning) as a training target. Roll/pitch always come from "
+                                         "the pose sensor's own record, even if slam etc. is selected as the "
+                                         "ego-pose source.\n"
+                                         "ON adds 2 more dimensions (roll, pitch) to the pose output.",
+        'tip_location_include_attitude_disabled': "Unavailable: this session's pose sensor records do not include "
+                                                  "roll/pitch (vehicle attitude).",
         'label_location_pose_loss_weight': 'Pose loss weight:',
         'tip_location_pose_loss_weight': 'Multi-task loss = classification loss + weight × pose loss',
         'label_location_pose_note': '* Coordinates are learned in map frame [m] and heading in rad; normalization parameters are stored in the model. Horizontal-flip augmentation is disabled for pose regression.',
@@ -3367,6 +3535,17 @@ Google Cloud Console での OAuth設定手順
         'label_location_history_src_measured': 'measured',
         'label_location_history_src_inference': 'predictions',
         'label_location_result_history': 'History input: {0} steps x {1} frame interval (training noise σ={2} m / {3}°, dropout {4})',
+        # LiDAR point cloud (distance scan) additional input
+        'chk_location_lidar': 'Add LiDAR point cloud data as input',
+        'tip_location_lidar': 'Encode the LiDAR distance scan (lidar/*.npy) from the same session with a lightweight '
+                              '1D-CNN and feed it to the model together with the image features. Preprocessing '
+                              '(downsampling, normalization, invalid-value masking) reuses the same code as the '
+                              'LiDAR Policy model.',
+        'tip_location_lidar_disabled': 'Unavailable: this session has no LiDAR records (lidar/*.npy).',
+        'label_location_lidar_note': '* To keep the model from relying on LiDAR alone, training drops the whole scan with a fixed probability. Set stacked frames to 1 to use only the current frame.',
+        'label_location_lidar_info': 'LiDAR input: {0} of {1} stacked frames have a scan',
+        'label_location_result_lidar': 'LiDAR input: {0} bins x {1} stacked frames (interval {2} frames)',
+        'label_location_result_skipped_lidar': 'Excluded: no LiDAR scan {0}',
         'label_location_grid_sigma': 'Label smoothing σ (cells):',
         'tip_location_grid_sigma': 'Spread the target over neighboring cells with a Gaussian centered on the true position (0 = one-hot).\nMakes spatial proximity easier to learn and gives the Top-N weighted mean a meaning.',
         'chk_location_grid_balance': 'Weight by cell frequency',
@@ -3386,8 +3565,13 @@ Google Cloud Console での OAuth設定手順
         'label_location_result_grid': 'Grid: cell {0} m, {1} x {2} = {3} cells',
         'label_location_result_pos_error': 'Best val. position error: {0} m',
         'label_location_result_heading_error': 'Best val. heading error: {0}°',
+        'label_location_result_attitude_error': 'Best val. attitude error: {0}°',
         'label_location_result_skipped': 'Excluded: no ego-pose {0} / missing input images {1}',
+        'label_location_result_skipped_attitude': 'Excluded: no attitude (roll/pitch) data {0}',
+        'label_location_result_skipped_heading': 'Excluded: no pose sensor heading (θ) data {0}',
         'label_location_result_pose_source': 'Ego-pose source: {0} (heading: {1})',
+        'label_location_result_heading_from_pose': 'Heading (θ): trained from the pose sensor instead of the ego-pose source',
+        'label_location_result_attitude_on': 'Attitude (roll/pitch): trained from the pose sensor',
         'label_location_result_inputs': 'Input images: {0} ({1})',
         'label_location_resolution_info': 'Trained at the actual image size, like the driving model. Use the slider to shrink the input size (resize) or degrade image content while keeping the size (pixelate).',
         'label_location_resolution_size': 'Original {0}x{1} → training input size {2}x{3}',
@@ -3395,6 +3579,8 @@ Google Cloud Console での OAuth設定手順
         'label_location_pose_result': 'Estimated pose: x={0} m, y={1} m, θ={2}',
         'label_location_pose_error': 'Error vs. measured: position {0} m / heading {1}°',
         'label_location_pose_error_pos_only': 'Error vs. measured: position {0} m',
+        'label_location_attitude_result': 'Estimated attitude: roll={0}°, pitch={1}°',
+        'label_location_attitude_error': 'Error vs. measured (pose sensor): roll {0}° / pitch {1}°',
         'msg_need_at_least_2_locations': 'At least 2 different location labels are required. Current: {0} types',
         'msg_no_valid_location_annotations': 'No valid location annotations.',
         'msg_preparing_location_training': "Preparing training data for location model '{0}'...",
@@ -4074,6 +4260,46 @@ Notes
         'msg_togivad_track_prereq': ('Agent tracking (T2-b) requires both '
                                      '"Agent motion prediction (2)" and '
                                      '"Temporal BEV fusion (T1-a)" enabled'),
+        # --- LiDAR Policy (2D LiDAR -> angle/throttle) ---
+        'label_lidar_policy_params': 'LiDAR Policy Parameters',
+        'label_lidar_preset': 'Preset',
+        'opt_lidar_preset_base': 'base (ResNet1D-lite)',
+        'opt_lidar_preset_tiny': 'tiny (TinyLidarNet-like)',
+        'label_lidar_num_bins': 'Bins',
+        'label_lidar_downsample': 'Downsample',
+        'opt_lidar_ds_minpool': 'min-pool',
+        'opt_lidar_ds_index': 'uniform (RL compat.)',
+        'label_lidar_stack': 'Stacked frames K',
+        'chk_lidar_valid_ch': 'Add invalid-beam channel',
+        'tip_lidar_valid_ch': ('Feed a separate valid=1/invalid=0 channel for zero or '
+                               'out-of-range beams so dark objects / dropouts are not '
+                               'mistaken for "far away"'),
+        'label_lidar_max_range': 'Max range [mm]',
+        'label_lidar_max_speed': 'Max speed [m/s]',
+        'chk_lidar_traj': 'Aux. trajectory head',
+        'tip_lidar_traj': ('Regress the future trajectory built from localization '
+                           '(pose/slam) as an auxiliary task to regularize the encoder. '
+                           'Auto-disabled without localization. Adds a traj output to '
+                           'ONNX (ignored on the vehicle)'),
+        'label_lidar_mode_filter': 'Teacher data',
+        'label_lidar_pose_source': 'Traj. label',
+        'opt_lidar_mode_all': 'All',
+        'opt_lidar_mode_auto': 'Autonomous only (auto_*)',
+        'opt_lidar_mode_user': 'Manual only (user)',
+        'label_lidar_split': 'Split',
+        'opt_lidar_split_block': 'Contiguous blocks',
+        'opt_lidar_split_random': 'Random',
+        'tip_lidar_split': ('Contiguous blocks: split in ~200-frame chunks so adjacent '
+                            'frames never straddle train/val. Random splits overestimate '
+                            'validation accuracy'),
+        'chk_lidar_mirror': 'Mirror augmentation (flip scan + negate steering)',
+        'tip_lidar_mirror': ('Off by default because it can conflict with the course '
+                             'side preference (path_variant). Enable only for symmetric '
+                             'driving'),
+        'chk_lidar_steer_balance': 'Inverse-frequency weighting for large steering',
+        'label_lidar_info': 'Input: lidar/*.npy (K stacked) + speed -> angle/throttle. No image sources; ONNX auto-exported',
+        'msg_lidar_no_scans': ('No LiDAR data (lidar/*_lidar_distance_array_.npy) found. '
+                               'Load a session recorded with LiDAR'),
         'msg_togivad_no_agents': ('No agent labels (togivad/agents) found. '
                                   'Write them back via "Compute & save agent '
                                   'labels" in the map view before training'),

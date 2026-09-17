@@ -30,6 +30,7 @@ class ModelType(Enum):
     YOLO_SEGMENTATION = "yolo_segmentation"
     SEQUENCE = "sequence"
     TOGIVAD = "togivad"
+    LIDAR_POLICY = "lidar_policy"
     GRU_TRAJECTORY = "gru_trajectory"  # 後方互換
 
 class MLflowManager:
@@ -44,6 +45,7 @@ class MLflowManager:
         ModelType.YOLO_SEGMENTATION: "yolo_segmentation_models",
         ModelType.SEQUENCE: "sequence_models",
         ModelType.TOGIVAD: "togivad_models",
+        ModelType.LIDAR_POLICY: "lidar_policy_models",
         ModelType.GRU_TRAJECTORY: "gru_trajectory_models"  # 後方互換
     }
 
@@ -843,10 +845,13 @@ class MLflowManager:
         params["task_type"] = {"class": "classification", "pose": "regression",
                                "class_pose": "multitask"}.get(output_mode, "classification")
         for key in ("num_sources", "fusion_method", "selected_sources", "virtual_source_type",
-                    "temporal_interval", "pose_source", "include_heading", "pose_loss_weight",
+                    "temporal_interval", "pose_source", "include_heading", "heading_from_pose",
+                    "include_attitude", "pose_loss_weight",
                     "grid_cell_size", "num_grid_classes", "grid_loss_weight", "grid_label_sigma",
                     "grid_class_balance", "pose_history_steps", "pose_history_interval",
-                    "history_noise_xy_m", "history_noise_theta_deg", "history_drop_prob"):
+                    "history_noise_xy_m", "history_noise_theta_deg", "history_drop_prob",
+                    "use_lidar", "lidar_num_bins", "lidar_downsample_mode", "lidar_stack_frames",
+                    "lidar_interval", "lidar_max_range_mm"):
             if training_params.get(key) is not None:
                 params[key] = training_params[key]
 
@@ -863,7 +868,7 @@ class MLflowManager:
             "final_train_acc": metrics.get("final_train_acc", 0.0),
             "final_val_acc": metrics.get("final_val_acc", 0.0)
         }
-        for key in ("best_val_pos_error_m", "best_val_heading_error_deg",
+        for key in ("best_val_pos_error_m", "best_val_heading_error_deg", "best_val_attitude_error_deg",
                     "best_val_grid_acc", "best_val_grid_top1_error_m", "best_val_grid_weighted_error_m"):
             if key in metrics:
                 run_metrics[key] = metrics[key]
@@ -1457,6 +1462,107 @@ class MLflowManager:
 
         success = self._log_with_local_fallback(
             ModelType.TOGIVAD, run_name, params, run_metrics, tags,
+            dataset_info if dataset_info else {}, metrics, model_path,
+            extra_artifacts=extra_artifacts
+        )
+
+        if success:
+            return {"status": "success", "run_name": run_name}
+        else:
+            return {"status": "error", "message": "記録に失敗しました"}
+
+
+    def log_lidar_policy_model(self, model_path, training_params, metrics,
+                               dataset_info, extra_artifacts: list = None):
+        """LiDAR Policy（2D LiDAR → angle/throttle 1D-CNN）の学習結果を記録
+
+        Args:
+            extra_artifacts: 追加で記録するファイル（学習曲線PNG・ONNX等）のリスト
+        """
+        params = {
+            "framework": "pytorch",
+            "model_type": "lidar_policy",
+            "model_arch": "lidar_policy",
+            "data_folder": training_params.get("data_folder", "unknown"),
+            "task_type": "lidar_behavior_cloning",
+            "preset": training_params.get("preset", "base"),
+            "num_bins": training_params.get("num_bins"),
+            "num_beams_raw": training_params.get("num_beams_raw"),
+            "downsample_mode": training_params.get("downsample_mode"),
+            "stack_frames": training_params.get("stack_frames"),
+            "use_valid_ch": training_params.get("use_valid_ch"),
+            "max_range_mm": training_params.get("max_range_mm"),
+            "max_speed": training_params.get("max_speed"),
+            "hidden_dim": training_params.get("hidden_dim"),
+            "dropout": training_params.get("dropout"),
+            "use_traj": training_params.get("use_traj"),
+            "horizon": training_params.get("horizon"),
+            "dt": training_params.get("dt"),
+            "pose_source": training_params.get("pose_source", ""),
+            "w_steer": training_params.get("w_steer"),
+            "w_speed": training_params.get("w_speed"),
+            "w_traj": training_params.get("w_traj"),
+            "steer_balance": training_params.get("steer_balance"),
+            "mode_filter": training_params.get("mode_filter"),
+            "split_mode": training_params.get("split_mode"),
+            "augment": training_params.get("augment"),
+            "mirror": training_params.get("mirror"),
+            "epochs": training_params.get("num_epochs", 0),
+            "learning_rate": training_params.get("learning_rate"),
+            "batch_size": training_params.get("batch_size"),
+            "val_split": training_params.get("val_split"),
+            "weight_decay": training_params.get("weight_decay"),
+            "quality_excluded_frames": training_params.get("quality_excluded_frames"),
+            "early_stopping": ("enabled" if training_params.get("use_early_stopping")
+                               else "disabled"),
+            "patience": training_params.get("patience"),
+            "model_params_total": training_params.get("model_params_total"),
+            "device": training_params.get("device"),
+            "torch_version": training_params.get("torch_version"),
+            "cuda_version": training_params.get("cuda_version"),
+        }
+        if training_params.get("comment"):
+            params["comment"] = training_params["comment"]
+
+        run_metrics = {
+            "best_val_loss": metrics.get("best_val_loss", 0.0),
+            "final_train_loss": metrics.get("final_train_loss", 0.0),
+            "final_val_loss": metrics.get("final_val_loss", 0.0),
+            "best_epoch": metrics.get("best_epoch", 0),
+            "best_val_steer_mae": metrics.get("best_val_steer_mae", 0.0),
+            "best_val_speed_mae": metrics.get("best_val_speed_mae", 0.0),
+            "best_val_ade_m": metrics.get("best_val_ade_m", 0.0),
+            "total_training_time": metrics.get("total_training_time", 0.0),
+            "avg_epoch_time": metrics.get("avg_epoch_time", 0.0),
+            "completed_epochs": metrics.get("completed_epochs", 0)
+        }
+
+        tags = {
+            "model_category": "lidar_policy",
+            "model_arch": "lidar_policy",
+            "task_type": "lidar_behavior_cloning",
+            "framework": "pytorch",
+            "status": metrics.get("status", "completed"),
+            "preset": str(training_params.get("preset", "base")),
+            "training_environment": training_params.get("training_environment", "local")
+        }
+
+        if dataset_info:
+            params.update({
+                "train_samples": dataset_info.get("train_samples", 0),
+                "val_samples": dataset_info.get("val_samples", 0),
+                "total_sequences": dataset_info.get("total_sequences", 0)
+            })
+
+        custom_name = training_params.get('model_name', '')
+        if custom_name:
+            run_name = custom_name
+        else:
+            run_name = (f"lidar_policy_{training_params.get('preset', 'base')}_"
+                        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+
+        success = self._log_with_local_fallback(
+            ModelType.LIDAR_POLICY, run_name, params, run_metrics, tags,
             dataset_info if dataset_info else {}, metrics, model_path,
             extra_artifacts=extra_artifacts
         )

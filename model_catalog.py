@@ -2620,6 +2620,68 @@ def encode_pose_history(past_poses, pose_norm, steps):
     return vec
 
 
+# --- LiDAR 点群（距離スキャン）の追加入力 -----------------------------------
+# 前処理（間引き・正規化・無効値マスク）は managers.lidar_policy_models.ScanPreprocessor を
+# 再利用し、LiDAR Policy モデルと同一の規約（1081点, -135°〜+135°, mm, 0=無効）に揃える。
+
+LOCATION_LIDAR_DEFAULT_NUM_BEAMS = 1081   # Hokuyo UST20 の記録点数（manifest.lidar_data_points）
+
+
+def stack_lidar_scans(scans, stack_frames, num_beams_raw=LOCATION_LIDAR_DEFAULT_NUM_BEAMS):
+    """複数フレームの生距離スキャン[mm] → 積層配列 (stack_frames, num_beams_raw) float32
+
+    scans: 新しい順（t, t-interval, t-2*interval, ...）の np.ndarray[mm] または None のリスト
+           （欠損フレームは 0 埋め＝ScanPreprocessor 側で「無効」として扱われる）。
+           長さが stack_frames に満たなければ末尾を欠損扱い。
+    """
+    stack_frames = int(stack_frames)
+    out = np.zeros((stack_frames, num_beams_raw), dtype=np.float32)
+    for k in range(stack_frames):
+        s = scans[k] if scans is not None and k < len(scans) else None
+        if s is None:
+            continue
+        s = np.asarray(s, dtype=np.float32).reshape(-1)
+        n = min(len(s), num_beams_raw)
+        out[k, :n] = s[:n]
+    return out
+
+
+class _LidarScanEncoder(nn.Module):
+    """LiDAR 距離スキャン用の軽量 1D-CNN エンコーダ（位置推論モデルの補助入力）
+
+    managers.lidar_policy_models.ScanPreprocessor で前処理（間引き・正規化・無効値マスク）した
+    上で小さな Conv1d スタックに通し、avg+max プーリングした特徴量を返す。LiDAR Policy の
+    "tiny" プリセットよりさらに軽量（位置推定の補助情報としてのみ使うため）。
+    """
+
+    def __init__(self, lidar_config):
+        super().__init__()
+        from managers.lidar_policy_models import LidarPolicyConfig, ScanPreprocessor
+        self.cfg = LidarPolicyConfig(
+            num_beams_raw=int(lidar_config.get('num_beams_raw', LOCATION_LIDAR_DEFAULT_NUM_BEAMS)),
+            num_bins=int(lidar_config.get('num_bins', 541)),
+            stack_frames=int(lidar_config.get('stack_frames', 1)),
+            downsample_mode=lidar_config.get('downsample_mode', 'minpool'),
+            max_range_mm=float(lidar_config.get('max_range_mm', 10000.0)),
+            min_range_mm=float(lidar_config.get('min_range_mm', 50.0)),
+            use_valid_ch=True,
+        )
+        self.preprocessor = ScanPreprocessor(self.cfg)
+        in_ch = self.cfg.in_channels
+        self.backbone = nn.Sequential(
+            nn.Conv1d(in_ch, 16, kernel_size=9, stride=4, padding=4), nn.BatchNorm1d(16), nn.ReLU(inplace=True),
+            nn.Conv1d(16, 32, kernel_size=5, stride=4, padding=2), nn.BatchNorm1d(32), nn.ReLU(inplace=True),
+            nn.Conv1d(32, 32, kernel_size=5, stride=2, padding=2), nn.BatchNorm1d(32), nn.ReLU(inplace=True),
+        )
+        self.feat_dim = 64   # 32ch × (avg + max) プーリング
+
+    def forward(self, scan_mm):
+        """scan_mm: (B, stack_frames, num_beams_raw) 生距離[mm]（0/範囲外=無効）"""
+        x = self.preprocessor(scan_mm)
+        f = self.backbone(x)
+        return torch.cat([f.mean(-1), f.amax(-1)], dim=1)
+
+
 def location_virtual_sources(img, virtual_type, num_sources):
     """単一画像から仮想ソース画像のリストを生成する（crop / scale）
 
@@ -2664,13 +2726,15 @@ def split_location_outputs(outputs, output_mode):
     return by_head.get('class'), by_head.get('pose'), by_head.get('grid')
 
 
-def normalize_pose_targets(poses, pose_norm, include_heading=True):
-    """[x, y, theta] の配列を学習用ベクトルへ正規化する
+def normalize_pose_targets(poses, pose_norm, include_heading=True, include_attitude=False):
+    """[x, y, theta] または [x, y, theta, roll, pitch] の配列を学習用ベクトルへ正規化する
 
     x, y は pose_norm の min/max で [-1, 1] へ、theta は (cos, sin) へ変換する。
-    Returns: np.ndarray [N, 4] (include_heading) または [N, 2]
+    include_attitude=True の場合、roll・pitch（車体姿勢角、pose センサー[IMU]特有。
+    slam/vslam/aruco には無い）も pose_norm の min/max で [-1, 1] へ変換して末尾に追加する。
+    Returns: np.ndarray [N, dim]（dim = 2 + 2*include_heading + 2*include_attitude）
     """
-    arr = np.asarray(poses, dtype=np.float64).reshape(-1, 3)
+    arr = np.asarray(poses, dtype=np.float64).reshape(-1, 5 if include_attitude else 3)
     x_rng = max(pose_norm['x_max'] - pose_norm['x_min'], 1e-6)
     y_rng = max(pose_norm['y_max'] - pose_norm['y_min'], 1e-6)
     xn = 2.0 * (arr[:, 0] - pose_norm['x_min']) / x_rng - 1.0
@@ -2678,24 +2742,39 @@ def normalize_pose_targets(poses, pose_norm, include_heading=True):
     cols = [xn, yn]
     if include_heading:
         cols.extend([np.cos(arr[:, 2]), np.sin(arr[:, 2])])
+    if include_attitude:
+        roll_rng = max(pose_norm['roll_max'] - pose_norm['roll_min'], 1e-6)
+        pitch_rng = max(pose_norm['pitch_max'] - pose_norm['pitch_min'], 1e-6)
+        cols.append(2.0 * (arr[:, 3] - pose_norm['roll_min']) / roll_rng - 1.0)
+        cols.append(2.0 * (arr[:, 4] - pose_norm['pitch_min']) / pitch_rng - 1.0)
     return np.stack(cols, axis=1).astype(np.float32)
 
 
-def denormalize_pose_output(vec, pose_norm, include_heading=True):
-    """モデル出力ベクトル → (x[m], y[m], theta[rad] or None)"""
+def denormalize_pose_output(vec, pose_norm, include_heading=True, include_attitude=False):
+    """モデル出力ベクトル → (x[m], y[m], theta[rad] or None, roll[rad] or None, pitch[rad] or None)"""
     vec = np.asarray(vec, dtype=np.float64).reshape(-1)
     x_rng = pose_norm['x_max'] - pose_norm['x_min']
     y_rng = pose_norm['y_max'] - pose_norm['y_min']
     x = (vec[0] + 1.0) / 2.0 * x_rng + pose_norm['x_min']
     y = (vec[1] + 1.0) / 2.0 * y_rng + pose_norm['y_min']
+    idx = 2
     theta = None
-    if include_heading and vec.shape[0] >= 4:
-        theta = float(np.arctan2(vec[3], vec[2]))
-    return float(x), float(y), theta
+    if include_heading and vec.shape[0] >= idx + 2:
+        theta = float(np.arctan2(vec[idx + 1], vec[idx]))
+        idx += 2
+    roll = pitch = None
+    if include_attitude and vec.shape[0] >= idx + 2:
+        roll_rng = pose_norm['roll_max'] - pose_norm['roll_min']
+        pitch_rng = pose_norm['pitch_max'] - pose_norm['pitch_min']
+        roll = float((vec[idx] + 1.0) / 2.0 * roll_rng + pose_norm['roll_min'])
+        pitch = float((vec[idx + 1] + 1.0) / 2.0 * pitch_rng + pose_norm['pitch_min'])
+    return float(x), float(y), theta, roll, pitch
 
 
-def pose_errors(pred_vec, target_vec, pose_norm, include_heading=True):
-    """正規化ベクトル同士から (位置誤差[m], 方位誤差[rad] or None) を計算する（バッチ対応）"""
+def pose_errors(pred_vec, target_vec, pose_norm, include_heading=True, include_attitude=False):
+    """正規化ベクトル同士から (位置誤差[m], 方位誤差[rad] or None, 姿勢角誤差[rad] or None) を
+    計算する（バッチ対応）。姿勢角誤差は roll・pitch それぞれの誤差の平均絶対値。
+    """
     pred = np.asarray(pred_vec, dtype=np.float64)
     tgt = np.asarray(target_vec, dtype=np.float64)
     pred = pred.reshape(-1, pred.shape[-1])
@@ -2705,12 +2784,21 @@ def pose_errors(pred_vec, target_vec, pose_norm, include_heading=True):
     dx = (pred[:, 0] - tgt[:, 0]) / 2.0 * x_rng
     dy = (pred[:, 1] - tgt[:, 1]) / 2.0 * y_rng
     pos_err = np.hypot(dx, dy)
+    idx = 2
     head_err = None
-    if include_heading and pred.shape[1] >= 4 and tgt.shape[1] >= 4:
-        th_p = np.arctan2(pred[:, 3], pred[:, 2])
-        th_t = np.arctan2(tgt[:, 3], tgt[:, 2])
+    if include_heading and pred.shape[1] >= idx + 2 and tgt.shape[1] >= idx + 2:
+        th_p = np.arctan2(pred[:, idx + 1], pred[:, idx])
+        th_t = np.arctan2(tgt[:, idx + 1], tgt[:, idx])
         head_err = np.abs((th_p - th_t + np.pi) % (2 * np.pi) - np.pi)
-    return pos_err, head_err
+        idx += 2
+    attitude_err = None
+    if include_attitude and pred.shape[1] >= idx + 2 and tgt.shape[1] >= idx + 2:
+        roll_rng = pose_norm['roll_max'] - pose_norm['roll_min']
+        pitch_rng = pose_norm['pitch_max'] - pose_norm['pitch_min']
+        d_roll = (pred[:, idx] - tgt[:, idx]) / 2.0 * roll_rng
+        d_pitch = (pred[:, idx + 1] - tgt[:, idx + 1]) / 2.0 * pitch_rng
+        attitude_err = (np.abs(d_roll) + np.abs(d_pitch)) / 2.0
+    return pos_err, head_err, attitude_err
 
 
 class MultiSourceLocationModel(BaseLocationModel):
@@ -2731,7 +2819,8 @@ class MultiSourceLocationModel(BaseLocationModel):
 
     def __init__(self, base_model_name, num_sources=1, fusion_method='concat',
                  num_classes=8, output_mode='class', pose_dim=4, pretrained=True,
-                 input_size=None, num_grid_classes=0, pose_history_steps=0):
+                 input_size=None, num_grid_classes=0, pose_history_steps=0,
+                 lidar_config=None):
         heads = location_heads(output_mode)   # 不正な output_mode はここで ValueError
         if 'grid' in heads and int(num_grid_classes or 0) <= 0:
             raise ValueError("格子分類には num_grid_classes（格子セル数）が必要です。")
@@ -2789,6 +2878,14 @@ class MultiSourceLocationModel(BaseLocationModel):
                 nn.Linear(self.pose_history_dim, 64), nn.ReLU(inplace=True),
                 nn.Linear(64, self.history_feat_dim), nn.ReLU(inplace=True))
             fused_dim = fused_dim + self.history_feat_dim
+
+        # --- LiDAR 点群（距離スキャン）の追加入力（軽量1D-CNNで符号化し画像特徴に結合） ---
+        self.lidar_config = dict(lidar_config) if lidar_config else None
+        if self.lidar_config:
+            self.lidar_encoder = _LidarScanEncoder(self.lidar_config)
+            fused_dim = fused_dim + self.lidar_encoder.feat_dim
+        else:
+            self.lidar_encoder = None
         self.fused_dim = fused_dim
 
         # --- 出力ヘッド ---
@@ -2839,11 +2936,13 @@ class MultiSourceLocationModel(BaseLocationModel):
             self.last_attn_weights = attn_weights.detach()
         return self.norm(seq + attn_out)[:, 0, :]
 
-    def forward(self, x, history=None):
+    def forward(self, x, history=None, lidar_scan=None):
         """ヘッドが1つならテンソル、複数なら LOCATION_HEAD_ORDER 順のタプルを返す
 
         history: 過去の座標・姿勢の履歴ベクトル [B, pose_history_dim]（履歴入力ありのモデルのみ。
                  None なら全ステップ欠損（valid=0）として扱う）
+        lidar_scan: LiDAR 生距離スキャン[mm] [B, stack_frames, num_beams_raw]（LiDAR入力ありの
+                 モデルのみ。None なら全ビーム無効（0）として扱う。0/範囲外は前処理側で無効扱い）
         """
         fused = self._fuse(x)
         if self.pose_history_dim > 0:
@@ -2851,6 +2950,12 @@ class MultiSourceLocationModel(BaseLocationModel):
                 history = torch.zeros(fused.shape[0], self.pose_history_dim,
                                       device=fused.device, dtype=fused.dtype)
             fused = torch.cat([fused, self.history_encoder(history.to(fused.dtype))], dim=1)
+        if self.lidar_encoder is not None:
+            if lidar_scan is None:
+                lidar_scan = torch.zeros(fused.shape[0], self.lidar_encoder.cfg.stack_frames,
+                                         self.lidar_encoder.cfg.num_beams_raw,
+                                         device=fused.device, dtype=fused.dtype)
+            fused = torch.cat([fused, self.lidar_encoder(lidar_scan.to(fused.dtype))], dim=1)
         outs = []
         for head in self.heads:
             if head == 'class':
@@ -2871,12 +2976,13 @@ class MultiSourceLocationModel(BaseLocationModel):
             transforms.ToTensor()
         ])
 
-    def run(self, *img_arrs, virtual_type=None, history_vec=None):
+    def run(self, *img_arrs, virtual_type=None, history_vec=None, lidar_scan=None):
         """複数画像で推論を実行し、{'probs': ndarray|None, 'pose_vec': ndarray|None} を返す
 
         virtual_type='crop'/'scale' の場合は1枚の画像から仮想ソースを生成する。
         pose_vec は正規化値のため、denormalize_pose_output で座標へ戻す。
         history_vec: encode_pose_history で作った履歴入力（履歴入力ありのモデルのみ）
+        lidar_scan: stack_lidar_scans で作った生距離スキャン[mm]（LiDAR入力ありのモデルのみ）
         """
         if self._preprocess is None:
             self._preprocess = self.get_preprocess()
@@ -2893,8 +2999,12 @@ class MultiSourceLocationModel(BaseLocationModel):
         if self.pose_history_dim > 0 and history_vec is not None:
             history = torch.as_tensor(np.asarray(history_vec, dtype=np.float32)).reshape(1, -1)
             history = history.to(device=self.device, dtype=model_dtype)
+        lidar = None
+        if self.lidar_encoder is not None and lidar_scan is not None:
+            lidar = torch.as_tensor(np.asarray(lidar_scan, dtype=np.float32)).unsqueeze(0)
+            lidar = lidar.to(device=self.device, dtype=model_dtype)
         with torch.no_grad():
-            outputs = self(stacked, history)
+            outputs = self(stacked, history, lidar)
         logits, pose, grid = split_location_outputs(outputs, self.output_mode)
         result = {'probs': None, 'pose_vec': None, 'grid_probs': None}
         if logits is not None:
@@ -2911,10 +3021,10 @@ class MultiSourceLocationModel(BaseLocationModel):
 def create_multi_source_location_model(base_model_name, num_sources=1, fusion_method='concat',
                                        num_classes=8, output_mode='class', pose_dim=4,
                                        pretrained=True, input_size=None, num_grid_classes=0,
-                                       pose_history_steps=0):
+                                       pose_history_steps=0, lidar_config=None):
     """位置推論ラッパーモデルのファクトリ関数"""
     return MultiSourceLocationModel(
         base_model_name=base_model_name, num_sources=num_sources, fusion_method=fusion_method,
         num_classes=num_classes, output_mode=output_mode, pose_dim=pose_dim,
         pretrained=pretrained, input_size=input_size, num_grid_classes=num_grid_classes,
-        pose_history_steps=pose_history_steps)
+        pose_history_steps=pose_history_steps, lidar_config=lidar_config)

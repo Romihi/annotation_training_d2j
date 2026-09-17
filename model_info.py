@@ -214,6 +214,15 @@ SEQUENCE_MODEL_INFO = {
         'param_count': 1.5,
         'gflops': 0.9,
     },
+    'lidar_policy': {
+        'name': 'LiDAR Policy',
+        'description': ('2D LiDAR 生スキャン(Kフレーム積層)+車速 → angle/throttle の '
+                        '1D-CNN 模倣学習モデル。補助で将来軌道も回帰'),
+        'backbone': 'ResNet1D-lite (base) / Conv1D×5 (tiny)',
+        'temporal': 'フレーム積層 (K ch)',
+        'param_count': 1.2,
+        'gflops': 0.05,
+    },
 }
 
 SEQUENCE_PAPER_INFO = {
@@ -231,6 +240,13 @@ SEQUENCE_PAPER_INFO = {
         'repo': 'https://github.com/locuslab/TCN',
     },
     'causal_cnn': {
+        'title': 'TinyLidarNet: 2D LiDAR-based End-to-End Deep Learning Model for F1TENTH Autonomous Racing',
+        'authors': 'Mohammed Misbah Zarrar,Jaehyun Kim, Sang-Hyun Park, Jae-Han Park, Seung-Jun Han',
+        'year': 2024,
+        'url': 'https://arxiv.org/abs/2405.04436',
+        'repo': 'https://github.com/CPR-D/TinyLidarNet',
+    },
+    'lidar_policy': {
         'title': 'TinyLidarNet: 2D LiDAR-based End-to-End Deep Learning Model for F1TENTH Autonomous Racing',
         'authors': 'Mohammed Misbah Zarrar,Jaehyun Kim, Sang-Hyun Park, Jae-Han Park, Seung-Jun Han',
         'year': 2024,
