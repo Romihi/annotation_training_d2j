@@ -9977,7 +9977,6 @@ class ImageAnnotationTool(QMainWindow):
                 "last_model_file": self.get_selected_model_filename() if hasattr(self, 'model_combo') and self.model_combo.count() > 0 else "",
                 "last_model_sources": (self._multi_source_config.get('sources') if hasattr(self, '_multi_source_config') and self._multi_source_config else None),
                 "extra_models": extra_models_info,
-                "max_speed": self.main_image_view.max_speed if hasattr(self, 'main_image_view') else MAX_SPEED,
                 "detection_classes": self.classes_input.text() if hasattr(self, 'classes_input') else "",
                 "location_classes": {str(k): v for k, v in getattr(self, 'location_class_names', {}).items() if v.strip()},
                 "masks": [{'id': m['id'], 'name': m['name'], 'visible': m.get('visible', True),
@@ -12078,7 +12077,10 @@ class ImageAnnotationTool(QMainWindow):
         Returns:
             dict: {index: {angle, throttle, x, y, [attention_weights]}}
         """
-        sources = ms_info.get('selected_sources') or []
+        # 追加スロットはソース選択ダイアログを出さずチェックポイントの
+        # selected_sources をそのまま使うため、ここで現在のデータへ読み替える
+        sources = self._resolve_model_sources_cached(
+            ms_info.get('selected_sources') or [])
         num_sources = ms_info['num_sources']
         image_groups = getattr(self, 'image_groups', {})
 
@@ -21306,9 +21308,7 @@ class ImageAnnotationTool(QMainWindow):
         session_info = self.load_session_info()
         self._pending_session_info = session_info  # モデル復元のために保持
 
-        # max_speedの復元
-        if session_info and "max_speed" in session_info:
-            self.main_image_view.max_speed = session_info["max_speed"]
+        # max_speed は config.MAX_SPEED を唯一の設定元とする（セッションからは復元しない）
 
         # マスクの復元（旧形式の vehicle_mask / background_mask も読み込む）
         if session_info:
@@ -23006,7 +23006,10 @@ class ImageAnnotationTool(QMainWindow):
             print("マルチソース推論設定がありません")
             return {}
 
-        sources = config['sources']
+        # セッション復元やデータ切替でソース名が現在のデータと食い違うことが
+        # あるため読み替える（不一致のままだと下の missing_source で全フレーム
+        # スキップされ、無言で結果が空になる）
+        sources = self._resolve_model_sources_cached(config['sources'])
         num_sources = config['num_sources']
         image_groups = getattr(self, 'image_groups', {})
         variant_images = getattr(self, 'variant_images', {})
@@ -31041,6 +31044,154 @@ class ImageAnnotationTool(QMainWindow):
             import traceback
             traceback.print_exc()
 
+    @staticmethod
+    def _normalize_source_key(name):
+        """カメラキー比較用の正規化（大小文字・記号・末尾連番を無視）。
+
+        'cam3' / 'Cam_3' / 'cam' → 'cam'、'camera_3' → 'camera'。
+        学習時と収録時でカメラ名の付け方が違う（cam3 で学習したモデルを
+        cam しか無いデータで推論する等）ケースを吸収するための下ごしらえ。
+        """
+        base = ''.join(ch for ch in str(name).lower() if ch.isalnum())
+        return base.rstrip('0123456789') or base
+
+    def _resolve_model_sources(self, model_sources, warn=True):
+        """モデルに記録されたカメラキーを、現在のデータのキーへ読み替える。
+
+        TogiVAD/時系列モデルのチェックポイントには学習時の selected_sources
+        （例 ['cam3']）が入っているが、推論対象データのキー（variant_images の
+        キー。例 'cam'）と違うと managers 側の _image_path が None を返し、
+        **例外も出さずに推論結果が空**になる（表示されない原因）。
+        ここで不一致を検出して警告し、可能なら読み替えたキー列を返す。
+
+        Args:
+            model_sources (list[str]): モデル側のキー列
+            warn (bool): 不一致時に警告ダイアログを出すか
+
+        Returns:
+            list[str] — 現在のデータで使うキー列（解決できなければ元名のまま）
+        """
+        sources = [s for s in (model_sources or []) if s]
+        available = list((getattr(self, 'source_images_map', None) or {}).keys())
+        # データを切り替えたときに再解決できるよう、元のキー列と解決時の
+        # データキーを覚えておく（_refresh_gru_sources_for_current_data）
+        self._gru_sources_raw = list(sources)
+        self._gru_sources_data_keys = list(available)
+        if not sources or not available:
+            return sources
+
+        norm_avail = {}
+        for key in available:
+            norm_avail.setdefault(self._normalize_source_key(key), []).append(key)
+        lower_avail = {str(k).lower(): k for k in available}
+
+        resolved = list(sources)
+        notes = []          # 読み替え内容（ユーザー向け表示用）
+        unresolved = []     # 読み替え先が見つからなかったキー
+        used = set()
+
+        for i, src in enumerate(sources):
+            if src in available:                       # ① 完全一致
+                used.add(src)
+                continue
+            # 既に別のソースへ割り当てたキーは候補から外す。4カメラのモデルを
+            # 1カメラのデータへ流し込んで同じ画像を4枚与える、といった
+            # 「一見動くが中身が誤り」な読み替えを防ぐ
+            hit = lower_avail.get(str(src).lower())    # ② 大小文字違い
+            if hit in used:
+                hit = None
+            if hit is None:                            # ③ 末尾連番・記号違い
+                cands = [k for k in norm_avail.get(self._normalize_source_key(src), [])
+                         if k not in used]
+                if len(cands) == 1:
+                    hit = cands[0]
+            if hit is None:                            # ④ 前方一致（cam ⇔ camera）
+                nsrc = self._normalize_source_key(src)
+                cands = [k for k in available
+                         if k not in used
+                         and len(nsrc) >= 3 and len(self._normalize_source_key(k)) >= 3
+                         and (self._normalize_source_key(k).startswith(nsrc)
+                              or nsrc.startswith(self._normalize_source_key(k)))]
+                if len(cands) == 1:
+                    hit = cands[0]
+            if hit is None:
+                unresolved.append((i, src))
+                continue
+            resolved[i] = hit
+            used.add(hit)
+            notes.append(f"{src} → {hit}")
+
+        # ⑤ 残りが1対1で対応づく場合のみ、並び順で推定する
+        remaining = [k for k in available if k not in used]
+        if unresolved and len(unresolved) == len(remaining):
+            for (i, src), key in zip(unresolved, remaining):
+                resolved[i] = key
+                notes.append(f"{src} → {key} (順序による推定)")
+            unresolved = []
+
+        if not notes and not unresolved:
+            return resolved
+
+        summary = "\n".join(f"  {n}" for n in notes) if notes else "  (なし)"
+        print(f"[WARN] カメラキー不一致: model={sources} data={available}")
+        for n in notes:
+            print(f"[WARN]   読み替え: {n}")
+        for _, src in unresolved:
+            print(f"[WARN]   読み替え不可: {src}")
+
+        if warn:
+            msg = get_text('msg_model_source_mismatch',
+                           ", ".join(sources), ", ".join(available), summary)
+            if unresolved:
+                msg += "\n\n" + get_text(
+                    'msg_model_source_unresolved',
+                    ", ".join(src for _, src in unresolved))
+            QMessageBox.warning(self, get_text('dlg_warning'), msg)
+        if notes:
+            self.statusBar().showMessage(
+                get_text('status_model_source_remapped', " / ".join(notes)),
+                8000)
+        return resolved
+
+    def _resolve_model_sources_cached(self, model_sources):
+        """_resolve_model_sources のキャッシュ版（フレーム毎に呼ぶ経路向け）。
+
+        位置推論や追加スロットの推論は全フレームで走るため、素で呼ぶと
+        警告ダイアログが毎フレーム出てしまう。(モデル側キー, データ側キー) が
+        同じ組み合わせなら最初の1回だけ解決・警告し、以後は結果を使い回す。
+        """
+        sources = [s for s in (model_sources or []) if s]
+        if not sources:
+            return sources
+        available = tuple((getattr(self, 'source_images_map', None) or {}).keys())
+        cache = getattr(self, '_source_remap_cache', None)
+        if cache is None:
+            cache = self._source_remap_cache = {}
+        key = (tuple(sources), available)
+        if key not in cache:
+            # ここでの解決結果は _gru_sources_raw を上書きしてしまうため退避する
+            saved = (getattr(self, '_gru_sources_raw', None),
+                     getattr(self, '_gru_sources_data_keys', None))
+            cache[key] = self._resolve_model_sources(sources)
+            self._gru_sources_raw, self._gru_sources_data_keys = saved
+        return list(cache[key])
+
+    def _refresh_gru_sources_for_current_data(self):
+        """モデル読込後にデータを切り替えた場合、カメラキーを解決し直す。
+
+        _load_gru_model は同一モデルなら早期 return するため、ここを通さないと
+        前のデータで解決した読み替え結果が残り、また推論が空になる。
+        データキーが変わっていないときは何もしない（警告の再表示を避ける）。
+        """
+        raw = getattr(self, '_gru_sources_raw', None)
+        if not raw:
+            return
+        available = list((getattr(self, 'source_images_map', None) or {}).keys())
+        if available == list(getattr(self, '_gru_sources_data_keys', []) or []):
+            return
+        self._gru_sources = self._resolve_model_sources(raw)
+        self._togivad_miss_reported = False
+
     def _load_gru_model(self):
         """コンボボックスで選択された時系列モデルをロードしてキャッシュする。
 
@@ -31061,8 +31212,10 @@ class ImageAnnotationTool(QMainWindow):
             QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_traj_models'))
             return False
 
-        # 既に同じモデルをロード済みなら再利用
+        # 既に同じモデルをロード済みなら再利用（ただしモデル読込後にデータを
+        # 切り替えた場合はカメラキーの読み替えをやり直す）
         if self._gru_model is not None and self._gru_model_path == selected_model_path:
+            self._refresh_gru_sources_for_current_data()
             return True
 
         try:
@@ -31080,6 +31233,7 @@ class ImageAnnotationTool(QMainWindow):
                 self._gru_vocab = None
                 self._gru_pose_source = meta.get('pose_source') or 'pose'
                 self._gru_sources = []
+                self._gru_sources_raw = []      # LiDAR Policy は画像を使わない
                 self._gru_manager = LidarPolicyTrainingManager(models_dir)
                 if cfg.use_traj:
                     total_seconds = float(cfg.horizon) * float(cfg.dt)
@@ -31101,7 +31255,11 @@ class ImageAnnotationTool(QMainWindow):
                     selected_model_path, device)
                 self._gru_vocab = vocab
                 self._gru_pose_source = meta.get('pose_source', 'pose')
-                self._gru_sources = meta.get('selected_sources', ['cam'])
+                # 学習時のカメラキー（例 cam3）が現在のデータのキー（例 cam）と
+                # 違うと _image_path が None を返して**無言で推論結果が空**に
+                # なるため、ここで検出・警告して読み替える
+                self._gru_sources = self._resolve_model_sources(
+                    meta.get('selected_sources', ['cam']))
                 self._gru_manager = TogivadTrainingManager(models_dir)
                 # 緑の実測走行軌道（学習データGT）を読込モデルの時間窓へ同期する。
                 # 秒数・点数・dt・pose_source を合わせることで、推論軌道（シアン）と
@@ -31135,7 +31293,7 @@ class ImageAnnotationTool(QMainWindow):
             else:
                 model, cfg, sources = SequenceTrainingManager.load_model(
                     selected_model_path, device)
-                self._gru_sources = sources
+                self._gru_sources = self._resolve_model_sources(sources)
                 self._gru_vocab = None
                 self._gru_pose_source = None
                 self._gru_manager = SequenceTrainingManager(models_dir)
@@ -31148,6 +31306,7 @@ class ImageAnnotationTool(QMainWindow):
             # モデルが変わったので予測キャッシュをクリア
             self.gru_predictions = {}
             self.togivad_control_results = {}
+            self._togivad_miss_reported = False
             # togivad の cfg は dataclass（.get 無し）— 消費側は dict 前提の
             # ため表示用 dict に変換して保持する
             self.gru_prediction_config = (
@@ -31182,6 +31341,8 @@ class ImageAnnotationTool(QMainWindow):
                     if out.get("best") is not None:
                         self.gru_predictions[current_index] = out["best"].tolist()
                     self._store_togivad_control_result(current_index, out)
+                else:
+                    self._report_togivad_predict_miss(current_index)
             else:
                 deleted = getattr(self, 'deleted_indexes', set())
                 traj = self._gru_manager.predict_current(
@@ -31194,6 +31355,26 @@ class ImageAnnotationTool(QMainWindow):
                     self.gru_predictions[current_index] = traj
         except Exception as e:
             print(f"時系列逐次推論エラー: {e}")
+
+    def _report_togivad_predict_miss(self, idx):
+        """predict_current が None（=画像を1枚も引けなかった）ときの診断。
+
+        predict_current は画像パスが引けないと例外を出さず None を返すため、
+        「モデルは読めたのに推論だけ出ない」状態になる。どのキーで落ちたかを
+        ステータスバーとコンソールに出す（初回のみ）。
+        """
+        if getattr(self, '_togivad_miss_reported', False):
+            return
+        self._togivad_miss_reported = True
+        smap = getattr(self, 'source_images_map', None) or {}
+        missing = [s for s in (self._gru_sources or [])
+                   if s not in smap and s != 'cam']
+        detail = (f"未解決のカメラキー={missing}" if missing
+                  else f"index={idx} に対応する画像がありません")
+        print(f"[WARN] TogiVAD 推論なし: {detail} "
+              f"(model sources={self._gru_sources}, data keys={list(smap)})")
+        self.statusBar().showMessage(
+            f"TogiVAD 推論結果を取得できません: {detail}", 8000)
 
     def _store_togivad_control_result(self, idx, out):
         """TogiVAD の制御量を**専用ストア**に格納する（自動運転モデルの
@@ -33127,6 +33308,8 @@ class ImageAnnotationTool(QMainWindow):
         self._gru_model = None
         self._gru_cfg = None
         self._gru_sources = None
+        self._gru_sources_raw = None        # モデルに記録された生のカメラキー
+        self._gru_sources_data_keys = None  # 読み替えを解決したときのデータキー
         self._gru_model_path = None
         self._gru_device = None
         self._gru_infer_enabled = False  # 逐次推論(現在画像)が有効か
@@ -33470,6 +33653,7 @@ class ImageAnnotationTool(QMainWindow):
         
         try:
             # マネージャーを使用してモデルをロード
+            self._location_source_fallback_reported = False
             success, result = self.location_model_manager.load_model(
                 model_type, model_path, update_progress
             )
@@ -33667,13 +33851,42 @@ class ImageAnnotationTool(QMainWindow):
         virtual_type = cfg.get('virtual_source_type')
         if num_sources <= 1 and not selected_sources:
             return self.images[index]
+        # 学習時のカメラキー（例 cam0..cam3）が現在のデータのキーと違うと
+        # 下の paths が None になり、現在画像1枚で代替 → run_inference が
+        # それを num_sources 枚に複製するため、**誤った結果が表示されてしまう**。
+        # まず読み替えを試みる
+        selected_sources = self._resolve_model_sources_cached(selected_sources)
         paths = self._location_source_paths_for_index(
             index, selected_sources, virtual_type, num_sources,
             int(cfg.get('temporal_interval', 10) or 10))
         if not paths:
             # 学習時のソースが揃わない場合は現在の画像で代替する
+            self._report_location_source_fallback(selected_sources, num_sources,
+                                                  virtual_type)
             return self.images[index]
         return paths
+
+    def _report_location_source_fallback(self, sources, num_sources, virtual_type):
+        """位置推論が学習時のカメラを揃えられず現在画像で代替したことを通知（初回のみ）。
+
+        仮想ソース(crop/scale/temporal)は1枚から生成するので代替は正常動作。
+        実カメラが複数必要なモデルで代替した場合は、同じ画像が複製されて
+        推論されるため結果は信用できない旨を明示する。
+        """
+        if virtual_type or getattr(self, '_location_source_fallback_reported', False):
+            return
+        self._location_source_fallback_reported = True
+        keys = list((getattr(self, 'source_images_map', None) or {}).keys())
+        print(f"[WARN] 位置推論: 学習時のカメラ {sources} を現在のデータ {keys} で"
+              f"揃えられず、現在画像で代替します")
+        if num_sources > 1:
+            self.statusBar().showMessage(
+                f"位置推論: カメラ{num_sources}枚分を揃えられず同じ画像を複製して"
+                f"います（結果は不正確）。学習時={sources} / データ={keys}", 10000)
+        else:
+            self.statusBar().showMessage(
+                f"位置推論: 学習時のカメラ{sources}が無いため現在画像で代替します"
+                f"（データ={keys}）", 8000)
 
     def run_location_inference(self):
         """現在の画像に対して位置推論を実行"""

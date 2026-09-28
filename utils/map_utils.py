@@ -135,6 +135,157 @@ def resolve_background_map(data_dir: str,
     return find_latest_map(maps_root) if os.path.isdir(maps_root) else None
 
 
+# ---- 走行時に追従した経路（centerline / raceline CSV） --------------------------
+# 走行データの manifest.json 3行目（メタ辞書）に記録される path_csv（追従した
+# ウェイポイント CSV の走行機側フルパス）を、学習PC側の地図フォルダで解決する。
+# CSV 形式は togikaidrive-dev localization/path_follow.py のローダーと同じ:
+#   centerline : x_m, y_m, [w_tr_right_m, w_tr_left_m, [v_mps]]
+#   raceline   : s_m, x_m, y_m, psi_rad, kappa_radpm, vx_mps, ax_mps2（7列以上）
+#   （'#' 行・ヘッダ行はスキップ）
+PATH_CSV_GLOBS = ("*_centerline*.csv", "*_raceline*.csv")
+
+
+def load_manifest_meta(data_dir: str) -> Optional[dict]:
+    """<data_dir>/manifest.json の3行目（記録メタ辞書）を返す。無ければ None。"""
+    path = os.path.join(data_dir, "manifest.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+        if len(lines) < 3:
+            return None
+        meta = json.loads(lines[2])
+        return meta if isinstance(meta, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _map_dir_candidates(data_dir: str, ref: Optional[dict]) -> list:
+    """map_ref の map_dir（リポジトリ相対 "data/maps/<backend>/<name>_<TS>"）を
+    学習PC上で探す候補フォルダ列。data_dir の各祖先について
+    <祖先>/<map_dir> と <祖先>/maps/<backend>/<name>_<TS> を試す
+    （データが data/ 直下でなく data/<任意名>/data_<TS> に置かれていても届く）。
+    """
+    if not ref or not ref.get("map_dir"):
+        return []
+    rel = ref["map_dir"].replace("\\", "/").strip("/")
+    parts = rel.split("/")
+    tails = [rel]
+    if "maps" in parts:
+        tails.append("/".join(parts[parts.index("maps"):]))   # maps/<backend>/<name>
+    cands = []
+    cur = os.path.abspath(data_dir)
+    for _ in range(6):
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+        for t in tails:
+            c = os.path.normpath(os.path.join(cur, t))
+            if c not in cands:
+                cands.append(c)
+    return cands
+
+
+def list_path_csvs(map_dir: str) -> list:
+    """地図フォルダ内の追従経路 CSV（centerline/raceline）をソート済みで返す。
+    course_editor の制御点ファイル（*_wp.csv）とバックアップ（.bak）は除く。"""
+    if not map_dir or not os.path.isdir(map_dir):
+        return []
+    hits = set()
+    for g in PATH_CSV_GLOBS:
+        for p in glob.glob(os.path.join(map_dir, g)):
+            if p.endswith(".csv") and not p.endswith("_wp.csv"):
+                hits.add(os.path.normpath(p))
+    return sorted(hits)
+
+
+def resolve_path_csv(data_dir: str, map_dir: Optional[str] = None) -> Optional[dict]:
+    """走行時に追従した経路 CSV を解決して
+    {csv, map_dir, candidates, source, variant} を返す（無ければ None）。
+
+    解決順:
+      1. <data_dir>/map/ 同梱スナップショット内の同名 CSV
+      2. map_ref.json の map_dir を学習PC上で解決（_map_dir_candidates）した
+         フォルダ内の、manifest path_csv と同名の CSV
+      3. 同フォルダの <map_name>_centerline_<variant>.csv → <map_name>_raceline_<variant>.csv
+         → <map_name>_centerline.csv → <map_name>_raceline.csv
+    source は "snapshot" / "manifest" / "variant" のいずれか。
+    candidates はそのフォルダ内で切り替え可能な経路 CSV 一覧。
+    """
+    data_dir = os.path.abspath(data_dir)
+    meta = load_manifest_meta(data_dir) or {}
+    ref = load_map_ref(data_dir) or {}
+    path_csv = meta.get("path_csv")
+    basename = os.path.basename(path_csv) if path_csv else None
+    variant = meta.get("path_variant")
+    map_name = ref.get("map_name") or meta.get("map_name") or "map"
+
+    dirs = []
+    snap = os.path.join(data_dir, "map")
+    if os.path.isdir(snap):
+        dirs.append((snap, "snapshot"))
+    if map_dir and os.path.isdir(map_dir):
+        dirs.append((os.path.abspath(map_dir), "manifest"))
+    for c in _map_dir_candidates(data_dir, ref):
+        if os.path.isdir(c):
+            dirs.append((c, "manifest"))
+
+    for d, src in dirs:
+        cands = list_path_csvs(d)
+        if not cands:
+            continue
+        if basename:
+            for c in cands:
+                if os.path.basename(c) == basename:
+                    return {"csv": c, "map_dir": d, "candidates": cands,
+                            "source": src, "variant": variant}
+        names = []
+        if variant:
+            names += [f"{map_name}_centerline_{variant}.csv",
+                      f"{map_name}_raceline_{variant}.csv"]
+        names += [f"{map_name}_centerline.csv", f"{map_name}_raceline.csv"]
+        for n in names:
+            p = os.path.normpath(os.path.join(d, n))
+            if p in cands:
+                return {"csv": p, "map_dir": d, "candidates": cands,
+                        "source": "variant", "variant": variant}
+        # 名前が一致しなくても候補があれば一覧だけ返す（手動切替用）
+        return {"csv": None, "map_dir": d, "candidates": cands,
+                "source": src, "variant": variant}
+    return None
+
+
+def load_path_csv(path: str) -> dict:
+    """追従経路 CSV を読み {xy: [(x,y),...], speed: [v,...]|None, kind} で返す。
+    kind は "raceline"（7列以上）/ "manual"（centerline + v_mps）/ "centerline"。
+    形式判定は path_follow.PurePursuitFollower._load_csv と同じ。"""
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            parts = [p for p in s.replace(";", ",").split(",") if p != ""]
+            try:
+                vals = [float(p) for p in parts]
+            except ValueError:
+                continue   # ヘッダ行
+            if len(vals) >= 2:
+                rows.append(vals)
+    if not rows:
+        raise ValueError(f"no numeric rows in {path}")
+    ncol = max(len(r) for r in rows)
+    if ncol >= 7:
+        return {"xy": [(r[1], r[2]) for r in rows],
+                "speed": [r[5] for r in rows], "kind": "raceline"}
+    xy = [(r[0], r[1]) for r in rows]
+    if ncol >= 5 and all(len(r) >= 5 for r in rows):
+        return {"xy": xy, "speed": [r[4] for r in rows], "kind": "manual"}
+    return {"xy": xy, "speed": None, "kind": "centerline"}
+
+
 # ---- 位置領域（location_regions.json） ---------------------------------------
 # 軌跡マップ上で定義した「位置クラス領域」（閉ポリゴン）の永続化。地図（マップ
 # フォルダ）に紐づけて保存することで、同じコースの別セッションでも再利用できる。

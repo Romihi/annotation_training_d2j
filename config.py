@@ -123,7 +123,7 @@ SEGMENTATION_VERTEX_HANDLE_RADIUS = 8
 SEGMENTATION_HOVER_VERTEX_RADIUS = 5
 
 # Speed
-MAX_SPEED = 5  # speed正規化の最大値 (m/s)
+MAX_SPEED = 10  # speed正規化の最大値 (m/s)
 
 # オフライン重み付け BC（強化学習要素）の UI 既定値
 # 詳細: dev/SPEC_offline_rl_throttle.md §4.1 / §6。キーは managers.offline_reward.RewardConfig に対応

@@ -146,6 +146,11 @@ class MapViewWidget(QWidget):
 
         self._bg_image_path = None
         self._bg_extent = None
+        # 走行時に追従した経路（centerline/raceline CSV）の重畳表示。
+        # 候補は地図フォルダ内の経路 CSV 一覧、既定選択は manifest の path_csv
+        self._wp_candidates = []           # 切替可能な CSV フルパス一覧
+        self._wp_csv = None                # 表示中の CSV（None=非表示）
+        self._wp_data = None               # load_path_csv の結果 {xy, speed, kind}
         self._plotted_indexes = []
         self._current_marker = None
         # ジャンプ検出のマーカー表示に使う閾値（品質フィルタのスピンボックスと同期）
@@ -277,6 +282,26 @@ class MapViewWidget(QWidget):
         self.color_by_combo.setCurrentIndex(self.color_by_combo.findData('speed'))   # 既定: 速度
         self.color_by_combo.currentIndexChanged.connect(self.refresh)
         grid.addWidget(self.color_by_combo, 1, 1)
+
+        # 走行時に追従した経路（WP）の表示切替: 「非表示」＋地図フォルダ内の
+        # centerline/raceline CSV。既定は manifest.json の path_csv（自動解決）
+        grid.addWidget(QLabel(get_text('map_view_wp_label')), 2, 0)
+        wp_row = QHBoxLayout()
+        wp_row.setContentsMargins(0, 0, 0, 0)
+        wp_row.setSpacing(2)
+        self.wp_combo = QComboBox()
+        self.wp_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.wp_combo.setToolTip(get_text('map_view_wp_tip'))
+        self.wp_combo.addItem(get_text('map_view_wp_none'), None)
+        self.wp_combo.currentIndexChanged.connect(self._on_wp_changed)
+        wp_row.addWidget(self.wp_combo, 1)
+        self.wp_browse_button = QToolButton()
+        self.wp_browse_button.setText("…")
+        self.wp_browse_button.setAutoRaise(True)
+        self.wp_browse_button.setToolTip(get_text('map_view_wp_browse_tip'))
+        self.wp_browse_button.clicked.connect(self._on_wp_browse_clicked)
+        wp_row.addWidget(self.wp_browse_button)
+        grid.addLayout(wp_row, 2, 1)
 
         disp.addLayout(grid)
 
@@ -572,6 +597,7 @@ class MapViewWidget(QWidget):
         # 既存の location_regions.json があれば自動で読み込む
         self._map_dir = os.path.dirname(os.path.abspath(yaml_path))
         self._auto_load_regions()
+        self._auto_load_wp()
         self.refresh()
 
     def auto_load_background(self, data_dir: str) -> None:
@@ -591,8 +617,10 @@ class MapViewWidget(QWidget):
             self.status_label.setText(get_text('map_view_background_load_error', str(e)))
             return
         if not hit:
-            # 地図が無くても、データフォルダ直下の領域定義があれば読み込む
+            # 地図が無くても、データフォルダ直下の領域定義・経路 CSV があれば読み込む
             self._auto_load_regions()
+            if self._auto_load_wp():
+                self.refresh()
             return
         self.set_background_map(hit["map_yaml"])
         if self._bg_image_path:   # 読み込み成功時のみ由来を表示
@@ -605,6 +633,105 @@ class MapViewWidget(QWidget):
         self._bg_image_path = None
         self._bg_extent = None
         self.refresh()
+
+    # --- 走行時に追従した経路（WP / raceline） -------------------------------
+
+    def _auto_load_wp(self) -> bool:
+        """データフォルダ・地図フォルダから経路 CSV の候補と既定選択を解決して
+        コンボへ反映する。候補が見つかれば True。手動で選択済みなら何もしない。"""
+        if self._wp_csv and self._wp_csv in self._wp_candidates:
+            return False
+        if not self._data_dir and not self._map_dir:
+            return False
+        try:
+            from utils.map_utils import resolve_path_csv, list_path_csvs
+            hit = resolve_path_csv(self._data_dir, self._map_dir) if self._data_dir else None
+            if hit:
+                cands, default = hit["candidates"], hit["csv"]
+            else:
+                cands, default = list_path_csvs(self._map_dir), None
+        except Exception as e:
+            self.status_label.setText(get_text('map_view_wp_load_error', str(e)))
+            return False
+        if not cands:
+            return False
+        self._populate_wp_combo(cands, default)
+        return True
+
+    def _populate_wp_combo(self, candidates, selected) -> None:
+        """候補一覧をコンボへ載せ、selected（フルパス or None）を選ぶ（シグナル抑止）"""
+        self._wp_candidates = list(candidates)
+        self.wp_combo.blockSignals(True)
+        self.wp_combo.clear()
+        self.wp_combo.addItem(get_text('map_view_wp_none'), None)
+        for c in self._wp_candidates:
+            self.wp_combo.addItem(os.path.basename(c), c)
+            self.wp_combo.setItemData(self.wp_combo.count() - 1, c, Qt.ToolTipRole)
+        idx = self.wp_combo.findData(selected) if selected else 0
+        self.wp_combo.setCurrentIndex(max(idx, 0))
+        self.wp_combo.blockSignals(False)
+        self._load_wp(selected if idx > 0 else None)
+
+    def _load_wp(self, csv_path) -> None:
+        """CSV を読み込んで表示対象にする（None で非表示）。描画は呼び出し側"""
+        self._wp_csv = None
+        self._wp_data = None
+        if not csv_path:
+            return
+        try:
+            from utils.map_utils import load_path_csv
+            self._wp_data = load_path_csv(csv_path)
+            self._wp_csv = csv_path
+        except Exception as e:
+            self.status_label.setText(get_text('map_view_wp_load_error', str(e)))
+
+    def _on_wp_changed(self, _index=None) -> None:
+        self._load_wp(self.wp_combo.currentData())
+        self.refresh()
+
+    def _on_wp_browse_clicked(self) -> None:
+        start_dir = (os.path.dirname(self._wp_csv) if self._wp_csv
+                     else (self._map_dir or self._data_dir or ""))
+        path, _ = QFileDialog.getOpenFileName(
+            self, get_text('map_view_wp_browse_tip'), start_dir, "Path CSV (*.csv)")
+        if not path:
+            return
+        path = os.path.normpath(path)
+        if path not in self._wp_candidates:
+            self._wp_candidates.append(path)
+        self._populate_wp_combo(self._wp_candidates, path)
+        self.refresh()
+
+    # WP 線の色（軌跡の速度カラーマップ・ラップ色・推論紫と被らない濃いピンク）
+    WP_COLOR = '#d81b60'
+
+    def _draw_wp(self, legend_handles) -> None:
+        """追従経路を破線＋小マーカーで軌跡の点の上（zorder 2.5）に描き、凡例を追加する。
+        全ラップ表示で点が密でも経路が埋もれないよう軌跡より上に置く（破線なので
+        下の点も見える）。現在フレームのマーカー（zorder 5 以上）よりは下。"""
+        if not self._wp_data or not self._wp_data.get("xy"):
+            return
+        xy = self._wp_data["xy"]
+        xs = [p[0] for p in xy]
+        ys = [p[1] for p in xy]
+        # 周回コースは終点→始点も結ぶ（course_editor の loop=1 前提。始点と終点が
+        # 離れている片道コースは閉じない）
+        if len(xy) >= 3 and math.hypot(xs[0] - xs[-1], ys[0] - ys[-1]) < 2.0:
+            xs = xs + [xs[0]]
+            ys = ys + [ys[0]]
+        self.ax.plot(xs, ys, '--', color=self.WP_COLOR, linewidth=1.3, alpha=0.9, zorder=2.5)
+        self.ax.scatter([p[0] for p in xy], [p[1] for p in xy], s=5, color=self.WP_COLOR,
+                        alpha=0.6, zorder=2.5, edgecolors='none')
+        # 始点（s=0）は白抜きの菱形で強調
+        self.ax.scatter([xy[0][0]], [xy[0][1]], marker='D', s=40, facecolors='white',
+                        edgecolors=self.WP_COLOR, linewidths=1.5, zorder=2.6)
+        speed = self._wp_data.get("speed")
+        label = f"WP: {os.path.basename(self._wp_csv)} ({len(xy)})"
+        if speed:
+            label += f"  {min(speed):.1f}-{max(speed):.1f} m/s"
+        legend_handles.append(Line2D(
+            [0], [0], linestyle='--', color=self.WP_COLOR, marker='o', markersize=3,
+            label=label))
 
     # --- 位置領域（閉ポリゴン） ---------------------------------------------
 
@@ -1329,6 +1456,9 @@ class MapViewWidget(QWidget):
 
         # 位置領域は軌跡の有無に関わらず描く（領域だけ先に確認できるように）
         self._draw_regions()
+        # 走行時に追従した経路（WP）も軌跡の有無に関わらず描く（凡例は後段で合流）
+        legend_handles = []
+        self._draw_wp(legend_handles)
         # 格子分類モデルの格子線（読み込み中のモデルが格子出力を持つときのみ）
         self._draw_grid_lines()
 
@@ -1339,6 +1469,9 @@ class MapViewWidget(QWidget):
         if self.pose_manager is None or not self.pose_manager.has_any_pose():
             self._plotted_indexes = []
             self.status_label.setText(get_text('map_view_no_pose_data'))
+            if legend_handles:
+                self.ax.legend(handles=legend_handles, fontsize=8, loc='upper right', framealpha=0.8)
+                self.ax.set_aspect('equal', adjustable='datalim')
             _finish_draw()
             return
 
@@ -1440,7 +1573,6 @@ class MapViewWidget(QWidget):
         self._draw_colorbar(color_mode, poses, laps, traj_scatter, cmap)
 
         # ラップ色分け時はラップごとの凡例（点数付き・最大12項目）
-        legend_handles = []
         if color_mode == 'lap' and laps:
             for l in sorted(set(laps))[:12]:
                 legend_handles.append(Line2D(

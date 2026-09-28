@@ -2080,6 +2080,9 @@ Google Cloud Console での OAuth設定手順
         'label_traj_pred_throttle': '予測(throttle)',
         'label_traj_inference_result': '時系列推論結果(a,t)s:',
         'label_togivad_inference_result': '推論軌道 t+Δt, x, y (s, m, m):',
+        'msg_model_source_mismatch': 'モデル学習時のカメラキーと、現在読み込んでいるデータのキーが一致しません。\n\nモデル(学習時): {0}\n現在のデータ: {1}\n\n読み替え:\n{2}',
+        'msg_model_source_unresolved': '読み替え先が見つからないカメラキー: {0}\n\nこのままでは画像を読み込めず、推論結果は表示されません。\n対応する画像キーを含むデータを読み込むか、モデルを選び直してください。',
+        'status_model_source_remapped': 'カメラキーを読み替えました: {0}',
         'label_traj_section_title': '時系列モデル',
         'label_all': 'すべて',
         'label_combined_view': '結合表示',
@@ -2154,6 +2157,11 @@ Google Cloud Console での OAuth設定手順
         'map_view_legend_rough': '悪路',
         'map_view_background_load_error': '地図の読み込みに失敗しました: {0}',
         'map_view_auto_loaded': '地図を自動読み込み: {0}（{1}）',
+        'map_view_wp_label': 'WP:',
+        'map_view_wp_none': '非表示',
+        'map_view_wp_tip': '走行時に追従した経路（centerline / raceline CSV）を地図に重ねて表示します。\n既定は manifest.json の path_csv。地図フォルダ内の他の経路にも切り替えられます。',
+        'map_view_wp_browse_tip': '経路 CSV を開く…',
+        'map_view_wp_load_error': '経路 CSV の読み込みに失敗しました: {0}',
 
         # map_view_quality_ / map_view_segment_ / map_view_interp_ / map_view_writeback_ : Phase 2 編集機能
         'map_view_quality_label': '品質フィルタ:',
@@ -4340,6 +4348,9 @@ Notes
         'label_traj_pred_throttle': 'Pred (throttle)',
         'label_traj_inference_result': 'Sequence Inference:',
         'label_togivad_inference_result': 'TogiVAD trajectory t+Δt, x, y (s, m, m):',
+        'msg_model_source_mismatch': 'The camera keys recorded in the model do not match the keys of the currently loaded data.\n\nModel (training): {0}\nCurrent data: {1}\n\nRemapping:\n{2}',
+        'msg_model_source_unresolved': 'Camera keys with no match: {0}\n\nImages cannot be loaded, so no inference result will be shown.\nLoad data containing the matching image keys, or pick another model.',
+        'status_model_source_remapped': 'Camera keys remapped: {0}',
         'label_traj_section_title': 'Time-Series Sequence Model',
         'label_all': 'All',
         'label_combined_view': 'Combined',
@@ -4414,6 +4425,11 @@ Notes
         'map_view_legend_rough': 'Rough road',
         'map_view_background_load_error': 'Failed to load map: {0}',
         'map_view_auto_loaded': 'Map auto-loaded: {0} ({1})',
+        'map_view_wp_label': 'WP:',
+        'map_view_wp_none': 'Hidden',
+        'map_view_wp_tip': 'Overlay the path followed during the run (centerline / raceline CSV) on the map.\nDefaults to path_csv in manifest.json; other paths in the map folder can be selected.',
+        'map_view_wp_browse_tip': 'Open path CSV...',
+        'map_view_wp_load_error': 'Failed to load path CSV: {0}',
 
         # map_view_quality_ / map_view_segment_ / map_view_interp_ / map_view_writeback_ : Phase 2 editing
         'map_view_quality_label': 'Quality filter:',
