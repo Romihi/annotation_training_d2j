@@ -1700,6 +1700,7 @@ Google Cloud Console での OAuth設定手順
 
         # map_view_ : 走行軌跡マップビュー
         'toolbar_map_view': 'マップビュー',
+        'toolbar_extcam': '外部カメラ',
         'map_view_dock_title': '走行軌跡マップ',
         'map_view_source_label': 'ソース:',
         'map_view_source_auto': '自動選択（優先順）',
@@ -3438,6 +3439,7 @@ Notes
 
         # map_view_ : Trajectory map view
         'toolbar_map_view': 'Map View',
+        'toolbar_extcam': 'External Camera',
         'map_view_dock_title': 'Trajectory Map',
         'map_view_source_label': 'Source:',
         'map_view_source_auto': 'Auto (by priority)',

@@ -5508,6 +5508,12 @@ class ImageAnnotationTool(QMainWindow):
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         toolbar.addWidget(spacer)
 
+        # 外部カメラ（sidecam）の走行動画: 較正・ラベル・学習・追跡（extcam/window.py、別ウィンドウ）
+        extcam_button = QPushButton(f"🎥 {get_text('toolbar_extcam')}")
+        extcam_button.clicked.connect(self.open_extcam_window)
+        extcam_button.setStyleSheet("padding: 4px 8px;")
+        toolbar.addWidget(extcam_button)
+
         # MLflowボタン
         mlflow_button = QPushButton(f"📊 {get_text('toolbar_mlflow')}")
         mlflow_button.clicked.connect(self._show_mlflow_menu)
@@ -5547,6 +5553,17 @@ class ImageAnnotationTool(QMainWindow):
 
         self.addToolBar(Qt.TopToolBarArea, toolbar)
         self.settings_toolbar = toolbar
+
+    def open_extcam_window(self):
+        """外部カメラの走行動画ウィンドウを開く。読み込み中の走行フォルダに extcam/ があればそれを開く。"""
+        from extcam.window import ExtcamWindow
+        run_dir = None
+        for d in [getattr(self, 'folder_path', '')] + list(getattr(self, 'folder_paths', []) or []):
+            if d and os.path.isdir(os.path.join(d, 'extcam')):
+                run_dir = d
+                break
+        self.extcam_window = ExtcamWindow(run_dir)
+        self.extcam_window.show()
 
     def open_map_view(self):
         """走行軌跡マップビューを別ウィンドウで開く（データ分析ダイアログと同様の方式）"""
