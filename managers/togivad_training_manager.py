@@ -821,7 +821,10 @@ class TogivadTrainingManager:
                 training_params = {
                     "model_type": "togivad",
                     "model_arch": "togivad",
-                    "data_folder": os.path.basename(self.models_dir),
+                    # 学習に使ったデータフォルダ。以前は models ディレクトリ名を入れて
+                    # いたため全 run が data_folder=models になっていた
+                    "data_folder": config.get("data_folder")
+                    or os.path.basename(self.models_dir),
                     "pose_source": pose_source,
                     "vocab_k": vocab_k,
                     "vocab_from_logs": vocab_from_logs,

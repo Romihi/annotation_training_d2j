@@ -21,6 +21,19 @@ except ImportError:
     db_config = None
     DATABRICKS_CONFIG_AVAILABLE = False
 
+def _as_csv(value):
+    """リスト/タプルをMLflowパラメータ用のカンマ区切り文字列にする（Noneはそのまま）。
+
+    None は _log_run_to_target 側で記録対象から除外されるため、値が無い項目を
+    空文字で埋めずにそのまま通す。
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return ",".join(map(str, value))
+    return value
+
+
 class ModelType(Enum):
     """モデルタイプの定義"""
     AUTONOMOUS_DRIVING = "autonomous_driving"
@@ -719,7 +732,20 @@ class MLflowManager:
             "augmentation_enabled": training_params.get("augmentation_enabled", False),
             "use_speed_output": training_params.get("use_speed_output", False),
             "use_future_output": training_params.get("use_future_output", False),
-            "masks_enabled": training_params.get("masks_enabled", None)
+            "masks_enabled": training_params.get("masks_enabled", None),
+            # 最適化設定（呼び出し側は以前から渡していたが記録されていなかった）
+            "val_split": training_params.get("val_split"),
+            "weight_decay": training_params.get("weight_decay"),
+            "optimizer": training_params.get("optimizer"),
+            "scheduler": training_params.get("scheduler"),
+            "min_delta": training_params.get("min_delta"),
+            # 入力構成: どのカメラで学習したかは推論時の読み替え可否に直結するため
+            # 単一ソースでも必ず残す
+            "num_sources": training_params.get("num_sources"),
+            "selected_sources": _as_csv(training_params.get("selected_sources")),
+            "fusion_method": training_params.get("fusion_method"),
+            "virtual_source_type": training_params.get("virtual_source_type"),
+            "input_size": _as_csv(training_params.get("input_size")),
         }
 
         # 画像埋込有効時は埋込ソースも記録
@@ -781,6 +807,14 @@ class MLflowManager:
             "final_val_loss": metrics.get("final_val_loss", 0.0)
         }
 
+        # 学習時間・エポック（他モデルでは記録しているが自動運転だけ欠けていた）
+        for key in ("completed_epochs", "stopped_epoch", "total_training_time",
+                    "avg_epoch_time",
+                    "final_train_steering_loss", "final_train_throttle_loss",
+                    "final_val_steering_loss", "final_val_throttle_loss"):
+            if isinstance(metrics.get(key), (int, float)):
+                run_metrics[key] = metrics[key]
+
         # 重み付き学習時の重み無し学習損失（比較用）
         if "final_train_loss_unweighted" in metrics:
             run_metrics["final_train_loss_unweighted"] = metrics["final_train_loss_unweighted"]
@@ -798,9 +832,12 @@ class MLflowManager:
         # タグ
         tags = {
             "model_category": "autonomous_driving",
+            "model_arch": training_params.get("model_type", "unknown"),
             "task_type": "regression",
             "framework": "pytorch",
             "status": metrics.get("status", "completed"),
+            # 他モデルと揃える: 実験一覧でカメラ構成を絞り込めるようにする
+            "image_sources": str(_as_csv(training_params.get("selected_sources")) or ""),
             "training_environment": training_params.get("training_environment", "local")  # local, colab, databricks
         }
 
@@ -842,8 +879,17 @@ class MLflowManager:
         # 入出力構成（複数画像入力 / 座標・姿勢出力）
         output_mode = training_params.get("output_mode", "class")
         params["output_mode"] = output_mode
-        params["task_type"] = {"class": "classification", "pose": "regression",
-                               "class_pose": "multitask"}.get(output_mode, "classification")
+        # output_mode は 'class' / 'pose' / 'grid' の組み合わせ（例 'pose_grid'）。
+        # 固定の辞書では pose_grid 等が既定値 classification に落ちて、座標回帰の
+        # run が分類として記録されてしまうため、ヘッド構成から判定する
+        _heads = str(output_mode).split('_')
+        if len(_heads) > 1:
+            _task = "multitask"
+        elif 'pose' in _heads:
+            _task = "regression"
+        else:
+            _task = "classification"   # class / grid は分類
+        params["task_type"] = _task
         for key in ("num_sources", "fusion_method", "selected_sources", "virtual_source_type",
                     "temporal_interval", "pose_source", "include_heading", "heading_from_pose",
                     "include_attitude", "pose_loss_weight",
@@ -884,7 +930,11 @@ class MLflowManager:
         # タグ
         tags = {
             "model_category": "position_estimation",
-            "task_type": "classification",
+            # params["task_type"] と同じ判定を使う（固定で classification にすると
+            # 座標回帰モデルが分類として並ぶ）
+            "task_type": params["task_type"],
+            "output_mode": str(output_mode),
+            "image_sources": str(_as_csv(training_params.get("selected_sources")) or ""),
             "framework": "pytorch",
             "status": metrics.get("status", "completed"),
             "coordinate_type": training_params.get("coordinate_system", "classification"),
@@ -1350,12 +1400,8 @@ class MLflowManager:
             "training_environment": training_params.get("training_environment", "local")
         }
 
-        if dataset_info:
-            params.update({
-                "train_samples": dataset_info.get("train_samples", 0),
-                "val_samples": dataset_info.get("val_samples", 0),
-                "total_sequences": dataset_info.get("total_sequences", 0)
-            })
+        # 件数は dataset_info 経由で dataset_train_samples 等として記録される。
+        # ここで params にも入れると同じ値が二重に並ぶため入れない。
 
         # カスタムモデル名が指定されていればそれを実行名に使用（他モデルと同様）
         custom_name = training_params.get('model_name', '')
@@ -1419,6 +1465,20 @@ class MLflowManager:
             "torch_version": training_params.get("torch_version"),
             "cuda_version": training_params.get("cuda_version"),
         }
+        # 有効化したヘッドと損失重み。これが無いと LiDAR Fusion / Pilot /
+        # World Model を使った run と素のカメラのみの run が MLflow 上で
+        # 全く区別できない（学習側は以前から渡していたが記録していなかった）
+        for key in ("pred_seconds", "pred_points",
+                    "use_residual", "lambda_residual",
+                    "use_temporal", "use_lidar",
+                    "use_control", "lambda_control", "lambda_consist",
+                    "lambda_smooth",
+                    "use_control_trj", "trj_mix",
+                    "use_world_model", "lambda_wm",
+                    "use_agent_motion", "lambda_agent",
+                    "use_track", "lambda_track"):
+            if training_params.get(key) is not None:
+                params[key] = training_params[key]
         if training_params.get("comment"):
             params["comment"] = training_params["comment"]
 
@@ -1434,6 +1494,10 @@ class MLflowManager:
             "avg_epoch_time": metrics.get("avg_epoch_time", 0.0),
             "completed_epochs": metrics.get("completed_epochs", 0)
         }
+        # Pilot（制御ヘッド）の精度。学習側は算出済みだが記録されていなかった
+        for key in ("best_val_ctl_angle_mae", "best_val_ctl_throttle_mae"):
+            if isinstance(metrics.get(key), (int, float)):
+                run_metrics[key] = metrics[key]
 
         tags = {
             "model_category": "togivad",
@@ -1446,12 +1510,8 @@ class MLflowManager:
             "training_environment": training_params.get("training_environment", "local")
         }
 
-        if dataset_info:
-            params.update({
-                "train_samples": dataset_info.get("train_samples", 0),
-                "val_samples": dataset_info.get("val_samples", 0),
-                "total_sequences": dataset_info.get("total_sequences", 0)
-            })
+        # 件数は dataset_info 経由で dataset_train_samples 等として記録される。
+        # ここで params にも入れると同じ値が二重に並ぶため入れない。
 
         custom_name = training_params.get('model_name', '')
         if custom_name:
@@ -1547,12 +1607,8 @@ class MLflowManager:
             "training_environment": training_params.get("training_environment", "local")
         }
 
-        if dataset_info:
-            params.update({
-                "train_samples": dataset_info.get("train_samples", 0),
-                "val_samples": dataset_info.get("val_samples", 0),
-                "total_sequences": dataset_info.get("total_sequences", 0)
-            })
+        # 件数は dataset_info 経由で dataset_train_samples 等として記録される。
+        # ここで params にも入れると同じ値が二重に並ぶため入れない。
 
         custom_name = training_params.get('model_name', '')
         if custom_name:

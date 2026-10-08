@@ -29846,7 +29846,11 @@ class ImageAnnotationTool(QMainWindow):
                     "is_multi_source": is_multi_source,
                     "num_sources": training_num_sources,
                     "fusion_method": training_fusion_method if is_multi_source else None,
-                    "selected_sources": selected_sources if is_multi_source else None,
+                    # 単一カメラでもカメラ名を残す（推論時にモデルとデータの
+                    # キーが食い違った際、学習時の構成を辿れるようにするため）
+                    "selected_sources": selected_sources,
+                    "virtual_source_type": training_virtual_type if is_virtual_source else None,
+                    "input_size": list(input_size) if input_size else None,
                     "rl_weighting": rl_weighting_meta,
                 },
                 dataset_info={
@@ -30877,6 +30881,9 @@ class ImageAnnotationTool(QMainWindow):
         # マルチカメラ融合パラメータ
         config['fusion_method'] = fusion_combo.currentData()
         config['attn_heads'] = attn_heads_spin.value()
+        # MLflow 用: 学習に使ったデータフォルダ（マネージャ側は models ディレクトリ
+        # しか知らないため、ここで渡さないと data_folder=models になる）
+        config['data_folder'] = getattr(self, 'folder_path', None) or "unknown"
 
         try:
             # 進捗ダイアログ
@@ -31658,6 +31665,20 @@ class ImageAnnotationTool(QMainWindow):
             # 重み付き学習時の重み無し学習損失（比較用）
             if training_results.get('train_losses_unweighted'):
                 metrics["final_train_loss_unweighted"] = training_results['train_losses_unweighted'][-1]
+
+            # 学習時間・エポック（他モデルでは記録しているが自動運転だけ欠けていた）
+            for key in ('completed_epochs', 'stopped_epoch',
+                        'total_training_time', 'avg_epoch_time'):
+                if isinstance(training_results.get(key), (int, float)):
+                    metrics[key] = training_results[key]
+            # ヘッド別の最終損失（steering と throttle のどちらが効いたかの比較用）
+            for src, dst in (('train_steering_losses', 'final_train_steering_loss'),
+                             ('train_throttle_losses', 'final_train_throttle_loss'),
+                             ('val_steering_losses', 'final_val_steering_loss'),
+                             ('val_throttle_losses', 'final_val_throttle_loss')):
+                seq = training_results.get(src)
+                if seq:
+                    metrics[dst] = seq[-1]
 
             # 自動運転特有のメトリクスを追加（可能であれば）
             if 'steering_accuracy' in training_results:

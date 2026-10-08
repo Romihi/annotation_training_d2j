@@ -360,7 +360,10 @@ class LidarPolicyTrainingManager:
                 best_epoch = (val_losses.index(best_val_loss) + 1) if val_losses else 0
                 training_params = {
                     "model_type": self.ARCH_NAME, "model_arch": self.ARCH_NAME,
-                    "data_folder": os.path.basename(self.models_dir),
+                    # 学習に使ったデータフォルダ。以前は models ディレクトリ名を入れて
+                    # いたため全 run が data_folder=models になっていた
+                    "data_folder": config.get("data_folder")
+                    or os.path.basename(self.models_dir),
                     "preset": preset, "num_bins": cfg.num_bins,
                     "num_beams_raw": cfg.num_beams_raw,
                     "downsample_mode": cfg.downsample_mode,
