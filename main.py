@@ -36477,7 +36477,7 @@ class ImageAnnotationTool(QMainWindow):
                                        f"{get_text('label_location_grid_result', mode_text, f'{ex:.2f}', f'{ey:.2f}')}"
                                        f"</span><br>")
                     inference_text += (f"<span style='color: {theme_color('strong')};'>"
-                                       f"{get_text('label_location_grid_top1', t1['ix'], t1['iy'], f'{t1['prob']:.3f}', f'{t1['x']:.2f}', f'{t1['y']:.2f}')}"
+                                       f"{get_text('label_location_grid_top1', t1['ix'], t1['iy'], format(t1['prob'], '.3f'), format(t1['x'], '.2f'), format(t1['y'], '.2f'))}"
                                        f"</span><br>")
                     # 実測との誤差
                     pm = getattr(self, 'pose_manager', None)
@@ -36493,7 +36493,7 @@ class ImageAnnotationTool(QMainWindow):
                     # Top-N 一覧（確率降順）
                     for rank, it in enumerate(top[:top_n], start=1):
                         inference_text += (f"<span style='color: {theme_color('muted')};'>"
-                                           f"{get_text('label_location_grid_rank', rank, it['ix'], it['iy'], f'{it['prob']:.3f}')}"
+                                           f"{get_text('label_location_grid_rank', rank, it['ix'], it['iy'], format(it['prob'], '.3f'))}"
                                            f"</span><br>")
 
                 # 上位3クラスの予測結果を表示（すでに確率でソートされている前提）
