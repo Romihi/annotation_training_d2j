@@ -6939,7 +6939,7 @@ class ImageAnnotationTool(QMainWindow):
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         toolbar.addWidget(spacer)
 
-        # 外部カメラ（sidecam）の走行動画: 較正・ラベル・学習・追跡（extcam/window.py、別ウィンドウ）
+        # 外部カメラ（extcam）の走行動画: 較正・ラベル・学習・追跡（extcam/window.py、別ウィンドウ）
         extcam_button = QPushButton(f"🎥 {get_text('toolbar_extcam')}")
         extcam_button.clicked.connect(self.open_extcam_window)
         extcam_button.setStyleSheet("padding: 4px 8px;")

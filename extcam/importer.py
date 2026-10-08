@@ -13,7 +13,7 @@ write は、時刻合わせした走行の時間範囲（前後に余白）だ�
   extcam/clip_NN.calib.json   このクリップ専用の較正（基準フレームの画素）。ref_index・取り込み元・時刻合わせの結果つき
   extcam/clip_NN.stab.npy     手持ちのとき、フレーム → 基準フレームのホモグラフィ（固定カメラなら作らない）
   extcam/clip_NN.import.json  取り込みの記録（合否の目安・元動画・ハッシュ）
-  extcam/clips.json           クリップ一覧へ追記（sidecam の取り込みと同じファイル）
+  extcam/clips.json           クリップ一覧へ追記（extcam の取り込みと同じファイル）
 """
 from __future__ import annotations
 

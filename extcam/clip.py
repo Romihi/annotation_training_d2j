@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 
 EXT_DIR = "extcam"
-VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".mov")   # sidecam は mkv。取り込み（importer）は ffmpeg が無いと avi
+VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".mov")   # extcam は mkv。取り込み（importer）は ffmpeg が無いと avi
 
 
 def list_clips(run_dir: str) -> list:

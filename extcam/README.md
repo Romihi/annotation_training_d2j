@@ -1,6 +1,6 @@
 # extcam — 外部カメラ動画で車両の位置・姿勢を追跡する
 
-コース脇の据え置きカメラ（togikaidrive の `sidecam/`）が撮った走行動画を、走行フォルダの `extcam/` から読み、
+コース脇の据え置きカメラ（togikaidrive の `extcam/`、`python3 -m extcam`）が撮った走行動画を、走行フォルダの `extcam/` から読み、
 **較正 → ラベル付け → YOLO11n-pose の学習 → BoT-SORT で追跡 → 地図座標で平滑化** を行う別ウィンドウ。
 
 起動: アノテーションツールのツールバー「🎥 外部カメラ」、または単体で `python -m extcam.window data/data_<TS>`。
@@ -12,7 +12,7 @@
 
 | ファイル | 中身 |
 |---|---|
-| `extcam/clip_NN.mkv` `clip_NN.frames.csv` | sidecam の切り出し動画と、フレームごとの時刻（`t_jetson` は catalog の `_timestamp_ms` と同じ時計） |
+| `extcam/clip_NN.mkv` `clip_NN.frames.csv` | extcam の切り出し動画と、フレームごとの時刻（`t_jetson` は catalog の `_timestamp_ms` と同じ時計） |
 | `map_ref.json` → `map_dir` | course_editor の地図（`*.yaml` + 画像）とコース外形 `map_bounds.json`（outer / holes）。較正の対応点に使う |
 | `catalog_*.catalog` `images/` | 車両の自己位置（fused > slam > aruco > vslam > pose の順で最初にあるもの）と車載画像。仮ラベルと比較に使う |
 | リポジトリ直下の `vehicle.json` | 車体寸法（キーポイントの既定値） |
@@ -53,7 +53,7 @@
 
 ## 他のカメラの動画を取り込む（「0. 取り込み」タブ / extcam.importer）
 
-スマホ等で撮った動画（手持ち可）を、走行と時刻合わせしてその走行の `extcam/` へ書き出す。sidecam の動画と同じように
+スマホ等で撮った動画（手持ち可）を、走行と時刻合わせしてその走行の `extcam/` へ書き出す。extcam の動画と同じように
 較正・ラベル・学習・追跡で使える（クリップ専用の較正 `clip_NN.calib.json` と手ぶれ補正 `clip_NN.stab.npy` を自動で使う）。
 
 1. 「0. 取り込み」で動画とデータ（data/）を選ぶ → ① 下ごしらえ（撮影時刻・手ぶれ補正）

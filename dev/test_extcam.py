@@ -218,7 +218,7 @@ def test_clipcam_precedence_roundtrip_and_extras(tmp_path):
     from extcam.clipcam import clip_setup_path, load_clip_camera, save_clip_setup, stab_path
     run = _fake_clip(tmp_path)
     cal = _true_camera()
-    save_setup(trk.setup_path(run), _true_camera(f=500.0), VehicleKpts(), [], None)     # 走行の（sidecam の）較正
+    save_setup(trk.setup_path(run), _true_camera(f=500.0), VehicleKpts(), [], None)     # 走行の（extcam の）較正
     cc, _, _, _, path = load_clip_camera(run, 0)
     assert path.endswith("calib.json") and not cc.handheld and abs(cc.calib.K[0][0] - 500) < 1e-9
     save_clip_setup(clip_setup_path(run, 0), cal, VehicleKpts(), [], None, extra={"ref_index": 5, "source": {"type": "import"}})

@@ -2,11 +2,11 @@
 
 較正ファイルの探し方:
   1. extcam/clip_NN.calib.json … そのクリップ専用（他のカメラから取り込んだ動画。importer が書く）
-  2. extcam/calib.json         … 走行のカメラ（sidecam）。クリップ専用が無いときに使う
+  2. extcam/calib.json         … 走行のカメラ（extcam）。クリップ専用が無いときに使う
 
 手ぶれ補正: extcam/clip_NN.stab.npy（N×3×3、フレーム i の画素 → 基準フレームの画素のホモグラフィ。NaN は補正なし）。
 較正は基準フレームの画素で行うので、手持ちのクリップでは「フレームの画素 ⇔ 基準フレームの画素」を挟んで投影・逆投影する。
-固定カメラ（sidecam）では stab が無く、すべて恒等変換になる。
+固定カメラ（extcam）では stab が無く、すべて恒等変換になる。
 """
 from __future__ import annotations
 

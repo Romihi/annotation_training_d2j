@@ -39,7 +39,7 @@ NK = len(KPT_NAMES)
 
 
 def setup_path(run_dir: str) -> str:
-    """走行のカメラ（sidecam）の較正。クリップ専用の較正は clipcam.setup_path_for。"""
+    """走行のカメラ（extcam）の較正。クリップ専用の較正は clipcam.setup_path_for。"""
     return os.path.join(run_dir, "extcam", "calib.json")
 
 
