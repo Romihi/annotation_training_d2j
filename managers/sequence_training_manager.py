@@ -318,7 +318,10 @@ class SequenceTrainingManager:
                 training_params = {
                     "model_type": "sequence",
                     "model_arch": model_arch,
-                    "data_folder": os.path.basename(self.models_dir),
+                    # 学習に使ったデータフォルダ。以前は models ディレクトリ名を入れて
+                    # いたため全 run が data_folder=models になっていた
+                    "data_folder": config.get("data_folder")
+                    or os.path.basename(self.models_dir),
                     "seq_len": seq_len,
                     "pred_horizon": pred_horizon,
                     "hidden_dim": hidden_dim,

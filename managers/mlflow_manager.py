@@ -21,6 +21,19 @@ except ImportError:
     db_config = None
     DATABRICKS_CONFIG_AVAILABLE = False
 
+def _as_csv(value):
+    """リスト/タプルをMLflowパラメータ用のカンマ区切り文字列にする（Noneはそのまま）。
+
+    None は _log_run_to_target 側で記録対象から除外されるため、値が無い項目を
+    空文字で埋めずにそのまま通す。
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return ",".join(map(str, value))
+    return value
+
+
 class ModelType(Enum):
     """モデルタイプの定義"""
     AUTONOMOUS_DRIVING = "autonomous_driving"
@@ -30,6 +43,7 @@ class ModelType(Enum):
     YOLO_SEGMENTATION = "yolo_segmentation"
     SEQUENCE = "sequence"
     TOGIVAD = "togivad"
+    LIDAR_POLICY = "lidar_policy"
     GRU_TRAJECTORY = "gru_trajectory"  # 後方互換
 
 class MLflowManager:
@@ -44,6 +58,7 @@ class MLflowManager:
         ModelType.YOLO_SEGMENTATION: "yolo_segmentation_models",
         ModelType.SEQUENCE: "sequence_models",
         ModelType.TOGIVAD: "togivad_models",
+        ModelType.LIDAR_POLICY: "lidar_policy_models",
         ModelType.GRU_TRAJECTORY: "gru_trajectory_models"  # 後方互換
     }
 
@@ -324,14 +339,36 @@ class MLflowManager:
             mlflow.set_tracking_uri(self.local_tracking_uri)
 
             # 全ての実験を作成（アーティファクトは file:// ルートに保存）
+            # 論理削除(soft-deleted)された実験は名前が衝突して作成に失敗し、
+            # 以後その種別のログが記録できなくなるため、見つけたら復活させる
+            from mlflow.tracking import MlflowClient
+            from mlflow.entities import ViewType
+            _client = MlflowClient()
             for model_type, experiment_name in self.EXPERIMENT_NAMES.items():
                 experiment = mlflow.get_experiment_by_name(experiment_name)
-                if experiment is None:
+                if experiment is not None:
+                    continue
+                try:
                     mlflow.create_experiment(
                         experiment_name,
                         artifact_location=f"{self.local_artifact_root}/{experiment_name}"
                     )
                     print(f"ローカル実験を作成: {experiment_name}")
+                except Exception as create_err:
+                    # 削除済みで名前衝突している場合は復活を試みる
+                    restored = False
+                    try:
+                        for exp in _client.search_experiments(
+                                view_type=ViewType.DELETED_ONLY,
+                                filter_string=f"name = '{experiment_name}'"):
+                            _client.restore_experiment(exp.experiment_id)
+                            print(f"削除済みローカル実験を復活: {experiment_name}")
+                            restored = True
+                            break
+                    except Exception as restore_err:
+                        print(f"実験復活に失敗 ({experiment_name}): {restore_err}")
+                    if not restored:
+                        print(f"ローカル実験の作成に失敗 ({experiment_name}): {create_err}")
 
             self._local_initialized = True
             print(f"ローカルMLflow初期化成功: {self.local_tracking_uri}")
@@ -692,8 +729,55 @@ class MLflowManager:
             "initial_weights": training_params.get("initial_weights", "pretrained"),
             "pretrained_model_name": training_params.get("pretrained_model_name", None),
             "sampling_strategy": training_params.get("sampling_strategy", "all"),
-            "augmentation_enabled": training_params.get("augmentation_enabled", False)
+            "augmentation_enabled": training_params.get("augmentation_enabled", False),
+            "use_speed_output": training_params.get("use_speed_output", False),
+            "use_future_output": training_params.get("use_future_output", False),
+            "masks_enabled": training_params.get("masks_enabled", None),
+            # 最適化設定（呼び出し側は以前から渡していたが記録されていなかった）
+            "val_split": training_params.get("val_split"),
+            "weight_decay": training_params.get("weight_decay"),
+            "optimizer": training_params.get("optimizer"),
+            "scheduler": training_params.get("scheduler"),
+            "min_delta": training_params.get("min_delta"),
+            # 入力構成: どのカメラで学習したかは推論時の読み替え可否に直結するため
+            # 単一ソースでも必ず残す
+            "num_sources": training_params.get("num_sources"),
+            "selected_sources": _as_csv(training_params.get("selected_sources")),
+            "fusion_method": training_params.get("fusion_method"),
+            "virtual_source_type": training_params.get("virtual_source_type"),
+            "input_size": _as_csv(training_params.get("input_size")),
         }
+
+        # 画像埋込有効時は埋込ソースも記録
+        if training_params.get("pip_embed_source"):
+            params["pip_embed_source"] = training_params["pip_embed_source"]
+
+        # 将来予測有効時は予測フレームオフセットも記録
+        if training_params.get("use_future_output", False):
+            params["future_offsets"] = training_params.get("future_offsets", "5,10")
+
+        # speed出力有効時はspeed正規化値（MAX_SPEED相当）も記録
+        if training_params.get("use_speed_output", False):
+            params["speed_normalize"] = training_params.get("speed_normalize", None)
+
+        # オフライン重み付け BC（dev/SPEC_offline_rl_throttle.md §4.8）
+        rl_meta = training_params.get("rl_weighting") or {}
+        params["rl_weighting"] = "enabled" if rl_meta.get("enabled") else "disabled"
+        if rl_meta.get("enabled"):
+            rl_cfg = rl_meta.get("config", {}) or {}
+            for k in ("method", "target_head", "gamma", "beta", "w_min", "w_max", "top_k",
+                      "baseline_mode", "episode_gap_s", "speed_norm", "wall_mm", "side_mm"):
+                if k in rl_cfg:
+                    params[f"rl_{k}"] = rl_cfg[k]
+            params["rl_coeffs"] = ",".join(
+                f"{k}={rl_cfg[k]}" for k in ("c_speed", "c_wall", "c_side", "c_slip", "c_stuck", "c_yaw")
+                if k in rl_cfg)
+            params["rl_weight_columns"] = ",".join(map(str, rl_meta.get("weight_columns", []) or []))
+            rl_st = rl_meta.get("weight_stats", {}) or {}
+            for k in ("weight_mean", "weight_median", "weight_p05", "weight_p95", "weight_max",
+                      "n_frames", "n_episodes"):
+                if k in rl_st:
+                    params[f"rl_{k}"] = rl_st[k]
 
         # コメントがあれば追加
         if training_params.get("comment"):
@@ -723,6 +807,18 @@ class MLflowManager:
             "final_val_loss": metrics.get("final_val_loss", 0.0)
         }
 
+        # 学習時間・エポック（他モデルでは記録しているが自動運転だけ欠けていた）
+        for key in ("completed_epochs", "stopped_epoch", "total_training_time",
+                    "avg_epoch_time",
+                    "final_train_steering_loss", "final_train_throttle_loss",
+                    "final_val_steering_loss", "final_val_throttle_loss"):
+            if isinstance(metrics.get(key), (int, float)):
+                run_metrics[key] = metrics[key]
+
+        # 重み付き学習時の重み無し学習損失（比較用）
+        if "final_train_loss_unweighted" in metrics:
+            run_metrics["final_train_loss_unweighted"] = metrics["final_train_loss_unweighted"]
+
         # 自動運転特有のメトリクス（利用可能な場合）
         if "steering_accuracy" in metrics:
             run_metrics["steering_accuracy"] = metrics["steering_accuracy"]
@@ -736,9 +832,12 @@ class MLflowManager:
         # タグ
         tags = {
             "model_category": "autonomous_driving",
+            "model_arch": training_params.get("model_type", "unknown"),
             "task_type": "regression",
             "framework": "pytorch",
             "status": metrics.get("status", "completed"),
+            # 他モデルと揃える: 実験一覧でカメラ構成を絞り込めるようにする
+            "image_sources": str(_as_csv(training_params.get("selected_sources")) or ""),
             "training_environment": training_params.get("training_environment", "local")  # local, colab, databricks
         }
 
@@ -777,6 +876,31 @@ class MLflowManager:
             "actual_classes": training_params.get("actual_classes", 0)
         }
 
+        # 入出力構成（複数画像入力 / 座標・姿勢出力）
+        output_mode = training_params.get("output_mode", "class")
+        params["output_mode"] = output_mode
+        # output_mode は 'class' / 'pose' / 'grid' の組み合わせ（例 'pose_grid'）。
+        # 固定の辞書では pose_grid 等が既定値 classification に落ちて、座標回帰の
+        # run が分類として記録されてしまうため、ヘッド構成から判定する
+        _heads = str(output_mode).split('_')
+        if len(_heads) > 1:
+            _task = "multitask"
+        elif 'pose' in _heads:
+            _task = "regression"
+        else:
+            _task = "classification"   # class / grid は分類
+        params["task_type"] = _task
+        for key in ("num_sources", "fusion_method", "selected_sources", "virtual_source_type",
+                    "temporal_interval", "pose_source", "include_heading", "heading_from_pose",
+                    "include_attitude", "pose_loss_weight",
+                    "grid_cell_size", "num_grid_classes", "grid_loss_weight", "grid_label_sigma",
+                    "grid_class_balance", "pose_history_steps", "pose_history_interval",
+                    "history_noise_xy_m", "history_noise_theta_deg", "history_drop_prob",
+                    "use_lidar", "lidar_num_bins", "lidar_downsample_mode", "lidar_stack_frames",
+                    "lidar_interval", "lidar_max_range_mm"):
+            if training_params.get(key) is not None:
+                params[key] = training_params[key]
+
         # コメントがあれば追加
         if training_params.get("comment"):
             params["comment"] = training_params["comment"]
@@ -790,6 +914,10 @@ class MLflowManager:
             "final_train_acc": metrics.get("final_train_acc", 0.0),
             "final_val_acc": metrics.get("final_val_acc", 0.0)
         }
+        for key in ("best_val_pos_error_m", "best_val_heading_error_deg", "best_val_attitude_error_deg",
+                    "best_val_grid_acc", "best_val_grid_top1_error_m", "best_val_grid_weighted_error_m"):
+            if key in metrics:
+                run_metrics[key] = metrics[key]
 
         # 分類精度関連のメトリクス（利用可能な場合）
         if "position_error_mean" in metrics:
@@ -802,7 +930,11 @@ class MLflowManager:
         # タグ
         tags = {
             "model_category": "position_estimation",
-            "task_type": "classification",
+            # params["task_type"] と同じ判定を使う（固定で classification にすると
+            # 座標回帰モデルが分類として並ぶ）
+            "task_type": params["task_type"],
+            "output_mode": str(output_mode),
+            "image_sources": str(_as_csv(training_params.get("selected_sources")) or ""),
             "framework": "pytorch",
             "status": metrics.get("status", "completed"),
             "coordinate_type": training_params.get("coordinate_system", "classification"),
@@ -1268,12 +1400,8 @@ class MLflowManager:
             "training_environment": training_params.get("training_environment", "local")
         }
 
-        if dataset_info:
-            params.update({
-                "train_samples": dataset_info.get("train_samples", 0),
-                "val_samples": dataset_info.get("val_samples", 0),
-                "total_sequences": dataset_info.get("total_sequences", 0)
-            })
+        # 件数は dataset_info 経由で dataset_train_samples 等として記録される。
+        # ここで params にも入れると同じ値が二重に並ぶため入れない。
 
         # カスタムモデル名が指定されていればそれを実行名に使用（他モデルと同様）
         custom_name = training_params.get('model_name', '')
@@ -1337,6 +1465,20 @@ class MLflowManager:
             "torch_version": training_params.get("torch_version"),
             "cuda_version": training_params.get("cuda_version"),
         }
+        # 有効化したヘッドと損失重み。これが無いと LiDAR Fusion / Pilot /
+        # World Model を使った run と素のカメラのみの run が MLflow 上で
+        # 全く区別できない（学習側は以前から渡していたが記録していなかった）
+        for key in ("pred_seconds", "pred_points",
+                    "use_residual", "lambda_residual",
+                    "use_temporal", "use_lidar",
+                    "use_control", "lambda_control", "lambda_consist",
+                    "lambda_smooth",
+                    "use_control_trj", "trj_mix",
+                    "use_world_model", "lambda_wm",
+                    "use_agent_motion", "lambda_agent",
+                    "use_track", "lambda_track"):
+            if training_params.get(key) is not None:
+                params[key] = training_params[key]
         if training_params.get("comment"):
             params["comment"] = training_params["comment"]
 
@@ -1352,6 +1494,10 @@ class MLflowManager:
             "avg_epoch_time": metrics.get("avg_epoch_time", 0.0),
             "completed_epochs": metrics.get("completed_epochs", 0)
         }
+        # Pilot（制御ヘッド）の精度。学習側は算出済みだが記録されていなかった
+        for key in ("best_val_ctl_angle_mae", "best_val_ctl_throttle_mae"):
+            if isinstance(metrics.get(key), (int, float)):
+                run_metrics[key] = metrics[key]
 
         tags = {
             "model_category": "togivad",
@@ -1364,12 +1510,8 @@ class MLflowManager:
             "training_environment": training_params.get("training_environment", "local")
         }
 
-        if dataset_info:
-            params.update({
-                "train_samples": dataset_info.get("train_samples", 0),
-                "val_samples": dataset_info.get("val_samples", 0),
-                "total_sequences": dataset_info.get("total_sequences", 0)
-            })
+        # 件数は dataset_info 経由で dataset_train_samples 等として記録される。
+        # ここで params にも入れると同じ値が二重に並ぶため入れない。
 
         custom_name = training_params.get('model_name', '')
         if custom_name:
@@ -1389,8 +1531,113 @@ class MLflowManager:
         else:
             return {"status": "error", "message": "記録に失敗しました"}
 
+
+    def log_lidar_policy_model(self, model_path, training_params, metrics,
+                               dataset_info, extra_artifacts: list = None):
+        """LiDAR Policy（2D LiDAR → angle/throttle 1D-CNN）の学習結果を記録
+
+        Args:
+            extra_artifacts: 追加で記録するファイル（学習曲線PNG・ONNX等）のリスト
+        """
+        params = {
+            "framework": "pytorch",
+            "model_type": "lidar_policy",
+            "model_arch": "lidar_policy",
+            "data_folder": training_params.get("data_folder", "unknown"),
+            "task_type": "lidar_behavior_cloning",
+            "preset": training_params.get("preset", "base"),
+            "num_bins": training_params.get("num_bins"),
+            "num_beams_raw": training_params.get("num_beams_raw"),
+            "downsample_mode": training_params.get("downsample_mode"),
+            "stack_frames": training_params.get("stack_frames"),
+            "use_valid_ch": training_params.get("use_valid_ch"),
+            "max_range_mm": training_params.get("max_range_mm"),
+            "max_speed": training_params.get("max_speed"),
+            "hidden_dim": training_params.get("hidden_dim"),
+            "dropout": training_params.get("dropout"),
+            "use_traj": training_params.get("use_traj"),
+            "horizon": training_params.get("horizon"),
+            "dt": training_params.get("dt"),
+            "pose_source": training_params.get("pose_source", ""),
+            "w_steer": training_params.get("w_steer"),
+            "w_speed": training_params.get("w_speed"),
+            "w_traj": training_params.get("w_traj"),
+            "steer_balance": training_params.get("steer_balance"),
+            "mode_filter": training_params.get("mode_filter"),
+            "split_mode": training_params.get("split_mode"),
+            "augment": training_params.get("augment"),
+            "mirror": training_params.get("mirror"),
+            "epochs": training_params.get("num_epochs", 0),
+            "learning_rate": training_params.get("learning_rate"),
+            "batch_size": training_params.get("batch_size"),
+            "val_split": training_params.get("val_split"),
+            "weight_decay": training_params.get("weight_decay"),
+            "quality_excluded_frames": training_params.get("quality_excluded_frames"),
+            "early_stopping": ("enabled" if training_params.get("use_early_stopping")
+                               else "disabled"),
+            "patience": training_params.get("patience"),
+            "model_params_total": training_params.get("model_params_total"),
+            "device": training_params.get("device"),
+            "torch_version": training_params.get("torch_version"),
+            "cuda_version": training_params.get("cuda_version"),
+        }
+        if training_params.get("comment"):
+            params["comment"] = training_params["comment"]
+
+        run_metrics = {
+            "best_val_loss": metrics.get("best_val_loss", 0.0),
+            "final_train_loss": metrics.get("final_train_loss", 0.0),
+            "final_val_loss": metrics.get("final_val_loss", 0.0),
+            "best_epoch": metrics.get("best_epoch", 0),
+            "best_val_steer_mae": metrics.get("best_val_steer_mae", 0.0),
+            "best_val_speed_mae": metrics.get("best_val_speed_mae", 0.0),
+            "best_val_ade_m": metrics.get("best_val_ade_m", 0.0),
+            "total_training_time": metrics.get("total_training_time", 0.0),
+            "avg_epoch_time": metrics.get("avg_epoch_time", 0.0),
+            "completed_epochs": metrics.get("completed_epochs", 0)
+        }
+
+        tags = {
+            "model_category": "lidar_policy",
+            "model_arch": "lidar_policy",
+            "task_type": "lidar_behavior_cloning",
+            "framework": "pytorch",
+            "status": metrics.get("status", "completed"),
+            "preset": str(training_params.get("preset", "base")),
+            "training_environment": training_params.get("training_environment", "local")
+        }
+
+        # 件数は dataset_info 経由で dataset_train_samples 等として記録される。
+        # ここで params にも入れると同じ値が二重に並ぶため入れない。
+
+        custom_name = training_params.get('model_name', '')
+        if custom_name:
+            run_name = custom_name
+        else:
+            run_name = (f"lidar_policy_{training_params.get('preset', 'base')}_"
+                        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+
+        success = self._log_with_local_fallback(
+            ModelType.LIDAR_POLICY, run_name, params, run_metrics, tags,
+            dataset_info if dataset_info else {}, metrics, model_path,
+            extra_artifacts=extra_artifacts
+        )
+
+        if success:
+            return {"status": "success", "run_name": run_name}
+        else:
+            return {"status": "error", "message": "記録に失敗しました"}
+
     def _get_default_mlflow_uri(self):
-        """デフォルトのmlrunsディレクトリURI(sqlite)を取得"""
+        """同期・状態表示で使うローカルMLflowストアのURI(sqlite)を取得
+
+        ローカル学習の記録・MLflow UI（open_ui）は self.local_tracking_uri
+        （画像フォルダ内の mlflow.db）を使う。同期系がこれと別ストアを見ると
+        「取得したのに UI に出ない」不整合になるため、初期化済みなら同じストアを
+        返す。未初期化時のみ config.mlflow_dir のデフォルトにフォールバックする。
+        """
+        if self.local_tracking_uri:
+            return self.local_tracking_uri
         try:
             from config import mlflow_dir
             tracking_uri, _ = self._build_local_uris(mlflow_dir)

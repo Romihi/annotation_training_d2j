@@ -3,7 +3,9 @@
 アプリケーションのスタイル定義
 テーマとスタイルを統合して管理するモジュール
 """
-from PyQt5.QtGui import QColor
+import os
+from PyQt5.QtGui import QColor, QPalette
+from PyQt5.QtWidgets import QApplication
 
 class Styles:
     """アプリケーションのスタイルとテーマを管理するクラス"""
@@ -136,7 +138,7 @@ class Styles:
             }}
             QPushButton:disabled {{
                 background-color: {self.colors['primary_disabled']};
-                color: #F1F5F9;
+                color: #475569;  /* 淡い無効時背景でも読めるよう暗めの文字にする */
             }}
         """
 
@@ -158,7 +160,7 @@ class Styles:
             }}
             QPushButton:disabled {{
                 background-color: {self.colors['secondary_disabled']};
-                color: #F1F5F9;
+                color: #475569;  /* 淡い無効時背景でも読めるよう暗めの文字にする */
             }}
         """
 
@@ -180,7 +182,7 @@ class Styles:
             }}
             QPushButton:disabled {{
                 background-color: {self.colors['success_disabled']};
-                color: #F1F5F9;
+                color: #475569;  /* 淡い無効時背景でも読めるよう暗めの文字にする */
             }}
         """
 
@@ -202,7 +204,7 @@ class Styles:
             }}
             QPushButton:disabled {{
                 background-color: {self.colors['warning_disabled']};
-                color: #F1F5F9;
+                color: #475569;  /* 淡い無効時背景でも読めるよう暗めの文字にする */
             }}
         """
 
@@ -224,7 +226,7 @@ class Styles:
             }}
             QPushButton:disabled {{
                 background-color: {self.colors['special_disabled']};
-                color: #F1F5F9;
+                color: #475569;  /* 淡い無効時背景でも読めるよう暗めの文字にする */
             }}
         """
         # 削除などの破壊的アクションボタン
@@ -245,7 +247,7 @@ class Styles:
             }}
             QPushButton:disabled {{
                 background-color: {self.colors['error_disabled']};
-                color: #F1F5F9;
+                color: #475569;  /* 淡い無効時背景でも読めるよう暗めの文字にする */
             }}
         """
 
@@ -267,7 +269,7 @@ class Styles:
             }}
             QPushButton:disabled {{
                 background-color: {self.colors['nav_disabled']};
-                color: #F1F5F9;
+                color: #475569;  /* 淡い無効時背景でも読めるよう暗めの文字にする */
             }}
         """
 
@@ -813,3 +815,323 @@ def get_location_color(location_value):
 def get_location_color_hex(location_value):
     """位置情報の値から16進数カラーコードを取得するグローバル関数"""
     return app_styles.get_location_color_hex(location_value)
+
+
+# =====================================================================
+# ダークモード（アプリ全体テーマ）
+# =====================================================================
+# ダークモードでは QSS でウィジェット全体の文字色を白にするため、個々の
+# ウィジェットに "color: #333" のような固定色を書くと背景と同化して読めなく
+# なる。固定色の代わりに「役割」だけをプロパティで付け（set_text_role など）、
+# 実際の色はモードごとのアプリ全体QSSで決める。切替時は QSS を貼り直すだけで
+# 既存ウィジェットにも反映される。
+
+_is_dark_mode = False
+_light_palette = None  # 初回適用時にデフォルトパレットを退避する
+
+# 文字色の役割: 役割名 -> (ライト, ダーク)
+TEXT_ROLE_COLORS = {
+    'strong':  ('#333333', '#E6E8EB'),   # 本文より少し強調（旧 #333/#444）
+    'muted':   ('#666666', '#A8B0B8'),   # 補足説明（旧 #666/#777/#555）
+    'faint':   ('#888888', '#8E979F'),   # さらに薄い注記（旧 #888/gray/#aaa）
+    'success': ('#2E7D32', '#81C784'),   # 成功・件数などの緑
+    'error':   ('#D32F2F', '#FF6B6B'),   # エラー・削除済みの赤
+    'warning': ('#E65100', '#FFB74D'),   # 注意のオレンジ
+    'info':    ('#1565C0', '#64B5F6'),   # 情報の青
+    'accent':  ('#6A1B9A', '#CE93D8'),   # 紫（TogiVAD・セグメンテーション）
+    'teal':    ('#009999', '#4DD0E1'),   # 推論値の青緑
+}
+
+# 面（背景）の役割: 役割名 -> ((ライト背景, ライト枠), (ダーク背景, ダーク枠))
+PANEL_ROLE_COLORS = {
+    'box':    (('#f8f8f8', '#dddddd'), ('#383838', '#555555')),  # 枠付きの薄い箱
+    'strip':  (('#f8f8f8', None),      ('#383838', None)),       # 枠なしの帯
+    'code':   (('#f0f0f0', '#cccccc'), ('#3a3a3a', '#555555')),  # 固定文字列の表示欄
+    'footer': (('#e8eaed', None),      ('#333333', None)),       # ダイアログ下部の固定エリア
+}
+
+_DARK_BASE_QSS = """
+QMainWindow, QWidget {
+    background-color: #2b2b2b;
+    color: #ffffff;
+}
+QPushButton {
+    background-color: #404040;
+    color: #ffffff;
+}
+QPushButton:hover { background-color: #505050; }
+QPushButton:pressed { background-color: #606060; }
+QPushButton:checked { background-color: #0078d4; }
+QPushButton:disabled { color: #8E979F; }
+QToolButton { background-color: transparent; color: #ffffff; }
+QToolButton:hover { background-color: #505050; }
+QLabel {
+    background-color: transparent;
+    color: #ffffff;
+}
+QLineEdit, QTextEdit, QPlainTextEdit, QTextBrowser,
+QSpinBox, QDoubleSpinBox, QComboBox {
+    background-color: #404040;
+    color: #ffffff;
+    selection-background-color: #0078d4;
+    selection-color: #ffffff;
+}
+QLineEdit:disabled, QTextEdit:disabled, QPlainTextEdit:disabled,
+QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {
+    color: #8E979F;
+}
+QComboBox QAbstractItemView {
+    background-color: #404040;
+    color: #ffffff;
+    selection-background-color: #0078d4;
+    selection-color: #ffffff;
+}
+QListView, QTreeView, QTableView {
+    background-color: #353535;
+    alternate-background-color: #3d3d3d;
+    color: #ffffff;
+    selection-background-color: #0078d4;
+    selection-color: #ffffff;
+    gridline-color: #555555;
+}
+QHeaderView::section {
+    background-color: #404040;
+    color: #ffffff;
+    border: 1px solid #2b2b2b;
+}
+QTableCornerButton::section { background-color: #404040; }
+QScrollArea { background-color: #2b2b2b; }
+QGroupBox { color: #ffffff; }
+QGroupBox::title { color: #ffffff; }
+QCheckBox, QRadioButton { color: #ffffff; background-color: transparent; }
+QCheckBox:disabled, QRadioButton:disabled { color: #8E979F; }
+/* 標準スタイルの枠はダークパレットだと背景に溶けるので、枠と塗りを明示する */
+QCheckBox::indicator, QRadioButton::indicator {
+    width: 13px;
+    height: 13px;
+    border: 1px solid #9AA3AC;
+    background-color: #404040;
+}
+QCheckBox::indicator { border-radius: 2px; }
+QRadioButton::indicator { border-radius: 7px; }
+QCheckBox::indicator:hover, QRadioButton::indicator:hover { border-color: #64B5F6; }
+QCheckBox::indicator:checked {
+    border-color: #0078d4;
+    background-color: #0078d4;
+    image: url(%(check_icon)s);
+}
+QRadioButton::indicator:checked {
+    border: 4px solid #0078d4;
+    background-color: #ffffff;
+}
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {
+    border-color: #5a5a5a;
+    background-color: #333333;
+}
+QCheckBox::indicator:checked:disabled { background-color: #4a5a6a; border-color: #4a5a6a; }
+QRadioButton::indicator:checked:disabled { border-color: #4a5a6a; background-color: #8E979F; }
+QDialog {
+    background-color: #2b2b2b;
+    color: #ffffff;
+}
+QTabWidget::pane { background-color: #2b2b2b; }
+QTabBar::tab {
+    background-color: #404040;
+    color: #ffffff;
+}
+QTabBar::tab:selected { background-color: #0078d4; }
+QMenuBar { background-color: #2b2b2b; color: #ffffff; }
+QMenuBar::item:selected { background-color: #0078d4; }
+QMenu { background-color: #353535; color: #ffffff; }
+QMenu::item:selected { background-color: #0078d4; }
+QMenu::item:disabled { color: #8E979F; }
+QToolTip {
+    background-color: #404040;
+    color: #ffffff;
+    border: 1px solid #555555;
+}
+QStatusBar { color: #ffffff; }
+QProgressBar { color: #ffffff; }
+QProgressBar::chunk { background-color: #0078d4; }
+"""
+
+# 排他選択（セグメンテッドコントロール）ボタン。set_segmented() で付ける。
+_SEGMENTED_QSS_LIGHT = (
+    'QPushButton[segmented="true"]{border:1px solid #aaa;border-radius:3px;padding:4px 8px;background:#f0f0f0;}'
+    'QPushButton[segmented="true"]:hover{background:#e6e6e6;}'
+    'QPushButton[segmented="true"]:checked{background:#4a90d9;color:white;border-color:#2a70b9;font-weight:bold;}'
+)
+_SEGMENTED_QSS_DARK = (
+    'QPushButton[segmented="true"]{border:1px solid #666;border-radius:3px;padding:4px 8px;background:#404040;color:#ffffff;}'
+    'QPushButton[segmented="true"]:hover{background:#505050;}'
+    'QPushButton[segmented="true"]:checked{background:#4a90d9;color:white;border-color:#6ab0f9;font-weight:bold;}'
+)
+
+
+def _role_qss(is_dark):
+    """役割プロパティ -> 色 の QSS を組み立てる（ライト/ダーク共通の仕組み）"""
+    idx = 1 if is_dark else 0
+    rules = []
+    for role, colors in TEXT_ROLE_COLORS.items():
+        rules.append(f'*[textRole="{role}"] {{ color: {colors[idx]}; }}')
+    for role, variants in PANEL_ROLE_COLORS.items():
+        bg, border = variants[idx]
+        border_qss = f' border: 1px solid {border}; border-radius: 4px;' if border else ''
+        rules.append(f'*[panelRole="{role}"] {{ background-color: {bg};{border_qss} }}')
+    rules.append(_SEGMENTED_QSS_DARK if is_dark else _SEGMENTED_QSS_LIGHT)
+    return "\n".join(rules)
+
+
+def _dark_base_qss():
+    check_icon = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              'assets', 'check_white.png').replace(os.sep, '/')
+    return _DARK_BASE_QSS % {'check_icon': check_icon}
+
+
+def build_app_qss(is_dark):
+    """アプリ全体に貼る QSS を返す。ライトはネイティブ見た目を保ち役割色のみ定義する"""
+    base = _dark_base_qss() if is_dark else ""
+    return base + "\n" + _role_qss(is_dark)
+
+
+def _build_dark_palette():
+    """QSS の効かない部分（palette() 参照、ネイティブ描画）用のダークパレット"""
+    white = QColor('#ffffff')
+    p = QPalette()
+    p.setColor(QPalette.Window, QColor('#2b2b2b'))
+    p.setColor(QPalette.WindowText, white)
+    p.setColor(QPalette.Base, QColor('#404040'))
+    p.setColor(QPalette.AlternateBase, QColor('#353535'))
+    p.setColor(QPalette.ToolTipBase, QColor('#404040'))
+    p.setColor(QPalette.ToolTipText, white)
+    p.setColor(QPalette.Text, white)
+    p.setColor(QPalette.Button, QColor('#404040'))
+    p.setColor(QPalette.ButtonText, white)
+    p.setColor(QPalette.BrightText, white)
+    p.setColor(QPalette.Highlight, QColor('#0078d4'))
+    p.setColor(QPalette.HighlightedText, white)
+    p.setColor(QPalette.Link, QColor('#64B5F6'))
+    p.setColor(QPalette.Light, QColor('#5a5a5a'))
+    p.setColor(QPalette.Midlight, QColor('#4a4a4a'))
+    p.setColor(QPalette.Mid, QColor('#555555'))
+    p.setColor(QPalette.Dark, QColor('#1e1e1e'))
+    p.setColor(QPalette.Shadow, QColor('#000000'))
+    if hasattr(QPalette, 'PlaceholderText'):
+        p.setColor(QPalette.PlaceholderText, QColor('#8E979F'))
+    disabled = QColor('#8E979F')
+    for role in (QPalette.Text, QPalette.WindowText, QPalette.ButtonText):
+        p.setColor(QPalette.Disabled, role, disabled)
+    return p
+
+
+def apply_app_theme(is_dark):
+    """ダーク/ライトをアプリ全体（全ウィンドウ・ダイアログ）に適用する"""
+    global _is_dark_mode, _light_palette
+    _is_dark_mode = bool(is_dark)
+    set_theme('dark' if _is_dark_mode else 'light')
+    app = QApplication.instance()
+    if app is None:
+        return
+    if _light_palette is None:
+        _light_palette = QPalette(app.palette())
+    app.setPalette(_build_dark_palette() if _is_dark_mode else _light_palette)
+    app.setStyleSheet(build_app_qss(_is_dark_mode))
+
+
+def is_dark_mode():
+    """現在ダークモードかどうか"""
+    return _is_dark_mode
+
+
+def theme_color(role):
+    """役割名から現在のモードの文字色（16進文字列）を返す。リッチテキスト用"""
+    colors = TEXT_ROLE_COLORS.get(role)
+    if colors is None:
+        print(f"警告: 未定義の文字色役割 '{role}' が指定されました")
+        return '#ffffff' if _is_dark_mode else '#000000'
+    return colors[1 if _is_dark_mode else 0]
+
+
+def set_style_role(widget, prop, value):
+    """QSS 用の動的プロパティを設定し、作成済みウィジェットにも即反映させる"""
+    widget.setProperty(prop, value)
+    style = widget.style()
+    style.unpolish(widget)
+    style.polish(widget)
+    widget.update()
+
+
+def set_text_role(widget, role):
+    """文字色の役割を付ける（None で解除）。色は setStyleSheet に書かないこと"""
+    if role is not None and role not in TEXT_ROLE_COLORS:
+        print(f"警告: 未定義の文字色役割 '{role}' が指定されました")
+    set_style_role(widget, 'textRole', role)
+
+
+def set_panel_role(widget, role):
+    """面（背景・枠）の役割を付ける（None で解除）"""
+    if role is not None and role not in PANEL_ROLE_COLORS:
+        print(f"警告: 未定義の面役割 '{role}' が指定されました")
+    set_style_role(widget, 'panelRole', role)
+
+
+def set_segmented(button):
+    """排他選択ボタンの見た目を付ける"""
+    set_style_role(button, 'segmented', True)
+
+
+def location_button_qss(color=None):
+    """位置ボタンの QSS。color(QColor) を渡すとその位置の色で、None ならグレー表示"""
+    if color is not None:
+        checked = f"""
+            QPushButton:checked {{
+                background-color: {color.name()};
+                color: white;
+                font-weight: bold;
+            }}"""
+        if _is_dark_mode:
+            normal_bg, normal_fg = color.darker(250).name(), '#ffffff'
+        else:
+            normal_bg, normal_fg = color.lighter(140).name(), 'black'
+        border = color.name()
+    else:
+        checked = """
+            QPushButton:checked {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+            }"""
+        if _is_dark_mode:
+            normal_bg, normal_fg, border = '#3a3a3a', '#A8B0B8', '#555555'
+        else:
+            normal_bg, normal_fg, border = '#f0f0f0', '#888888', '#cccccc'
+    return f"""
+        QPushButton {{
+            padding: 8px;
+            border: 1px solid {border};
+            border-radius: 4px;
+            background-color: {normal_bg};
+            color: {normal_fg};
+        }}{checked}
+    """
+
+
+def location_text_color(location_value):
+    """位置情報の色を文字用に返す。ダークでは暗い色（青・紫）が沈むので明るくする"""
+    color = get_location_color(location_value)
+    if _is_dark_mode:
+        h, s, v, a = color.getHsv()
+        color = QColor.fromHsv(h, min(s, 170), max(v, 230), a)
+    return color
+
+
+def tint_group_qss(bg_color, border_color):
+    """設定パネル（QGroupBox）を淡く塗り分ける QSS。ダークでは同系色の暗い面にする"""
+    if _is_dark_mode:
+        bg_color = QColor(bg_color).darker(400).name()
+        border_color = QColor(border_color).darker(250).name()
+    return (
+        "QGroupBox { background-color: %s; border: 1px solid %s;"
+        " border-radius: 6px; margin-top: 8px; padding-top: 6px; font-weight: bold; }"
+        " QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }"
+        % (bg_color, border_color))

@@ -123,7 +123,24 @@ SEGMENTATION_VERTEX_HANDLE_RADIUS = 8
 SEGMENTATION_HOVER_VERTEX_RADIUS = 5
 
 # Speed
-MAX_SPEED = 5  # speed正規化の最大値 (m/s)
+MAX_SPEED = 10  # speed正規化の最大値 (m/s)
+
+# オフライン重み付け BC（強化学習要素）の UI 既定値
+# 詳細: dev/SPEC_offline_rl_throttle.md §4.1 / §6。キーは managers.offline_reward.RewardConfig に対応
+RL_WEIGHT_DEFAULTS = {
+    'method': 'awr',            # 'awr' | 'filtered'
+    'target_head': 'speed',     # 'speed' | 'throttle' | 'both'（speed 出力が無いモデルは throttle）
+    'gamma': 0.97,              # 割引率
+    'beta': 0.7,                # AWR 温度
+    'w_min': 0.1,               # 重み下限
+    'w_max': 5.0,               # 重み上限
+    'top_k': 0.4,               # Filtered BC の上位割合
+    'baseline_mode': 'speed_bin',  # 'speed_bin' | 'global'
+    'episode_gap_s': 1.0,       # エピソード分割の時間間隔 [s]
+    'c_speed': 1.0, 'c_wall': 1.0, 'c_side': 0.5, 'c_slip': 2.0, 'c_stuck': 5.0, 'c_yaw': 0.2,
+    'wall_mm': 1000.0,          # 前方壁ペナルティ開始距離 [mm]
+    'side_mm': 500.0,           # 斜め前壁ペナルティ開始距離 [mm]
+}
 
 # ===========================================
 # 色設定（QColorは使用側で生成）
@@ -222,6 +239,17 @@ SEQ_TCN_DEFAULT_KERNEL_SIZE = 3
 # CausalCNN固有パラメータ
 SEQ_CAUSAL_CNN_DEFAULT_CHANNELS = [64, 128, 256]
 SEQ_CAUSAL_CNN_DEFAULT_KERNEL_SIZE = 3
+
+# LiDAR Policy（2D LiDAR → angle/throttle 1D-CNN。dev/SPEC_lidar_policy.md）
+LIDAR_POLICY_DEFAULT_PRESET = 'base'        # 'base' (ResNet1D-lite) / 'tiny' (TinyLidarNet相当)
+LIDAR_POLICY_DEFAULT_NUM_BINS = 541         # 前処理後のビン数（1081/541/271/108）
+LIDAR_POLICY_DEFAULT_STACK_FRAMES = 3       # 積層フレーム数 K
+LIDAR_POLICY_DEFAULT_MAX_RANGE_MM = 10000.0 # 実機 config.LIDAR_MAX_DISTANCE と合わせる
+LIDAR_POLICY_DEFAULT_MAX_SPEED = 5.0        # 実機 config.F1TENTH_MAX_SPEED と合わせる
+LIDAR_POLICY_DEFAULT_PRED_SECONDS = 1.0     # 補助軌道ヘッドのホライズン [s]
+LIDAR_POLICY_DEFAULT_PRED_POINTS = 10       # 補助軌道ヘッドの点数
+LIDAR_POLICY_DEFAULT_EPOCHS = 30
+LIDAR_POLICY_DEFAULT_BATCH_SIZE = 64
 
 # 後方互換エイリアス
 GRU_DEFAULT_SEQ_LEN = SEQ_DEFAULT_SEQ_LEN

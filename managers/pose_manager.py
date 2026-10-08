@@ -24,7 +24,9 @@ import numpy as np
 # slam: 2D LiDAR SLAM（地図座標系、通常は安定）
 # vslam: Visual/Inertial SLAM（連続的だがドリフトしうる）
 # pose: 車載デッドレコニング＋IMU融合（常時稼働だが長時間でドリフト）
-DEFAULT_PRIORITY = ["aruco", "slam", "vslam", "pose"]
+# fused: 複数ソースを融合した推定値（fused/x, y, theta, status）。現行の記録には
+#        含まれないが、将来のキーとして認識する（データが無ければ候補に出ない）
+DEFAULT_PRIORITY = ["aruco", "fused", "slam", "vslam", "pose"]
 
 OK_STATUSES = {"ok"}
 INTERP_SOURCE = "interp"
@@ -200,6 +202,44 @@ class PoseSourceManager:
             return True
         return (max(xs) - min(xs) < 1e-6) and (max(ys) - min(ys) < 1e-6)
 
+    def source_frame_count(self, source: str, ok_only: bool = True) -> int:
+        """指定ソースのサンプルを持つフレーム数（ok_only=True なら status ok のみ）"""
+        if ok_only:
+            return int(self._source_ok_counts.get(source, 0))
+        return int(self._source_total_counts.get(source, 0))
+
+    def has_extra_field(self, source: str, field: str) -> bool:
+        """指定ソースの extra に field を持つサンプルが1つでもあるか
+
+        pose（IMU デッドレコニング）センサーのみが roll/pitch（車体姿勢角）を持つため、
+        姿勢角度を教師データに使えるかどうかの判定に使う。
+        """
+        for samples in self._raw.values():
+            sample = samples.get(source)
+            if sample is not None and field in sample.extra:
+                return True
+        return False
+
+    def get_source_pose(self, index: int, source: str, require_ok: bool = True,
+                        allow_interp: bool = True) -> Optional[PoseSample]:
+        """指定ソースのサンプルだけを返す（他ソースへはフォールバックしない）
+
+        学習ラベルのように「選んだソースの値だけを使いたい」用途向け。get_pose は
+        優先順位に従って他ソースへ落ちるため、slam を選んでも欠損フレームでは
+        pose が混ざる。補間結果（interpolate_gaps）は allow_interp=True なら返す。
+        """
+        samples = self._raw.get(index)
+        if not samples:
+            return None
+        if allow_interp and index in self._interpolated_indexes and INTERP_SOURCE in samples:
+            return samples[INTERP_SOURCE]
+        sample = samples.get(source)
+        if sample is None:
+            return None
+        if require_ok and not sample.is_ok:
+            return None
+        return sample
+
     def get_pose(self, index: int, prefer: Optional[str] = None) -> Optional[PoseSample]:
         """指定フレームの自己位置を優先順位に従って取得（statusがokのものを優先）
 
@@ -297,6 +337,27 @@ class PoseSourceManager:
             if pose is not None and pose.extra.get("road_condition", 0) == 1:
                 result.add(idx)
         return result
+
+    def frame_speed(self, index: int) -> Optional[float]:
+        """フレーム index の車速 [m/s]（pose/speed → pose/v_imu の順、無ければ None）
+
+        速度は pose センサー行にしか記録されないため、表示ソースが slam/vslam/aruco
+        でも同フレームの pose サンプルから引く（色分け「速度」用）。
+        """
+        samples = self._raw.get(index)
+        if not samples:
+            return None
+        pose = samples.get("pose")
+        if pose is None:
+            return None
+        for key in ("speed", "v_imu"):
+            v = pose.extra.get(key)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    continue
+        return None
 
     def slip_indexes(self, min_slip: float = 1.0) -> Set[int]:
         """スリップが検知されたフレーム集合（pose/slip >= min_slip）
@@ -477,6 +538,37 @@ class PoseSourceManager:
             return 0.0
         d = (p1.theta - p0.theta + math.pi) % (2 * math.pi) - math.pi
         return d / dtau
+
+    def relative_dpose(self, prev_index: int, index: int,
+                       prefer: Optional[str] = None,
+                       max_dt_gap_s: float = 0.5) -> Optional[np.ndarray]:
+        """前フレーム prev_index → フレーム index の ego 相対運動 [dx, dy, dθ]。
+
+        TogiVAD 時系列融合（T1-a）の warp 入力。**実測 pose 差分**から作るので
+        走行軌道表示・学習ラベル（compute_future_trajectory）と同一情報源・同一
+        座標規約になる（速度×dt の近似は使わない）。世界→ego 変換は
+        compute_future_trajectory と同じ式。
+
+        座標: 返り値は **prev フレーム系**（+X 前方 / +Y 左）での並進 (dx, dy) と
+        方位差 dθ（(-π, π]）。dt ギャップ超過・pose 欠落・時刻欠落では None。
+        """
+        t0 = self._timestamps_ms.get(prev_index)
+        t1 = self._timestamps_ms.get(index)
+        if t0 is None or t1 is None:
+            return None
+        dtau = (t1 - t0) / 1000.0
+        if dtau <= 1e-6 or dtau > max_dt_gap_s:
+            return None
+        p0 = self.get_pose(prev_index, prefer=prefer)
+        p1 = self.get_pose(index, prefer=prefer)
+        if p0 is None or p1 is None:
+            return None
+        dx_w, dy_w = p1.x - p0.x, p1.y - p0.y
+        cos_t, sin_t = math.cos(p0.theta), math.sin(p0.theta)
+        dx = dx_w * cos_t + dy_w * sin_t            # 前 ego 系 前方
+        dy = -dx_w * sin_t + dy_w * cos_t           # 前 ego 系 左
+        dth = (p1.theta - p0.theta + math.pi) % (2 * math.pi) - math.pi
+        return np.array([dx, dy, dth], dtype=np.float32)
 
 
 def _interpolate_angle(a: float, b: float, ratio: float) -> float:

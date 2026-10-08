@@ -20,6 +20,11 @@ from .sequence_training_manager import SequenceTrainingManager
 # TogiVAD（軌道語彙分類 E2E。モデル本体はリポジトリ直下の togivad パッケージ）
 from .togivad_training_manager import TogivadTrainingManager, TogivadDataset
 
+# LiDAR Policy（2D LiDAR 点群 → angle/throttle。dev/SPEC_lidar_policy.md 段階1）
+from .lidar_policy_models import LidarPolicyConfig, LidarPolicyNet, LIDAR_POLICY_PRESETS
+from .lidar_policy_dataset import LidarPolicyDataset
+from .lidar_policy_training_manager import LidarPolicyTrainingManager
+
 # 後方互換エイリアス
 GRUSequenceDataset = SequenceDataset
 GRUTrainingManager = SequenceTrainingManager
@@ -34,6 +39,9 @@ __all__ = [
     'SequenceDataset', 'SequenceTrainingManager',
     # togivad
     'TogivadTrainingManager', 'TogivadDataset',
+    # lidar policy
+    'LidarPolicyConfig', 'LidarPolicyNet', 'LIDAR_POLICY_PRESETS',
+    'LidarPolicyDataset', 'LidarPolicyTrainingManager',
     # legacy aliases
     'GRUSequenceDataset', 'GRUTrainingManager',
 ]

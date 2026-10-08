@@ -164,11 +164,95 @@ TRANSLATIONS = {
         # --- ナビゲーション ---
         'btn_reverse_play': '◀逆再生',
         'btn_forward_play': '▶再生',
-        'btn_delete_current': '現在のアノテーション削除',
-        'btn_restore_deleted': '削除状態を復元',
-        'btn_restore_all_deleted': '全ての削除状態を復元',
+        'btn_delete_current': '現在のフレームを削除',
+        'btn_restore_deleted': '現在のフレームを復元',
+        'btn_restore_all_deleted': '全フレームを復元',
+        'btn_delete_reverse': '後進フレーム削除',
+        'tip_delete_reverse': 'throttleが負（後進）のフレームを全て削除済みとしてマークします',
         'btn_current_position': '現在位置',
         'btn_range_delete': '範囲削除',
+
+        # --- マスク（対象プルダウン + 編集ボタン + 表示チェック） ---
+        'label_mask_target': 'マスク:',
+        'opt_mask_target_vehicle': '車両',
+        'opt_mask_target_background': '背景',
+        'opt_mask_add': '＋追加',
+        'opt_mask_delete': 'ー削除',
+        'tip_mask_target': '編集・表示切替の対象マスクを選びます。\n'
+                           '車両: 画像下側の車体領域 / 背景: 背景など任意の領域\n'
+                           '「＋追加」で任意のマスクを増やせます（車両・背景は削除できません）。\n'
+                           '編集中は対象を切り替えられません（「編集」を再度押して確定してください）。',
+        'btn_mask_edit': '編集',
+        'tip_mask_edit': '選択中のマスクのポリゴンを編集します。',
+        'tip_mask_edit_named': '「{0}」のポリゴンを編集します。\n'
+                               '押すと編集モードになり、画像クリックで頂点を追加できます。\n'
+                               '左クリック: 頂点追加 / 頂点をドラッグ: 移動 / 頂点を右クリック: その頂点を削除\n'
+                               '右クリック: 直前の頂点を削除 / Ctrl+右クリック: 全消去\n'
+                               'もう一度「編集」を押すと確定します（学習ダイアログの「マスクを適用」で使用されます）。',
+        'chk_grid_visible': 'グリッド',
+        'section_canvas_scale': 'キャンバス表示倍率',
+        'label_canvas_scale': '表示倍率:',
+        'tip_canvas_scale': ('画像・結合画像・測距図をキャンバスに収めた大きさ（100%）に対する割合。'
+                             '小さくすると周囲に余白ができ、軸ラベルやゲージを広く取れます'),
+        'canvas_range_label': 'レンジ',
+        'canvas_range_tooltip': '測距ソースの表示レンジを拡大/縮小（上=拡大）。画像は常にキャンバスへ自動フィット',
+        'tip_grid_visible': 'angle/throttle 平面のグリッドと目盛りを表示する（画像ソース・測距ソース共通）',
+        'chk_mask_visible': '表示',
+        'tip_mask_visible': '選択中のマスクのオーバーレイ表示をON/OFFします（学習・推論での適用には影響しません）。\n'
+                            '結合表示中は表示位置が合わないため、設定に関わらず自動的に非表示になります。',
+
+        # --- マスクの追加・削除 ---
+        'dlg_add_mask_title': '新規マスクの追加',
+        'label_new_mask_name': 'マスク名:',
+        'placeholder_new_mask_name': '例: 看板',
+        'chk_new_mask_symmetric': '左右対称にする',
+        'tip_new_mask_symmetric': 'ONにすると、打った頂点が中央線の反対側にも自動でミラーされます（車両・背景と同じ挙動）。\n'
+                                  'OFFにすると打った頂点だけでポリゴンを作ります（片側だけの領域を消したい場合はOFF）。',
+        'msg_mask_name_required': 'マスク名を入力してください。',
+        'msg_mask_name_duplicate': '「{0}」は既に存在します。別の名前を入力してください。',
+        'msg_confirm_delete_mask': 'マスク「{0}」を削除しますか？\nこの操作は元に戻せません。',
+        'status_mask_added': 'マスク「{0}」を追加しました',
+        'status_mask_deleted': 'マスク「{0}」を削除しました',
+        'status_mask_builtin_undeletable': '車両・背景は組み込みマスクのため削除できません',
+
+        # --- マスク編集のステータス ---
+        'status_mask_edit_on': '「{0}」編集中: 左クリックで頂点追加 / ドラッグで頂点移動 / 右クリックで頂点削除 / Ctrl+右クリックで全消去 / 「編集」再押下で確定',
+        'status_mask_set': '「{0}」を設定しました（頂点: {1}点 → ポリゴン {2}点）',
+        'status_mask_cleared': '「{0}」の頂点をクリアしました',
+        'status_mask_point_added': '「{0}」の頂点を追加しました（{1}点）',
+        'status_mask_point_removed': '「{0}」の頂点を削除しました（残り{1}点）',
+        'status_mask_combined_blocked': '結合表示中はマスクの表示・編集はできません（単一画像表示に切り替えてください）',
+
+        # --- 学習ダイアログのマスク適用 ---
+        'chk_use_mask': '「{0}」マスクを適用（該当領域を無視）',
+        'tip_use_mask': '設定済みのマスク領域を黒塗りにして学習します。\nマスクはモデルに保存され、推論時にも自動的に同じマスクが適用されます。',
+        'label_mask_info': '　{0}頂点の閉ポリゴン（マスク領域は黒塗りで無視されます）',
+        'label_mask_not_set': 'マスク未設定（解像度スライダー右の「マスク」プルダウンで対象を選び「編集」ボタンで設定できます）',
+        'chk_custom_future_frames': '予測フレームを指定',
+        'tip_custom_future_frames': '将来予測（angle/throttle/speed）を何フレーム先まで出力するかをカンマ区切りで2つ指定します（例: 5,10）。\n'
+                                    '未指定またはチェックOFFの場合は5,10フレーム先を予測します。\n'
+                                    '指定値はモデルに保存され、推論表示にも反映されます。',
+        'label_future_frames_unit': 'フレーム先（カンマ区切りで2つ）',
+        'msg_invalid_future_frames': '予測フレームの指定が不正です。\n正の整数を2つ、カンマ区切りで入力してください（例: 5,10）。',
+        'tip_speed_seek_graph': 'speedの推移グラフ（薄い山）。赤マークはspeed欠損フレーム。\nクリック/ドラッグでシークできます。',
+        'chk_pip_embed': '画像埋込',
+        'tip_pip_embed': '選択した別ソースの画像（例: lidar BEV）を縮小してベース画像に埋め込み、\n'
+                         '1枚の画像として既存のシングルソースモデルで学習します。\n'
+                         '埋込設定はモデルに保存され、推論時にも同じ合成が自動適用されます。\n'
+                         '※ マルチソース・仮想ソースとは併用できません。',
+        'label_pip_source': '埋込画像:',
+        'label_pip_position': '埋込位置:',
+        'opt_pip_pos_mask': '車両マスク位置（デフォルト）',
+        'opt_pip_pos_coords': '座標指定',
+        'label_pip_rect': 'x, y, 幅, 高さ（0-1）:',
+        'label_pip_note': '※ 車両マスク位置: マスク外形の矩形に合わせて埋め込みます（マスクで捨てた領域を再利用）',
+        'msg_pip_requires_single': '画像埋込はマルチソース・仮想ソースと併用できません。\n'
+                                   '画像ソースを1つだけ選択し、仮想ソースタイプを「なし」にしてください。',
+        'msg_pip_no_mask': '埋込位置が「車両マスク位置」ですが、車両マスクが未設定です。\n'
+                           '「マスク: 車両」＋「編集」ボタンでマスクを設定するか、「座標指定」を選択してください。',
+        'msg_pip_no_source_images': '埋込ソース「{0}」の画像が見つかりません。\n'
+                                    'データフォルダに該当ソースの画像が含まれているか確認してください。',
+        'msg_pip_invalid_rect': '埋込領域の幅と高さは0より大きい値を指定してください。',
 
         # --- ダウンサンプリング ---
         'btn_detect': '検出',
@@ -186,11 +270,79 @@ TRANSLATIONS = {
         'label_image_count': '画像 {0} of {1}:{2}',
         'label_deleted_suffix': '[削除済み]',
         'label_image_source': '画像ソース',
+        'image_source_lidar': '測距',
+        'tip_image_source_lidar': ('測距データを表示する: LiDAR 生スキャン（極座標: 自車=中心・前方=上、'
+                                   'または角度×距離のプロファイル）。無効ビーム・過去フレーム積層・'
+                                   'モデル入力（前処理後）と、catalog の測距ゾーン値（lidar/ または '
+                                   'ultrasonic/ の RrLH,FrLH,FrFR,FrRH,RrRH）を monitor と同じ扇形で確認できる。'
+                                   '運転アノテーション点・推論点は画像ソースと同じ angle/throttle 平面で'
+                                   '重ねて表示・クリック編集できる。lidar/*.npy か測距ゾーン値がある時のみ選択可'),
+        'label_lidar_layers_only': '測距表示:',
+        'tip_lidar_layers_only': '画像ソースで 測距 を選択しているときのみ有効',
+        'opt_lidar_view_polar': '極座標',
+        'opt_lidar_view_profile': '距離プロファイル',
+        'label_lidar_view_range': 'レンジ',
+        'chk_lidar_zones': '測距ゾーン',
+        'tip_chk_lidar_zones': ('catalog の lidar/ または ultrasonic/ の RrLH,FrLH,FrFR,FrRH,RrRH を'
+                                'togikaidrive monitor と同じ扇形で描く（<300mm 赤 / <600mm 黄 / 緑）。'
+                                'UST20 は config の ZONE_INDEX と同じ角度範囲'),
+        'chk_lidar_points': '生点群',
+        'tip_chk_lidar_points': '現フレームの全ビームを距離で着色して描く（橙=近, 青=遠）。無効ビームは灰のマーク',
+        'chk_lidar_history': '過去フレーム',
+        'tip_chk_lidar_history': 'LiDAR Policy の積層フレーム数 K に合わせて過去 K-1 フレームを薄く重ねる',
+        'chk_lidar_model_input': 'モデル入力',
+        'tip_chk_lidar_model_input': ('学習と同じ前処理（min-pool間引き・レンジ・無効マスク）を通した'
+                                      'ビン列を黄の折れ線で描く。LiDAR Policy モデル読込中はその設定を使う'),
+        'lidar_view_no_scan': 'このフレームの測距データ（lidar/*.npy・測距ゾーン値）がありません',
+        'lidar_legend_zones': '測距ゾーン（{}/）',
+        'lidar_view_profile_axis': '角度（0°=前方, +=左）',
+        'lidar_legend_points': '生点群（橙=近 → 青=遠）',
+        'lidar_legend_invalid': '無効ビーム',
+        'lidar_legend_history': '過去 {} フレーム',
+        'lidar_legend_model': 'モデル入力（{} bin）',
+        'lidar_legend_inference': '推論アーク',
+        'lidar_stat_beams': '{} beams / 有効 {}%',
+        'lidar_stat_min': '最小 前{} 左{} 右{}',
+        'lidar_stat_stack': '積層 K={}（複製 {}）',
         'image_source_bev': 'BEV',
         'tip_image_source_bev': '真上から見た図（BEV）。操舵軌道(赤)・走行軌道(緑)・予測軌道(シアン)をego座標のまま俯瞰表示する。各軌道の表示ON/OFFは既存のチェックボックスに連動。pose/slam がある時のみ選択可',
         'bev_legend_steering': '操舵軌道',
         'bev_legend_recorded': '走行軌道(実測)',
         'bev_legend_prediction': '予測軌道',
+        'chk_bev_camera': 'CAM投影',
+        'chk_bev_occupancy': '障害物',
+        'chk_bev_boundary': '境界',
+        'chk_bev_agents': '他車',
+        'bev_legend_occupancy': '障害物(LiDAR)',
+        'bev_legend_boundary': 'コース境界(左)',
+        'bev_legend_boundary_r': 'コース境界(右)',
+        'bev_legend_agent': '他車②',
+        'yolo_auto_annot_menu': 'YOLO自動アノテーション(他車/セグ)',
+        'yolo_auto_annot_title': 'YOLO自動アノテーション',
+        'yolo_auto_annot_model': 'モデル',
+        'yolo_model_loaded_det': '読込済みモデル(検出)',
+        'yolo_model_loaded_seg': '読込済みモデル(セグ)',
+        'yolo_model_dl_tag': 'DL',
+        'yolo_model_dl_failed': 'モデルのダウンロード/読み込みに失敗しました。ネット接続を確認してください。',
+        'yolo_auto_annot_task': 'タスク',
+        'yolo_auto_annot_detect': '物体検出(矩形)',
+        'yolo_auto_annot_segment': 'セグメンテーション',
+        'yolo_auto_annot_src': '元クラス(カンマ区切り)',
+        'yolo_auto_annot_tgt': '変換先クラス',
+        'yolo_auto_annot_conf': '信頼度しきい値',
+        'yolo_auto_annot_all': '全フレームに実行（OFFで現フレームのみ）',
+        'yolo_auto_annot_replace': '既存のAI自動アノテーションを置換（手動分は保持）',
+        'yolo_auto_annot_hint': ('学習済みYOLOで他車を自動検出し、元クラスを「変換先クラス」'
+                                 '(既定 opponent)へ写像してアノテーションします。\n'
+                                 'モデルは上の「モデル」から選択。手元に無ければ末尾(DL)の'
+                                 'yolov8n.pt 等を選ぶと自動ダウンロードして models に保存します'
+                                 '（COCO事前学習で car/truck/bus/motorcycle を検出）。\n'
+                                 'opponent 矩形はマップビューの「他車ラベルを計算して保存(②)」'
+                                 'で togivad/agents に変換され②の学習に使えます。'),
+        'yolo_auto_annot_no_model': ('YOLOモデルが読み込まれていません。先に「YOLOモデル読込」'
+                                     'で検出/セグモデルを読み込んでください。'),
+        'yolo_auto_annot_running': 'YOLO推論でアノテーション中...',
+        'yolo_auto_annot_result': '自動アノテーション完了: {0}個 / {1}フレーム',
 
         # --- 自動運転モデル ---
         'label_pilot_model_select': 'モデルタイプ:',
@@ -391,8 +543,21 @@ TRANSLATIONS = {
         'label_display_mode': '表示モード:',
         'label_mode_hint': '※Bキーを押すとモードが切り替わります',
         'label_location_info': 'コースの位置情報:',
-        'label_current_location': '現在の位置情報: なし',
-        'label_current_location_value': '現在の位置情報: {0}',
+        'label_current_location': '現在: なし',
+        'label_current_location_value': '現在: 位置{0}',
+        'label_new_location_id': '追加する位置ID:',
+        'tip_toggle_location_info': 'コースの位置情報パネルを展開/折り畳みします',
+        'tip_loc_mode_position': '位置ボタンを「位置 N」の通し番号で表示します',
+        'tip_loc_mode_corner': '位置ボタンをコーナー形状（ストレート/30°〜180°）で表示します',
+        'label_overlay_group': '表示オーバーレイ',
+        'label_bev_layers_only': 'BEVレイヤ:',
+        'tip_bev_layers_only': '画像ソースを BEV（真上から見た図）に切り替えたときだけ有効になります',
+        'btn_camera_geometry': '⚙ 変更',
+        'tip_camera_geometry': 'カメラ幾何（最大舵角/カメラ俯角/画角FOV/カメラ高）の設定を開きます',
+        'dlg_camera_geometry': 'カメラ幾何の設定',
+        'label_camera_geometry_info': '軌道を画像へ投影するときに使う車両・カメラの物理パラメータです。'
+                                      'セッション中はほぼ固定のため、ここでまとめて設定します。',
+        'label_camera_geometry_summary': '舵角 {0}° / 俯角 {1}°\nFOV {2}° / 高 {3}m',
         'label_gallery': 'ギャラリー:',
         'label_deleted': '削除済',
 
@@ -522,10 +687,28 @@ TRANSLATIONS = {
         'chk_show_driving_direction': '走行方向を表示',
         'chk_show_auto_driving_direction': '操舵軌道を表示（赤）',
         'chk_show_recorded_trajectory': '走行軌道を表示（緑）',
+        'chk_use_all_sources': '全画像ソースのアノテーションを学習に使う',
+        'tip_use_all_sources': 'OFF: 表示中の画像ソース(cam0など)のアノテーションだけを学習・エクスポートに使う\n'
+                               'ON : 読み込み済みの全ソースのアノテーションをまとめて使う',
+        'label_source_summary': 'アノテーション: {0}（学習対象: {1}）',
+        'label_source_count_bbox': '物検{0}枚',
+        'label_source_count_seg': 'セグ{0}枚',
+        'label_scope_all_sources': '全ソース',
+        'label_scope_current_source': '表示中のソースのみ',
         'chk_apply_last_bbox': '前回のバウンディングボックスを適用',
         'chk_apply_last_segmentation': '前回のセグメンテーションを適用',
         'chk_auto_skip_on_click': 'クリック時自動スキップ枚数',
         'chk_apply_location': '前回の位置情報を適用',
+        # 位置クラス情報（内容記載・保存）
+        'btn_save_location_classes': '位置クラス情報を保存',
+        'tip_save_location_classes': '各位置クラスの内容をJSONファイルに保存します（togikaidriveで再利用できます）',
+        'placeholder_location_class': 'クラス内容を記載',
+        'tip_location_class_input': 'この位置クラスの内容（例: 直線、右コーナー）を記載します',
+        'dlg_save_location_classes': '位置クラス情報の保存先を選択',
+        'dlg_save_complete': '保存完了',
+        'msg_no_location_classes': '保存する位置クラスがありません。',
+        'msg_location_classes_saved': '位置クラス情報を保存しました:\n{0}',
+        'msg_location_classes_save_failed': '位置クラス情報の保存に失敗しました: {0}',
         'chk_detection_inference': '物体検知推論結果表示',
         'chk_early_stopping': 'Early Stopping を有効にする',
         'chk_data_augmentation': 'データオーグメンテーションを有効にする',
@@ -548,6 +731,33 @@ TRANSLATIONS = {
         'chk_show_inference_result': '推論結果を表示する（水色丸）',
         'chk_show_diff_vector': '差分ベクトルを表示（緑矢印）',
         'chk_add_speed_output': 'Speed（速度）を出力に追加',
+        # オフライン重み付け BC（dev/SPEC_offline_rl_throttle.md）
+        'label_rl_weight_settings': 'オフライン重み付け (RL)',
+        'chk_rl_weight_enable': '走行ログの報酬に基づくサンプル重み付けを有効化',
+        'tip_rl_weight_enable': '速度・壁距離・slip 等から報酬→リターン→アドバンテージを計算し、良い運転のフレームほど speed/throttle 出力の損失を重くします（angle は等重み）',
+        'label_rl_weight_info': '既存ログだけで RL の考え方を導入します。検証損失は重み無しで計算されるため従来モデルと比較できます。詳細: dev/SPEC_offline_rl_throttle.md',
+        'label_rl_method': '方式',
+        'label_rl_target': '対象ヘッド',
+        'label_rl_clip': 'clip',
+        'label_rl_topk': '上位k%',
+        'label_rl_baseline': 'ベースライン',
+        'label_rl_gap': 'エピソード分割 [s]',
+        'label_rl_coeffs': '報酬係数:',
+        'label_rl_thresholds': '壁閾値 [mm]:',
+        'rl_method_awr': 'AWR  w=exp(A/β)',
+        'rl_method_filtered': 'Filtered BC（上位k%）',
+        'rl_target_speed': 'speed（推奨）',
+        'rl_target_throttle': 'throttle',
+        'rl_target_both': 'both',
+        'rl_baseline_speed_bin': '速度ビン平均',
+        'rl_baseline_global': '全体平均',
+        'btn_rl_preview': '重み分布をプレビュー',
+        'label_rl_no_speed': '※ speed データが無いため対象は throttle 固定です。速度報酬は enc/speed が無い場合 0 になります',
+        'dlg_rl_preview': 'オフライン重み付けプレビュー',
+        'label_rl_top_frames': '上位フレーム（重みが大きい = 良い運転と判定）',
+        'label_rl_bottom_frames': '下位フレーム（重みが小さい）',
+        'label_rl_term_contrib': '報酬項の平均寄与',
+        'msg_rl_no_annotations': '重み計算の対象となるアノテーションがありません',
         'chk_add_future_prediction': '将来フレームの予測を出力に追加',
         'chk_exclude_downsampled': 'ダウンサンプリング対象を除外',
         'chk_overwrite_annotation': '既存のアノテーションを上書きする',
@@ -604,10 +814,13 @@ TRANSLATIONS = {
         'label_speed_normalize_note': '※ Speed値はこの値で除算されます',
         'label_future_info': '※ 5フレーム先と10フレーム先のangle, throttle(, speed)を追加出力',
         'label_future_detail': '出力例（speed有）: [angle, throttle, speed, t+5_angle, t+5_throttle, t+5_speed, t+10_angle, t+10_throttle, t+10_speed]',
-        'chk_future_label_output': '将来フレームを出力',
-        'tip_future_label_output': '現在フレームの入力に対して N フレーム先のアノテーションをラベルとして学習します。\n将来フレームが削除済みの場合、その画像は学習対象から除外されます。',
-        'label_future_label_frames': 'フレーム先のアノテーションを出力',
-        'label_future_label_info': '※ 現在フレームの画像入力に対して N フレーム先のアノテーションを出力として学習（削除フレームは除外）',
+        'chk_future_label_output': 'ラベルをNフレーム先にずらす（遅延補償）',
+        'tip_future_label_output': '現在フレームの画像入力に対して N フレーム先のアノテーションを正解ラベルとして学習します。\n'
+                                   '出力数は増えず、モデルが「少し先の操作」を出力するようになるため、推論遅延の補償に使えます。\n'
+                                   '（「将来フレームの予測を出力に追加」とは別機能です）\n'
+                                   '将来フレームが削除済みの場合、その画像は学習対象から除外されます。',
+        'label_future_label_frames': 'フレーム先のアノテーションをラベルに使用',
+        'label_future_label_info': '※ 出力数は変えずにラベルだけNフレーム先へずらす遅延補償用の設定（削除フレームは除外）',
         'label_min_delta': '最小改善量:',
         'label_validation_ratio': '検証データ割合:',
         'label_skip_count': 'スキップ枚数:',
@@ -1014,6 +1227,118 @@ TRANSLATIONS = {
 
         # 位置モデル関連
         'msg_need_location_annotations': '位置モデルを学習するには位置アノテーションが必要です。',
+        'msg_need_location_or_pose': '位置モデルを学習するには位置アノテーション、または自己位置データ（pose/slam 等）が必要です。',
+        'btn_location_inference_all': '全画像を推論',
+        'tip_location_inference_all': '読み込み済みの位置モデルで全画像を推論します。\n結果は情報パネルと走行軌跡マップ（推論位置マーカー / 色分け「推論クラス」）で確認できます。',
+        'msg_location_inference_all_progress': '位置推論中... {0}/{1}',
+        'status_location_inference_all_done': '位置推論が完了しました: {0}/{1}枚',
+        'status_location_inference_all_cancelled': '（キャンセル）',
+        'msg_need_pose_for_regression': '座標・姿勢回帰を学習するには自己位置データ（pose/slam 等）を含む記録が必要です。',
+        # 位置モデル学習: 入力画像ソース / 出力（教師データ）
+        'label_location_input_sources': '入力画像ソース',
+        'label_location_input_sources_info': '複数ソースを選択すると各画像を同時入力して特徴融合します。単一ソースでは仮想ソース（クロップ/スケール/時間差スタック）を生成できます。',
+        'label_location_source_count': '選択中: {0}ソース / モデル入力枚数: {1}枚',
+        'label_location_output_settings': '出力（教師データ）',
+        'label_location_output_info': '位置クラス分類と座標・姿勢回帰を選択できます（両方選択でマルチタスク学習）。',
+        'chk_location_output_class': '位置クラス分類（位置ボタンのアノテーション: {0}クラス）',
+        'tip_location_output_class_disabled': '位置クラスが2種類以上アノテーションされていません',
+        'chk_location_output_pose': '座標・姿勢回帰（pose/slam の自己位置を教師データに使用: {0}フレーム）',
+        'tip_location_output_pose_disabled': 'このセッションには自己位置データ（pose/slam/vslam/aruco）がありません',
+        'label_location_pose_source': '自己位置ソース:',
+        'label_location_pose_source_item': '{0} ({1}フレーム)',
+        'tip_location_pose_source': '教師データに使う自己位置ソース（既定 slam: map 座標系の絶対位置）。\n'
+                                    'このセッションで有効なソース（aruco / fused / slam / vslam / pose）のみ表示し、括弧内は status ok のフレーム数です。\n'
+                                    '学習ラベルには選んだソースの値だけを使い、そのフレームに無ければ除外します（他ソースは混ぜません）。\n'
+                                    '欠損が多い場合はマップビューの「欠損補間」で埋めてから学習できます。',
+        'chk_location_include_heading': '姿勢（方位 θ）も出力に含める',
+        'tip_location_include_heading': 'ONの場合、出力は x, y, cosθ, sinθ の4次元。OFFの場合は x, y の2次元',
+        'chk_location_heading_from_pose': '方位(θ)は pose センサーから取得する（自己位置ソースの代わりに）',
+        'tip_location_heading_from_pose': 'OFF（既定）: 方位(θ)の教師データは座標(x, y)と同じ自己位置ソース（上の「自己位置ソース」欄で選択中、例 slam）の値を使います。\n'
+                                         'ON: 方位(θ)だけは選択中のソースに関わらず pose（デッドレコニング＋IMU）センサーの値を使います。\n'
+                                         'pose は再ローカライズのテレポートが無く連続的なため、座標は slam 等の絶対位置、方位は pose の滑らかな値を使いたい場合に有効にします。',
+        'tip_location_heading_from_pose_disabled': 'このセッションに pose センサーの記録がないため選択できません。',
+        'chk_location_include_attitude': '車体姿勢角（roll, pitch）も出力に含める',
+        'tip_location_include_attitude': 'pose センサー（IMU デッドレコニング）が記録した車体の傾き（roll, pitch）を'
+                                         '教師データに追加します。自己位置ソースに slam 等を選んでいても、'
+                                         'roll/pitch は常に pose センサーの記録から取得します。\n'
+                                         'ONの場合、座標・姿勢出力にさらに roll, pitch の2次元が加わります。',
+        'tip_location_include_attitude_disabled': 'このセッションの pose センサー記録に roll/pitch（車体姿勢角）が'
+                                                  '含まれていないため選択できません。',
+        'label_location_pose_loss_weight': '座標・姿勢損失の重み:',
+        'tip_location_pose_loss_weight': 'マルチタスク学習時の損失 = クラス分類損失 + 重み × 座標・姿勢損失',
+        'label_location_pose_note': '※ 座標は map 座標系[m]、方位は rad で学習し、正規化パラメータはモデルに保存されます。座標・姿勢回帰では左右反転オーグメンテーションは無効になります。',
+        'label_location_result_output_mode': '出力モード: {0}',
+        'opt_location_output_class': 'クラス分類',
+        'opt_location_output_pose': '座標・姿勢回帰',
+        'opt_location_output_class_pose': 'クラス分類 + 座標・姿勢回帰',
+        'opt_location_head_class': 'クラス分類',
+        'opt_location_head_pose': '座標・姿勢回帰',
+        'opt_location_head_grid': '格子分類',
+        # 格子分類（x, y を格子セルに離散化して分類）
+        'chk_location_output_grid': '格子分類（x, y を格子に離散化し、どのセルにいるかを分類）',
+        'tip_location_output_grid': '自己位置の x, y を一辺 [m] の格子に区切り、セル index をクラスとして学習します。\n推論では Top-N セルの確率と、Top1 セル中心 / Top1〜N の確率重み付き平均座標を表示できます。',
+        'label_location_grid_cell_size': 'セル一辺:',
+        'label_location_grid_loss_weight': '格子損失の重み:',
+        'label_location_grid_preview': '格子: 約 {0} x {1} = {2} セル（自己位置の範囲から算出）',
+        # 過去の座標・姿勢の時系列入力
+        'chk_location_pose_history': '過去の座標・姿勢を入力に加える（時系列）',
+        'tip_location_pose_history': '過去 N ステップ（間隔フレームごと）の自己位置 [x, y, θ] を画像特徴と一緒にモデルへ入力します。\n学習時は実測の自己位置にノイズを加えて入力し、推論時は実測または過去フレームの推論結果を履歴として使えます。',
+        'label_location_history_steps': 'ステップ数:',
+        'label_location_history_interval': '間隔:',
+        'label_location_history_noise': '学習時ノイズ σ (座標 / 方位):',
+        'label_location_history_drop': '履歴欠損率:',
+        'label_location_history_note': '※ 履歴に頼りすぎて画像を見なくなるのを防ぐため、学習時は座標・方位にノイズを加え、一定確率で履歴を欠損させます。推論時に履歴が無いフレームは欠損として扱われます。',
+        'chk_location_history_from_inference': '履歴に推論結果を使用（実機動作の模擬）',
+        'tip_location_history_from_inference': 'ON: 過去フレームの推論結果（推定座標）を履歴として入力します（無いフレームは実測で補完）。\nOFF: 学習時と同じ実測の自己位置を履歴に使います。\n再生や「全画像を推論」でフレーム順に推論すると推定の積み上がりを確認できます。',
+        'label_location_history_info': '履歴入力: {0}（有効 {1}/{2} ステップ）',
+        'label_location_history_src_measured': '実測',
+        'label_location_history_src_inference': '推論結果',
+        'label_location_result_history': '履歴入力: {0}ステップ x {1}フレーム間隔（学習ノイズ σ={2} m / {3}°, 欠損率 {4}）',
+        # LiDAR 点群（距離スキャン）の追加入力
+        'chk_location_lidar': 'LiDAR点群データを入力に追加する',
+        'tip_location_lidar': '同セッションの LiDAR 距離スキャン（lidar/*.npy）を、軽量な1D-CNNで符号化して'
+                              '画像特徴と一緒にモデルへ入力します。前処理（間引き・正規化・無効値マスク）は'
+                              'LiDAR Policy モデルと同じコードを使用します。',
+        'tip_location_lidar_disabled': 'このセッションには LiDAR 記録（lidar/*.npy）がないため選択できません。',
+        'label_location_lidar_note': '※ LiDAR に頼りすぎて画像を見なくなるのを防ぐため、学習時は一定確率でスキャン全体を欠損させます。積層フレーム数を1にすると現フレームのみを使用します。',
+        'label_location_lidar_info': 'LiDAR入力: 積層 {1}フレーム中 {0}フレームにスキャンあり',
+        'label_location_result_lidar': 'LiDAR入力: {0}ビン x {1}フレーム積層（間隔 {2}フレーム）',
+        'label_location_result_skipped_lidar': '除外: LiDARスキャンなし {0}件',
+        'label_location_grid_sigma': 'ラベル平滑化 σ (セル):',
+        'tip_location_grid_sigma': '真値座標を中心とするガウス分布で近傍セルにも確率を配って学習します（0 = one-hot）。\n空間的な近さを学びやすくなり、Top-N の重み付き平均が意味を持ちます。',
+        'chk_location_grid_balance': 'セル頻度で重み付け',
+        'tip_location_grid_balance': '停車区間などフレームが集中するセルに予測が偏らないよう、真値セルの出現頻度の逆数（平方根）で損失を重み付けします。\nOFF にすると「どのフレームでも最頻セルを予測する」崩れが起きやすくなります。',
+        'label_location_topn': 'Top-N:',
+        'tip_location_topn': '格子分類で表示・重み付けに使う上位セル数',
+        'opt_location_grid_top1': 'Top1 セル',
+        'opt_location_grid_weighted': 'Top1〜N 重み付き',
+        'tip_location_grid_mode': '推定位置の決め方: Top1 セルの中心 / Top1〜N セル中心の確率重み付き平均',
+        'label_location_grid_weighted_n': 'Top1〜{0} 重み付き',
+        'label_location_grid_result': '格子推定（{0}）: x={1} m, y={2} m',
+        'label_location_grid_top1': 'Top1 セル ({0}, {1}) p={2} → x={3}, y={4}',
+        'label_location_grid_error': '実測との誤差: Top1 {0} m / Top1〜{1} 重み付き {2} m',
+        'label_location_grid_rank': '{0}位: セル ({1}, {2}) p={3}',
+        'label_location_result_grid_acc': '最良検証格子精度: {0}%',
+        'label_location_result_grid_error': '最良検証格子位置誤差: Top1 {0} m / Top1〜{1} 重み付き {2} m',
+        'label_location_result_grid': '格子: セル {0} m, {1} x {2} = {3} セル',
+        'label_location_result_pos_error': '最良検証位置誤差: {0} m',
+        'label_location_result_heading_error': '最良検証方位誤差: {0}°',
+        'label_location_result_attitude_error': '最良検証姿勢角誤差: {0}°',
+        'label_location_result_skipped': '除外: 自己位置なし {0}件 / 入力画像不足 {1}件',
+        'label_location_result_skipped_attitude': '除外: 姿勢角度（roll/pitch）データなし {0}件',
+        'label_location_result_skipped_heading': '除外: pose センサーの方位(θ)データなし {0}件',
+        'label_location_result_pose_source': '自己位置ソース: {0} (方位: {1})',
+        'label_location_result_heading_from_pose': '方位(θ): 自己位置ソースではなく pose センサーから取得して学習',
+        'label_location_result_attitude_on': '姿勢角度（roll/pitch）: pose センサーから取得して学習',
+        'label_location_result_inputs': '入力画像枚数: {0} ({1})',
+        'label_location_resolution_info': '自動運転モデルと同様に実画像サイズで学習します。スライダーで入力サイズを縮小（サイズ縮小）またはサイズを維持したまま画質を劣化（ピクセレーション）できます。',
+        'label_location_resolution_size': '元画像 {0}x{1} → 学習入力サイズ {2}x{3}',
+        'label_location_result_input_size': '学習入力サイズ: {0}x{1} ({2})',
+        'label_location_pose_result': '推定座標: x={0} m, y={1} m, θ={2}',
+        'label_location_pose_error': '実測との誤差: 位置 {0} m / 方位 {1}°',
+        'label_location_pose_error_pos_only': '実測との誤差: 位置 {0} m',
+        'label_location_attitude_result': '推定姿勢角: roll={0}°, pitch={1}°',
+        'label_location_attitude_error': '実測(poseセンサー)との誤差: roll {0}° / pitch {1}°',
         'msg_need_at_least_2_locations': '位置モデルを学習するには少なくとも2つの異なる位置ラベルが必要です。現在: {0}種類',
         'msg_no_valid_location_annotations': '有効な位置アノテーションがありません。',
         'msg_preparing_location_training': "位置モデル '{0}' の学習データを準備中...",
@@ -1092,7 +1417,7 @@ TRANSLATIONS = {
         'unit_seconds_suffix': ' 秒',
         'unit_seconds_label': '秒',
         'unit_points_label': '点',
-        'tip_recorded_traj_source': '走行軌道(緑)の自己位置ソース。既定 pose（デッドレコニングで滑らか）。slam は絶対位置だが再ローカライズのテレポートで補完できず軌道が途切れるフレームが多い。TogiVADモデル読込時はそのモデルの学習ソースへ同期',
+        'tip_recorded_traj_source': '走行軌道(緑)の自己位置ソース。既定 pose（デッドレコニングで滑らか）。slam は絶対位置だが再ローカライズのテレポートで軌道が途切れるフレームが多い。vslam は Visual SLAM（連続的だがドリフトしうる。未記録セッションでは原点に潰れる）。TogiVADモデル読込時はそのモデルの学習ソースへ同期',
         'tip_recorded_traj_seconds': '走行軌道を表示する時間窓[秒]（dt=秒数/点数）。TogiVADモデル読込時はそのモデルの秒数(horizon×dt)へ自動同期し、推論軌道と同じ時間窓で比較できる',
         'tip_recorded_traj_points': '走行軌道の標本点数（空欄で20点。dt=秒数/点数）。TogiVADモデル読込時はそのモデルのhorizon/dt/pose_sourceに自動同期し推論軌道と同じ標本点になる',
         'tip_auto_max_steering': '操舵軌道表示に使用する最大舵角（度）',
@@ -1258,7 +1583,7 @@ TRANSLATIONS = {
         'btn_reverse_play': '◀逆再生',
         'dlg_waypoint_shortage': 'Waypoint不足',
         'msg_waypoint_shortage': '現在の画像には{0}個のwaypointが配置されていますが、\n{1}個必要です。\n\n残り{2}個のwaypointを配置してから次の画像に進んでください。\n\n※配置を中止する場合は、Deleteキーで全てのwaypointを削除してください。',
-        'msg_cannot_set_location_deleted': '削除済みの画像には位置情報を設定できません。\n先に「削除状態を復元」を実行してください。',
+        'msg_cannot_set_location_deleted': '削除済みの画像には位置情報を設定できません。\n先に「現在のフレームを復元」を実行してください。',
 
         # Databricks/Colab関連
         'tip_keep_current_input': '現在の入力内容を保持',
@@ -1620,6 +1945,50 @@ Google Cloud Console での OAuth設定手順
         'label_vocab_size': '軌道語彙数 K',
         'chk_vocab_from_logs': '語彙をログから構築（k-means）',
         'label_ego_dropout': 'ego ドロップアウト',
+        'chk_togivad_residual': '残差回帰で脱量子化（T1-b・ADE改善）',
+        'tip_togivad_residual': ('選択語彙に残差(オフセット)を回帰して 6.25cm '
+                                 '量子化を脱する。分類の頑健さを保ったまま軌道の'
+                                 '連続精度が上がる。ONNXに traj_residual 出力が付く'),
+        'chk_togivad_temporal': '時系列BEV融合（T1-a・pose-warp）',
+        'tip_togivad_temporal': ('前フレームBEVを実測pose差分でwarpして融合する。'
+                                 '記録の連続フレームと _timestamp_ms 由来の実dtで'
+                                 '2フレーム展開学習する（走行軌道表示と同一情報源）。'
+                                 'ONNXに prev_bev/ego_dpose 入力と bev_state 出力が付く'),
+        'chk_togivad_lidar': 'LiDAR占有をBEV融合（Fusion）',
+        'tip_togivad_lidar': ('LiDAR占有ラスタ (1ch) をカメラBEVと1×1convで融合する'
+                              '（TogiVAD-Fusion）。遮蔽・白飛び時も直接測距で壁/他車'
+                              'の位置が裏付けられる。LiDAR記録のあるセッションが必要'
+                              '（欠損フレームはゼロ=無情報）。ONNXに lidar_bev 入力が付く'),
+        'chk_togivad_control': '制御入出力（Pilot・angle/throttle直接出力）',
+        'chk_togivad_control_trj': '軌道入力制御（Pilot-Trj・学習トラッカー）',
+        'tip_togivad_control_trj': ('推論された**最終軌道**（マスク・スコア適用後）を'
+                                    '入力に (angle, throttle) を出す学習トラッカー'
+                                    '（TogiVAD-Pilot-Trj）。教師は「GT走行軌道↔当時の'
+                                    '運転アノテーション」で全フレームに完備。Pilot とは'
+                                    '排他。実行時は軌道選択と制御が常に一致し、'
+                                    'ONNXグラフは不変（numpy評価＋sidecar）'),
+        'tip_togivad_control': ('直前指令を ego 入力に加え、走行軌道を考慮した '
+                                '(angle, throttle) を直接出力する（TogiVAD-Pilot）。'
+                                '損失=模倣L1＋pure-pursuit整合＋平滑。運転アノテーション'
+                                '（angle/throttle）が必要。実行時は traj/pilot/blend '
+                                'の3モードで切替（pure pursuit は安全フォールバック）'),
+        'chk_togivad_world': '世界モデル自己教師（T2-a・少データ汎化）',
+        'tip_togivad_world': ('「現在のBEVトークン＋選択軌道→次フレームのBEV'
+                              'トークン」を予測する補助損失（LAW/DriveWorld-lite）。'
+                              '教師は次フレーム画像そのもの＝アノテーション不要。'
+                              '表現学習でデータ効率が上がる。学習専用ヘッドのため'
+                              'ONNX・推論コストは不変（推論コスト0）'),
+        'chk_togivad_agent_motion': '他車動き予測（②・要 他車ラベル）',
+        'tip_togivad_agent_motion': ('マルチモーダル他車動き予測（K\'モード×T_a点）'
+                                     'を学習する。GT はマップビューの「他車ラベルを'
+                                     '計算して保存」で書き戻した togivad/agents。'
+                                     'ONNXに agent_motion/agent_mode_logits 出力が付く'),
+        'chk_togivad_track': 'agent追跡強化（T2-b・track embedding）',
+        'tip_togivad_track': ('AgentHead クエリの track embedding を前後フレームの'
+                              '対照学習で対応付け、同一他車に一貫した表現を与える'
+                              '（UniAD-lite）。他車動き予測（②）と時系列BEV融合'
+                              '（T1-a）が前提。GT は他車ラベル書き戻し時の'
+                              ' togivad/agent_ids。学習専用のため ONNX は不変'),
         'label_togivad_info': ('軌道: 1.0秒 / 20点（MPPI互換）。画像ソース数は '
                                '1/2/4/5 台に対応。品質不良フレーム'
                                '（テレポート等）は自動除外されます'),
@@ -1629,6 +1998,51 @@ Google Cloud Console での OAuth設定手順
                                 'TogiVADの学習には自己位置付き記録が必要です'),
         'msg_togivad_bad_horizon': ('予測秒数は正の値、予測点数は1以上を'
                                     '指定してください'),
+        'msg_togivad_track_prereq': ('agent追跡強化（T2-b）には「他車動き予測（②）」'
+                                     'と「時系列BEV融合（T1-a）」の両方を有効に'
+                                     'してください'),
+        # --- LiDAR Policy（2D LiDAR → angle/throttle） ---
+        'label_lidar_policy_params': 'LiDAR Policy パラメータ',
+        'label_lidar_preset': 'プリセット',
+        'opt_lidar_preset_base': 'base（ResNet1D-lite）',
+        'opt_lidar_preset_tiny': 'tiny（TinyLidarNet相当）',
+        'label_lidar_num_bins': 'ビン数',
+        'label_lidar_downsample': '間引き',
+        'opt_lidar_ds_minpool': 'min-pool',
+        'opt_lidar_ds_index': '等間隔（RL互換）',
+        'label_lidar_stack': '積層フレーム K',
+        'chk_lidar_valid_ch': '無効ビームchを追加',
+        'tip_lidar_valid_ch': ('0/範囲外のビームを有効=1/無効=0 の別chとして入力する。'
+                               '黒色物体や反射抜けを「最遠」と誤認しにくくなる'),
+        'label_lidar_max_range': '最大距離 [mm]',
+        'label_lidar_max_speed': '最大速度 [m/s]',
+        'chk_lidar_traj': '補助軌道ヘッド',
+        'tip_lidar_traj': ('将来軌道を回帰する補助タスク（推論では未使用）。'
+                           '自己位置（pose/slam）から作った将来軌道を補助タスクとして'
+                           '回帰し表現学習を正則化する。自己位置の無い記録では自動OFF。'
+                           'ONNXに traj 出力が付く（実機では無視）'),
+        'label_lidar_mode_filter': '教師データ',
+        'label_lidar_pose_source': '軌道ラベル',
+        'opt_lidar_mode_all': 'すべて',
+        'opt_lidar_mode_auto': '自動運転のみ（auto_*）',
+        'opt_lidar_mode_user': '手動運転のみ（user）',
+        'label_lidar_split': '分割',
+        'opt_lidar_split_block': '連続ブロック',
+        'opt_lidar_split_random': 'ランダム',
+        'tip_lidar_split': ('連続ブロック（推奨）: 時系列で隣接するフレームが train/val に'
+                            '跨らないよう約200フレーム単位で分割する。ランダム分割は'
+                            '検証精度が過大評価されやすい'),
+        'chk_lidar_mirror': '左右反転拡張（スキャン反転 + 操舵符号反転）',
+        'tip_lidar_mirror': ('コースの左右寄り（path_variant）と矛盾しうるため既定OFF。'
+                             '左右対称に走らせたいときのみ有効化'),
+        'chk_lidar_steer_balance': '大舵角サンプルを逆頻度で重み付け',
+        'label_lidar_info': '入力: lidar/*.npy（Kフレーム積層）+ 車速 → angle/throttle。画像ソース不使用・ONNX自動書き出し',
+        'msg_lidar_no_scans': ('LiDAR データ（lidar/*_lidar_distance_array_.npy）が'
+                               '見つかりません。LiDAR記録のあるセッションを読み込んで'
+                               'ください'),
+        'msg_togivad_no_agents': ('他車ラベル（togivad/agents）が見つかりません。'
+                                  'マップビューの「他車ラベルを計算して保存」で'
+                                  '書き戻してから学習してください'),
         'label_stride': 'ストライド',
         'label_hidden_dim': 'Hidden Size',
         'label_dropout': 'Dropout',
@@ -1660,10 +2074,15 @@ Google Cloud Console での OAuth設定手順
         'label_select_traj_model': '時系列モデル選択',
         'label_traj_model_info': '{0} | seq={1}, horizon={2}, sources={3}',
         'chk_show_traj_prediction': '時系列予測軌道を表示',
+        'label_togivad_control_infer': '推論結果（TogiVAD）:',
+        'chk_show_togivad_control_infer': '推論 angle/throttle を表示',
         'label_traj_pred_steering': '予測(steering)',
         'label_traj_pred_throttle': '予測(throttle)',
         'label_traj_inference_result': '時系列推論結果(a,t)s:',
-        'label_togivad_inference_result': 'TogiVAD推論軌道 t+Δt, x, y (s, m, m):',
+        'label_togivad_inference_result': '推論軌道 t+Δt, x, y (s, m, m):',
+        'msg_model_source_mismatch': 'モデル学習時のカメラキーと、現在読み込んでいるデータのキーが一致しません。\n\nモデル(学習時): {0}\n現在のデータ: {1}\n\n読み替え:\n{2}',
+        'msg_model_source_unresolved': '読み替え先が見つからないカメラキー: {0}\n\nこのままでは画像を読み込めず、推論結果は表示されません。\n対応する画像キーを含むデータを読み込むか、モデルを選び直してください。',
+        'status_model_source_remapped': 'カメラキーを読み替えました: {0}',
         'label_traj_section_title': '時系列モデル',
         'label_all': 'すべて',
         'label_combined_view': '結合表示',
@@ -1706,6 +2125,26 @@ Google Cloud Console での OAuth設定手順
         'map_view_source_auto': '自動選択（優先順）',
         'map_view_colorby_label': '色分け:',
         'map_view_colorby_time': '時間',
+        'map_view_colorby_lap': 'ラップ',
+        'map_view_lap_all_short': '全',
+        'map_view_show_line': '線表示',
+        'map_view_laptime_current': 'ラップ{0}: {1}s｜ラップ内 {2}s',
+        'map_view_laptime_header': 'ラップ{0}: {1}/{2}s',
+        'map_view_laptime_best': 'ベスト: ラップ{0} {1}s｜経過 {2}s',
+        'map_view_laptime_total': '経過 {0}s',
+        'map_view_lap_table_btn': 'ラップ一覧',
+        'map_view_lap_table_title': 'ラップタイム一覧',
+        'map_view_lap_table_col_lap': 'ラップ',
+        'map_view_lap_table_col_time': 'タイム[s]',
+        'map_view_lap_table_col_start': '開始フレーム',
+        'map_view_lap_table_col_note': '備考',
+        'map_view_lap_table_best': '★ベスト',
+        'map_view_lap_table_running': '走行中',
+        'map_view_lap_table_close': '閉じる',
+        'map_view_lap_label': 'ラップ:',
+        'map_view_lap_all': '全ラップ',
+        'map_view_lap_item': 'ラップ {0}',
+        'map_view_lap_status': '周回数: {0}',
         'map_view_colorby_speed': '速度',
         'map_view_colorby_source': 'ソース',
         'map_view_colorby_status': 'ステータス',
@@ -1713,12 +2152,17 @@ Google Cloud Console での OAuth設定手順
         'map_view_clear_background': '地図をクリア',
         'map_view_no_pose_data': 'このセッションには自己位置データ（pose/slam/vslam/aruco）がありません',
         'map_view_available_sources': '利用可能なソース: {0}',
-        'map_view_status_extras': '軌道ラベル（黒枠）: {0}件 / ジャンプ（赤×）: {1}件',
+        'map_view_status_extras': '軌道ラベル保存済み: {0}件 / ジャンプ（赤×）: {1}件',
         'map_view_legend_jump': 'ジャンプ',
         'map_view_legend_slip': 'スリップ',
         'map_view_legend_rough': '悪路',
         'map_view_background_load_error': '地図の読み込みに失敗しました: {0}',
         'map_view_auto_loaded': '地図を自動読み込み: {0}（{1}）',
+        'map_view_wp_label': 'WP:',
+        'map_view_wp_none': '非表示',
+        'map_view_wp_tip': '走行時に追従した経路（centerline / raceline CSV）を地図に重ねて表示します。\n既定は manifest.json の path_csv。地図フォルダ内の他の経路にも切り替えられます。',
+        'map_view_wp_browse_tip': '経路 CSV を開く…',
+        'map_view_wp_load_error': '経路 CSV の読み込みに失敗しました: {0}',
 
         # map_view_quality_ / map_view_segment_ / map_view_interp_ / map_view_writeback_ : Phase 2 編集機能
         'map_view_quality_label': '品質フィルタ:',
@@ -1748,6 +2192,10 @@ Google Cloud Console での OAuth設定手順
         'map_view_writeback_horizon_label': '予測点数:',
         'map_view_writeback_dt_label': '間隔[s]:',
         'map_view_writeback_btn': '軌道ラベルを計算して保存',
+        'map_view_agent_writeback_btn': '他車ラベルを計算して保存(②)',
+        'map_view_agent_writeback_tooltip': '相手車の矩形アノテーション（opponentクラス）を ego 地面へ逆投影し、\n実測poseで追跡して他車の将来軌道（togivad/agents）を計算・保存します。\nTogiVAD②マルチモーダル他車動き予測の教師ラベルになります。\n元のファイルは .bak にバックアップされます。',
+        'map_view_agent_writeback_none': '相手車（opponent）の矩形アノテーションが見つかりません。\nクラスプリセット「TogiVAD他車(E2E)」で相手車を矩形アノテーションしてから実行してください。',
+        'map_view_agent_writeback_result': '他車ラベル(togivad/agents)を保存しました。\n他車ありフレーム: {0} / 逆投影した矩形: {1}',
         'map_view_writeback_tooltip': '現在の自己位置データ（品質フィルタ・区間編集・補間を反映）から、\n各フレームの将来軌道（togivad学習用の教師ラベル togivad/future_traj）を計算し、\n記録データ（catalogファイル）に保存します。\n元のファイルは .bak としてバックアップされます。',
         'map_view_writeback_hint': '※ 各フレームから「予測点数×間隔」秒先までの走行軌跡を教師ラベルとして計算し、記録データに保存します（togivadの学習で使用）。保存前に元ファイルは .bak にバックアップされます。',
         'map_view_writeback_horizon_tooltip': '将来軌道の点数（デフォルト20点 = togivadの設定と同じ）',
@@ -1761,7 +2209,61 @@ Google Cloud Console での OAuth設定手順
         'map_view_writeback_error': '保存中にエラーが発生しました: {0}',
         'map_view_writeback_no_manifest': 'manifest.jsonが読み込まれていません。先にデータを読み込んでください。',
 
+        # map_view_region_ / map_view_autoloc_ : 位置領域（閉ポリゴン）と位置自動アノテーション（Phase 1）
+        'map_view_colorby_loc': '位置',
+        'map_view_colorby_pred_loc': '推論クラス',
+        'map_view_colorbar_unlabeled': '未付与',
+        'map_view_section_display': '表示設定',
+        'map_view_all_laps': '全ラップ',
+        'map_view_source_all': '全ソース（重ね表示）',
+        'map_view_lap_table_btn_short': '一覧',
+        'map_view_nav_more_tip': 'その他のグラフ操作（戻る/進む/移動/ズーム/設定/保存）',
+        'map_view_all_laps_tip': 'ON: 全ラップの軌跡を表示 / OFF: 現在フレームのラップだけ表示（フレーム移動に追従）',
+        'map_view_side_panel_toggle_tip': 'サイドパネルを折り畳む／展開する（畳むと地図が全幅になります）',
+        'map_view_section_edit': '編集・ラベル',
+        'map_view_tab_pose_edit': '位置補正',
+        'map_view_tab_labels': 'ラベル',
+        'map_view_tab_regions': '領域',
+        'map_view_hint_hover': '※ 操作説明はラベル・ボタンにマウスを重ねると表示されます',
+        'map_view_show_inference': '推論位置',
+        'map_view_show_inference_tip': '位置推論モデルの推定座標を紫で重ねて表示します（座標・姿勢回帰モデルを読み込み、推論済みのフレームのみ）。\n現在フレームは紫三角、実測との誤差は点線で示します。再生中に推論されたフレームの丸も順次追加されます。',
+        'map_view_legend_inference': '推論位置 ({0}件, 平均誤差 {1} m)',
+        'map_view_region_label': '位置領域:',
+        'map_view_region_edit_btn': '領域編集',
+        'map_view_region_edit_tooltip': 'ONの間、マップ上でポリゴン領域を編集できます（セグメンテーションと同じ操作感）。\n・空き地クリックで新規ポリゴン開始→頂点を順にクリック→最初の頂点クリックまたは右クリックで閉じて確定\n・既存領域: クリックで選択＋ドラッグで移動、頂点ドラッグで変形、右クリックで点を挿入、\n　Shift+右クリックでクラス変更、Delete/Backspaceで頂点/領域を削除（未選択でもホバー中の領域を削除可）、\n　Shift+クリックで選択解除\n・既存領域の頂点の近くをクリックするとその頂点を共有します（隣接領域の境界合わせ）\n・Ctrl+クリックで既存領域の上からでも新規ポリゴンを開始できます（重ね塗り修正用）',
+        'map_view_region_class_label': 'クラス:',
+        'map_view_region_undo_btn': '最後を削除',
+        'map_view_region_clear_btn': '全クリア',
+        'map_view_region_save_btn': '領域を保存',
+        'map_view_region_save_tooltip': '領域定義を location_regions.json として地図フォルダへ保存します。\n同じ地図を使う別セッションでも自動で読み込まれ再利用できます。',
+        'map_view_region_saved': '位置領域を保存しました: {0}',
+        'map_view_region_save_error': '位置領域の保存に失敗しました: {0}',
+        'map_view_region_no_save_dir': '保存先が決められません（地図もデータフォルダも未読込です）',
+        'map_view_region_loaded': '保存済みの位置領域を読み込みました: {0}件（{1}）',
+        'map_view_region_count': '定義済み領域: {0}件',
+        'map_view_region_hint_start': '空き地クリックで新規ポリゴン開始（クラス {0}）。既存領域はクリックで選択して編集できます（Ctrl+クリックで領域上からも新規開始）',
+        'map_view_region_hint_progress': '頂点 {0}個（クラス {1}）。クリックで頂点追加（3点以上で閉じられます）',
+        'map_view_region_hint_close': '頂点 {0}個（クラス {1}）。最初の頂点（白丸）クリックまたは右クリックで閉じて確定します',
+        'map_view_region_hint_selected': '領域 {0}（クラス {1}）を選択中。頂点ドラッグで変形、内部ドラッグで移動、右クリックで点を挿入、Shift+右クリックでクラス変更、Delete で削除、Shift+クリックで解除',
+        'map_view_region_added': '領域を追加: クラス {0}（頂点 {1}個）',
+        'map_view_region_deleted': '領域を削除しました（クラス {0}）',
+        'map_view_region_point_added': 'ポリゴンに新しい点を追加しました (位置: {0})',
+        'map_view_region_menu_change_class': '位置クラスを変更...',
+        'map_view_region_none': '位置領域が定義されていません。「領域編集」をONにしてマップ上でポリゴンを描いてください。',
+        'map_view_region_hint': '※ 「領域編集」ONで空き地をクリックしてポリゴンを描き、最初の頂点クリックまたは右クリックで閉じると位置クラスの領域になります。既存領域はクリックで選択し、頂点ドラッグ・移動・点追加・クラス変更・Delete削除ができます（操作はセグメンテーションアノテーションと同じ）。「領域から位置を自動付与」で各フレームのpose（自己位置）を内包する領域の位置ラベルを一括付与します（重なりは後から定義した領域を優先。色分け「位置」で確認できます）。',
+        'map_view_autoloc_btn': '領域から位置を自動付与',
+        'map_view_autoloc_tooltip': '各フレームの自己位置（pose）を内包するポリゴン領域を探し、\nその領域の位置クラスを自動付与します（重なりは後から定義した領域を優先）。\n付与結果は位置ボタンのカウント・ギャラリー・色分け「位置」に反映されます。',
+        'map_view_autoloc_keep_manual': '手動アノテを保持',
+        'map_view_autoloc_keep_manual_tooltip': 'ON: 手動で付けた位置ラベルは上書きしません（自動付与分は更新されます）\nOFF: すべての位置ラベルを領域定義で上書きします',
+        'map_view_autoloc_confirm_title': '位置自動アノテーション',
+        'map_view_autoloc_confirm_msg': '{0}件のポリゴン領域を使って、poseのある全フレームへ位置ラベルを\n自動付与します（重なりは後から定義した領域を優先）。\n\n・手動アノテを保持: {1}\n\n実行しますか？',
+        'map_view_autoloc_progress': '位置ラベルを付与中... {0}/{1}',
+        'map_view_autoloc_cancelled': 'キャンセルしました（キャンセルまでに{0}件付与済み）。',
+        'map_view_autoloc_result': '位置自動アノテーションが完了しました。\n\n・付与: {0}件\n・手動アノテ保持のためスキップ: {1}件\n・pose無しのためスキップ: {2}件\n・領域外のためスキップ: {3}件\n・削除済みのため除外: {4}件',
+
         # --- Databricks連携（アプリ内設定・転送・学習・監視） ---
+        'db_connecting': 'Databricksに接続中...（OAuthの場合はブラウザで認証）',
+        'db_connect_failed': 'Databricksに接続できませんでした:\n{0}',
         'db_group_connection': '接続設定',
         'db_field_enabled': 'Databricks連携を有効化',
         'db_field_auth_method': '認証方式:',
@@ -1790,6 +2292,14 @@ Google Cloud Console での OAuth設定手順
         'db_field_compute': 'コンピュート:',
         'db_compute_serverless': 'サーバーレス（フリープラン対応）',
         'db_compute_cluster': 'クラスター（設定のクラスターIDを使用）',
+        'db_field_accelerator': 'アクセラレータ:',
+        'db_accel_cpu': 'CPU',
+        'db_accel_gpu': 'GPU',
+        'db_field_env_version': '環境バージョン:',
+        'db_tip_env_version': 'サーバーレス環境のバージョン（例: 2, 3）。ノートブックに紐づく環境を上書きし、GPU/CPUの不整合を回避します。ワークスペースで有効な値を指定してください。',
+        'db_field_base_env': 'GPUベース環境名:',
+        'db_base_env_placeholder': '例: databricks-gpu（ワークスペースの表示に合わせる）',
+        'db_tip_base_env': 'GPUアクセラレータで実行する場合のベース環境名。ワークスペースの「環境」パネルに表示される名称を指定します。CPUの場合は空でOKです。',
         'db_chk_deploy_notebooks': '学習前にノートブックを自動配置する',
         'db_model_basic': '基本モデル（ステア/スロットル回帰・resnet18）',
         'db_model_togivad': 'TogiVAD（軌道語彙分類・要 togivad/future_traj ラベル）',
@@ -1899,11 +2409,95 @@ Google Cloud Console での OAuth設定手順
         # --- Navigation ---
         'btn_reverse_play': '◀ Reverse',
         'btn_forward_play': '▶ Play',
-        'btn_delete_current': 'Delete Current',
-        'btn_restore_deleted': 'Restore Deleted',
-        'btn_restore_all_deleted': 'Restore All',
+        'btn_delete_current': 'Delete Current Frame',
+        'btn_restore_deleted': 'Restore Current Frame',
+        'btn_restore_all_deleted': 'Restore All Frames',
+        'btn_delete_reverse': 'Delete Reverse Frames',
+        'tip_delete_reverse': 'Mark all frames with negative throttle (reversing) as deleted',
         'btn_current_position': 'Current',
         'btn_range_delete': 'Delete Range',
+
+        # --- Mask (target dropdown + edit button + show checkbox) ---
+        'label_mask_target': 'Mask:',
+        'opt_mask_target_vehicle': 'Vehicle',
+        'opt_mask_target_background': 'Background',
+        'opt_mask_add': '+ Add',
+        'opt_mask_delete': '- Delete',
+        'tip_mask_target': 'Choose which mask the Edit button and Show checkbox act on.\n'
+                           'Vehicle: the car body area at the bottom / Background: any area such as the background\n'
+                           'Use "+ Add" to create more masks (Vehicle and Background cannot be deleted).\n'
+                           'The target cannot be switched while editing (press "Edit" again to confirm).',
+        'btn_mask_edit': 'Edit',
+        'tip_mask_edit': 'Edit the polygon of the selected mask.',
+        'tip_mask_edit_named': 'Edit the polygon of "{0}".\n'
+                               'Press to enter edit mode, then click on the image to add vertices.\n'
+                               'Left click: add vertex / Drag vertex: move / Right click on vertex: remove it\n'
+                               'Right click: remove last vertex / Ctrl+Right click: clear all\n'
+                               'Press "Edit" again to confirm (used via "Apply mask" in the training dialog).',
+        'chk_grid_visible': 'Grid',
+        'section_canvas_scale': 'Canvas display scale',
+        'label_canvas_scale': 'Scale:',
+        'tip_canvas_scale': ('Percentage of the size that fits the image / combined image / ranging view '
+                             'to the canvas (100%). Smaller values leave more room around the view'),
+        'canvas_range_label': 'Range',
+        'canvas_range_tooltip': 'Zoom the ranging view range (up = zoom in). Images always auto-fit the canvas',
+        'tip_grid_visible': 'Show the angle/throttle grid and scale (applies to image and ranging sources)',
+        'chk_mask_visible': 'Show',
+        'tip_mask_visible': 'Toggle the overlay display of the selected mask (does not affect training/inference masking).\n'
+                            'Automatically hidden in combined view because positions do not align.',
+
+        # --- Adding / deleting masks ---
+        'dlg_add_mask_title': 'Add New Mask',
+        'label_new_mask_name': 'Mask name:',
+        'placeholder_new_mask_name': 'e.g. Signboard',
+        'chk_new_mask_symmetric': 'Mirror left/right',
+        'tip_new_mask_symmetric': 'When on, each vertex is automatically mirrored across the center line (same as Vehicle/Background).\n'
+                                  'When off, the polygon uses only the vertices you place (use this for one-sided areas).',
+        'msg_mask_name_required': 'Please enter a mask name.',
+        'msg_mask_name_duplicate': '"{0}" already exists. Please enter a different name.',
+        'msg_confirm_delete_mask': 'Delete the mask "{0}"?\nThis cannot be undone.',
+        'status_mask_added': 'Mask "{0}" added',
+        'status_mask_deleted': 'Mask "{0}" deleted',
+        'status_mask_builtin_undeletable': 'Vehicle and Background are built-in masks and cannot be deleted',
+
+        # --- Mask editing status ---
+        'status_mask_edit_on': 'Editing "{0}": left click to add vertex / drag to move / right click to remove / Ctrl+right click to clear / press "Edit" again to confirm',
+        'status_mask_set': '"{0}" set ({1} vertices -> {2}-point polygon)',
+        'status_mask_cleared': 'Vertices of "{0}" cleared',
+        'status_mask_point_added': 'Vertex added to "{0}" ({1} points)',
+        'status_mask_point_removed': 'Vertex removed from "{0}" ({1} remaining)',
+        'status_mask_combined_blocked': 'Mask display/editing is unavailable in combined view (switch to a single image view)',
+
+        # --- Mask options in the training dialog ---
+        'chk_use_mask': 'Apply "{0}" mask (ignore that area)',
+        'tip_use_mask': 'Train with the configured mask area filled in black.\nThe mask is saved with the model and automatically applied at inference time.',
+        'label_mask_info': '  Closed polygon with {0} vertices (masked area is blacked out and ignored)',
+        'label_mask_not_set': 'No mask configured (pick a target in the "Mask" dropdown next to the resolution slider and press "Edit")',
+        'chk_custom_future_frames': 'Custom prediction frames',
+        'tip_custom_future_frames': 'Specify how many frames ahead the future predictions (angle/throttle/speed) are output,\n'
+                                    'as two comma-separated values (e.g. 5,10). Defaults to 5,10 when unchecked or empty.\n'
+                                    'The values are saved with the model and reflected in inference display.',
+        'label_future_frames_unit': 'frames ahead (two, comma-separated)',
+        'msg_invalid_future_frames': 'Invalid prediction frame specification.\nEnter two positive integers separated by a comma (e.g. 5,10).',
+        'tip_speed_seek_graph': 'Speed profile graph (faint hills). Red marks are frames with missing speed.\nClick/drag to seek.',
+        'chk_pip_embed': 'Image Embedding',
+        'tip_pip_embed': 'Shrink an image from another source (e.g. lidar BEV) and embed it into the base image,\n'
+                         'training a standard single-source model on the composite.\n'
+                         'The embedding config is saved with the model and applied automatically at inference.\n'
+                         '* Cannot be combined with multi-source or virtual-source modes.',
+        'label_pip_source': 'Embed image:',
+        'label_pip_position': 'Embed position:',
+        'opt_pip_pos_mask': 'Vehicle mask area (default)',
+        'opt_pip_pos_coords': 'Coordinates',
+        'label_pip_rect': 'x, y, width, height (0-1):',
+        'label_pip_note': '* Vehicle mask area: fits the mask bounding box (reuses pixels discarded by the mask)',
+        'msg_pip_requires_single': 'Image embedding cannot be combined with multi-source or virtual-source modes.\n'
+                                   'Select exactly one image source and set virtual source type to none.',
+        'msg_pip_no_mask': 'Embed position is set to "Vehicle mask area" but no vehicle mask is configured.\n'
+                           'Set a mask with "Mask: Vehicle" + "Edit", or choose "Coordinates".',
+        'msg_pip_no_source_images': 'No images found for embed source "{0}".\n'
+                                    'Check that the data folder contains images for that source.',
+        'msg_pip_invalid_rect': 'Embed region width and height must be greater than 0.',
 
         # --- Downsampling ---
         'btn_detect': 'Detect',
@@ -1921,11 +2515,82 @@ Google Cloud Console での OAuth設定手順
         'label_image_count': 'Image {0} of {1}:{2}',
         'label_deleted_suffix': '[Deleted]',
         'label_image_source': 'Image Source',
+        'image_source_lidar': 'Ranging',
+        'tip_image_source_lidar': ('Show ranging data: the raw LiDAR scan (polar: ego at center, forward up; '
+                                   'or an angle-vs-range profile). Inspect invalid beams, stacked '
+                                   'past frames and the model input after preprocessing, plus the catalog '
+                                   'zone ranges (lidar/ or ultrasonic/ RrLH,FrLH,FrFR,FrRH,RrRH) drawn as '
+                                   'fans like the vehicle monitor. Driving '
+                                   'annotation and inference points are overlaid in the same '
+                                   'angle/throttle plane as image sources and can be edited by '
+                                   'clicking. Available when lidar/*.npy or zone ranges exist'),
+        'label_lidar_layers_only': 'Ranging view:',
+        'tip_lidar_layers_only': 'Enabled only while the Ranging image source is selected',
+        'opt_lidar_view_polar': 'Polar',
+        'opt_lidar_view_profile': 'Range profile',
+        'label_lidar_view_range': 'Range',
+        'chk_lidar_zones': 'Zones',
+        'tip_chk_lidar_zones': ('Catalog zone ranges (lidar/ or ultrasonic/ RrLH,FrLH,FrFR,FrRH,RrRH) '
+                                'drawn as fans like the togikaidrive monitor (<300mm red / <600mm yellow / green). '
+                                'UST20 uses the same angular ranges as config ZONE_INDEX'),
+        'chk_lidar_points': 'Points',
+        'tip_chk_lidar_points': 'All beams of the current frame colored by range (orange=near, blue=far). Invalid beams as gray marks',
+        'chk_lidar_history': 'Past frames',
+        'tip_chk_lidar_history': 'Overlay the past K-1 frames (K = LiDAR Policy stacked frames) faintly',
+        'chk_lidar_model_input': 'Model input',
+        'tip_chk_lidar_model_input': ('Yellow polyline of the bins after the same preprocessing as '
+                                      'training (min-pool, range clip, invalid mask). Uses the loaded '
+                                      'LiDAR Policy settings when one is loaded'),
+        'lidar_view_no_scan': 'No ranging data (lidar/*.npy or zone ranges) for this frame',
+        'lidar_legend_zones': 'Zones ({}/)',
+        'lidar_view_profile_axis': 'angle (0°=front, +=left)',
+        'lidar_legend_points': 'Points (orange=near, blue=far)',
+        'lidar_legend_invalid': 'Invalid beams',
+        'lidar_legend_history': 'Past {} frames',
+        'lidar_legend_model': 'Model input ({} bins)',
+        'lidar_legend_inference': 'Inference arc',
+        'lidar_stat_beams': '{} beams / valid {}%',
+        'lidar_stat_min': 'min F{} L{} R{}',
+        'lidar_stat_stack': 'stack K={} (dup {})',
         'image_source_bev': 'BEV',
         'tip_image_source_bev': "Bird's-eye (top-down) view. Shows steering (red), driven (green) and predicted (cyan) trajectories in ego coordinates. Each trajectory's visibility follows its existing checkbox. Available only when pose/slam data exists.",
         'bev_legend_steering': 'Steering',
         'bev_legend_recorded': 'Driven (GT)',
         'bev_legend_prediction': 'Prediction',
+        'chk_bev_camera': 'CAM proj.',
+        'chk_bev_occupancy': 'Obstacles',
+        'chk_bev_boundary': 'Boundary',
+        'chk_bev_agents': 'Agents',
+        'bev_legend_occupancy': 'Obstacles (LiDAR)',
+        'bev_legend_boundary': 'Boundary (left)',
+        'bev_legend_boundary_r': 'Boundary (right)',
+        'bev_legend_agent': 'Agent ②',
+        'yolo_auto_annot_menu': 'YOLO auto-annotate (agents/seg)',
+        'yolo_auto_annot_title': 'YOLO auto-annotation',
+        'yolo_auto_annot_model': 'Model',
+        'yolo_model_loaded_det': 'Loaded model (detect)',
+        'yolo_model_loaded_seg': 'Loaded model (segment)',
+        'yolo_model_dl_tag': 'download',
+        'yolo_model_dl_failed': 'Failed to download/load the model. Check your internet connection.',
+        'yolo_auto_annot_task': 'Task',
+        'yolo_auto_annot_detect': 'Detection (boxes)',
+        'yolo_auto_annot_segment': 'Segmentation',
+        'yolo_auto_annot_src': 'Source classes (comma-separated)',
+        'yolo_auto_annot_tgt': 'Target class',
+        'yolo_auto_annot_conf': 'Confidence threshold',
+        'yolo_auto_annot_all': 'Run on all frames (off = current only)',
+        'yolo_auto_annot_replace': 'Replace previous AI annotations (keep manual)',
+        'yolo_auto_annot_hint': ('Auto-detect other vehicles with a trained YOLO and map the '
+                                 'source classes to the target class (default: opponent).\n'
+                                 'Pick a model above; if you have none, choose a "(download)" '
+                                 'preset like yolov8n.pt to auto-download it into models '
+                                 '(COCO-pretrained detects car/truck/bus/motorcycle).\n'
+                                 'Opponent boxes convert to togivad/agents via the map view '
+                                 '"Compute & save agent labels (②)" for ② training.'),
+        'yolo_auto_annot_no_model': ('No YOLO model loaded. Load a detection/segmentation '
+                                     'model first via "Load YOLO model".'),
+        'yolo_auto_annot_running': 'Annotating via YOLO inference...',
+        'yolo_auto_annot_result': 'Auto-annotation done: {0} items / {1} frames',
 
         # --- Pilot Model ---
         'label_pilot_model_select': 'Model Type:',
@@ -2126,8 +2791,22 @@ Google Cloud Console での OAuth設定手順
         'label_display_mode': 'Display Mode:',
         'label_mode_hint': '* Press B key to switch mode',
         'label_location_info': 'Course Location Info:',
-        'label_current_location': 'Current Location: None',
-        'label_current_location_value': 'Current Location: {0}',
+        'label_current_location': 'Current: None',
+        'label_current_location_value': 'Current: Loc {0}',
+        'label_new_location_id': 'New location ID:',
+        'tip_toggle_location_info': 'Expand / collapse the course location panel',
+        'tip_loc_mode_position': 'Label location buttons by index (Loc N)',
+        'tip_loc_mode_corner': 'Label location buttons by corner shape (straight / 30-180 deg)',
+        'label_overlay_group': 'Display Overlays',
+        'label_bev_layers_only': 'BEV layers:',
+        'tip_bev_layers_only': 'Active only when the image source is switched to BEV (top-down view)',
+        'btn_camera_geometry': '⚙ Edit',
+        'tip_camera_geometry': 'Open camera geometry settings (max steering / pitch / FOV / height)',
+        'dlg_camera_geometry': 'Camera Geometry',
+        'label_camera_geometry_info': 'Physical vehicle and camera parameters used to project '
+                                      'trajectories onto the image. They stay fixed during a '
+                                      'session, so they are configured here.',
+        'label_camera_geometry_summary': 'Steer {0}° / Pitch {1}°\nFOV {2}° / H {3}m',
         'label_gallery': 'Gallery:',
         'label_deleted': 'Deleted',
 
@@ -2257,10 +2936,28 @@ Google Cloud Console での OAuth設定手順
         'chk_show_driving_direction': 'Show Driving Direction',
         'chk_show_auto_driving_direction': 'Show Steering Trajectory (Red)',
         'chk_show_recorded_trajectory': 'Show Driven Trajectory (Green)',
+        'chk_use_all_sources': 'Use annotations from all image sources for training',
+        'tip_use_all_sources': 'OFF: use only the currently displayed source (e.g. cam0)\n'
+                               'ON : merge annotations from every loaded source',
+        'label_source_summary': 'Annotations: {0} (training scope: {1})',
+        'label_source_count_bbox': '{0} det',
+        'label_source_count_seg': '{0} seg',
+        'label_scope_all_sources': 'all sources',
+        'label_scope_current_source': 'current source only',
         'chk_apply_last_bbox': 'Apply Previous Bounding Box',
         'chk_apply_last_segmentation': 'Apply Previous Segmentation',
         'chk_auto_skip_on_click': 'Auto Skip on Click',
         'chk_apply_location': 'Apply Previous Location',
+        # Location class info (description input / save)
+        'btn_save_location_classes': 'Save Location Classes',
+        'tip_save_location_classes': 'Save the description of each location class to a JSON file (reusable in togikaidrive)',
+        'placeholder_location_class': 'Describe this class',
+        'tip_location_class_input': 'Describe this location class (e.g. straight, right corner)',
+        'dlg_save_location_classes': 'Select Save Location for Location Classes',
+        'dlg_save_complete': 'Save Complete',
+        'msg_no_location_classes': 'There are no location classes to save.',
+        'msg_location_classes_saved': 'Location class info saved:\n{0}',
+        'msg_location_classes_save_failed': 'Failed to save location class info: {0}',
         'chk_detection_inference': 'Show Detection Inference',
         'chk_early_stopping': 'Enable Early Stopping',
         'chk_data_augmentation': 'Enable Data Augmentation',
@@ -2283,6 +2980,33 @@ Google Cloud Console での OAuth設定手順
         'chk_show_inference_result': 'Show Inference Result (cyan circle)',
         'chk_show_diff_vector': 'Show Diff Vector (green arrow)',
         'chk_add_speed_output': 'Add Speed to Output',
+        # Offline weighted BC (dev/SPEC_offline_rl_throttle.md)
+        'label_rl_weight_settings': 'Offline RL Weighting',
+        'chk_rl_weight_enable': 'Enable reward-based sample weighting from driving logs',
+        'tip_rl_weight_enable': 'Computes reward -> return -> advantage from speed, wall distance, slip etc. and up-weights the speed/throttle loss of well-driven frames (angle stays unweighted)',
+        'label_rl_weight_info': 'Introduces the RL idea using existing logs only. Validation loss stays unweighted so models remain comparable. See dev/SPEC_offline_rl_throttle.md',
+        'label_rl_method': 'Method',
+        'label_rl_target': 'Target head',
+        'label_rl_clip': 'clip',
+        'label_rl_topk': 'top k%',
+        'label_rl_baseline': 'Baseline',
+        'label_rl_gap': 'Episode gap [s]',
+        'label_rl_coeffs': 'Reward coeffs:',
+        'label_rl_thresholds': 'Wall thresholds [mm]:',
+        'rl_method_awr': 'AWR  w=exp(A/β)',
+        'rl_method_filtered': 'Filtered BC (top k%)',
+        'rl_target_speed': 'speed (recommended)',
+        'rl_target_throttle': 'throttle',
+        'rl_target_both': 'both',
+        'rl_baseline_speed_bin': 'speed-bin mean',
+        'rl_baseline_global': 'global mean',
+        'btn_rl_preview': 'Preview weight distribution',
+        'label_rl_no_speed': '* No speed data: target is fixed to throttle. Speed reward is 0 without enc/speed',
+        'dlg_rl_preview': 'Offline weighting preview',
+        'label_rl_top_frames': 'Top frames (high weight = judged as good driving)',
+        'label_rl_bottom_frames': 'Bottom frames (low weight)',
+        'label_rl_term_contrib': 'Mean contribution per reward term',
+        'msg_rl_no_annotations': 'No annotations available for weight computation',
         'chk_add_future_prediction': 'Add Future Frame Prediction to Output',
         'chk_exclude_downsampled': 'Exclude Downsampling Targets',
         'chk_overwrite_annotation': 'Overwrite Existing Annotations',
@@ -2339,10 +3063,13 @@ Google Cloud Console での OAuth設定手順
         'label_speed_normalize_note': '* Speed value is divided by this value',
         'label_future_info': '* Adds angle, throttle(, speed) for +5 and +10 frames',
         'label_future_detail': 'Output example (with speed): [angle, throttle, speed, t+5_angle, t+5_throttle, t+5_speed, t+10_angle, t+10_throttle, t+10_speed]',
-        'chk_future_label_output': 'Output Future Frame',
-        'tip_future_label_output': 'Train with annotation from N frames ahead as label for current frame.\nFrames whose future annotation is deleted will be excluded from training.',
-        'label_future_label_frames': 'frames ahead as label',
-        'label_future_label_info': '* Uses annotation N frames ahead as output label (deleted future frames are excluded)',
+        'chk_future_label_output': 'Shift labels N frames ahead (latency compensation)',
+        'tip_future_label_output': 'Train with the annotation from N frames ahead as the ground-truth label for the current frame.\n'
+                                   'The number of outputs stays the same; the model learns to output slightly-future controls,\n'
+                                   'which compensates for inference latency. (Different from "Add future prediction outputs".)\n'
+                                   'Frames whose future annotation is deleted are excluded from training.',
+        'label_future_label_frames': 'frames ahead used as label',
+        'label_future_label_info': '* Shifts only the label N frames ahead without changing outputs, for latency compensation (deleted frames excluded)',
         'label_min_delta': 'Min Delta:',
         'label_validation_ratio': 'Validation Ratio:',
         'label_skip_count': 'Skip Count:',
@@ -2749,6 +3476,120 @@ Google Cloud Console での OAuth設定手順
 
         # Location Model
         'msg_need_location_annotations': 'Location annotations are required to train a location model.',
+        'msg_need_location_or_pose': 'Training a location model requires location annotations or ego-pose data (pose/slam etc.).',
+        'btn_location_inference_all': 'Infer All Images',
+        'tip_location_inference_all': 'Run the loaded location model on every image.\nResults appear in the info panel and on the trajectory map (inference markers / "Predicted class" coloring).',
+        'msg_location_inference_all_progress': 'Running location inference... {0}/{1}',
+        'status_location_inference_all_done': 'Location inference finished: {0}/{1} images',
+        'status_location_inference_all_cancelled': ' (cancelled)',
+        'msg_need_pose_for_regression': 'Coordinate/heading regression requires a recording with ego-pose data (pose/slam etc.).',
+        # Location model training: input image sources / outputs (targets)
+        'label_location_input_sources': 'Input Image Sources',
+        'label_location_input_sources_info': 'Select multiple sources to feed all images simultaneously with feature fusion. With a single source you can generate virtual sources (crop / scale / temporal stack).',
+        'label_location_source_count': 'Selected: {0} source(s) / model inputs: {1} image(s)',
+        'label_location_output_settings': 'Outputs (Training Targets)',
+        'label_location_output_info': 'Choose location class classification and/or coordinate & heading regression (both = multi-task).',
+        'chk_location_output_class': 'Location class classification (location button annotations: {0} classes)',
+        'tip_location_output_class_disabled': 'At least 2 different location classes must be annotated',
+        'chk_location_output_pose': 'Coordinate & heading regression (pose/slam ego-pose as targets: {0} frames)',
+        'tip_location_output_pose_disabled': 'This session has no ego-pose data (pose/slam/vslam/aruco)',
+        'label_location_pose_source': 'Ego-pose source:',
+        'label_location_pose_source_item': '{0} ({1} frames)',
+        'tip_location_pose_source': 'Ego-pose source used as the training target (default slam: absolute position in the map frame).\n'
+                                    'Only sources valid in this session (aruco / fused / slam / vslam / pose) are listed; the number is the count of status-ok frames.\n'
+                                    'Training labels use only the selected source; frames without it are excluded (no mixing of other sources).\n'
+                                    'If many frames are missing, fill gaps with the map view interpolation before training.',
+        'chk_location_include_heading': 'Include heading (θ) in the output',
+        'tip_location_include_heading': 'ON: 4-dim output (x, y, cosθ, sinθ). OFF: 2-dim output (x, y)',
+        'chk_location_heading_from_pose': 'Take heading (θ) from the pose sensor (instead of the ego-pose source)',
+        'tip_location_heading_from_pose': "OFF (default): heading (θ) targets come from the same ego-pose source as x, y (selected above in \"Ego-pose source\", e.g. slam).\n"
+                                          "ON: heading (θ) alone always comes from the pose (dead-reckoning + IMU) sensor, regardless of the selected source.\n"
+                                          "pose has no relocalization teleports and stays continuous, so enable this when you want absolute x, y from slam etc. but a smooth heading from pose.",
+        'tip_location_heading_from_pose_disabled': 'Unavailable: this session has no pose sensor records.',
+        'chk_location_include_attitude': 'Include vehicle attitude (roll, pitch) in the output',
+        'tip_location_include_attitude': "Add the vehicle body tilt (roll, pitch) recorded by the pose sensor "
+                                         "(IMU dead reckoning) as a training target. Roll/pitch always come from "
+                                         "the pose sensor's own record, even if slam etc. is selected as the "
+                                         "ego-pose source.\n"
+                                         "ON adds 2 more dimensions (roll, pitch) to the pose output.",
+        'tip_location_include_attitude_disabled': "Unavailable: this session's pose sensor records do not include "
+                                                  "roll/pitch (vehicle attitude).",
+        'label_location_pose_loss_weight': 'Pose loss weight:',
+        'tip_location_pose_loss_weight': 'Multi-task loss = classification loss + weight × pose loss',
+        'label_location_pose_note': '* Coordinates are learned in map frame [m] and heading in rad; normalization parameters are stored in the model. Horizontal-flip augmentation is disabled for pose regression.',
+        'label_location_result_output_mode': 'Output mode: {0}',
+        'opt_location_output_class': 'Classification',
+        'opt_location_output_pose': 'Coordinate & heading regression',
+        'opt_location_output_class_pose': 'Classification + coordinate & heading regression',
+        'opt_location_head_class': 'Classification',
+        'opt_location_head_pose': 'Coordinate & heading regression',
+        'opt_location_head_grid': 'Grid cell classification',
+        # Grid cell classification (x, y discretized into cells)
+        'chk_location_output_grid': 'Grid cell classification (discretize x, y into a grid and classify the cell)',
+        'tip_location_output_grid': 'Divide the ego-pose x, y into square cells [m] and learn the cell index as a class.\nInference shows Top-N cell probabilities plus the Top1 cell center / probability-weighted Top1..N position.',
+        'label_location_grid_cell_size': 'Cell size:',
+        'label_location_grid_loss_weight': 'Grid loss weight:',
+        'label_location_grid_preview': 'Grid: about {0} x {1} = {2} cells (from ego-pose extent)',
+        # Pose history (time series) input
+        'chk_location_pose_history': 'Add past coordinates & heading as input (time series)',
+        'tip_location_pose_history': 'Feed the ego-pose [x, y, θ] of the past N steps (every interval frames) to the model together with the image features.\nDuring training the measured poses are fed with noise; at inference the history can come from measured poses or from previous predictions.',
+        'label_location_history_steps': 'Steps:',
+        'label_location_history_interval': 'Interval:',
+        'label_location_history_noise': 'Training noise σ (position / heading):',
+        'label_location_history_drop': 'History dropout:',
+        'label_location_history_note': '* To keep the model from relying on the history alone, training adds noise to position/heading and drops the whole history with the given probability. Frames without history at inference are treated as missing.',
+        'chk_location_history_from_inference': 'Use predictions as history (simulate on-vehicle)',
+        'tip_location_history_from_inference': 'ON: use the estimated positions of previous frames as the history input (missing frames fall back to measured poses).\nOFF: use the measured ego-poses, as in training.\nPlayback or "Infer All Images" runs frames in order so you can see estimates accumulate.',
+        'label_location_history_info': 'History input: {0} (valid {1}/{2} steps)',
+        'label_location_history_src_measured': 'measured',
+        'label_location_history_src_inference': 'predictions',
+        'label_location_result_history': 'History input: {0} steps x {1} frame interval (training noise σ={2} m / {3}°, dropout {4})',
+        # LiDAR point cloud (distance scan) additional input
+        'chk_location_lidar': 'Add LiDAR point cloud data as input',
+        'tip_location_lidar': 'Encode the LiDAR distance scan (lidar/*.npy) from the same session with a lightweight '
+                              '1D-CNN and feed it to the model together with the image features. Preprocessing '
+                              '(downsampling, normalization, invalid-value masking) reuses the same code as the '
+                              'LiDAR Policy model.',
+        'tip_location_lidar_disabled': 'Unavailable: this session has no LiDAR records (lidar/*.npy).',
+        'label_location_lidar_note': '* To keep the model from relying on LiDAR alone, training drops the whole scan with a fixed probability. Set stacked frames to 1 to use only the current frame.',
+        'label_location_lidar_info': 'LiDAR input: {0} of {1} stacked frames have a scan',
+        'label_location_result_lidar': 'LiDAR input: {0} bins x {1} stacked frames (interval {2} frames)',
+        'label_location_result_skipped_lidar': 'Excluded: no LiDAR scan {0}',
+        'label_location_grid_sigma': 'Label smoothing σ (cells):',
+        'tip_location_grid_sigma': 'Spread the target over neighboring cells with a Gaussian centered on the true position (0 = one-hot).\nMakes spatial proximity easier to learn and gives the Top-N weighted mean a meaning.',
+        'chk_location_grid_balance': 'Weight by cell frequency',
+        'tip_location_grid_balance': 'Weight the loss by the inverse (square-root) frequency of the true cell so frames piled up in one cell (e.g. while stopped) do not dominate.\nWith this OFF the model tends to predict the most frequent cell for every frame.',
+        'label_location_topn': 'Top-N:',
+        'tip_location_topn': 'Number of top cells used for display and weighting in grid classification',
+        'opt_location_grid_top1': 'Top1 cell',
+        'opt_location_grid_weighted': 'Top1..N weighted',
+        'tip_location_grid_mode': 'How the estimated position is derived: Top1 cell center / probability-weighted mean of Top1..N cell centers',
+        'label_location_grid_weighted_n': 'Top1..{0} weighted',
+        'label_location_grid_result': 'Grid estimate ({0}): x={1} m, y={2} m',
+        'label_location_grid_top1': 'Top1 cell ({0}, {1}) p={2} → x={3}, y={4}',
+        'label_location_grid_error': 'Error vs. measured: Top1 {0} m / Top1..{1} weighted {2} m',
+        'label_location_grid_rank': '#{0}: cell ({1}, {2}) p={3}',
+        'label_location_result_grid_acc': 'Best val. grid cell accuracy: {0}%',
+        'label_location_result_grid_error': 'Best val. grid position error: Top1 {0} m / Top1..{1} weighted {2} m',
+        'label_location_result_grid': 'Grid: cell {0} m, {1} x {2} = {3} cells',
+        'label_location_result_pos_error': 'Best val. position error: {0} m',
+        'label_location_result_heading_error': 'Best val. heading error: {0}°',
+        'label_location_result_attitude_error': 'Best val. attitude error: {0}°',
+        'label_location_result_skipped': 'Excluded: no ego-pose {0} / missing input images {1}',
+        'label_location_result_skipped_attitude': 'Excluded: no attitude (roll/pitch) data {0}',
+        'label_location_result_skipped_heading': 'Excluded: no pose sensor heading (θ) data {0}',
+        'label_location_result_pose_source': 'Ego-pose source: {0} (heading: {1})',
+        'label_location_result_heading_from_pose': 'Heading (θ): trained from the pose sensor instead of the ego-pose source',
+        'label_location_result_attitude_on': 'Attitude (roll/pitch): trained from the pose sensor',
+        'label_location_result_inputs': 'Input images: {0} ({1})',
+        'label_location_resolution_info': 'Trained at the actual image size, like the driving model. Use the slider to shrink the input size (resize) or degrade image content while keeping the size (pixelate).',
+        'label_location_resolution_size': 'Original {0}x{1} → training input size {2}x{3}',
+        'label_location_result_input_size': 'Training input size: {0}x{1} ({2})',
+        'label_location_pose_result': 'Estimated pose: x={0} m, y={1} m, θ={2}',
+        'label_location_pose_error': 'Error vs. measured: position {0} m / heading {1}°',
+        'label_location_pose_error_pos_only': 'Error vs. measured: position {0} m',
+        'label_location_attitude_result': 'Estimated attitude: roll={0}°, pitch={1}°',
+        'label_location_attitude_error': 'Error vs. measured (pose sensor): roll {0}° / pitch {1}°',
         'msg_need_at_least_2_locations': 'At least 2 different location labels are required. Current: {0} types',
         'msg_no_valid_location_annotations': 'No valid location annotations.',
         'msg_preparing_location_training': "Preparing training data for location model '{0}'...",
@@ -2827,7 +3668,7 @@ Google Cloud Console での OAuth設定手順
         'unit_seconds_suffix': ' s',
         'unit_seconds_label': 's',
         'unit_points_label': 'pts',
-        'tip_recorded_traj_source': 'Localization source for the driven trajectory (green). Default pose (smooth dead reckoning). slam is absolute but has many frames that cannot be interpolated due to relocalization teleports, breaking the trajectory. Syncs to the model source when a TogiVAD model is loaded.',
+        'tip_recorded_traj_source': 'Localization source for the driven trajectory (green). Default pose (smooth dead reckoning). slam is absolute but breaks on relocalization teleports. vslam is Visual SLAM (continuous but may drift; collapses to the origin in sessions without records). Syncs to the model source when a TogiVAD model is loaded.',
         'tip_recorded_traj_seconds': 'Time window [s] of the driven trajectory (dt = seconds / points). When a TogiVAD model is loaded, auto-syncs to its seconds (horizon×dt) to compare against the prediction over the same window.',
         'tip_recorded_traj_points': 'Number of driven-trajectory sample points (empty = 20; dt = seconds / points). When a TogiVAD model is loaded, auto-syncs to its horizon/dt/pose_source to match the prediction sample points.',
         'tip_auto_max_steering': 'Maximum steering angle used for steering trajectory display (degrees)',
@@ -3357,6 +4198,63 @@ Notes
         'label_vocab_size': 'Trajectory vocabulary K',
         'chk_vocab_from_logs': 'Build vocabulary from logs (k-means)',
         'label_ego_dropout': 'Ego dropout',
+        'chk_togivad_residual': 'Residual regression (T1-b, de-quantize/ADE)',
+        'tip_togivad_residual': ('Regress an offset on the chosen vocabulary '
+                                 'to escape the 6.25cm quantization; keeps '
+                                 'classification robustness while adding '
+                                 'continuous precision. Adds traj_residual to ONNX.'),
+        'chk_togivad_temporal': 'Temporal BEV fusion (T1-a, pose-warp)',
+        'tip_togivad_temporal': ('Warp the previous-frame BEV by the measured '
+                                 'pose delta and fuse it. Trains as a 2-frame '
+                                 'unroll using real dt from _timestamp_ms (same '
+                                 'source as the driving-trajectory display). '
+                                 'Adds prev_bev/ego_dpose inputs and bev_state '
+                                 'output to ONNX.'),
+        'chk_togivad_lidar': 'Fuse LiDAR occupancy into BEV (Fusion)',
+        'tip_togivad_lidar': ('Fuse the LiDAR occupancy raster (1ch) with the '
+                              'camera BEV via a 1x1 conv (TogiVAD-Fusion). '
+                              'Direct ranging backs up walls/agents under '
+                              'occlusion or glare. Requires sessions with LiDAR '
+                              'records (missing frames become zeros). Adds a '
+                              'lidar_bev input to ONNX.'),
+        'chk_togivad_control': 'Control I/O (Pilot, direct angle/throttle)',
+        'chk_togivad_control_trj': 'Trajectory-input control (Pilot-Trj)',
+        'tip_togivad_control_trj': ('A learned tracker that outputs (angle, throttle) '
+                                    'from the **final inferred trajectory** (after '
+                                    'masking/scoring). Supervised by GT-trajectory vs '
+                                    'driving annotations, available on every frame. '
+                                    'Mutually exclusive with Pilot. Control always '
+                                    'matches the executed trajectory; ONNX graph '
+                                    'unchanged (numpy head + sidecar).'),
+        'tip_togivad_control': ('Feed the previous command into ego and output '
+                                'trajectory-aware (angle, throttle) directly '
+                                '(TogiVAD-Pilot). Loss = imitation L1 + '
+                                'pure-pursuit consistency + smoothness. Needs '
+                                'driving annotations (angle/throttle). Runtime '
+                                'modes: traj / pilot / blend (pure pursuit '
+                                'remains the safety fallback).'),
+        'chk_togivad_world': 'World-model self-supervision (T2-a)',
+        'tip_togivad_world': ('Auxiliary loss predicting next-frame BEV tokens '
+                              'from current tokens + selected trajectory '
+                              '(LAW/DriveWorld-lite). The teacher is the next '
+                              'camera frame itself — no annotation needed. '
+                              'Improves data efficiency via representation '
+                              'learning. Train-only head: ONNX and inference '
+                              'cost are unchanged (zero inference cost).'),
+        'chk_togivad_agent_motion': 'Agent motion prediction (2, needs agent labels)',
+        'tip_togivad_agent_motion': ('Learn multi-modal agent motion (K\' modes '
+                                     'x T_a points). GT is togivad/agents written '
+                                     'back via "Compute & save agent labels" in '
+                                     'the map view. Adds agent_motion / '
+                                     'agent_mode_logits outputs to ONNX.'),
+        'chk_togivad_track': 'Agent tracking (T2-b, track embedding)',
+        'tip_togivad_track': ('Associate AgentHead queries across consecutive '
+                              'frames via contrastive track embeddings '
+                              '(UniAD-lite), giving each opponent a consistent '
+                              'representation. Requires agent motion (2) and '
+                              'temporal BEV fusion (T1-a). GT is '
+                              'togivad/agent_ids from the agent-label '
+                              'write-back. Train-only: ONNX unchanged.'),
         'label_togivad_info': ('Trajectory: 1.0s / 20 points (MPPI compatible). '
                                'Supports 1/2/4/5 image sources. Low-quality '
                                'frames (teleports etc.) are excluded '
@@ -3368,6 +4266,52 @@ Notes
                                 'localization'),
         'msg_togivad_bad_horizon': ('Predict seconds must be positive and '
                                     'predict points >= 1'),
+        'msg_togivad_track_prereq': ('Agent tracking (T2-b) requires both '
+                                     '"Agent motion prediction (2)" and '
+                                     '"Temporal BEV fusion (T1-a)" enabled'),
+        # --- LiDAR Policy (2D LiDAR -> angle/throttle) ---
+        'label_lidar_policy_params': 'LiDAR Policy Parameters',
+        'label_lidar_preset': 'Preset',
+        'opt_lidar_preset_base': 'base (ResNet1D-lite)',
+        'opt_lidar_preset_tiny': 'tiny (TinyLidarNet-like)',
+        'label_lidar_num_bins': 'Bins',
+        'label_lidar_downsample': 'Downsample',
+        'opt_lidar_ds_minpool': 'min-pool',
+        'opt_lidar_ds_index': 'uniform (RL compat.)',
+        'label_lidar_stack': 'Stacked frames K',
+        'chk_lidar_valid_ch': 'Add invalid-beam channel',
+        'tip_lidar_valid_ch': ('Feed a separate valid=1/invalid=0 channel for zero or '
+                               'out-of-range beams so dark objects / dropouts are not '
+                               'mistaken for "far away"'),
+        'label_lidar_max_range': 'Max range [mm]',
+        'label_lidar_max_speed': 'Max speed [m/s]',
+        'chk_lidar_traj': 'Aux. trajectory head',
+        'tip_lidar_traj': ('Regress the future trajectory built from localization '
+                           '(pose/slam) as an auxiliary task to regularize the encoder. '
+                           'Auto-disabled without localization. Adds a traj output to '
+                           'ONNX (ignored on the vehicle)'),
+        'label_lidar_mode_filter': 'Teacher data',
+        'label_lidar_pose_source': 'Traj. label',
+        'opt_lidar_mode_all': 'All',
+        'opt_lidar_mode_auto': 'Autonomous only (auto_*)',
+        'opt_lidar_mode_user': 'Manual only (user)',
+        'label_lidar_split': 'Split',
+        'opt_lidar_split_block': 'Contiguous blocks',
+        'opt_lidar_split_random': 'Random',
+        'tip_lidar_split': ('Contiguous blocks: split in ~200-frame chunks so adjacent '
+                            'frames never straddle train/val. Random splits overestimate '
+                            'validation accuracy'),
+        'chk_lidar_mirror': 'Mirror augmentation (flip scan + negate steering)',
+        'tip_lidar_mirror': ('Off by default because it can conflict with the course '
+                             'side preference (path_variant). Enable only for symmetric '
+                             'driving'),
+        'chk_lidar_steer_balance': 'Inverse-frequency weighting for large steering',
+        'label_lidar_info': 'Input: lidar/*.npy (K stacked) + speed -> angle/throttle. No image sources; ONNX auto-exported',
+        'msg_lidar_no_scans': ('No LiDAR data (lidar/*_lidar_distance_array_.npy) found. '
+                               'Load a session recorded with LiDAR'),
+        'msg_togivad_no_agents': ('No agent labels (togivad/agents) found. '
+                                  'Write them back via "Compute & save agent '
+                                  'labels" in the map view before training'),
         'label_stride': 'Stride',
         'label_hidden_dim': 'Hidden Size',
         'label_dropout': 'Dropout',
@@ -3399,10 +4343,15 @@ Notes
         'label_select_traj_model': 'Select Sequence Model',
         'label_traj_model_info': '{0} | seq={1}, horizon={2}, sources={3}',
         'chk_show_traj_prediction': 'Show Sequence Prediction',
+        'label_togivad_control_infer': 'Driving inference (TogiVAD):',
+        'chk_show_togivad_control_infer': 'Show inferred angle/throttle',
         'label_traj_pred_steering': 'Pred (steering)',
         'label_traj_pred_throttle': 'Pred (throttle)',
         'label_traj_inference_result': 'Sequence Inference:',
         'label_togivad_inference_result': 'TogiVAD trajectory t+Δt, x, y (s, m, m):',
+        'msg_model_source_mismatch': 'The camera keys recorded in the model do not match the keys of the currently loaded data.\n\nModel (training): {0}\nCurrent data: {1}\n\nRemapping:\n{2}',
+        'msg_model_source_unresolved': 'Camera keys with no match: {0}\n\nImages cannot be loaded, so no inference result will be shown.\nLoad data containing the matching image keys, or pick another model.',
+        'status_model_source_remapped': 'Camera keys remapped: {0}',
         'label_traj_section_title': 'Time-Series Sequence Model',
         'label_all': 'All',
         'label_combined_view': 'Combined',
@@ -3445,6 +4394,26 @@ Notes
         'map_view_source_auto': 'Auto (by priority)',
         'map_view_colorby_label': 'Color by:',
         'map_view_colorby_time': 'Time',
+        'map_view_colorby_lap': 'Lap',
+        'map_view_lap_all_short': 'All',
+        'map_view_show_line': 'Line',
+        'map_view_laptime_current': 'Lap {0}: {1}s | in-lap {2}s',
+        'map_view_laptime_header': 'Lap {0}: {1}/{2}s',
+        'map_view_laptime_best': 'Best: Lap {0} {1}s | elapsed {2}s',
+        'map_view_laptime_total': 'Elapsed {0}s',
+        'map_view_lap_table_btn': 'Lap list',
+        'map_view_lap_table_title': 'Lap times',
+        'map_view_lap_table_col_lap': 'Lap',
+        'map_view_lap_table_col_time': 'Time [s]',
+        'map_view_lap_table_col_start': 'Start frame',
+        'map_view_lap_table_col_note': 'Note',
+        'map_view_lap_table_best': '★ Best',
+        'map_view_lap_table_running': 'running',
+        'map_view_lap_table_close': 'Close',
+        'map_view_lap_label': 'Lap:',
+        'map_view_lap_all': 'All laps',
+        'map_view_lap_item': 'Lap {0}',
+        'map_view_lap_status': 'Laps: {0}',
         'map_view_colorby_speed': 'Speed',
         'map_view_colorby_source': 'Source',
         'map_view_colorby_status': 'Status',
@@ -3452,12 +4421,17 @@ Notes
         'map_view_clear_background': 'Clear Map',
         'map_view_no_pose_data': 'This session has no pose data (pose/slam/vslam/aruco)',
         'map_view_available_sources': 'Available sources: {0}',
-        'map_view_status_extras': 'traj labels (black edge): {0} / jumps (red x): {1}',
+        'map_view_status_extras': 'traj labels saved: {0} / jumps (red x): {1}',
         'map_view_legend_jump': 'Jump',
         'map_view_legend_slip': 'Slip',
         'map_view_legend_rough': 'Rough road',
         'map_view_background_load_error': 'Failed to load map: {0}',
         'map_view_auto_loaded': 'Map auto-loaded: {0} ({1})',
+        'map_view_wp_label': 'WP:',
+        'map_view_wp_none': 'Hidden',
+        'map_view_wp_tip': 'Overlay the path followed during the run (centerline / raceline CSV) on the map.\nDefaults to path_csv in manifest.json; other paths in the map folder can be selected.',
+        'map_view_wp_browse_tip': 'Open path CSV...',
+        'map_view_wp_load_error': 'Failed to load path CSV: {0}',
 
         # map_view_quality_ / map_view_segment_ / map_view_interp_ / map_view_writeback_ : Phase 2 editing
         'map_view_quality_label': 'Quality filter:',
@@ -3487,6 +4461,10 @@ Notes
         'map_view_writeback_horizon_label': 'Points:',
         'map_view_writeback_dt_label': 'Interval [s]:',
         'map_view_writeback_btn': 'Compute & save trajectory labels',
+        'map_view_agent_writeback_btn': 'Compute & save agent labels (②)',
+        'map_view_agent_writeback_tooltip': 'Unproject opponent bounding boxes to the ego ground, track them with measured pose,\nand compute other-vehicle future trajectories (togivad/agents).\nThese become the GT for TogiVAD ② multimodal agent motion.\nThe original files are backed up as .bak.',
+        'map_view_agent_writeback_none': 'No opponent bounding boxes found.\nAnnotate opponents with the class preset "TogiVAD他車(E2E)" first, then run this.',
+        'map_view_agent_writeback_result': 'Saved agent labels (togivad/agents).\nFrames with agents: {0} / unprojected boxes: {1}',
         'map_view_writeback_tooltip': 'Computes each frame\'s future trajectory (togivad training label\ntogivad/future_traj) from the current pose data (with quality filter,\nsegment overrides and interpolation applied) and saves it into the\nrecorded catalog files. Original files are backed up as .bak.',
         'map_view_writeback_hint': 'Computes the driving trajectory up to "points × interval" seconds ahead of each frame as a training label and saves it into the recorded data (used by togivad training). Original files are backed up as .bak before saving.',
         'map_view_writeback_horizon_tooltip': 'Number of future trajectory points (default 20 = togivad default)',
@@ -3500,7 +4478,61 @@ Notes
         'map_view_writeback_error': 'Error while saving: {0}',
         'map_view_writeback_no_manifest': 'manifest.json is not loaded. Load a session first.',
 
+        # map_view_region_ / map_view_autoloc_ : location regions (closed polygons) & auto location annotation (Phase 1)
+        'map_view_colorby_loc': 'Location',
+        'map_view_colorby_pred_loc': 'Predicted class',
+        'map_view_colorbar_unlabeled': 'None',
+        'map_view_section_display': 'Display',
+        'map_view_all_laps': 'All laps',
+        'map_view_source_all': 'All sources (overlay)',
+        'map_view_lap_table_btn_short': 'List',
+        'map_view_nav_more_tip': 'More plot tools (back/forward/pan/zoom/configure/save)',
+        'map_view_all_laps_tip': 'ON: show every lap / OFF: show only the current frame\'s lap (follows frame changes)',
+        'map_view_side_panel_toggle_tip': 'Collapse / expand the side panel (the map takes the full width when collapsed)',
+        'map_view_section_edit': 'Edit & labels',
+        'map_view_tab_pose_edit': 'Pose',
+        'map_view_tab_labels': 'Labels',
+        'map_view_tab_regions': 'Regions',
+        'map_view_hint_hover': 'Hover over labels and buttons for details',
+        'map_view_show_inference': 'Inference',
+        'map_view_show_inference_tip': 'Overlay the location model\'s estimated coordinates in purple (pose-regression model loaded, inferred frames only).\nCurrent frame is a purple triangle; the dashed line shows the error to the measured pose. Circles for frames inferred during playback are added on the fly.',
+        'map_view_legend_inference': 'Inference ({0}, mean error {1} m)',
+        'map_view_region_label': 'Location regions:',
+        'map_view_region_edit_btn': 'Edit regions',
+        'map_view_region_edit_tooltip': 'While ON, polygon regions can be edited on the map (same feel as segmentation annotation).\n- Click empty space to start a new polygon, click vertices in order, then click the first vertex or right-click to close\n- Existing regions: click to select + drag to move, drag vertices to reshape, right-click inserts a point,\n  Shift+right-click changes the class, Delete/Backspace removes the vertex/region (a hovered region can be\n  deleted without selecting), Shift+click deselects\n- Clicking near a vertex of an existing region reuses that vertex (shared boundaries)\n- Ctrl+click starts a new polygon even on top of an existing region (for overlay patches)',
+        'map_view_region_class_label': 'Class:',
+        'map_view_region_undo_btn': 'Undo last',
+        'map_view_region_clear_btn': 'Clear all',
+        'map_view_region_save_btn': 'Save regions',
+        'map_view_region_save_tooltip': 'Saves the region definitions as location_regions.json into the map folder.\nSessions using the same map auto-load and reuse them.',
+        'map_view_region_saved': 'Saved location regions: {0}',
+        'map_view_region_save_error': 'Failed to save location regions: {0}',
+        'map_view_region_no_save_dir': 'No save location available (neither a map nor a data folder is loaded)',
+        'map_view_region_loaded': 'Loaded saved location regions: {0} region(s) ({1})',
+        'map_view_region_count': 'Defined regions: {0}',
+        'map_view_region_hint_start': 'Click empty space to start a new polygon (class {0}). Click an existing region to select and edit it (Ctrl+click starts a new polygon even on a region)',
+        'map_view_region_hint_progress': '{0} vertex(es) (class {1}). Click to add vertices (3+ vertices to close)',
+        'map_view_region_hint_close': '{0} vertex(es) (class {1}). Click the first vertex (white dot) or right-click to close and confirm',
+        'map_view_region_hint_selected': 'Region {0} (class {1}) selected. Drag vertices to reshape, drag inside to move, right-click inserts a point, Shift+right-click changes the class, Delete removes, Shift+click deselects',
+        'map_view_region_added': 'Region added: class {0} ({1} vertices)',
+        'map_view_region_deleted': 'Region deleted (class {0})',
+        'map_view_region_point_added': 'Added a new point to the polygon (position: {0})',
+        'map_view_region_menu_change_class': 'Change location class...',
+        'map_view_region_none': 'No location regions defined. Turn on "Edit regions" and draw polygons on the map first.',
+        'map_view_region_hint': 'With "Edit regions" ON, click empty space to draw a polygon and close it via its first vertex or right-click to make a location-class region. Click an existing region to select it, then drag vertices, move it, add points, change its class, or Delete it (same interactions as segmentation annotation). "Auto-label from regions" assigns each frame the location label of the polygon containing its pose (overlaps: the later-defined region wins; check results with color-by "Location").',
+        'map_view_autoloc_btn': 'Auto-label from regions',
+        'map_view_autoloc_tooltip': 'Finds the polygon region containing each frame\'s pose and assigns that\nregion\'s location class (overlaps: the later-defined region wins).\nResults are reflected in the location buttons, gallery, and color-by "Location".',
+        'map_view_autoloc_keep_manual': 'Keep manual labels',
+        'map_view_autoloc_keep_manual_tooltip': 'ON: manually set location labels are never overwritten (auto labels are refreshed)\nOFF: all location labels are overwritten from the region definitions',
+        'map_view_autoloc_confirm_title': 'Auto location annotation',
+        'map_view_autoloc_confirm_msg': 'Auto-assign location labels to all frames with pose data using\n{0} polygon region(s) (overlaps: the later-defined region wins).\n\n- Keep manual labels: {1}\n\nProceed?',
+        'map_view_autoloc_progress': 'Assigning location labels... {0}/{1}',
+        'map_view_autoloc_cancelled': 'Cancelled ({0} label(s) had already been assigned).',
+        'map_view_autoloc_result': 'Auto location annotation finished.\n\n- Assigned: {0}\n- Skipped (manual kept): {1}\n- Skipped (no pose): {2}\n- Skipped (outside all regions): {3}\n- Excluded (deleted frames): {4}',
+
         # --- Databricks integration (in-app settings / transfer / train / monitor) ---
+        'db_connecting': 'Connecting to Databricks... (a browser opens for OAuth)',
+        'db_connect_failed': 'Could not connect to Databricks:\n{0}',
         'db_group_connection': 'Connection settings',
         'db_field_enabled': 'Enable Databricks integration',
         'db_field_auth_method': 'Auth method:',
@@ -3529,6 +4561,14 @@ Notes
         'db_field_compute': 'Compute:',
         'db_compute_serverless': 'Serverless (works on free plan)',
         'db_compute_cluster': 'Cluster (use configured cluster ID)',
+        'db_field_accelerator': 'Accelerator:',
+        'db_accel_cpu': 'CPU',
+        'db_accel_gpu': 'GPU',
+        'db_field_env_version': 'Environment version:',
+        'db_tip_env_version': 'Serverless environment version (e.g. 2, 3). Overrides the environment bound to the notebook to avoid GPU/CPU mismatch. Use a value valid in your workspace.',
+        'db_field_base_env': 'GPU base environment:',
+        'db_base_env_placeholder': 'e.g. databricks-gpu (match your workspace)',
+        'db_tip_base_env': 'Base environment name when running on a GPU accelerator. Use the name shown in the workspace Environment panel. Leave empty for CPU.',
         'db_chk_deploy_notebooks': 'Deploy notebooks before training',
         'db_model_basic': 'Basic model (steer/throttle regression, resnet18)',
         'db_model_togivad': 'TogiVAD (trajectory-vocab classification, needs togivad/future_traj labels)',

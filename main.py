@@ -44,11 +44,11 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                             QScrollArea, QGridLayout, QFrame, QLineEdit, QProgressDialog,
                             QCheckBox, QSpinBox, QComboBox, QSlider, QInputDialog,
                             QDoubleSpinBox, QDialog, QDialogButtonBox, QFormLayout,
-                            QGroupBox, QRadioButton, QTabWidget, QSizePolicy,QButtonGroup,
+                            QGroupBox, QRadioButton, QTabWidget, QSizePolicy,QButtonGroup, QSplitter,
                             QListView, QTreeView, QAbstractItemView,QStyleOptionSlider,QStyle, QTextEdit, QPlainTextEdit,
                             QGraphicsOpacityEffect, QListWidget, QListWidgetItem)
-from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont, QPolygon, QCursor, QIcon, QPainterPath
-from PyQt5.QtCore import Qt, QRect, QPoint, QSize, QTimer, QEvent, QThread, pyqtSignal
+from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage, QBrush, QFont, QPolygon, QPolygonF, QCursor, QIcon, QPainterPath
+from PyQt5.QtCore import Qt, QRect, QRectF, QPoint, QPointF, QSize, QTimer, QEvent, QThread, pyqtSignal
 
 from PIL import Image, ImageDraw
 
@@ -69,19 +69,24 @@ from utils.image_utils import (
 )
 
 # カスタムモジュールのインポート
-from model_catalog import get_model, list_available_models, VirtualSourceDataset
+from model_catalog import get_model, list_available_models, list_available_location_models, VirtualSourceDataset, apply_masks
 from utils.inference_utils import batch_inference
 from utils.export_utils import export_to_donkey, export_to_jetracer, export_to_video, export_to_video_multi_source
 from model_training import train_model, create_datasets
 from model_training import train_location_model, create_location_datasets, LocationModelManager, create_waypoint_datasets
 from model_training import generate_augmentation_samples
 # TODO:ボタンのスタイルを実装、他のUIの移植については後ほど検討
-from styles import get_location_color, apply_style, set_theme, get_current_theme, PRIMARY_STYLE, MODEL_STYLE, TRAINING_STYLE, EXPORT_STYLE, SPECIAL_STYLE, DESTRUCTIVE_STYLE, NAV_STYLE
+from styles import (get_location_color, apply_style, set_theme, get_current_theme, PRIMARY_STYLE, MODEL_STYLE,
+                    TRAINING_STYLE, EXPORT_STYLE, SPECIAL_STYLE, DESTRUCTIVE_STYLE, NAV_STYLE,
+                    apply_app_theme, is_dark_mode, theme_color, set_text_role, set_panel_role,
+                    set_segmented, location_button_qss, location_text_color, tint_group_qss)
 
 
-from managers import AnnotationDataManager, MLflowManager, ModelType, SequenceTrainingManager, PoseSourceManager, TogivadTrainingManager
+from managers import AnnotationDataManager, MLflowManager, ModelType, SequenceTrainingManager, PoseSourceManager, TogivadTrainingManager, LidarPolicyTrainingManager
 from map_view import MapViewDialog
-from utils.yolo_utils import train_yolo_with_ui, TrainingOutputDialog
+from utils.yolo_utils import (train_yolo_with_ui, TrainingOutputDialog,
+                              dets_to_bboxes, masks_to_segments,
+                              DEFAULT_VEHICLE_CLASSES, DEFAULT_EGO_REGION)
 from data_analysis import DataAnalysisDialog
 from utils.databricks_transfer import DatabricksTransferManager
 
@@ -95,6 +100,43 @@ sys.excepthook = exception_hook
 # グローバル設定変数（移植中）
 from config import *
 from translations import get_text, set_language, get_current_language, t
+
+# ─── マスク ─────────────────────────────────────────────
+
+# 組み込みマスクのID（プルダウンから削除できない）
+BUILTIN_MASK_IDS = ('vehicle', 'background')
+
+# マスクオーバーレイの色（インデックス順に割り当て、超えた分は循環）
+MASK_OVERLAY_COLORS = [
+    (128, 128, 128),  # 車両: グレー
+    (60, 130, 220),   # 背景: 青
+    (220, 140, 40),   # 以降は追加マスク用
+    (80, 180, 100),
+    (200, 80, 180),
+    (200, 190, 60),
+]
+
+
+def mask_overlay_color(index):
+    """マスクindexに対応するオーバーレイ色 (r, g, b) を返す"""
+    return MASK_OVERLAY_COLORS[index % len(MASK_OVERLAY_COLORS)]
+
+
+# ─── モデル表示名 ヘルパー関数 ─────────────────────────────────────────────
+
+def _shorten_model_display_name(filename, prefix=None):
+    """モデルファイル名からプレフィックス（アーキ/タイプ名）とサフィックス（拡張子）を省略した表示名を作る
+
+    例: donkeycar_20260902_184035.pth, prefix="donkeycar" -> "20260902_184035"
+    """
+    name = os.path.basename(filename)
+    if name.lower().endswith('.pth'):
+        name = name[:-len('.pth')]
+    if prefix:
+        p = prefix if prefix.endswith('_') else f"{prefix}_"
+        if name.lower().startswith(p.lower()):
+            name = name[len(p):]
+    return name if name else os.path.basename(filename)
 
 # ─── フラッドフィル ヘルパー関数 ─────────────────────────────────────────────
 
@@ -307,6 +349,116 @@ def _seg_annotation_to_mask(seg, img_h, img_w):
         _IDraw.Draw(img_p).polygon(pts, fill=1)
         return _np.array(img_p, dtype=bool)
 
+# 排他選択（セグメンテッドコントロール）の見た目は styles.set_segmented() で付ける。
+# アノテーションモード切替と位置/コーナー切替で共有し、ダーク/ライトで色が切り替わる。
+
+# タイトル無しの枠だけの群（QGroupBox）用スタイル。上マージンは不要。
+PANEL_FRAME_QSS = "QGroupBox{border:1px solid #d0d0d0;border-radius:4px;}"
+
+# 折り返した2段目の行頭インデント（親のチェックボックスにぶら下がって見せる）
+_INDENT_WIDTH = 18
+
+# バウンディングボックス四隅ハンドルの一辺（画面ピクセル）。
+# 描画と当たり判定の両方でこの値を使い、見た目と操作範囲を一致させる。
+BBOX_HANDLE_SIZE = 8
+
+# 画像ソース(cam0/cam1/…)ごとに分けて保持する辞書。フレーム番号だけをキーに
+# しているため、ソースを切り替えるときに丸ごと載せ替える必要がある。
+SOURCE_SCOPED_STORES = (
+    'bbox_annotations',
+    'segmentation_annotations',
+    'detection_inference_results',
+    'segmentation_inference_results',
+)
+
+# パネル境界のドラッグハンドル。掴める場所と分かるよう見えるグリップを出す。
+SPLITTER_HANDLE_QSS = (
+    "QSplitter::handle:horizontal{background:#dcdcdc;border-left:1px solid #c4c4c4;"
+    "border-right:1px solid #c4c4c4;margin:2px 0;}"
+    "QSplitter::handle:horizontal:hover{background:#4a90d9;}"
+    "QSplitter::handle:horizontal:pressed{background:#2a70b9;}"
+)
+
+
+def make_panel_splitter(widgets, stretches, handle_width=6):
+    """パネル境界をドラッグで動かせる QSplitter を組み立てる。
+
+    widgets: 左から順に並べるウィジェット
+    stretches: 各ウィジェットのストレッチ係数（ウィンドウ拡大時の配分）
+    子は畳めないようにして、ドラッグでパネルが消えるのを防ぐ。
+    """
+    splitter = QSplitter(Qt.Horizontal)
+    splitter.setChildrenCollapsible(False)
+    splitter.setHandleWidth(handle_width)
+    splitter.setStyleSheet(SPLITTER_HANDLE_QSS)
+    for index, widget in enumerate(widgets):
+        splitter.addWidget(widget)
+        splitter.setStretchFactor(index, stretches[index])
+    return splitter
+
+
+def panel_group_qss(font_metrics):
+    """タイトル付き QGroupBox（右パネルの群）用スタイルを返す。
+
+    QSS で border を指定すると Qt がタイトル分の余白を自動確保しなくなるため、
+    タイトルの実高さから margin-top を算出してフレームを押し下げる。
+    フォントサイズ変更で高さが変わるので、そのたびに作り直して適用する。
+    """
+    title_h = font_metrics.height()
+    return (
+        "QGroupBox{border:1px solid #d0d0d0;border-radius:4px;"
+        f"margin-top:{title_h}px;padding-top:6px;font-weight:bold;}}"
+        "QGroupBox::title{subcontrol-origin:margin;subcontrol-position:top left;"
+        "left:8px;padding:0 4px;}"
+    )
+
+
+def _available_screen_geometry(widget):
+    """ウィジェットが載っている画面の利用可能領域（タスクバー等を除く）"""
+    handle = widget.windowHandle()
+    screen = handle.screen() if handle is not None else QApplication.primaryScreen()
+    return screen.availableGeometry()
+
+
+def fit_dialog_to_scroll_content(dialog, scrolls, max_ratio=0.95):
+    """スクロール領域の中身が横に収まる大きさまでダイアログを広げる（画面内に収める）。
+
+    必要な幅はフォントやDPIで変わるので、表示後の実寸（ダイアログ全体と
+    ビューポートの差＝枠や余白の分）から求める。exec_() の直前に
+    QTimer.singleShot(0, ...) で予約して、表示直後に呼ぶ想定。
+    scrolls には非表示タブのスクロール領域も渡してよい（中身の最大幅を使う）。
+    """
+    scrolls = [s for s in scrolls if s.widget() is not None]
+    if not scrolls:
+        return
+    ref = next((s for s in scrolls if s.isVisible()), scrolls[0])
+    chrome_w = dialog.width() - ref.viewport().width()
+    chrome_h = dialog.height() - ref.viewport().height()
+    need_w = (max(s.widget().sizeHint().width() for s in scrolls)
+              + ref.verticalScrollBar().sizeHint().width() + chrome_w)
+    need_h = max(s.widget().sizeHint().height() for s in scrolls) + chrome_h
+
+    avail = _available_screen_geometry(dialog)
+    w = min(max(dialog.width(), need_w), int(avail.width() * max_ratio))
+    h = min(max(dialog.height(), need_h), int(avail.height() * max_ratio))
+    if (w, h) == (dialog.width(), dialog.height()):
+        return
+    dialog.resize(w, h)
+    # 広げた分で画面からはみ出さないよう、親の中央に置き直してから画面内に収める
+    parent = dialog.parentWidget()
+    center = parent.frameGeometry().center() if parent is not None else avail.center()
+    x = max(avail.left(), min(center.x() - w // 2, avail.right() - w))
+    y = max(avail.top(), min(center.y() - h // 2, avail.bottom() - h))
+    dialog.move(x, y)
+
+# アノテーションモードID → ステータスバー用メッセージキー
+_MODE_STATUS_KEYS = {
+    0: 'status_switched_to_auto_driving',
+    1: 'status_switched_to_detection',
+    2: 'status_switched_to_segmentation',
+    3: 'status_switched_to_waypoint',
+}
+
 # 位置インデックス → (角度deg, ラベル) のマッピング（コーナー表示モード用）
 _CORNER_INFO = [
     (0,   "ストレート"),
@@ -390,14 +542,21 @@ class ImageLabel(QLabel):
         self.grid_size = DEFAULT_GRID_SIZE    
         self.inference_point = None
         self.show_inference = False
+        self.togivad_control_point = None   # TogiVAD angle/throttle 推論点（濃紫円）
+        self.show_togivad_control = False   # TogiVAD 推論表示フラグ（独立トグル）
         self.extra_inference_points = []  # 追加モデルの推論ポイントリスト [(QPoint, QColor, show_flag), ...]
         self.sequence_prediction_points = []  # 時系列予測軌道 [(QPoint, ...)]
         self.show_gru_prediction = False  # 時系列予測表示フラグ
         self.bev_mode = False  # BEV(真上から見た図)表示モード（画像ソース='__bev__'）
+        self.lidar_mode = False  # LiDAR 生スキャン表示モード（画像ソース='__lidar__'）
         self.zoom_factor = DEFAULT_ZOOM_FACTOR
+        # キャンバス表示倍率（フィット=1.0 に対する割合。表示設定ダイアログで変更・保存）
+        self.canvas_scale = 1.0
         self.resolution_scale = 1.0          # 1.0=フル解像度, 0.1=10%
         self.crop_overlay_config = None      # 仮想ソース表示用
         self.virtual_overlay_mode = 'fill'   # 'none', 'border', 'fill'
+        self._mask_drag_index = None         # マスク編集: ドラッグ中の頂点インデックス
+        self._mask_drag_mirrored = False     # マスク編集: 鏡像側ハンドルをドラッグ中か
         self._temporal_thumb_cache = {}      # {(path, w, h): QPixmap}
         self.is_deleted = False
         self.is_downsampled = False  # ダウンサンプリング対象フラグ
@@ -822,20 +981,37 @@ class ImageLabel(QLabel):
             painter.end()
             return
 
+        # LiDAR モード: 生スキャン（極座標/距離プロファイル）を描き、その上に
+        # 画像ソースと同じ angle/throttle 平面のアノテーション点・推論点・差分
+        # ベクトルを重ねる（クリックによるアノテーションも画像と同じ座標系で動く）。
+        if getattr(self, 'lidar_mode', False):
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            self.draw_lidar_view(painter, self.target_rect)
+            self.draw_grid(painter, self.target_rect)
+            self.draw_control_points(painter, self.target_rect,
+                                     self.pix_width, self.pix_height)
+            painter.end()
+            return
+
         self.draw_virtual_overlay(painter, self.target_rect)
 
         # CAMオーバーレイを描画（ベース画像の上、他のアノテーションの下）
         self.draw_gradcam_overlay(painter, self.target_rect)
 
+        # マスクのオーバーレイ（学習時に無視される領域の可視化）
+        self.draw_masks(painter, self.target_rect)
+
         # 各機能毎に描画（描画順序を調整）
         self.draw_grid(painter, self.target_rect)
         self.draw_background_frame(painter, self.target_rect)
-        # バウンディングボックス（YOLO推論結果含む）を先に描画
-        self.draw_bbox(self.pix_width, self.pix_height, painter, self.target_rect)
-        self.draw_segmentation(self.pix_width, self.pix_height, painter, self.target_rect)
-        self.draw_waypoints(self.pix_width, self.pix_height, painter, self.target_rect)
-        # 結合表示時は推論対象セルのサブ矩形・ピクセル寸法を使う
+        # 結合表示時は推論対象セルのサブ矩形・ピクセル寸法を使う。
+        # 矩形/セグ（検出・推論）も全体でなくこのセル矩形に合わせる（結合表示で
+        # ボックスが対象カメラセルからはみ出てずれるのを防ぐ）。
         _ann_rect, _ann_pw, _ann_ph = self._get_annotation_draw_params(self.target_rect)
+        # バウンディングボックス（YOLO推論結果含む）を先に描画（対象カメラセル矩形へ）
+        self.draw_bbox(_ann_pw, _ann_ph, painter, _ann_rect)
+        self.draw_segmentation(_ann_pw, _ann_ph, painter, _ann_rect)
+        self.draw_waypoints(self.pix_width, self.pix_height, painter, self.target_rect)
 
         # アノテーション点、推論点、差分ベクトルを最後に描画（上に表示）
         self.draw_control_points(painter, _ann_rect, _ann_pw, _ann_ph)
@@ -855,13 +1031,14 @@ class ImageLabel(QLabel):
             self.draw_auto_driving_direction(_ann_pw, _ann_ph, painter, _ann_rect)
             # 記録された自己位置からの実測走行軌道（緑）を描画
             self.draw_recorded_trajectory(_ann_pw, _ann_ph, painter, _ann_rect)
-            # TogiVAD 予測軌道（シアン）を同じ魚眼投影で描画（走行軌道と原点・
+            # TogiVAD 予測軌道（明るい紫）を同じ魚眼投影で描画（走行軌道と原点・
             # スケールを揃える。トップダウン overlay は使わない）
             self.draw_prediction_trajectory(_ann_pw, _ann_ph, painter, _ann_rect)
 
-        # SpeedGaugeWidget（画像外の独立ウィジェット）を更新
-        if self.main_window and hasattr(self.main_window, 'speed_gauge'):
-            self.main_window.speed_gauge.update()
+        # 注: SpeedGaugeWidgetの更新はここでは行わない。
+        # paintEvent毎（アノテーションクリックやマウス移動のたび）にゲージが
+        # 再描画されてちらつくため、フレーム移動・推論更新・speed編集の
+        # タイミングでのみ明示的に更新する。
 
         # マウス座標表示（自動運転モードのみ、最後に描画して常に最前面に）
         if self.main_window and self.main_window.current_mode == 0:
@@ -873,18 +1050,43 @@ class ImageLabel(QLabel):
 
         painter.end()
 
+    # グリッドの軸ラベル（左: "-1"〜"1" を x-50、上: y-5、右: x+w+5）が切れない
+    # ようにキャンバス内で確保する余白 [px]
+    FIT_MARGIN_LEFT = 56
+    FIT_MARGIN_RIGHT = 22
+    FIT_MARGIN_TOP = 22
+    FIT_MARGIN_BOTTOM = 8
+
+    def fit_zoom_factor(self, pix_width=None, pix_height=None):
+        """画像（結合画像含む）を余白付きでキャンバスに収める倍率。
+
+        手動ズームは廃止し、常にこの倍率で表示する（zoom_factor には最後に
+        使った値を入れ、マウス判定など既存コードの座標計算と一致させる）。
+        """
+        pw = pix_width or (self.pixmap().width() if self.pixmap() else 0)
+        ph = pix_height or (self.pixmap().height() if self.pixmap() else 0)
+        if pw <= 0 or ph <= 0:
+            return 1.0
+        avail_w = max(1, self.width() - self.FIT_MARGIN_LEFT - self.FIT_MARGIN_RIGHT)
+        avail_h = max(1, self.height() - self.FIT_MARGIN_TOP - self.FIT_MARGIN_BOTTOM)
+        scale = float(getattr(self, 'canvas_scale', 1.0) or 1.0)
+        return max(0.05, min(avail_w / pw, avail_h / ph) * scale)
+
     def draw_initial_frame(self, painter):
         # 元の画像のサイズ
         self.pix_width = self.pixmap().width()
         self.pix_height = self.pixmap().height()
-        
-        # ズーム係数を使用して拡大後のサイズを計算
+
+        # 常にキャンバスへフィット（余白は軸ラベル用）
+        self.zoom_factor = self.fit_zoom_factor(self.pix_width, self.pix_height)
         self.scaled_width = int(self.pix_width * self.zoom_factor)
         self.scaled_height = int(self.pix_height * self.zoom_factor)
-        
-        # 中央に配置するための座標計算
-        self.x = (self.width() - self.scaled_width) // 2
-        self.y = (self.height() - self.scaled_height) // 2
+
+        # 余白を除いた領域の中央に配置
+        avail_w = self.width() - self.FIT_MARGIN_LEFT - self.FIT_MARGIN_RIGHT
+        avail_h = self.height() - self.FIT_MARGIN_TOP - self.FIT_MARGIN_BOTTOM
+        self.x = self.FIT_MARGIN_LEFT + (avail_w - self.scaled_width) // 2
+        self.y = self.FIT_MARGIN_TOP + (avail_h - self.scaled_height) // 2
 
         # 画像を拡大して描画
         self.target_rect = QRect(self.x, self.y, self.scaled_width, self.scaled_height)
@@ -896,6 +1098,107 @@ class ImageLabel(QLabel):
             pix = pix.scaled(small_w, small_h, Qt.IgnoreAspectRatio, Qt.FastTransformation)
             pix = pix.scaled(self.scaled_width, self.scaled_height, Qt.IgnoreAspectRatio, Qt.FastTransformation)
         painter.drawPixmap(self.target_rect, pix)
+
+    def _find_mask_vertex(self, rel_x, rel_y):
+        """編集中マスクの頂点のうち、指定の正規化座標近傍にあるものを探す
+
+        Returns:
+            (index, is_mirrored): 見つからない場合は (None, False)。
+            is_mirrored=True は鏡像側ハンドルをつかんだことを示す（左右対称マスクのみ）。
+        """
+        mw = self.main_window
+        mask = mw.editing_mask() if mw else None
+        if not mask or not mask['points'] or not self.target_rect or self.target_rect.width() <= 0:
+            return None, False
+
+        # スクリーン座標で半径8px以内を近傍とみなす
+        threshold = 8.0
+        symmetric = mask.get('symmetric', True)
+        tw, th = self.target_rect.width(), self.target_rect.height()
+        for i, (px, py) in enumerate(mask['points']):
+            if abs((rel_x - px) * tw) <= threshold and abs((rel_y - py) * th) <= threshold:
+                return i, False
+            if symmetric and (abs((rel_x - (1.0 - px)) * tw) <= threshold
+                              and abs((rel_y - py) * th) <= threshold):
+                return i, True
+        return None, False
+
+    def draw_masks(self, painter, target_rect):
+        """全マスクポリゴンのオーバーレイ描画（編集中のマスクは頂点と中央線も表示）"""
+        mw = self.main_window
+        if not mw:
+            return
+        # 結合表示中はtarget_rectが単一画像と対応せず表示位置がずれるため自動的に非表示
+        if getattr(mw, 'current_variant', None) == '__combined__':
+            return
+        masks = getattr(mw, 'masks', None)
+        if not masks:
+            return
+
+        tx, ty = target_rect.x(), target_rect.y()
+        tw, th = target_rect.width(), target_rect.height()
+        edit_index = getattr(mw, 'mask_edit_index', None)
+
+        def to_screen(p):
+            return QPointF(tx + p[0] * tw, ty + p[1] * th)
+
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        for i, mask in enumerate(masks):
+            editing = (i == edit_index)
+            # 表示オフ設定時は描画しない（編集中は設定に関わらず表示する）
+            if not mask.get('visible', True) and not editing:
+                continue
+            points = mask['points']
+            if not editing and not points:
+                continue
+
+            r, g, b = mask_overlay_color(i)
+            symmetric = mask.get('symmetric', True)
+
+            # 編集中かつ左右対称なら中央線（対称軸）を点線で表示
+            if editing and symmetric:
+                painter.setPen(QPen(QColor(r, g, b, 200), 1, Qt.DashLine))
+                painter.drawLine(int(tx + tw / 2), ty, int(tx + tw / 2), ty + th)
+
+            polygon = mw.get_mask_polygon(i)
+            if polygon:
+                screen_points = [to_screen(p) for p in polygon]
+                painter.setPen(QPen(QColor(max(0, r - 40), max(0, g - 40), max(0, b - 40), 220), 2))
+                painter.setBrush(QBrush(QColor(r, g, b, 110)))
+                painter.drawPolygon(QPolygonF(screen_points))
+
+                # マスク領域の重心にマスク名ラベルを表示
+                label_text = mw.mask_display_name(mask)
+                cx = sum(sp.x() for sp in screen_points) / len(screen_points)
+                cy = sum(sp.y() for sp in screen_points) / len(screen_points)
+                painter.setFont(QFont("Arial", 9, QFont.Bold))
+                fm = painter.fontMetrics()
+                text_x = int(cx - fm.horizontalAdvance(label_text) / 2)
+                text_y = int(cy + fm.ascent() / 2)
+                # 白の縁取りで背景に埋もれないようにする
+                painter.setPen(QPen(QColor(255, 255, 255, 200), 1))
+                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    painter.drawText(text_x + dx, text_y + dy, label_text)
+                painter.setPen(QPen(QColor(max(0, r - 60), max(0, g - 60), max(0, b - 60), 230), 1))
+                painter.drawText(text_x, text_y, label_text)
+
+            # 編集中は頂点マーカーを表示（ユーザー頂点=塗り、鏡像=白抜き）
+            # どちらのハンドルもドラッグで移動、右クリックで削除できる
+            if editing and points:
+                for p in points:
+                    sp = to_screen(p)
+                    painter.setPen(QPen(QColor(255, 255, 255), 1))
+                    painter.setBrush(QBrush(QColor(r, g, b, 240)))
+                    painter.drawEllipse(sp, 5, 5)
+                    if symmetric:
+                        mp = to_screen((1.0 - p[0], p[1]))
+                        painter.setPen(QPen(QColor(r, g, b, 240), 2))
+                        painter.setBrush(QBrush(QColor(255, 255, 255, 180)))
+                        painter.drawEllipse(mp, 5, 5)
+
+        painter.restore()
 
     def draw_virtual_overlay(self, painter, target_rect):
         """仮想ソース領域をオーバーレイ表示（crop/scale/temporal 対応）"""
@@ -1172,8 +1475,8 @@ class ImageLabel(QLabel):
                     
                     # 選択されているバウンディングボックスにはリサイズ用のハンドルを表示
                     if is_selected:
-                        # ハンドルのサイズを設定（より大きく、視認性向上）
-                        handle_size = 8
+                        # ハンドルのサイズ（当たり判定と同じ定数を使う）
+                        handle_size = BBOX_HANDLE_SIZE
                         painter.setBrush(QBrush(color))
                         
                         # 四隅にハンドルを描画
@@ -1302,6 +1605,23 @@ class ImageLabel(QLabel):
         
         return None
 
+    def _bbox_handle_tolerance(self, x1, y1, x2, y2):
+        """四隅ハンドルの当たり判定の半径を元画像座標で返す。
+
+        判定は画面に描いているハンドル（BBOX_HANDLE_SIZE px 四方）に合わせる。
+        元画像座標で固定値を使うと、ズーム倍率や画像解像度によって見た目と
+        大きくズレる（160x120 の画像を 2.5 倍表示すると、従来の 10px 判定は
+        画面上 25px ＝ 描画ハンドルの 6 倍以上あった）。
+        さらに小さなボックスでは四隅の判定同士が重なって中央まで覆うため、
+        ボックス寸法の 1/4 を上限にする。
+        """
+        zoom = getattr(self, 'zoom_factor', 1.0) or 1.0
+        tolerance = (BBOX_HANDLE_SIZE / 2.0) / max(zoom, 0.01)
+        tolerance = min(tolerance,
+                        max(abs(x2 - x1) / 4.0, 1.0),
+                        max(abs(y2 - y1) / 4.0, 1.0))
+        return max(tolerance, 1.0)
+
     def get_resize_handle_at_position(self, pos, target_rect, bbox_index):
         """指定した位置にあるリサイズハンドルの種類を取得"""
         if not (self.main_window and hasattr(self.main_window, 'bbox_annotations')):
@@ -1322,8 +1642,7 @@ class ImageLabel(QLabel):
         x2 = int(target_rect.x() + bbox['x2'] * target_rect.width())
         y2 = int(target_rect.y() + bbox['y2'] * target_rect.height())
         
-        handle_size = 8
-        tolerance = handle_size // 2
+        tolerance = BBOX_HANDLE_SIZE / 2.0
         
         # 各ハンドルの位置をチェック
         handles = {
@@ -1486,7 +1805,7 @@ class ImageLabel(QLabel):
                 # 推論対象未指定なら最初のカメラソース（BEV以外）のセルを既定に
                 # する。全キャンバスを返すと軌道がセル境界をまたいで描画されたり、
                 # _cell_specific 判定で走行/予測軌道がスキップされてしまう。
-                cam_srcs = [s for s in combined_sources if s != 'BEV']
+                cam_srcs = [s for s in combined_sources if s not in ('BEV', 'LIDAR')]
                 if not cam_srcs:
                     return target_rect, self.pix_width, self.pix_height
                 slot_idx = combined_sources.index(cam_srcs[0])
@@ -1568,15 +1887,18 @@ class ImageLabel(QLabel):
                         painter.setBrush(QBrush())  # 塗りつぶしなし
                         painter.drawEllipse(future_scaled_x - size // 2, future_scaled_y - size // 2, size, size)
 
-        # 将来の推論点を描画（t+5, t+10）- 現在の推論点の下に描画
+        # 将来の推論点を描画（t+o1, t+o2。オフセットはモデルの学習設定に従う）- 現在の推論点の下に描画
         if self.show_inference and self.show_future_annotations and self.main_window:
             current_index = self.main_window.current_index
             if hasattr(self.main_window, 'inference_results') and current_index in self.main_window.inference_results:
                 inference_data = self.main_window.inference_results[current_index]
-                future_offsets = [10, 5]  # 先に遠い方を描画（後に描画されるものが上に来る）
-                future_sizes = {5: 22, 10: 14}  # インデックスごとのサイズ（現在は30）
-                # シアン系の色（アノテーションのオレンジ/黄色に対応）
-                future_colors = {5: QColor(0, 200, 200), 10: QColor(0, 150, 150)}  # 5:明るいシアン, 10:暗いシアン
+                _inf_offsets = inference_data.get('future_offsets', [5, 10])
+                _near = _inf_offsets[0]
+                _far = _inf_offsets[1] if len(_inf_offsets) > 1 else _inf_offsets[0]
+                future_offsets = [_far, _near]  # 先に遠い方を描画（後に描画されるものが上に来る）
+                future_sizes = {_near: 22, _far: 14}
+                # シアン系の色（アノテーションのオレンジ/黄色に対応）近:明るいシアン, 遠:暗いシアン
+                future_colors = {_near: QColor(0, 200, 200), _far: QColor(0, 150, 150)}
 
                 for offset in future_offsets:
                     future_key = f"future_{offset}"
@@ -1598,6 +1920,16 @@ class ImageLabel(QLabel):
                         painter.setPen(QPen(color, 3))
                         painter.setBrush(QBrush())  # 塗りつぶしなし
                         painter.drawEllipse(future_scaled_x - size // 2, future_scaled_y - size // 2, size, size)
+
+        # 濃い紫: TogiVAD の angle/throttle 推論点（自動運転モデルの推論点とは独立）
+        if self.show_togivad_control and self.togivad_control_point is not None:
+            rel_x = self.togivad_control_point.x() / pix_width
+            rel_y = self.togivad_control_point.y() / pix_height
+            scaled_x = int(target_rect.x() + rel_x * target_rect.width())
+            scaled_y = int(target_rect.y() + rel_y * target_rect.height())
+            painter.setPen(QPen(QColor(106, 27, 154), 4))   # 濃い紫
+            painter.setBrush(QBrush())                       # 塗りつぶしなし
+            painter.drawEllipse(scaled_x - 15, scaled_y - 15, 30, 30)
 
         # 明るい水色：推論点（推論結果）
         if self.show_inference and self.inference_point is not None:
@@ -1639,12 +1971,12 @@ class ImageLabel(QLabel):
                 painter.drawEllipse(scaled_x - 15, scaled_y - 15, 30, 30)
 
         # 時系列予測軌道を描画（中実三角＋矢印接続、t+1が最大で段階的に縮小）
-        # 推論軌跡は暗めのシアン（ティール）。将来アノテーション表示（緑）と
-        # 明確に区別するため（両方緑だと重なって見分けられなかった）
+        # 推論軌跡は明るい紫。将来アノテーション表示（緑）と明確に区別し、
+        # TogiVAD の推論結果表示（濃紫円）と同系色で揃える
         if getattr(self, 'show_gru_prediction', False) and getattr(self, 'sequence_prediction_points', []):
-            traj_color = QColor(0, 150, 160)  # 暗めシアン（塗り）
-            traj_border = QColor(0, 90, 100)  # 濃いティール（枠）
-            tp1_border = QColor(0, 55, 70)    # t+1強調用の深いティール
+            traj_color = QColor(190, 80, 230)  # 明るい紫（塗り）
+            traj_border = QColor(140, 40, 180) # 濃い紫（枠）
+            tp1_border = QColor(110, 20, 150)  # t+1強調用の深い紫
             n_pts = len(self.sequence_prediction_points)
             base_r = ANNOTATION_CIRCLE_SIZE - 1  # t+1のサイズ（アノテーション円より1pt小さい）
             min_r = 3
@@ -2239,7 +2571,7 @@ class ImageLabel(QLabel):
             QColor(0, 200, 0, 220), draw_dots=True)
 
     def draw_prediction_trajectory(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
-        """TogiVAD 予測軌道(シアン)を、走行軌道と同じ魚眼投影でカメラ画像へ描く。
+        """TogiVAD 予測軌道(明るい紫)を、走行軌道と同じ魚眼投影でカメラ画像へ描く。
 
         従来はトップダウンの自動スケール overlay だったため原点・スケールが
         走行軌道(緑)と揃わなかった。ここで同一投影に統一する。
@@ -2257,7 +2589,7 @@ class ImageLabel(QLabel):
             return
         self._draw_ego_trajectory_fisheye(
             pred, pix_width, pix_height, painter, target_rect,
-            QColor(0, 170, 180, 235), draw_dots=False, arrow=True)
+            QColor(190, 80, 230, 235), draw_dots=False, arrow=True)
 
     def _bev_steering_arc(self, idx, max_fwd, n=24):
         """操舵角(annotation angle)から定曲率アークを ego座標 (n,2)[m] で作る。
@@ -2270,7 +2602,11 @@ class ImageLabel(QLabel):
         ann = mw.annotations.get(idx, {}) if getattr(mw, 'annotations', None) else {}
         if 'angle' not in ann:
             return None
-        angle_val = float(ann['angle'])
+        return self._bev_arc_from_angle(float(ann['angle']), max_fwd, n)
+
+    def _bev_arc_from_angle(self, angle_val, max_fwd, n=24):
+        """angle∈[-1,1]（+1=右）→ 定曲率アーク ego座標 (n,2)[m]（_bev_steering_arc の本体）"""
+        mw = self.main_window
         max_steer = math.radians(getattr(mw, 'auto_max_steering_angle', 25.0))
         wheelbase = 0.25  # RC カーの代表値[m]（BEVの向き指標なので厳密さは不要）
         delta = angle_val * max_steer
@@ -2289,6 +2625,482 @@ class ImageLabel(QLabel):
             x = np.sin(kappa * s) / kappa
             y = (1.0 - np.cos(kappa * s)) / kappa
         return np.stack([x, y], axis=1)
+
+    # ------------------------------------------------------------ LiDAR ビュー
+    def _lidar_frame_data(self, mw, idx):
+        """現フレームの LiDAR スキャン（K積層）・統計・モデル入力ビンを idx キャッシュで返す。"""
+        cfg = mw._lidar_view_cfg()
+        key = (idx, mw.images[idx] if (mw.images and 0 <= idx < len(mw.images)) else None,
+               cfg.stack_frames, cfg.num_bins, cfg.downsample_mode, cfg.max_range_mm,
+               cfg.use_valid_ch)
+        if getattr(mw, '_lidar_frame_key', None) == key:
+            return mw._lidar_frame_cache
+        data = None
+        try:
+            from utils.lidar_view_utils import (collect_lidar_frame, scan_stats,
+                                                model_input_bins, zone_readings,
+                                                zone_geometry)
+            fr = collect_lidar_frame(mw.images, idx, cfg.stack_frames)
+            if fr is not None:
+                cfg.num_beams_raw = int(fr["meta"]["data_points"])
+                fr["stats"] = scan_stats(fr["scans"][-1], fr["meta"],
+                                         cfg.min_range_mm, cfg.max_range_mm)
+                try:
+                    fr["model_bins"] = model_input_bins(fr["scans"], cfg)
+                except Exception as e:
+                    print(f"lidar model input: {e}")
+                    fr["model_bins"] = None
+            # 測距ゾーン（catalog の lidar/{zone} or ultrasonic/{zone}）。
+            # 点群 npy が無いセッション（超音波のみ等）でもゾーンだけで描く。
+            ann = (getattr(mw, 'annotations', {}) or {}).get(idx)
+            prefix, zones = zone_readings(ann)
+            if fr is None and zones:
+                fr = {"scans": [], "duplicated": 0, "stats": {}, "model_bins": None,
+                      "meta": {"angle_start": -135.0, "angle_end": 135.0,
+                               "clockwise": False, "data_points": None}}
+            if fr is not None:
+                fr["cfg"] = cfg
+                fr["zone_prefix"] = prefix
+                fr["zones"] = zones
+                fr["zone_geom"] = zone_geometry(prefix, fr["meta"]) if zones else {}
+                data = fr
+        except Exception as e:
+            print(f"lidar frame load: {e}")
+        mw._lidar_frame_key = key
+        mw._lidar_frame_cache = data
+        return data
+
+    @staticmethod
+    def _lidar_range_color(frac, is_dark, alpha=255):
+        """距離比 0(近)→1(遠) を 橙→青 に補間した色"""
+        f = max(0.0, min(1.0, float(frac)))
+        near = (255, 130, 30) if not is_dark else (255, 150, 60)
+        far = (40, 110, 240) if not is_dark else (90, 160, 255)
+        return QColor(int(near[0] + (far[0] - near[0]) * f),
+                      int(near[1] + (far[1] - near[1]) * f),
+                      int(near[2] + (far[2] - near[2]) * f), alpha)
+
+    def draw_lidar_view(self, painter, rect):
+        """LiDAR 生スキャンを描く（画像ソース '__lidar__'）。
+
+        極座標（自車=中心・前方=上・左=左）または距離プロファイル（角度×距離）。
+        レイヤ: 生点群（距離で着色、無効ビームは灰のマーク）/ 過去 K-1 フレーム /
+        モデル入力（学習と同じ ScanPreprocessor 通過後のビン列）/ ego 軌道
+        （操舵アーク(赤)・推論アーク(シアン)・TogiVAD/LiDAR制御(濃紫)・走行(緑)・予測(紫)）。
+        """
+        mw = self.main_window
+        if mw is None:
+            return
+        idx = getattr(mw, 'current_index', None)
+        if idx is None:
+            return
+        is_dark = getattr(mw, 'is_dark_mode', False)
+        bg = QColor(24, 27, 32) if is_dark else QColor(244, 246, 248)
+        grid_col = QColor(70, 76, 84) if is_dark else QColor(205, 210, 216)
+        axis_col = QColor(110, 118, 128) if is_dark else QColor(160, 166, 174)
+        txt_col = QColor(190, 196, 204) if is_dark else QColor(80, 86, 94)
+
+        painter.save()
+        painter.setClipRect(rect)
+        painter.fillRect(rect, bg)
+        # 目盛・凡例のフォントは描画解像度に比例させる（結合表示の小セルでも収まる）。
+        # BEV(0.045) の半分程度にして点群やゾーンの邪魔にならないようにする
+        fs = max(6, int(round(rect.height() * 0.022)))
+        label_font = QFont("Arial")
+        label_font.setPixelSize(fs)
+        painter.setFont(label_font)
+        self._lidar_fs = fs
+
+        data = self._lidar_frame_data(mw, idx)
+        if data is None:
+            painter.setPen(QPen(txt_col))
+            painter.drawText(rect, Qt.AlignCenter, get_text('lidar_view_no_scan'))
+            painter.restore()
+            return
+
+        mode = getattr(mw, 'lidar_view_mode', 'polar')
+        if mode == 'profile':
+            self._draw_lidar_profile(painter, rect, mw, data, is_dark,
+                                     grid_col, axis_col, txt_col)
+        else:
+            self._draw_lidar_polar(painter, rect, mw, idx, data, is_dark,
+                                   grid_col, axis_col, txt_col)
+        painter.restore()
+
+    def _draw_lidar_polar(self, painter, rect, mw, idx, data, is_dark,
+                          grid_col, axis_col, txt_col):
+        from utils.lidar_view_utils import scan_to_xy
+        cfg = data["cfg"]
+        meta = data["meta"]
+        R = float(getattr(mw, 'lidar_view_range_m', 10.0)) / float(getattr(mw, 'lidar_view_zoom', 1.0) or 1.0)
+        fs = self._lidar_fs
+        pw = max(1, fs // 4)                     # 点の太さ
+        margin = max(6, fs)
+        avail_w = rect.width() - 2 * margin
+        avail_h = rect.height() - 2 * margin
+        # 後方は FOV(±135°) の到達 R·cos45° ぶんだけ確保して自車を下寄りに置く
+        a_max = max(abs(meta["angle_start"]), abs(meta["angle_end"]))
+        rear = R * max(0.0, -math.cos(math.radians(min(a_max, 180.0)))) if a_max > 90 else 0.0
+        rear = max(rear, 0.15 * R)
+        scale = min(avail_w / (2.0 * R), avail_h / (R + rear))
+        ox = rect.x() + rect.width() / 2.0
+        oy = rect.y() + margin + R * scale
+
+        def to_screen(x_fwd, y_left):
+            return (ox - y_left * scale, oy - x_fwd * scale)
+
+        # --- リング・軸・FOV ---
+        step = 0.5 if R <= 3 else (1.0 if R <= 12 else (2.0 if R <= 25 else 5.0))
+        painter.setBrush(Qt.NoBrush)
+        r = step
+        while r <= R + 1e-6:
+            painter.setPen(QPen(grid_col if abs(r - R) > 1e-6 else axis_col, 1))
+            painter.drawEllipse(QPointF(ox, oy), r * scale, r * scale)
+            painter.setPen(QPen(txt_col))
+            painter.drawText(int(ox + 4), int(oy - r * scale - 2), f"{r:g}m")
+            r += step
+        painter.setPen(QPen(axis_col, 1, Qt.DashLine))
+        painter.drawLine(int(ox), int(oy - R * scale), int(ox), int(oy + rear * scale))
+        painter.drawLine(int(ox - R * scale), int(oy), int(ox + R * scale), int(oy))
+        # FOV 境界と死角（後方の扇形を薄く塗る）
+        a0 = math.radians(meta["angle_start"]); a1 = math.radians(meta["angle_end"])
+        for a in (a0, a1):
+            ex, ey = to_screen(R * math.cos(a), R * math.sin(a))
+            painter.setPen(QPen(axis_col, 1))
+            painter.drawLine(int(ox), int(oy), int(ex), int(ey))
+        blind = QColor(0, 0, 0, 14) if not is_dark else QColor(255, 255, 255, 10)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(blind))
+        span_deg = 360.0 - (meta["angle_end"] - meta["angle_start"])
+        if span_deg > 0.5:
+            # Qt の角度は 1/16°, 0=3時, CCW 正。画面では前方=上(90°)、左=左。
+            start_qt = int((90.0 + meta["angle_end"]) * 16)
+            painter.drawPie(QRectF(ox - R * scale, oy - R * scale, 2 * R * scale, 2 * R * scale),
+                            start_qt, int(span_deg * 16))
+
+        # --- 測距ゾーン（monitor.py の drawSensorFan と同じ扇形。点群の下） ---
+        if getattr(mw, 'show_lidar_zones', True) and data.get("zones"):
+            self._draw_lidar_zone_fans(painter, rect, data, R, scale, ox, oy, is_dark, txt_col)
+
+        # --- 点群（過去フレーム → 現フレーム） ---
+        scans = data["scans"]
+        show_hist = getattr(mw, 'show_lidar_history', True)
+        show_pts = getattr(mw, 'show_lidar_points', True)
+        frames = scans if show_hist else scans[-1:]
+        n_fr = len(frames)
+        for fi, scan in enumerate(frames):
+            is_cur = (fi == n_fr - 1)
+            if not show_pts and is_cur:
+                continue
+            X, Y, valid, rm, ang = scan_to_xy(scan, meta, cfg.min_range_mm, cfg.max_range_mm)
+            inrange = valid & (rm <= R)
+            if is_cur:
+                # 距離で着色（drawPoints をレンジ帯ごとにまとめて高速化）
+                frac = np.clip(rm / R, 0, 1)
+                bands = np.minimum((frac * 8).astype(int), 7)
+                for b in range(8):
+                    m = inrange & (bands == b)
+                    if not m.any():
+                        continue
+                    painter.setPen(QPen(self._lidar_range_color((b + 0.5) / 8, is_dark), pw))
+                    pts = [QPointF(*to_screen(x, y)) for x, y in zip(X[m], Y[m])]
+                    painter.drawPoints(QPolygonF(pts))
+                # 無効ビーム: 外周に灰のマーク（角度の欠けが見える）
+                inv = ~valid
+                if inv.any():
+                    painter.setPen(QPen(QColor(150, 150, 150, 170), 1))
+                    for a in ang[inv]:
+                        x0, y0 = to_screen(0.965 * R * math.cos(a), 0.965 * R * math.sin(a))
+                        x1, y1 = to_screen(R * math.cos(a), R * math.sin(a))
+                        painter.drawLine(int(x0), int(y0), int(x1), int(y1))
+            else:
+                alpha = int(40 + 60 * (fi + 1) / max(1, n_fr - 1))
+                painter.setPen(QPen(QColor(120, 130, 140, alpha) if not is_dark
+                                    else QColor(170, 180, 190, alpha), max(1, pw - 1)))
+                pts = [QPointF(*to_screen(x, y)) for x, y in zip(X[inrange], Y[inrange])]
+                if pts:
+                    painter.drawPoints(QPolygonF(pts))
+
+        # --- モデル入力（前処理後ビン）: 黄の折れ線 ---
+        if getattr(mw, 'show_lidar_model_input', True) and data.get("model_bins") is not None:
+            r_m, valid_b, ang_b = data["model_bins"]
+            painter.setPen(QPen(QColor(235, 190, 0) if not is_dark else QColor(255, 215, 60), max(1, pw - 1)))
+            prev = None
+            prev_r = None
+            for rr, ok, a in zip(r_m, valid_b, ang_b):
+                if not ok or rr > R:
+                    prev = None
+                    continue
+                cur = to_screen(rr * math.cos(a), rr * math.sin(a))
+                # 隣接ビン間の距離ジャンプ（壁の縁→遠方）は面ではないので線を切る
+                if prev is not None and abs(rr - prev_r) <= max(0.3, 0.3 * min(rr, prev_r)):
+                    painter.drawLine(int(prev[0]), int(prev[1]), int(cur[0]), int(cur[1]))
+                else:
+                    painter.drawPoint(int(cur[0]), int(cur[1]))
+                prev, prev_r = cur, rr
+
+        # --- ego 軌道（操舵/推論/制御/走行/予測。各表示チェックボックスに連動） ---
+        self._draw_lidar_ego_overlays(painter, mw, idx, to_screen, min(R, 3.0), is_dark)
+
+        # --- 自車 ---
+        painter.setPen(QPen(axis_col, 1))
+        painter.setBrush(QBrush(QColor(60, 70, 80) if not is_dark else QColor(200, 210, 220)))
+        tw = max(3, fs * 0.5)
+        tri = QPolygonF([QPointF(ox, oy - 1.5 * tw), QPointF(ox - tw, oy + tw), QPointF(ox + tw, oy + tw)])
+        painter.drawPolygon(tri)
+
+        # --- 凡例 + 統計 ---
+        self._draw_lidar_legend(painter, rect, mw, data, is_dark, txt_col, bottom=True)
+
+    def _draw_lidar_profile(self, painter, rect, mw, data, is_dark,
+                            grid_col, axis_col, txt_col):
+        """距離プロファイル: 横=ビーム角度[deg]（左端=angle_start）、縦=距離[m]。"""
+        from utils.lidar_view_utils import scan_to_xy
+        cfg = data["cfg"]
+        meta = data["meta"]
+        R = float(getattr(mw, 'lidar_view_range_m', 10.0)) / float(getattr(mw, 'lidar_view_zoom', 1.0) or 1.0)
+        fs = self._lidar_fs
+        pw = max(1, fs // 4)
+        left, right, top, bottom = fs * 3, fs, int(fs * 3.2), int(fs * 2.8)
+        px0 = rect.x() + left; px1 = rect.x() + rect.width() - right
+        py0 = rect.y() + top; py1 = rect.y() + rect.height() - bottom
+        if px1 - px0 < 20 or py1 - py0 < 20:
+            return
+        a_lo, a_hi = float(meta["angle_start"]), float(meta["angle_end"])
+
+        def to_screen(a_deg, r_m):
+            fx = (a_deg - a_lo) / max(1e-6, (a_hi - a_lo))
+            fy = min(1.0, max(0.0, r_m / R))
+            return (px0 + fx * (px1 - px0), py1 - fy * (py1 - py0))
+
+        # グリッド
+        step = 0.5 if R <= 3 else (1.0 if R <= 12 else (2.0 if R <= 25 else 5.0))
+        r = 0.0
+        while r <= R + 1e-6:
+            y = to_screen(a_lo, r)[1]
+            painter.setPen(QPen(grid_col, 1))
+            painter.drawLine(int(px0), int(y), int(px1), int(y))
+            painter.setPen(QPen(txt_col))
+            painter.drawText(int(rect.x() + 3), int(y + fs // 3), f"{r:g}")
+            r += step
+        for a in range(int(math.ceil(a_lo / 45.0)) * 45, int(a_hi) + 1, 45):
+            x = to_screen(a, 0)[0]
+            painter.setPen(QPen(axis_col if a == 0 else grid_col, 2 if a == 0 else 1))
+            painter.drawLine(int(x), int(py0), int(x), int(py1))
+            painter.setPen(QPen(txt_col))
+            lab = f"{a:+d}°" if a else "0°"
+            lw = painter.fontMetrics().horizontalAdvance(lab)
+            lx = min(max(int(x - lw / 2), rect.x() + 2), rect.x() + rect.width() - lw - 2)
+            painter.drawText(lx, int(py1 + fs + 2), lab)
+        painter.setPen(QPen(txt_col))
+        cap = get_text('lidar_view_profile_axis')
+        cw = painter.fontMetrics().horizontalAdvance(cap)
+        painter.drawText(int((px0 + px1) / 2 - cw / 2), int(py1 + 2 * fs + 6), cap)
+
+        sweep_sign = -1.0 if meta.get("clockwise") else 1.0
+        # 測距ゾーン: 角度幅の帯を測距値の高さに描く（点群の下）
+        if getattr(mw, 'show_lidar_zones', True) and data.get("zones"):
+            from utils.lidar_view_utils import zone_color_rgb
+            for z, mm in data["zones"].items():
+                g = data["zone_geom"].get(z)
+                if g is None or mm <= 0:
+                    continue
+                c_rad, w_rad = g
+                d0 = math.degrees(c_rad - w_rad / 2) * sweep_sign
+                d1 = math.degrees(c_rad + w_rad / 2) * sweep_sign
+                x0, yb = to_screen(min(d0, d1), min(mm / 1000.0, R))
+                x1, _ = to_screen(max(d0, d1), 0)
+                rr, gg, bb = zone_color_rgb(mm)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(QColor(rr, gg, bb, 70)))
+                painter.drawRect(QRectF(x0, yb, x1 - x0, py1 - yb))
+                painter.setPen(QPen(QColor(rr, gg, bb, 230), max(2, pw)))
+                painter.drawLine(int(x0), int(yb), int(x1), int(yb))
+                painter.setPen(QPen(txt_col))
+                painter.drawText(int((x0 + x1) / 2 - fs), int(yb - 3), f"{z}")
+
+        scans = data["scans"]
+        show_hist = getattr(mw, 'show_lidar_history', True)
+        show_pts = getattr(mw, 'show_lidar_points', True)
+        frames = scans if show_hist else scans[-1:]
+        n_fr = len(frames)
+        for fi, scan in enumerate(frames):
+            is_cur = (fi == n_fr - 1)
+            if not show_pts and is_cur:
+                continue
+            _, _, valid, rm, ang = scan_to_xy(scan, meta, cfg.min_range_mm, cfg.max_range_mm)
+            deg = np.degrees(ang) * sweep_sign
+            if is_cur:
+                frac = np.clip(rm / R, 0, 1)
+                bands = np.minimum((frac * 8).astype(int), 7)
+                for b in range(8):
+                    m = valid & (bands == b)
+                    if not m.any():
+                        continue
+                    painter.setPen(QPen(self._lidar_range_color((b + 0.5) / 8, is_dark), pw))
+                    pts = [QPointF(*to_screen(d, rr)) for d, rr in zip(deg[m], rm[m])]
+                    painter.drawPoints(QPolygonF(pts))
+                inv = ~valid
+                if inv.any():
+                    painter.setPen(QPen(QColor(150, 150, 150, 200), 1))
+                    for d in deg[inv]:
+                        x = to_screen(d, 0)[0]
+                        painter.drawLine(int(x), int(py1), int(x), int(py1 - 6))
+            else:
+                alpha = int(40 + 60 * (fi + 1) / max(1, n_fr - 1))
+                painter.setPen(QPen(QColor(120, 130, 140, alpha) if not is_dark
+                                    else QColor(170, 180, 190, alpha), max(1, pw - 1)))
+                pts = [QPointF(*to_screen(d, rr)) for d, rr in zip(deg[valid], rm[valid])]
+                if pts:
+                    painter.drawPoints(QPolygonF(pts))
+
+        if getattr(mw, 'show_lidar_model_input', True) and data.get("model_bins") is not None:
+            r_m, valid_b, ang_b = data["model_bins"]
+            deg_b = np.degrees(ang_b) * sweep_sign
+            painter.setPen(QPen(QColor(235, 190, 0) if not is_dark else QColor(255, 215, 60), max(1, pw - 1)))
+            prev = None
+            for rr, ok, d in zip(r_m, valid_b, deg_b):
+                if not ok:
+                    prev = None
+                    continue
+                cur = to_screen(d, min(rr, R))
+                if prev is not None:
+                    painter.drawLine(int(prev[0]), int(prev[1]), int(cur[0]), int(cur[1]))
+                prev = cur
+
+        self._draw_lidar_legend(painter, rect, mw, data, is_dark, txt_col)
+
+    def _draw_lidar_ego_overlays(self, painter, mw, idx, to_screen, max_fwd, is_dark):
+        """LiDAR 極座標図に ego 軌道を重ねる（BEV と同じ配色）。"""
+        items = []  # (points(N,2), QColor, width)
+        # 操舵アーク(赤): 「操舵軌道を表示（赤）」に連動（BEV と同じ）
+        if getattr(mw, 'show_auto_driving_direction', False):
+            arc = self._bev_steering_arc(idx, max_fwd)
+            if arc is not None:
+                items.append((arc, QColor(230, 40, 40), 3))
+        # 推論アーク(シアン): 推論点の表示フラグに連動
+        inf = (getattr(mw, 'inference_results', {}) or {}).get(idx)
+        if inf is not None and 'angle' in inf and getattr(self, 'show_inference', False):
+            arc = self._bev_arc_from_angle(float(inf['angle']), max_fwd)
+            if arc is not None:
+                items.append((arc, QColor(0, 170, 170), 3))
+        # TogiVAD / LiDAR Policy の制御(濃紫): 専用トグルに連動
+        ctl = (getattr(mw, 'togivad_control_results', {}) or {}).get(idx)
+        if ctl is not None and getattr(self, 'show_togivad_control', False):
+            arc = self._bev_arc_from_angle(float(ctl['angle']), max_fwd)
+            if arc is not None:
+                items.append((arc, QColor(120, 40, 170), 3))
+        pm = getattr(mw, 'pose_manager', None)
+        if getattr(mw, 'show_recorded_trajectory', False) and pm and pm.has_any_pose():
+            g = pm.compute_future_trajectory(
+                idx, horizon=max(1, int(getattr(mw, 'recorded_traj_points', 20))),
+                dt=float(getattr(mw, 'recorded_traj_dt', 0.05)),
+                prefer=getattr(mw, 'recorded_traj_source', None))
+            if g is not None and len(g) >= 1:
+                items.append((np.asarray(g, dtype=float), QColor(0, 200, 0), 2))
+        if getattr(mw, 'show_gru_predictions', False) and getattr(mw, '_gru_is_togivad', False):
+            pred_raw = (getattr(mw, 'gru_predictions', {}) or {}).get(idx)
+            if pred_raw:
+                items.append((np.asarray(pred_raw, dtype=float), QColor(190, 80, 230), 2))
+        for pts, col, w in items:
+            painter.setPen(QPen(col, w))
+            painter.setBrush(Qt.NoBrush)
+            sp = [to_screen(float(x), float(y)) for x, y in pts]
+            for k in range(len(sp) - 1):
+                painter.drawLine(int(sp[k][0]), int(sp[k][1]), int(sp[k + 1][0]), int(sp[k + 1][1]))
+
+    def _draw_lidar_zone_fans(self, painter, rect, data, R, scale, ox, oy, is_dark, txt_col):
+        """測距ゾーン（lidar/ultrasonic の RrLH/FrLH/FrFR/FrRH/RrRH）を扇形で描く。
+
+        monitor.py の drawSensorFan と同じ: 自車から測距値までの扇（幅はゾーンの
+        角度範囲）、色は距離閾値（<300mm 赤 / <600mm 黄 / 緑）、外側に距離テキスト。
+        """
+        from utils.lidar_view_utils import zone_color_rgb
+        fs = self._lidar_fs
+        for z, mm in data["zones"].items():
+            g = data["zone_geom"].get(z)
+            if g is None:
+                continue
+            c_rad, w_rad = g
+            rr, gg, bb = zone_color_rgb(mm)
+            if mm <= 0:
+                # 測距なし: 輪郭だけ灰で
+                col_fill, col_line = QColor(0, 0, 0, 0), QColor(140, 140, 140, 160)
+                rad_px = 0.12 * R * scale
+            else:
+                col_fill = QColor(rr, gg, bb, 110 if not is_dark else 130)
+                col_line = QColor(rr, gg, bb, 230)
+                rad_px = min(mm / 1000.0, R) * scale
+            # Qt の角度は 1/16°, 0=3時, CCW 正。画面は前方=上(90°)・左=左なので
+            # ロボット角 a → Qt 角 90°+a
+            start_qt = int((90.0 + math.degrees(c_rad - w_rad / 2)) * 16)
+            span_qt = int(math.degrees(w_rad) * 16)
+            box = QRectF(ox - rad_px, oy - rad_px, 2 * rad_px, 2 * rad_px)
+            painter.setPen(QPen(col_line, max(1, fs // 8)))
+            painter.setBrush(QBrush(col_fill))
+            painter.drawPie(box, start_qt, span_qt)
+            # 距離テキスト（扇の外側）
+            label = f"{z} {mm:.0f}mm" if mm > 0 else f"{z} --"
+            # 近距離ゾーン同士のラベル衝突を避けるため最小半径を確保する
+            lab_r = max(rad_px + fs * 1.2, 0.4 * R * scale)
+            tx = ox - math.sin(c_rad) * lab_r
+            ty = oy - math.cos(c_rad) * lab_r
+            tw = painter.fontMetrics().horizontalAdvance(label)
+            # ラベルは描画矩形内に収める（レンジ外の遠いゾーンは外周に寄る）
+            tx = min(max(tx, rect.x() + tw / 2 + 2), rect.x() + rect.width() - tw / 2 - 2)
+            ty = min(max(ty, rect.y() + fs + 2), rect.y() + rect.height() - 4)
+            painter.setPen(QPen(txt_col))
+            painter.drawText(int(tx - tw / 2), int(ty + fs / 3), label)
+
+    def _draw_lidar_legend(self, painter, rect, mw, data, is_dark, txt_col, bottom=False):
+        st = data.get("stats", {})
+        cfg = data["cfg"]
+        lines = []
+        if data.get("scans"):
+            lines += [
+                (self._lidar_range_color(0.15, is_dark), get_text('lidar_legend_points')),
+                (QColor(150, 150, 150), get_text('lidar_legend_invalid')),
+            ]
+        if getattr(mw, 'show_lidar_zones', True) and data.get("zones"):
+            lines.append((QColor(51, 200, 90), get_text('lidar_legend_zones',
+                                                       data.get("zone_prefix") or "")))
+        if data.get("scans") and getattr(mw, 'show_lidar_history', True) and cfg.stack_frames > 1:
+            lines.append((QColor(140, 150, 160), get_text('lidar_legend_history', cfg.stack_frames - 1)))
+        if getattr(mw, 'show_lidar_model_input', True) and data.get("model_bins") is not None:
+            lines.append((QColor(235, 190, 0), get_text('lidar_legend_model', cfg.num_bins)))
+        if getattr(mw, 'lidar_view_mode', 'polar') != 'profile':
+            if getattr(mw, 'show_auto_driving_direction', False):
+                lines.append((QColor(230, 40, 40), get_text('bev_legend_steering')))
+            if getattr(self, 'show_inference', False):
+                lines.append((QColor(0, 170, 170), get_text('lidar_legend_inference')))
+        fs = self._lidar_fs
+        row_h = fs + 3
+        x = rect.x() + 4
+        y = (rect.y() + rect.height() - 6 - row_h * (len(lines) - 1)) if bottom else (rect.y() + fs + 3)
+        for col, text in lines:
+            painter.setPen(QPen(col, max(2, fs // 5)))
+            painter.drawLine(x, y - fs // 3, x + fs, y - fs // 3)
+            painter.setPen(QPen(txt_col))
+            painter.drawText(x + fs + 4, y, text)
+            y += row_h
+        # 統計（右上）
+        def _fmt(v):
+            return "--" if (v is None or (isinstance(v, float) and math.isnan(v))) else f"{v:.2f}m"
+        stat_lines = []
+        if st:
+            stat_lines = [
+                get_text('lidar_stat_beams', st.get('n_beams', 0), int(st.get('valid_ratio', 0) * 100)),
+                get_text('lidar_stat_min', _fmt(st.get('front_min_m')), _fmt(st.get('left_min_m')),
+                         _fmt(st.get('right_min_m'))),
+            ]
+        if st and cfg.stack_frames > 1:
+            stat_lines.append(get_text('lidar_stat_stack', cfg.stack_frames, data.get('duplicated', 0)))
+        painter.setPen(QPen(txt_col))
+        fm = painter.fontMetrics()
+        y = (rect.y() + rect.height() - 6 - row_h * (max(0, len(stat_lines) - 1))) if bottom else (rect.y() + fs + 3)
+        for text in stat_lines:
+            painter.drawText(int(rect.x() + rect.width() - 4 - fm.horizontalAdvance(text)), y, text)
+            y += row_h
 
     def draw_bev(self, painter, rect):
         """真上から見た図(BEV)を描画する。
@@ -2338,7 +3150,7 @@ class ImageLabel(QLabel):
             pred_raw = preds.get(idx)
             if pred_raw:
                 pred = np.asarray(pred_raw, dtype=float)
-                trajs.append((pred, QColor(0, 170, 180), 'pred'))
+                trajs.append((pred, QColor(190, 80, 230), 'pred'))
 
         # --- 表示レンジ（前方・横）を決める。前方は軌道の最大到達か既定3m ---
         fwd_vals = [float(a[:, 0].max()) for a, _, _ in trajs if len(a)]
@@ -2365,6 +3177,9 @@ class ImageLabel(QLabel):
         def to_screen(x_fwd, y_left):
             return (ox - y_left * scale, oy - x_fwd * scale)
 
+        # CAM画像をIPMで地面へ投影して背景に敷く（グリッド/軌道の下）
+        self._draw_bev_camera(painter, mw, idx, to_screen)
+
         # 目盛・凡例の共通フォント（描画解像度に比例した小さめの px サイズ）
         fs = max(6, int(round(rect.height() * 0.045)))
         label_font = QFont("Arial")
@@ -2389,6 +3204,10 @@ class ImageLabel(QLabel):
             sx, _ = to_screen(0, m)
             painter.setPen(QPen(axis_col if m == 0 else grid_col, 1))
             painter.drawLine(int(sx), int(rect.y()), int(sx), int(rect.y() + rect.height()))
+
+        # --- 学習GTプレビュー: LiDAR占有(障害物マップ)・コース境界①・他車② ---
+        # モデルが学習する教師ラベルそのものを俯瞰に重畳し、目視検証できるようにする。
+        self._draw_bev_gt(painter, mw, idx, to_screen, ox, oy, scale, is_dark)
 
         # --- 車体マーカー（上向き三角） ---
         painter.setPen(QPen(QColor(60, 66, 74) if not is_dark else QColor(200, 206, 214), 1))
@@ -2432,7 +3251,16 @@ class ImageLabel(QLabel):
         if getattr(mw, 'show_recorded_trajectory', False) and pm and pm.has_any_pose():
             legend.append((QColor(0, 200, 0), get_text('bev_legend_recorded')))
         if pred is not None:
-            legend.append((QColor(0, 170, 180), get_text('bev_legend_prediction')))
+            legend.append((QColor(190, 80, 230), get_text('bev_legend_prediction')))
+        # 学習GT レイヤの凡例（占有・境界・他車）
+        if getattr(mw, 'show_bev_occupancy', True):
+            legend.append((QColor(230, 90, 60), get_text('bev_legend_occupancy')))
+        if getattr(mw, 'show_bev_boundary', True):
+            legend.append((QColor(20, 90, 225), get_text('bev_legend_boundary')))
+            legend.append((QColor(225, 105, 0), get_text('bev_legend_boundary_r')))
+        if getattr(mw, 'show_bev_agents', True) and \
+                getattr(mw, 'bbox_annotations', {}).get(idx):
+            legend.append((QColor(210, 60, 200), get_text('bev_legend_agent')))
         painter.setFont(label_font)
         sw = max(6, fs)               # 凡例の色見本の幅
         row_h = fs + 3
@@ -2445,6 +3273,268 @@ class ImageLabel(QLabel):
             painter.drawText(int(rect.x() + 4 + sw + 4), int(ly + fs), name)
             ly += row_h
         painter.setClipping(False)
+
+    def _bev_gt_data(self, mw, idx):
+        """現フレームの LiDAR 占有・境界①を計算（idx キャッシュ）。
+
+        画像パスから同セッションの LiDAR npy（{番号}_lidar_distance_array_.npy）を
+        引き、togivad と同一コード（occupancy_from_scan / boundary_from_occupancy）で
+        BEV 占有と左右境界を作る。失敗時は (None, None, None)。
+        """
+        if getattr(mw, '_bev_gt_idx', None) == idx:
+            return mw._bev_gt_occ, mw._bev_gt_bnd, mw._bev_gt_cfg
+        occ_cells = bnd = ucfg = None
+        try:
+            import sys as _sys
+            import numpy as _np
+            _rr = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if _rr not in _sys.path:
+                _sys.path.insert(0, _rr)
+            from togivad.config import make_config
+            from togivad.dataset import (occupancy_from_scan,
+                                         boundary_from_occupancy, _load_lidar_meta)
+            img_path = mw.images[idx]
+            session = os.path.dirname(os.path.dirname(img_path))
+            prefix = os.path.basename(img_path).split('_')[0]
+            npy = os.path.join(session, 'lidar',
+                               f'{prefix}_lidar_distance_array_.npy')
+            ucfg = getattr(mw, '_bev_gt_cfg', None) or make_config(1)
+            if os.path.exists(npy):
+                scan = _np.load(npy)
+                meta = _load_lidar_meta(session)
+                occ, has = occupancy_from_scan(scan, meta, ucfg)
+                if has > 0.5:
+                    ii, jj = _np.where(occ[0] > 0.5)
+                    X = ucfg.x_min_m + (ii + 0.5) * ucfg.cell_m
+                    Y = ucfg.y_max_m - (jj + 0.5) * ucfg.cell_m
+                    occ_cells = _np.stack([X, Y], axis=1)          # (N,2) ego[m]
+                    # 左右分離の中心線に走行経路を使う（カーブでの跨ぎを防ぐ）
+                    pm = getattr(mw, 'pose_manager', None)
+                    prefer = getattr(mw, 'recorded_traj_source', None)
+                    path = None
+                    if pm is not None and pm.has_any_pose():
+                        try:
+                            path = pm.compute_future_trajectory(
+                                idx, horizon=20, dt=0.1, prefer=prefer)
+                        except Exception:
+                            path = None
+                        # セッション末尾・停車で将来経路が無い/退化 → **過去の
+                        # 走行軌跡**（現 ego 系・原点で終端）にフォールバック。
+                        # 分離線の外挿（_extend_path）が直近の曲率で前方へ弧を
+                        # 伸ばすので、停止フレームでも左右判定が安定する。
+                        if path is None or len(path) < 2 or \
+                                float(_np.hypot(*(
+                                    _np.asarray(path[-1], float)
+                                    - _np.asarray(path[0], float)))) < 0.3:
+                            pts = []
+                            for j in range(max(0, idx - 25), idx):
+                                try:
+                                    dp = pm.relative_dpose(j, idx,
+                                                           prefer=prefer)
+                                except Exception:
+                                    dp = None
+                                if dp is None:
+                                    continue
+                                dx, dy, dth = (float(dp[0]), float(dp[1]),
+                                               float(dp[2]))
+                                c, s = _np.cos(dth), _np.sin(dth)
+                                # j の位置を現フレーム系へ（SE2 逆変換）
+                                pts.append((-(c * dx + s * dy),
+                                            -(-s * dx + c * dy)))
+                            pts.append((0.0, 0.0))
+                            path = _np.asarray(pts) if len(pts) >= 2 else None
+                    bnd = boundary_from_occupancy(occ, ucfg, has, path_xy=path)
+        except Exception:
+            occ_cells = bnd = None
+        mw._bev_gt_idx = idx
+        mw._bev_gt_occ = occ_cells
+        mw._bev_gt_bnd = bnd
+        mw._bev_gt_cfg = ucfg
+        return occ_cells, bnd, ucfg
+
+    def _bev_agent_points(self, mw, idx):
+        """現フレームの opponent 矩形を ego 地面点へ（②のライブ確認）。
+
+        カメラ単眼の**距離は不正確**（魚眼合成モデル・未較正）だが**方位は正確**。
+        そこで矩形底辺中心の逆投影で方位を得たら、その方位近傍の **LiDAR 占有
+        （壁から手前へ凸に出た＝他車）** に距離をスナップして位置を補正する
+        （LiDAR は直接測距なので正確）。占有が無ければカメラ推定のまま。
+        """
+        import numpy as _np
+        # 他車ボックス = opponent アノテ + 車両クラスの**推論結果**（car等）。
+        # 自動アノテ未実行でも推論表示だけで他車が出るようにする（自車領域は
+        # 推論側で DEFAULT_EGO_REGION 除外済み）。
+        veh = set(DEFAULT_VEHICLE_CLASSES) | {'opponent'}
+        opp = [b for b in getattr(mw, 'bbox_annotations', {}).get(idx, [])
+               if b.get('class') == 'opponent']
+        opp += [b for b in getattr(mw, 'detection_inference_results', {}).get(idx, [])
+                if b.get('class') in veh]
+        if not opp:
+            return []
+        W = int(getattr(mw, 'original_image_width', 0) or 160)
+        H = int(getattr(mw, 'original_image_height', 0) or 120)
+        unp = getattr(mw, '_bev_unprojector', None)
+        if unp is None or getattr(mw, '_bev_unproj_wh', None) != (W, H):
+            try:
+                import sys as _sys
+                _rr = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                if _rr not in _sys.path:
+                    _sys.path.insert(0, _rr)
+                from togivad.config import make_config
+                from togivad.tools.agent_labeler import GroundUnprojector
+                tv = make_config(5)
+                spec = next((c for c in tv.cameras if c.name == 'cam3'), None) \
+                    or min(tv.cameras, key=lambda s: abs(s.yaw_deg))
+                unp = GroundUnprojector(spec, (W, H))
+                mw._bev_unprojector = unp
+                mw._bev_unproj_wh = (W, H)
+            except Exception:
+                mw._bev_unprojector = False
+                return []
+        if unp is False:
+            return []
+        occ_cells = self._bev_gt_data(mw, idx)[0]        # LiDAR 占有点 (N,2)[m]
+        has_occ = occ_cells is not None and len(occ_cells)
+        pts = []
+        for b in opp:
+            try:
+                u = (b['x1'] + b['x2']) * 0.5 * W
+                v = max(b['y1'], b['y2']) * H
+                p = unp.unproject(u, v)
+                if p is None:
+                    continue
+                bearing = float(_np.arctan2(p[1], p[0]))
+                # マーカーの**サイズはボックスの画素比に比例**させる。cam3 は正式な
+                # 魚眼較正が無く（合成モデル）、近接地面の逆投影は距離も開き角も
+                # 大きく歪むため、計量的な実寸投影は信頼できない。位置は投影＋LiDAR
+                # スナップで補正し、大きさはボックスの見かけ(大→大)を反映する方針。
+                fw = abs(float(b['x2'] - b['x1']))        # 画像幅に対する比 0..1
+                fh = abs(float(b['y2'] - b['y1']))        # 画像高に対する比 0..1
+                if has_occ:
+                    # カメラ方位（正確）のレイ近傍の LiDAR 占有のうち、**カメラ距離
+                    # 推定に最も近い点**へスナップ（=その方位の実測他車位置）。
+                    # 遠方他車を手前の壁へ寄せない/大きく離れた点には飛ばない。
+                    perp = _np.abs(occ_cells[:, 0] * _np.sin(bearing)
+                                   - occ_cells[:, 1] * _np.cos(bearing))
+                    on_ray = perp < 0.2
+                    if on_ray.any():
+                        cand = occ_cells[on_ray]
+                        d = _np.linalg.norm(cand - _np.asarray(p), axis=1)
+                        k = int(_np.argmin(d))
+                        if d[k] < 1.0:                # 適度に近ければ LiDAR へ補正
+                            p = cand[k]
+                # 画素比 → 実寸[m]。1/10RC 相当(幅~0.2, 車長~0.4)に収める。
+                w_m = float(min(max(fw * 1.2, 0.12), 0.55))   # 横(=Y方向)
+                d_m = float(min(max(fh * 1.2, 0.15), 0.70))   # 前後(=X方向)
+                pts.append((float(p[0]), float(p[1]), w_m, d_m))
+            except Exception:
+                pass
+        return pts
+
+    def _draw_bev_camera(self, painter, mw, idx, to_screen):
+        """現フレームのカメラ画像を IPM で地面へ投影し BEV 背景に描く。
+
+        toggle: mw.show_bev_camera（既定 False）。対応表（ego→カメラ画素）は
+        カメラ較正のみで決まる静的量なので画像サイズごとにキャッシュし、毎フレームは
+        cv2.remap のみ。半透明でグリッド・軌道・境界が上に見えるようにする。
+        """
+        if not getattr(mw, 'show_bev_camera', False):
+            return
+        try:
+            import sys as _sys
+            import cv2
+            import numpy as _np
+            from PyQt5.QtGui import QImage
+            from PyQt5.QtCore import QRect
+            img = cv2.imread(mw.images[idx])              # BGR
+            if img is None:
+                return
+            Himg, Wimg = img.shape[:2]
+            key = (Wimg, Himg)
+            cache = getattr(mw, '_bev_cam_maps', None)
+            if cache is None or cache[0] != key:
+                rr = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                if rr not in _sys.path:
+                    _sys.path.insert(0, rr)
+                from togivad.config import make_config
+                from togivad.calib import bev_camera_maps
+                tv = make_config(5)
+                spec = next((c for c in tv.cameras if c.name == 'cam3'), None) \
+                    or min(tv.cameras, key=lambda s: abs(s.yaw_deg))
+                xr, yr, out = (0.2, 5.0), (-2.5, 2.5), (240, 250)
+                mx, my, valid = bev_camera_maps(spec, xr, yr, out, (Wimg, Himg))
+                cache = (key, mx, my, valid, xr, yr, out)
+                mw._bev_cam_maps = cache
+            _k, mx, my, valid, xr, yr, out = cache
+            warped = cv2.remap(img, mx, my, cv2.INTER_LINEAR)   # (H,W,3) BGR
+            H, W = out
+            rgba = _np.zeros((H, W, 4), _np.uint8)
+            rgba[..., :3] = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
+            rgba[..., 3] = (valid * 210).astype(_np.uint8)     # 半透明・無効は透明
+            qimg = QImage(rgba.data, W, H, 4 * W,
+                          QImage.Format_RGBA8888).copy()
+            tlx, tly = to_screen(xr[1], yr[1])                 # (X_MAX,Y_MAX)=左上
+            brx, bry = to_screen(xr[0], yr[0])                 # (X_MIN,Y_MIN)=右下
+            painter.drawImage(QRect(int(tlx), int(tly),
+                                    int(brx - tlx), int(bry - tly)), qimg)
+        except Exception as e:
+            print(f"bev camera projection: {e}")
+
+    def _draw_bev_gt(self, painter, mw, idx, to_screen, ox, oy, scale, is_dark):
+        """BEV に学習GT（占有・境界・他車）を重畳する。各トグルは既定ON。"""
+        # 1) LiDAR 占有（障害物マップ）: 淡いマスで背景に
+        if getattr(mw, 'show_bev_occupancy', True):
+            occ_cells, bnd, _ = self._bev_gt_data(mw, idx)
+            if occ_cells is not None and len(occ_cells):
+                col = QColor(230, 90, 60, 90) if not is_dark else QColor(250, 120, 90, 90)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(col))
+                sz = max(2, int(0.0625 * scale))          # セル1つぶんの見かけ幅
+                for X, Y in occ_cells:
+                    sx, sy = to_screen(float(X), float(Y))
+                    painter.drawRect(int(sx - sz / 2), int(sy - sz / 2), sz, sz)
+        else:
+            _, bnd, _ = self._bev_gt_data(mw, idx)
+        # 2) コース境界①: 左(青)・右(橙)のポリライン
+        if getattr(mw, 'show_bev_boundary', True) and bnd is not None:
+            pts_all, valid = bnd
+            cols = [QColor(20, 90, 225), QColor(225, 105, 0)]     # 左(濃青), 右(濃橙)
+            for inst in range(pts_all.shape[0]):
+                sp = [to_screen(float(x), float(y))
+                      for (x, y), ok in zip(pts_all[inst], valid[inst]) if ok > 0.5]
+                if len(sp) >= 2:
+                    painter.setPen(QPen(cols[inst % 2], 4, Qt.SolidLine))  # 濃く太く
+                    for k in range(len(sp) - 1):
+                        painter.drawLine(int(sp[k][0]), int(sp[k][1]),
+                                         int(sp[k + 1][0]), int(sp[k + 1][1]))
+                    # 点も打って視認性を上げる
+                    painter.setBrush(QBrush(cols[inst % 2]))
+                    painter.setPen(Qt.NoPen)
+                    for x, y in sp:
+                        painter.drawEllipse(int(x) - 2, int(y) - 2, 4, 4)
+        # 2.5) 自車周辺の除外範囲: 車両搭載物の反射ノイズを境界処理で無視する
+        #     半径（togivad.dataset.SELF_EXCLUDE_RADIUS_M と同値）をグレー点線円
+        #     で可視化する（この円内の LiDAR 点は境界に使われない）。
+        try:
+            from togivad.dataset import SELF_EXCLUDE_RADIUS_M as _exr
+        except Exception:
+            _exr = 0.7
+        cx, cy = to_screen(0.0, 0.0)
+        rr = int(_exr * scale)
+        pen = QPen(QColor(128, 128, 128, 180), 2, Qt.DashLine)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(int(cx - rr), int(cy - rr), 2 * rr, 2 * rr)
+        # 3) 他車②: opponent 矩形を ego 投影し、**実寸(幅×車長)に比例**した
+        #    楕円で描く（w_m=横=Y方向, d_m=前後=X方向。最小4pxで遠方も視認可）。
+        if getattr(mw, 'show_bev_agents', True):
+            painter.setPen(QPen(QColor(210, 60, 200), 2))
+            painter.setBrush(QBrush(QColor(210, 60, 200, 120)))
+            for X, Y, w_m, d_m in self._bev_agent_points(mw, idx):
+                sx, sy = to_screen(X, Y)
+                rx = max(4, int(0.5 * w_m * scale))       # 横半径(px)
+                ry = max(4, int(0.5 * d_m * scale))       # 前後半径(px)
+                painter.drawEllipse(int(sx - rx), int(sy - ry), 2 * rx, 2 * ry)
 
     def draw_segmentation_inference_results(self, pix_width, pix_height, painter: QPainter, target_rect: QRect):
         """セグメンテーション推論結果の描画"""
@@ -2985,6 +4075,13 @@ class ImageLabel(QLabel):
         # speed値を更新
         annotation['speed'] = new_speed
 
+        # スピードゲージとspeedグラフに反映
+        if self.main_window:
+            if hasattr(self.main_window, 'speed_gauge'):
+                self.main_window.speed_gauge.update()
+            if hasattr(self.main_window, 'speed_seek_graph'):
+                self.main_window.speed_seek_graph.update()
+
         # 調整中フラグを立てる
         self.is_adjusting_speed = True
 
@@ -3132,19 +4229,26 @@ class ImageLabel(QLabel):
 
             inference = self.main_window.inference_results[current_index]
 
-            # 将来の推論speedバーを描画（t+5, t+10）- 現在の横線の下に描画
+            # 推論speedは正規化値（0-1）。学習時の正規化値（speed_normalize、
+            # 無ければバーのmax_speed）でm/sに換算し、バーのスケール上に配置する
+            _infer_snorm = inference.get('speed_normalize') or _max_speed
+
+            # 将来の推論speedバーを描画（t+o1, t+o2。オフセットはモデルの学習設定に従う）
             if self.show_future_annotations:
-                future_offsets = [10, 5]  # 先に遠い方を描画
-                future_line_widths = {5: 3, 10: 2}  # 線の太さ
-                future_colors = {5: QColor(0, 200, 200), 10: QColor(0, 150, 150)}  # シアン系
+                _inf_offsets = inference.get('future_offsets', [5, 10])
+                _near = _inf_offsets[0]
+                _far = _inf_offsets[1] if len(_inf_offsets) > 1 else _inf_offsets[0]
+                future_offsets = [_far, _near]  # 先に遠い方を描画
+                future_line_widths = {_near: 3, _far: 2}  # 線の太さ
+                future_colors = {_near: QColor(0, 200, 200), _far: QColor(0, 150, 150)}  # シアン系
 
                 for offset in future_offsets:
                     future_key = f"future_{offset}"
                     if future_key in inference:
                         future_data = inference[future_key]
                         if 'speed' in future_data:
-                            future_infer_speed = future_data['speed']
-                            future_normalized = max(0, min(1, future_infer_speed))
+                            future_infer_speed_ms = future_data['speed'] * _infer_snorm
+                            future_normalized = max(0, min(1, future_infer_speed_ms / _max_speed)) if _max_speed > 0 else 0.0
 
                             future_y = bar_y + bar_height - int(bar_height * future_normalized)
                             future_color = future_colors.get(offset, QColor(0, 200, 200))
@@ -3154,17 +4258,16 @@ class ImageLabel(QLabel):
                             painter.drawLine(bar_x, future_y, bar_x + bar_width, future_y)
 
             if 'speed' in inference:
-                infer_speed = inference['speed']
-                # 推論speed値は正規化済み（0〜1）なのでそのまま使用
-                normalized_infer_speed = max(0, min(1, infer_speed))
+                # m/sに換算してからバーのスケール（max_speed）で位置を決める
+                infer_speed_ms = inference['speed'] * _infer_snorm
+                normalized_infer_speed = max(0, min(1, infer_speed_ms / _max_speed)) if _max_speed > 0 else 0.0
 
                 # 推論結果の位置にシアン色の太い横線を描画（推論点と同色）
                 infer_y = bar_y + bar_height - int(bar_height * normalized_infer_speed)
                 painter.setPen(QPen(QColor(0, 255, 255), 4))  # 明るい水色（推論点と同色）
                 painter.drawLine(bar_x - 2, infer_y, bar_x + bar_width + 2, infer_y)
 
-                # 推論speed値を横線の右側に表示（m/s実値に逆変換）
-                infer_speed_ms = infer_speed * _max_speed
+                # 推論speed値を横線の右側に表示（m/s実値）
                 painter.setPen(QPen(QColor(0, 200, 200), 1))
                 painter.setFont(QFont("Arial", 8, QFont.Bold))
                 painter.drawText(bar_x + bar_width + 25, infer_y + 4, f"({infer_speed_ms:.2f})")
@@ -3199,7 +4302,40 @@ class ImageLabel(QLabel):
             # 元の画像の座標に変換
             orig_x = int(rel_x * self.pix_width)
             orig_y = int(rel_y * self.pix_height)
-            
+
+            # マスク編集モード: 通常のアノテーション処理より優先して頂点を編集
+            if getattr(self.main_window, 'mask_edit_index', None) is not None:
+                # 結合表示中は座標系が合わないため編集操作を受け付けない
+                # （クリックは消費して誤アノテーションを防ぐ）
+                if getattr(self.main_window, 'current_variant', None) == '__combined__':
+                    if hasattr(self.main_window, 'statusBar'):
+                        self.main_window.statusBar().showMessage(
+                            get_text('status_mask_combined_blocked'), 4000)
+                    return
+                if event.button() == Qt.RightButton:
+                    if event.modifiers() & Qt.ControlModifier:
+                        self.main_window.clear_mask_points()  # Ctrl+右クリックで全消去
+                    else:
+                        # 頂点近傍の右クリックはその頂点を削除、それ以外は直前の頂点を削除
+                        vi, _ = self._find_mask_vertex(rel_x, rel_y)
+                        if vi is not None:
+                            self.main_window.remove_mask_point(vi)
+                        else:
+                            self.main_window.remove_last_mask_point()
+                elif event.button() == Qt.LeftButton:
+                    # 既存頂点（鏡像側ハンドル含む）の近傍ならドラッグ移動を開始
+                    vi, mirrored = self._find_mask_vertex(rel_x, rel_y)
+                    if vi is not None:
+                        self._mask_drag_index = vi
+                        self._mask_drag_mirrored = mirrored
+                        self.setCursor(Qt.ClosedHandCursor)
+                    else:
+                        self.main_window.add_mask_point(rel_x, rel_y)
+                return
+
+            # 別モードから持ち越された進行中フラグを捨ててから処理を分岐する
+            self._discard_stale_interaction_state()
+
             # 現在のモードに基づいて処理
             ## 物体検知モード
             if hasattr(self.main_window, 'current_mode') and self.main_window.current_mode == 1:
@@ -3219,8 +4355,8 @@ class ImageLabel(QLabel):
                         x2 = int(bbox['x2'] * self.pix_width)
                         y2 = int(bbox['y2'] * self.pix_height)
                         
-                        # ハンドルのサイズ
-                        handle_size = 10  # ハンドルの検出範囲を大きくする
+                        # ハンドルの検出範囲（画面上の見た目に合わせて算出）
+                        handle_size = self._bbox_handle_tolerance(x1, y1, x2, y2)
                         
                         # 左上ハンドル
                         if abs(orig_x - x1) <= handle_size and abs(orig_y - y1) <= handle_size:
@@ -3624,7 +4760,70 @@ class ImageLabel(QLabel):
                 else:
                     self.main_window.skip_images(1)  # デフォルトは1枚
 
+    def _reset_interaction_state(self):
+        """進行中のドラッグ/描画状態をすべて破棄する。
+
+        マウスリリースを取りこぼしたまま（ウィジェット外で離した、モーダル
+        ダイアログに奪われた、ドラッグ中にBキーでモードを変えた等）別モードへ
+        移ると、mouseReleaseEvent 冒頭の早期 return に引っかかって新しい操作を
+        確定できなくなる。モード切替時に必ず初期化してその持ち越しを断つ。
+        """
+        self.is_painting = False
+        self.current_paint_strokes = []
+        self.is_drawing_bbox = False
+        self.bbox_start = None
+        self.bbox_end = None
+        self.is_moving_bbox = False
+        self.move_start_pos = None
+        self.is_resizing_bbox = False
+        self.resize_handle = None
+        self.resize_start_pos = None
+        self.is_drawing_waypoints = False
+        self.drawing_waypoint_path = []
+        self.drawing_start_pos = None
+        self.is_moving_waypoint = False
+        self.selected_waypoint_index = None
+        self.waypoint_move_start_pos = None
+        self._mask_drag_index = None
+        self._mask_drag_mirrored = False
+        self.setCursor(Qt.ArrowCursor)
+
+    def _discard_stale_interaction_state(self):
+        """現在のモードに属さない進行中フラグを捨てる。
+
+        リリースを取りこぼすとフラグが残り、以後のリリースが冒頭の早期 return に
+        飲み込まれて別モードのアノテーションを確定できなくなる（例: セグの
+        ペイント途中で離し損ねた後、物体検知でバウンディングボックスが作れない）。
+        """
+        mode = getattr(self.main_window, 'current_mode', 0)
+        if mode != 2 and self.is_painting:
+            self.is_painting = False
+            self.current_paint_strokes = []
+        if mode != 3:
+            if self.is_drawing_waypoints:
+                self.is_drawing_waypoints = False
+                self.drawing_waypoint_path = []
+                self.drawing_start_pos = None
+            if self.is_moving_waypoint:
+                self.is_moving_waypoint = False
+                self.selected_waypoint_index = None
+                self.waypoint_move_start_pos = None
+        if (self._mask_drag_index is not None
+                and getattr(self.main_window, 'mask_edit_index', None) is None):
+            self._mask_drag_index = None
+            self._mask_drag_mirrored = False
+
     def mouseReleaseEvent(self, event):
+        # 別モードの操作から持ち越された進行中フラグを先に捨てる
+        self._discard_stale_interaction_state()
+
+        # マスク頂点のドラッグ終了
+        if self._mask_drag_index is not None:
+            self._mask_drag_index = None
+            self._mask_drag_mirrored = False
+            self.setCursor(Qt.ArrowCursor)
+            return
+
         # 一筆書きウェイポイント描画完了処理
         if self.is_drawing_waypoints:
             self.is_drawing_waypoints = False
@@ -3758,6 +4957,21 @@ class ImageLabel(QLabel):
         """マウス移動時の処理 - ハンドルによるサイズ変更機能を追加"""
         pos = event.pos()
 
+        # 別モードから持ち越されたフラグは移動イベントも横取りするので先に捨てる
+        self._discard_stale_interaction_state()
+
+        # マスク頂点のドラッグ移動
+        if (getattr(self.main_window, 'mask_edit_index', None) is not None
+                and self._mask_drag_index is not None):
+            if self.target_rect and self.target_rect.width() > 0 and self.target_rect.height() > 0:
+                rel_x = (pos.x() - self.target_rect.x()) / self.target_rect.width()
+                rel_y = (pos.y() - self.target_rect.y()) / self.target_rect.height()
+                # 鏡像側ハンドルをつかんでいる場合は本体側の座標に変換
+                if self._mask_drag_mirrored:
+                    rel_x = 1.0 - rel_x
+                self.main_window.move_mask_point(self._mask_drag_index, rel_x, rel_y)
+            return
+
         # カーソルオーバーレイ更新（セグメンテーションモード）
         mode = getattr(self, 'seg_tool_mode', 'polygon')
         if mode in ('paint', 'fill', 'eraser'):
@@ -3814,12 +5028,14 @@ class ImageLabel(QLabel):
             pix_height = self.pixmap().height()
             
             # ズーム係数を使用して拡大後のサイズを計算
-            scaled_width = int(pix_width * self.zoom_factor)
-            scaled_height = int(pix_height * self.zoom_factor)
-            
-            # 表示領域の計算
-            x = (self.width() - scaled_width) // 2
-            y = (self.height() - scaled_height) // 2
+            zoom = self.fit_zoom_factor(pix_width, pix_height)
+            scaled_width = int(pix_width * zoom)
+            scaled_height = int(pix_height * zoom)
+            # 描画と同じフィット倍率・余白付き配置
+            avail_w = self.width() - self.FIT_MARGIN_LEFT - self.FIT_MARGIN_RIGHT
+            avail_h = self.height() - self.FIT_MARGIN_TOP - self.FIT_MARGIN_BOTTOM
+            x = self.FIT_MARGIN_LEFT + (avail_w - scaled_width) // 2
+            y = self.FIT_MARGIN_TOP + (avail_h - scaled_height) // 2
             target_rect = QRect(x, y, scaled_width, scaled_height)
             
             # クリック位置が画像内かチェック
@@ -3958,11 +5174,14 @@ class ImageLabel(QLabel):
             pos = event.pos()
             pix_width = self.pixmap().width()
             pix_height = self.pixmap().height()
-            scaled_width = int(pix_width * self.zoom_factor)
-            scaled_height = int(pix_height * self.zoom_factor)
-            
-            x = (self.width() - scaled_width) // 2
-            y = (self.height() - scaled_height) // 2
+            zoom = self.fit_zoom_factor(pix_width, pix_height)
+            scaled_width = int(pix_width * zoom)
+            scaled_height = int(pix_height * zoom)
+            # 描画と同じフィット倍率・余白付き配置
+            avail_w = self.width() - self.FIT_MARGIN_LEFT - self.FIT_MARGIN_RIGHT
+            avail_h = self.height() - self.FIT_MARGIN_TOP - self.FIT_MARGIN_BOTTOM
+            x = self.FIT_MARGIN_LEFT + (avail_w - scaled_width) // 2
+            y = self.FIT_MARGIN_TOP + (avail_h - scaled_height) // 2
             target_rect = QRect(x, y, scaled_width, scaled_height)
             
             if not target_rect.contains(pos):
@@ -4043,11 +5262,14 @@ class ImageLabel(QLabel):
             pos = event.pos()
             pix_width = self.pixmap().width()
             pix_height = self.pixmap().height()
-            scaled_width = int(pix_width * self.zoom_factor)
-            scaled_height = int(pix_height * self.zoom_factor)
-            
-            x = (self.width() - scaled_width) // 2
-            y = (self.height() - scaled_height) // 2
+            zoom = self.fit_zoom_factor(pix_width, pix_height)
+            scaled_width = int(pix_width * zoom)
+            scaled_height = int(pix_height * zoom)
+            # 描画と同じフィット倍率・余白付き配置
+            avail_w = self.width() - self.FIT_MARGIN_LEFT - self.FIT_MARGIN_RIGHT
+            avail_h = self.height() - self.FIT_MARGIN_TOP - self.FIT_MARGIN_BOTTOM
+            x = self.FIT_MARGIN_LEFT + (avail_w - scaled_width) // 2
+            y = self.FIT_MARGIN_TOP + (avail_h - scaled_height) // 2
             target_rect = QRect(x, y, scaled_width, scaled_height)
             
             if not target_rect.contains(pos):
@@ -4096,11 +5318,14 @@ class ImageLabel(QLabel):
             pos = event.pos()
             pix_width = self.pixmap().width()
             pix_height = self.pixmap().height()
-            scaled_width = int(pix_width * self.zoom_factor)
-            scaled_height = int(pix_height * self.zoom_factor)
-            
-            x = (self.width() - scaled_width) // 2
-            y = (self.height() - scaled_height) // 2
+            zoom = self.fit_zoom_factor(pix_width, pix_height)
+            scaled_width = int(pix_width * zoom)
+            scaled_height = int(pix_height * zoom)
+            # 描画と同じフィット倍率・余白付き配置
+            avail_w = self.width() - self.FIT_MARGIN_LEFT - self.FIT_MARGIN_RIGHT
+            avail_h = self.height() - self.FIT_MARGIN_TOP - self.FIT_MARGIN_BOTTOM
+            x = self.FIT_MARGIN_LEFT + (avail_w - scaled_width) // 2
+            y = self.FIT_MARGIN_TOP + (avail_h - scaled_height) // 2
             target_rect = QRect(x, y, scaled_width, scaled_height)
             
             if not target_rect.contains(pos):
@@ -4455,8 +5680,8 @@ class ImageLabel(QLabel):
                     x2 = int(bbox['x2'] * self.pix_width)
                     y2 = int(bbox['y2'] * self.pix_height)
                     
-                    # ハンドルのサイズ
-                    handle_size = 10  # ハンドルの検出範囲
+                    # ハンドルの検出範囲（押下時と同じ基準）
+                    handle_size = self._bbox_handle_tolerance(x1, y1, x2, y2)
                     
                     # 左上ハンドル
                     if abs(orig_x - x1) <= handle_size and abs(orig_y - y1) <= handle_size:
@@ -4614,6 +5839,173 @@ class ImageLabel(QLabel):
         return None
 
 
+class SpeedSeekGraphWidget(QWidget):
+    """画像シークバーの上に表示する薄いspeedグラフ（YouTubeの再生ヒートマップ風）
+
+    - 全フレームのspeed値を薄いグレー系の面グラフとして表示
+    - speed欠損フレーム（アノテーション無し／speedキー無し）は下端に薄い赤マーク
+    - 現在位置に細い縦線を表示、クリック/ドラッグでシーク可能
+    """
+
+    GRAPH_HEIGHT = 26
+
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.setFixedHeight(self.GRAPH_HEIGHT)
+        self.setMinimumWidth(50)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(get_text('tip_speed_seek_graph'))
+
+    # --- スライダーと座標系を一致させるためのヘルパー ---
+    # QSliderのハンドルはグルーブ内側 (handle_len/2 〜 width-handle_len/2) を移動するため、
+    # グラフ側も同じマッピングで描画・シークしないと針の位置がずれる。
+    def _handle_len(self):
+        slider = getattr(self.main_window, 'image_slider', None)
+        if slider is not None:
+            try:
+                from PyQt5.QtWidgets import QStyle
+                return max(6, slider.style().pixelMetric(QStyle.PM_SliderLength, None, slider))
+            except Exception:
+                pass
+        return 11
+
+    def _x_from_index(self, idx, n, w, hl):
+        span = max(1, w - hl)
+        return int(hl / 2 + idx / max(1, n - 1) * span)
+
+    def _index_from_x(self, x, n, w, hl):
+        span = max(1, w - hl)
+        idx = int(round((x - hl / 2) / span * (n - 1)))
+        return max(0, min(n - 1, idx))
+
+    def _seek_to(self, x):
+        mw = self.main_window
+        n = len(mw.images) if mw and getattr(mw, 'images', None) else 0
+        if n <= 0 or self.width() <= 0:
+            return
+        idx = self._index_from_x(x, n, self.width(), self._handle_len())
+        if hasattr(mw, 'image_slider'):
+            mw.image_slider.setValue(idx)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._seek_to(event.pos().x())
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.LeftButton:
+            self._seek_to(event.pos().x())
+
+    def paintEvent(self, event):
+        mw = self.main_window
+        n = len(mw.images) if mw and getattr(mw, 'images', None) else 0
+        if n <= 0:
+            return
+
+        painter = QPainter(self)
+        w, h = self.width(), self.height()
+        anns = getattr(mw, 'annotations', {})
+        # 欠損赤マークは「speedデータが部分的に欠けている」場合のみ意味を持つ。
+        # speedを全く含まないデータセットで全面赤になるのを防ぐ。
+        has_speed_data = any(a.get('speed') is not None for a in anns.values())
+
+        ms = MAX_SPEED
+        if hasattr(mw, 'main_image_view'):
+            ms = getattr(mw.main_image_view, 'max_speed', MAX_SPEED) or MAX_SPEED
+
+        # スライダーのハンドル可動域（グルーブ内側）と同じ座標系で描画する
+        hl = self._handle_len()
+        pad = hl // 2
+        span = max(1, w - hl)
+
+        # 列（ピクセル）ごとにフレーム範囲を集約して speed の山と欠損を求める
+        top_points = []
+        missing_cols = []
+        for c in range(span + 1):
+            i0 = int(c / (span + 1) * n)
+            i1 = max(i0 + 1, int((c + 1) / (span + 1) * n))
+            col_speed = None
+            col_missing = False
+            for i in range(i0, min(i1, n)):
+                ann = anns.get(i)
+                spd = ann.get('speed') if ann else None
+                if spd is None:
+                    col_missing = True
+                else:
+                    col_speed = spd if col_speed is None else max(col_speed, spd)
+            x = pad + c
+            if col_speed is not None and ms > 0:
+                norm = max(0.0, min(1.0, col_speed / ms))
+                # 高さ2px分は常に確保して「データあり」を見えるようにする
+                y = h - 1 - int(norm * (h - 3))
+                top_points.append((x, y))
+            else:
+                top_points.append((x, None))
+            if col_missing and has_speed_data:
+                missing_cols.append(x)
+
+        # speedの山（薄いグレーブルーの面＋輪郭）
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(110, 140, 170, 60)))
+        run = []
+        for x, y in top_points + [(w, None)]:
+            if y is not None:
+                run.append((x, y))
+            elif run:
+                poly = QPolygonF(
+                    [QPointF(run[0][0], h)] +
+                    [QPointF(px, py) for px, py in run] +
+                    [QPointF(run[-1][0], h)]
+                )
+                painter.drawPolygon(poly)
+                painter.setPen(QPen(QColor(110, 140, 170, 110), 1))
+                painter.drawPolyline(QPolygonF([QPointF(px, py) for px, py in run]))
+                painter.setPen(Qt.NoPen)
+                run = []
+
+        # speed欠損マーク（下端の薄い赤）
+        if missing_cols:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor(230, 80, 80, 150)))
+            for x in missing_cols:
+                painter.drawRect(x, h - 4, 1, 4)
+
+        # lap境界の黒線とlap番号
+        boundaries = []
+        if hasattr(mw, 'compute_lap_boundaries'):
+            try:
+                boundaries = mw.compute_lap_boundaries()
+            except Exception:
+                boundaries = []
+        if boundaries and n > 1:
+            lap_font = QFont("Arial", 7)
+            painter.setFont(lap_font)
+            fm = painter.fontMetrics()
+            segment_starts = [0] + list(boundaries)
+            for b in boundaries:
+                bx = self._x_from_index(b, n, w, hl)
+                painter.setPen(QPen(QColor(0, 0, 0, 160), 1))
+                painter.drawLine(bx, 0, bx, h)
+            # 各lapの開始位置に番号を表示（幅が足りるセグメントのみ）
+            for li, start in enumerate(segment_starts, 1):
+                sx = self._x_from_index(start, n, w, hl)
+                end = segment_starts[li] if li < len(segment_starts) else n - 1
+                ex = self._x_from_index(end, n, w, hl)
+                text = str(li)
+                if ex - sx >= fm.horizontalAdvance(text) + 6:
+                    painter.setPen(QPen(QColor(60, 60, 60, 200), 1))
+                    painter.drawText(sx + 3, fm.ascent() + 1, text)
+
+        # 現在位置の縦線
+        cur = getattr(mw, 'current_index', 0)
+        if n > 1:
+            cx = self._x_from_index(cur, n, w, hl)
+            painter.setPen(QPen(QColor(0, 120, 215, 180), 1))
+            painter.drawLine(cx, 0, cx, h)
+
+        painter.end()
+
+
 class SpeedGaugeWidget(QWidget):
     """画像の外側に表示するスピードゲージウィジェット。
     ズームスライダーと同じ比率（上下 1/8 ずつ余白、トラック 6/8）でレイアウトし、
@@ -4737,23 +6129,31 @@ class SpeedGaugeWidget(QWidget):
             idx = mw.current_index
             inf = mw.inference_results.get(idx)
             if inf:
+                # 推論speedは正規化値（0-1）。学習時の正規化値（speed_normalize、
+                # 無ければゲージのmax_speed）でm/sに換算し、ゲージスケール上に配置する
+                _snorm = inf.get('speed_normalize') or ms
                 if getattr(mw.main_image_view, 'show_future_annotations', False):
-                    for offset, lw, lc in [(10, 2, QColor(0, 150, 150)), (5, 3, QColor(0, 200, 200))]:
+                    _inf_offsets = inf.get('future_offsets', [5, 10])
+                    _near = _inf_offsets[0]
+                    _far = _inf_offsets[1] if len(_inf_offsets) > 1 else _inf_offsets[0]
+                    for offset, lw, lc in [(_far, 2, QColor(0, 150, 150)), (_near, 3, QColor(0, 200, 200))]:
                         fd = inf.get(f"future_{offset}", {})
                         if 'speed' in fd:
-                            fn = max(0.0, min(1.0, fd['speed']))
+                            f_speed_ms = fd['speed'] * _snorm
+                            fn = max(0.0, min(1.0, f_speed_ms / ms)) if ms > 0 else 0.0
                             fy = self._y_from_norm(fn, tr)
                             painter.setPen(QPen(lc, lw))
                             painter.drawLine(tx, fy, tx + tw, fy)
                 if 'speed' in inf:
-                    ni = max(0.0, min(1.0, inf['speed']))
+                    infer_speed_ms = inf['speed'] * _snorm
+                    ni = max(0.0, min(1.0, infer_speed_ms / ms)) if ms > 0 else 0.0
                     iy = self._y_from_norm(ni, tr)
                     painter.setPen(QPen(QColor(0, 255, 255), 3))
                     painter.drawLine(tx - 2, iy, tx + tw + 2, iy)
-                    # 推論値テキスト
+                    # 推論値テキスト（m/s換算値）
                     painter.setPen(QPen(QColor(0, 200, 200), 1))
                     painter.setFont(QFont("Arial", 7, QFont.Bold))
-                    painter.drawText(tx + tw + 4, iy + 4, f"({inf['speed'] * ms:.2f})")
+                    painter.drawText(tx + tw + 4, iy + 4, f"({infer_speed_ms:.2f})")
 
         # ── 目盛り ──
         num_ticks = 11
@@ -4771,10 +6171,10 @@ class SpeedGaugeWidget(QWidget):
         # ── "SPEED X.XX" を1行でトラック直上に描画（ズームラベルと高さを合わせる）──
         painter.setFont(QFont("Arial", 7))
         fm = painter.fontMetrics()
-        gap = 8  # トラック上端からのクリアランス
+        gap = 14  # トラック上端からのクリアランス（レンジラベルと高さを揃える）
         label_baseline = max(fm.ascent() + 2, ty - fm.descent() - gap)
         painter.setPen(QPen(text_color, 1))
-        painter.drawText(2, label_baseline, f"SPEED {speed:.2f}")
+        painter.drawText(2, label_baseline, f"speed {speed:.2f}")
 
         # ── 現在値ハンドル（赤・太め） ──
         handle_y = self._y_from_norm(normalized, tr)
@@ -4821,6 +6221,8 @@ class SpeedGaugeWidget(QWidget):
         self._hover_y = y
         self.update()
         mw = self.main_window
+        if mw and hasattr(mw, 'speed_seek_graph'):
+            mw.speed_seek_graph.update()
         if mw and hasattr(mw, 'statusBar'):
             mw.statusBar().showMessage(get_text('status_speed_updated', new_speed), 2000)
 
@@ -4982,7 +6384,8 @@ class ThumbnailWidget(QWidget):
                     break
 
                 class_label = QLabel(f"{class_name}: {count}")
-                class_label.setStyleSheet("font-size: 10px; color: #333;")
+                class_label.setStyleSheet("font-size: 10px;")
+                set_text_role(class_label, 'strong')
                 info_layout.addWidget(class_label)
 
         # セグメンテーションアノテーション情報を追加（物体検知アノテーション情報の後に）
@@ -5015,7 +6418,8 @@ class ThumbnailWidget(QWidget):
                     break
 
                 seg_class_label = QLabel(f"{class_name}: {count}")
-                seg_class_label.setStyleSheet("font-size: 10px; color: #9C27B0;")
+                seg_class_label.setStyleSheet("font-size: 10px;")
+                set_text_role(seg_class_label, 'accent')
                 info_layout.addWidget(seg_class_label)
 
         # 残りのスペースを埋めるスペーサー
@@ -5037,7 +6441,9 @@ class ThumbnailWidget(QWidget):
 
         name_label = QLabel(filename)
         name_label.setAlignment(Qt.AlignCenter)
-        name_label.setStyleSheet("font-size: 12px; color: #444444; background-color: #f8f8f8;font-weight: bold;")
+        name_label.setStyleSheet("font-size: 12px; font-weight: bold;")
+        set_text_role(name_label, 'strong')
+        set_panel_role(name_label, 'strip')
         name_label.setFixedHeight(10)  # 高さを最小限に
         image_layout.addWidget(name_label)
 
@@ -5262,6 +6668,13 @@ class ImageAnnotationTool(QMainWindow):
         self.images = []
         self.current_index = 0
         self.available_variants = {}
+        # 画像ソース(cam0/cam1/…)ごとのアノテーション・推論結果を保持する。
+        # 表示中のソース分だけを self.bbox_annotations 等に載せ替えて扱うため、
+        # 既存コードはこれまでどおり「現在のソース」を見るだけでよい。
+        self._source_stores = {}
+        self._active_source_key = None
+        # 学習時に全ソースのアノテーションを使うか（False なら表示中のソースのみ）
+        self.use_all_sources_for_training = False
         self.annotations = {}
         self.annotation_history = []
         self.annotated_count = 0
@@ -5323,8 +6736,22 @@ class ImageAnnotationTool(QMainWindow):
         self.info_panel_width = 280  # 基本の幅
         self.info_panel_margin = 20  # パネル周りの余白（左右合計）
 
+        # マスク関連の初期化（指定領域を学習・推論入力から無視するためのポリゴン）
+        # points: ユーザーがクリックした頂点（正規化座標。symmetric時は左右対称の片側）
+        # 先頭2つは組み込みマスクで削除不可。プルダウンから任意個を追加できる。
+        self.masks = [
+            {'id': 'vehicle', 'name': None, 'points': [], 'visible': True, 'symmetric': True},
+            {'id': 'background', 'name': None, 'points': [], 'visible': True, 'symmetric': True},
+        ]
+        self.mask_edit_index = None   # 編集中マスクのindex（Noneなら非編集）
+        self._mask_target_index = 0   # プルダウンで選択中のマスクindex
+        self._mask_combo_updating = False  # コンボ再構築中の再入防止
+
         # 位置情報関連の初期化
         self.location_buttons = []  # 位置情報ボタンのリスト
+        self._location_row_widgets = []  # 位置ボタン＋クラス入力欄の行ウィジェット
+        self.location_class_inputs = {}  # 位置値 → クラス内容入力欄(QLineEdit)
+        self.location_class_names = {}  # 位置値 → クラス内容テキスト（行再生成時の復元用）
         self.current_location = None  # 現在選択されている位置情報
         self.location_annotations = {}  # 画像ごとの位置情報アノテーション
         self._location_display_mode = 'position'  # 'position' or 'corner'
@@ -5397,6 +6824,9 @@ class ImageAnnotationTool(QMainWindow):
         
         # Load saved display settings
         self.load_display_settings()
+        # 役割ごとの文字色（set_text_role 等）はアプリ全体QSSで決まるので、
+        # 設定ファイルが無くライトモードのままでも必ず一度は貼っておく
+        self.apply_dark_mode(self.is_dark_mode)
 
         # Update UI
         self.display_current_image()
@@ -5482,6 +6912,7 @@ class ImageAnnotationTool(QMainWindow):
             rb.toggled.connect(lambda checked, v=var: self.on_variant_changed(v) if checked else None)
         # pose/slam があるとき BEV(真上から見た図) ソースを追加
         self._add_bev_variant_button(variant_layout)
+        self._add_lidar_variant_button(variant_layout)
         # 複数ソースがある場合は結合表示ボタンを追加
         if len(self.available_variants) >= 2:
             combined_button = QPushButton(get_text('label_combined_view'))
@@ -5530,7 +6961,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # 同期進捗ラベル
         self.sync_progress_label = QLabel("")
-        self.sync_progress_label.setStyleSheet("font-size: 11px; color: #4a90d9;")
+        self.sync_progress_label.setStyleSheet("font-size: 11px;")
+        set_text_role(self.sync_progress_label, 'info')
         toolbar.addWidget(self.sync_progress_label)
 
         # セパレーター
@@ -5579,7 +7011,31 @@ class ImageAnnotationTool(QMainWindow):
             self.map_view_dialog.auto_load_background(self.folder_path)
         self.map_view_dialog.jump_to_image.connect(self.jump_to_index_from_map_view)
         self.map_view_dialog.highlight_frame(self.current_index)
-        self.map_view_dialog.show()
+        # 既定は右パネル（コースの位置情報の下の空きスペース）に重ねるコンパクト表示。
+        # 空きスペースが取れない（未表示等）場合は通常のウィンドウとして開く
+        rect = self._map_view_dock_rect()
+        if rect is not None:
+            self.map_view_dialog.show_docked(rect)
+        else:
+            self.map_view_dialog.show()
+
+    def _map_view_dock_rect(self):
+        """右パネルの「コースの位置情報」群の下〜パネル下端の空きスペース（グローバル座標）
+
+        走行軌跡マップの既定配置に使う。右パネルが無い／見えていない場合は None。
+        """
+        group = getattr(self, 'location_info_group', None)
+        if group is None or not group.isVisible():
+            return None
+        panel = group.parentWidget()
+        if panel is None or panel.width() <= 0:
+            return None
+        top_local = group.geometry().bottom() + 6
+        height = panel.height() - top_local
+        if height < 200:
+            return None
+        top_left = panel.mapToGlobal(QPoint(0, top_local))
+        return QRect(top_left.x(), top_left.y(), panel.width(), height)
 
     def jump_to_index_from_map_view(self, index):
         """マップビューでの軌跡クリックからのジャンプ要求を処理"""
@@ -5640,6 +7096,148 @@ class ImageAnnotationTool(QMainWindow):
             f"{marked_count}個のフレームを削除済みとしてマークしました。\n"
             f"削除済みインデックスの合計数: {len(self.deleted_indexes)}"
         )
+
+    def auto_annotate_locations_from_regions(self, regions, keep_manual=True,
+                                             prefer_source=None,
+                                             parent_widget=None):
+        """マップビューで定義した位置領域（閉ポリゴン）から位置ラベルを自動付与する。
+
+        各フレームの自己位置（pose）を内包するポリゴンを探し、その領域の位置
+        クラスを annotations["loc"] へ書き込む。複数ポリゴンが重なる場合は
+        **後から定義した領域を優先**する（部分的な上塗り修正ができるように）。
+        自動付与の印として "loc_auto": True を併記し、手動で位置ボタンを押すと
+        印は外れる。keep_manual=True の場合、手動付与済み（loc_auto の無い loc）
+        のフレームは上書きしない。
+
+        regions: [{"loc": int, "polygon": [(x, y), ...]}, ...]（map座標系[m]・頂点3点以上）
+        prefer_source: pose の優先ソース（マップビューのソース選択と同じ値）
+        parent_widget: 確認・進捗・結果ダイアログの親（マップビューは常に最前面の
+        ため、メインウィンドウ親のモーダルが裏に隠れる問題を避ける）。
+        """
+        parent = parent_widget if parent_widget is not None else self
+
+        # ポリゴン → matplotlib.path.Path（点内包判定用）。後定義優先のため
+        # 判定は逆順で行う
+        from matplotlib.path import Path as MplPath
+        polys = []
+        for region in regions:
+            poly = region.get("polygon") or []
+            if len(poly) >= 3:
+                polys.append((MplPath(np.asarray(poly, dtype=np.float64)),
+                              int(region["loc"])))
+        if not polys or not self.images:
+            QMessageBox.information(
+                parent, get_text('map_view_autoloc_confirm_title'),
+                get_text('map_view_region_none'))
+            return
+
+        reply = QMessageBox.question(
+            parent, get_text('map_view_autoloc_confirm_title'),
+            get_text('map_view_autoloc_confirm_msg',
+                     len(polys), "ON" if keep_manual else "OFF"),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        total = len(self.images)
+        progress = QProgressDialog(
+            get_text('map_view_autoloc_progress', 0, total),
+            get_text('btn_cancel'), 0, total, parent
+        )
+        progress.setWindowTitle(get_text('map_view_autoloc_confirm_title'))
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+
+        deleted = set(getattr(self, 'deleted_indexes', []) or [])
+        assigned = 0
+        manual_kept = 0
+        no_pose = 0
+        outside = 0
+        excluded = 0
+        cancelled = False
+        now_ms = int(time.time() * 1000)
+        assigned_locs = set()
+
+        for idx in range(total):
+            if idx % 200 == 0:
+                progress.setLabelText(
+                    get_text('map_view_autoloc_progress', idx, total))
+                progress.setValue(idx)
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    cancelled = True
+                    break
+
+            if idx in deleted:
+                excluded += 1
+                continue
+
+            # 手動アノテ保持: loc があり自動付与の印が無いフレームはスキップ
+            existing = self.annotations.get(idx)
+            if (keep_manual and existing is not None and 'loc' in existing
+                    and not existing.get('loc_auto')):
+                manual_kept += 1
+                continue
+
+            pose = self.pose_manager.get_pose(idx, prefer=prefer_source)
+            if pose is None:
+                no_pose += 1
+                continue
+
+            # 点内包判定（後から定義した領域を優先するため逆順に探す）
+            loc_value = None
+            for path, loc in reversed(polys):
+                if path.contains_point((pose.x, pose.y)):
+                    loc_value = loc
+                    break
+            if loc_value is None:
+                outside += 1
+                continue
+
+            if idx in self.annotations:
+                self.annotations[idx]['loc'] = loc_value
+            else:
+                self.annotations[idx] = {'loc': loc_value}
+            self.annotations[idx]['loc_auto'] = True
+            self.location_annotations[idx] = loc_value
+            self.annotation_timestamps[idx] = now_ms
+            assigned_locs.add(loc_value)
+            assigned += 1
+
+        progress.setValue(total)
+        progress.close()
+
+        if cancelled:
+            QMessageBox.information(
+                parent, get_text('map_view_autoloc_confirm_title'),
+                get_text('map_view_autoloc_cancelled', assigned))
+
+        # 付与された位置クラスのボタンが無ければ作成（8クラス超の定義に対応）
+        for loc_value in sorted(assigned_locs):
+            self.ensure_location_button_exists(loc_value)
+
+        # UI更新（auto_annotate と同じ後処理）
+        self.annotated_count = len(self.annotations)
+        self.update_location_button_counts()
+        self.display_current_image()
+        self.update_gallery()
+        if hasattr(self, 'update_distribution_graph'):
+            self.update_distribution_graph()
+        if hasattr(self, '_update_location_info_display'):
+            self._update_location_info_display()
+
+        if not cancelled:
+            QMessageBox.information(
+                parent, get_text('map_view_autoloc_confirm_title'),
+                get_text('map_view_autoloc_result',
+                         assigned, manual_kept, no_pose, outside, excluded))
+        print(f"位置自動アノテーション完了: assigned={assigned}, "
+              f"manual_kept={manual_kept}, no_pose={no_pose}, "
+              f"outside={outside}, excluded={excluded}, cancelled={cancelled}")
 
     def write_back_future_trajectories(self, horizon: int, dt: float, parent_widget=None):
         """マップビューで選択・編集した自己位置から将来軌道（togivad学習用の教師ラベル
@@ -5827,6 +7425,142 @@ class ImageAnnotationTool(QMainWindow):
             )
             print(f"future_traj保存エラー: {e}")
 
+    def write_back_agent_tracks(self, horizon=10, camera_name='cam3',
+                                classes=('opponent',), parent_widget=None):
+        """② 相手車の矩形アノテーション → togivad/agents（他車 ego 位置＋将来軌道）。
+
+        検出矩形（bbox_annotations の opponent クラス）を GroundUnprojector で
+        ego 地面点に逆投影し、pose_manager の実測 dpose でフレーム間追跡して
+        将来 T_a 点を各フレームの ego 系で構築し、catalog に書き戻す
+        （togivad/tools/agent_labeler の再利用。ego 版 write_back_future_trajectories
+        と同じ manifest/catalog・_index 照合・.bak 方式）。②の学習
+        （train_sequence_model で「TogiVAD他車(E2E)」有効）はこのキーを読む。
+        """
+        parent = parent_widget if parent_widget is not None else self
+        title = get_text('map_view_agent_writeback_btn')
+        manifest_path = getattr(self, 'last_manifest_path', None)
+        if not manifest_path or not os.path.exists(manifest_path):
+            QMessageBox.warning(parent, title,
+                                get_text('map_view_writeback_no_manifest'))
+            return
+        try:
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            catalog_files = json.loads(lines[4]).get('paths', []) \
+                if len(lines) >= 5 else []
+        except Exception as e:
+            QMessageBox.critical(parent, title,
+                                 get_text('map_view_writeback_error', str(e)))
+            return
+        if not catalog_files:
+            QMessageBox.warning(parent, title,
+                                get_text('map_view_writeback_no_manifest'))
+            return
+
+        # togivad の相手カメラ CameraSpec と逆投影器を用意
+        try:
+            import sys as _sys
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if repo_root not in _sys.path:
+                _sys.path.insert(0, repo_root)
+            from togivad.config import make_config
+            from togivad.tools.agent_labeler import (GroundUnprojector,
+                                                     build_agent_labels)
+            tvcfg = make_config(5, agent_horizon=int(horizon),
+                                use_agent_motion=True)
+            spec = next((c for c in tvcfg.cameras if c.name == camera_name), None) \
+                or min(tvcfg.cameras, key=lambda s: abs(s.yaw_deg))
+            image_wh = (640, 480)
+            unp = GroundUnprojector(spec, image_wh)
+        except Exception as e:
+            QMessageBox.critical(parent, title,
+                                 get_text('map_view_writeback_error', str(e)))
+            return
+
+        image_to_entry = getattr(self, '_manifest_image_to_entry', {})
+        excluded = set(self.deleted_indexes)
+        cls_set = set(classes)
+        W, H = image_wh
+
+        # 有効フレームを順序どおり並べ、各フレームの opponent 検出を ego へ逆投影
+        order, entry_of = [], {}
+        for img_idx in range(len(self.images)):
+            if img_idx in excluded:
+                continue
+            ei = image_to_entry.get(img_idx)
+            if ei is None:
+                continue
+            order.append(img_idx)
+            entry_of[img_idx] = ei
+        dets, n_boxes = [], 0
+        for img_idx in order:
+            ego_pts = []
+            for bb in self.bbox_annotations.get(img_idx, []):
+                if bb.get('class') not in cls_set:
+                    continue
+                px = ((bb['x1'] + bb['x2']) * 0.5 * W, max(bb['y1'], bb['y2']) * H)
+                p = unp.unproject(px[0], px[1])
+                if p is not None:
+                    ego_pts.append((float(p[0]), float(p[1])))
+                    n_boxes += 1
+            dets.append(ego_pts)
+        if n_boxes == 0:
+            QMessageBox.information(parent, title,
+                                    get_text('map_view_agent_writeback_none'))
+            return
+        dposes = [self.pose_manager.relative_dpose(order[k], order[k + 1])
+                  for k in range(len(order) - 1)]
+        agents, agent_ids = build_agent_labels(
+            dets, dposes, int(horizon),
+            max_agents=tvcfg.num_agent_queries, return_ids=True)
+        agents_by_entry = {entry_of[order[k]]: agents[k]
+                           for k in range(len(order))}
+        # T2-b: agents と同順のトラック ID（togivad/agent_ids）も書き戻す
+        ids_by_entry = {entry_of[order[k]]: agent_ids[k]
+                        for k in range(len(order))}
+
+        base_dir = os.path.dirname(manifest_path)
+        written = 0
+        try:
+            for catalog_file in catalog_files:
+                catalog_path = os.path.join(base_dir, catalog_file)
+                if not os.path.exists(catalog_path):
+                    continue
+                with open(catalog_path, 'r', encoding='utf-8') as f:
+                    catalog_lines = f.readlines()
+                modified, new_lines = False, []
+                for line in catalog_lines:
+                    s = line.strip()
+                    if not s:
+                        new_lines.append(line)
+                        continue
+                    row = json.loads(s)
+                    ag = agents_by_entry.get(row.get('_index'))
+                    if ag is not None:
+                        row['togivad/agents'] = [
+                            [round(float(v), 4) for v in a] for a in ag]
+                        row['togivad/agent_ids'] = [
+                            int(t) for t in ids_by_entry.get(row['_index'], [])]
+                        new_lines.append(json.dumps(row, ensure_ascii=False) + '\n')
+                        modified = True
+                        if ag:
+                            written += 1
+                    else:
+                        new_lines.append(line)
+                if modified:
+                    shutil.copy2(catalog_path, catalog_path + '.bak')
+                    with open(catalog_path, 'w', encoding='utf-8') as f:
+                        f.writelines(new_lines)
+            QMessageBox.information(
+                parent, title,
+                get_text('map_view_agent_writeback_result', written, n_boxes))
+            print(f"togivad/agents保存完了: frames_with_agents={written}, "
+                  f"boxes={n_boxes}")
+        except Exception as e:
+            QMessageBox.critical(parent, title,
+                                 get_text('map_view_writeback_error', str(e)))
+            print(f"togivad/agents保存エラー: {e}")
+
     def _show_mlflow_menu(self):
         """MLflowメニューを表示"""
         from PyQt5.QtWidgets import QMenu
@@ -5912,6 +7646,10 @@ class ImageAnnotationTool(QMainWindow):
         yolo_action = menu.addAction(f"📦 {get_text('load_yolo_annotation')}")
         yolo_action.triggered.connect(self.load_yolo_annotations)
 
+        # 学習済みYOLOで他車(opponent)/セグを自動アノテーション（②の他車GTを自動化）
+        auto_action = menu.addAction(f"🤖 {get_text('yolo_auto_annot_menu')}")
+        auto_action.triggered.connect(self.show_yolo_auto_annotate_dialog)
+
         # ボタンの下にメニューを表示
         button = self.load_annotation_button
         menu.exec_(button.mapToGlobal(button.rect().bottomLeft()))
@@ -5928,6 +7666,22 @@ class ImageAnnotationTool(QMainWindow):
         overwrite_action.triggered.connect(self.overwrite_manifest_deleted_indexes)
         if not has_manifest:
             overwrite_action.setToolTip("manifest.json が読み込まれていません")
+
+        # --- アノテーションを catalog へ上書き保存 ---
+        ann_overwrite_action = menu.addAction("🔴 アノテーション上書き保存（catalog）")
+        ann_overwrite_action.setEnabled(has_manifest and bool(self.annotations))
+        ann_overwrite_action.setToolTip(
+            "修正したangle/throttle/speed/位置情報を読込元のcatalogファイルへ"
+            "user/*キーとして上書き保存します（.bakバックアップ付き）")
+        ann_overwrite_action.triggered.connect(self.overwrite_catalog_annotations)
+
+        # --- speed欠損の確認・修復 ---
+        fix_speed_action = menu.addAction("🩹 speed欠損の確認・修復")
+        fix_speed_action.setEnabled(bool(self.images))
+        fix_speed_action.setToolTip(
+            "speedが欠損しているフレームを検出し、catalog再取込と前後フレームからの"
+            "線形補間で修復します")
+        fix_speed_action.triggered.connect(self.check_and_fix_missing_speed)
 
         menu.addSeparator()
 
@@ -6017,6 +7771,347 @@ class ImageAnnotationTool(QMainWindow):
             QMessageBox.critical(self, "上書き保存エラー", f"保存中にエラーが発生しました:\n{e}")
             print(f"manifest 上書き保存エラー: {e}")
 
+    def overwrite_catalog_annotations(self):
+        """編集済みアノテーションを読込元のcatalogファイルへ上書き保存する
+
+        angle/throttle/speed/loc を user/angle, user/throttle, user/speed, user/loc
+        キーに書き込む（enc/speed などのセンサー生値は変更しない）。
+        書き換え前に各catalogファイルの .bak バックアップを作成する。
+        """
+        manifest_path = getattr(self, 'last_manifest_path', None)
+        if not manifest_path or not os.path.exists(manifest_path):
+            QMessageBox.warning(self, "アノテーション上書き保存",
+                                "catalog（manifest.json）が読み込まれていません。\n"
+                                "「アノテーション読込」でcatalogを読み込んだデータのみ上書き保存できます。")
+            return
+        if not self.annotations:
+            QMessageBox.warning(self, "アノテーション上書き保存", "保存するアノテーションがありません。")
+            return
+
+        try:
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            catalog_files = json.loads(lines[4]).get('paths', []) if len(lines) >= 5 else []
+        except Exception as e:
+            QMessageBox.critical(self, "アノテーション上書き保存",
+                                 f"manifest.json の読み込みに失敗しました:\n{e}")
+            return
+        if not catalog_files:
+            QMessageBox.warning(self, "アノテーション上書き保存",
+                                "manifest.json にcatalogファイル情報がありません。")
+            return
+
+        # 画像インデックス → catalogエントリインデックス（_index）の対応を構築
+        image_to_entry = getattr(self, '_manifest_image_to_entry', {})
+        updates = {}  # entry_index -> {catalogキー: 値}
+        for img_idx, ann in self.annotations.items():
+            entry_index = image_to_entry.get(img_idx, ann.get('original_index'))
+            if entry_index is None:
+                continue
+            upd = {}
+            if 'angle' in ann:
+                upd['user/angle'] = float(ann['angle'])
+            if 'throttle' in ann:
+                upd['user/throttle'] = float(ann['throttle'])
+            if ann.get('speed') is not None:
+                upd['user/speed'] = float(ann['speed'])
+            if 'loc' in ann:
+                upd['user/loc'] = ann['loc']
+            if upd:
+                updates[entry_index] = upd
+
+        if not updates:
+            QMessageBox.warning(self, "アノテーション上書き保存",
+                                "catalogエントリに対応するアノテーションが見つかりません。")
+            return
+
+        reply = QMessageBox.question(
+            self, "アノテーション上書き保存",
+            f"現在のアノテーション {len(updates)}件 を読込元のcatalogに上書き保存します。\n\n"
+            f"書き込み先: {os.path.dirname(manifest_path)}\n"
+            f"書き込みキー: user/angle, user/throttle, user/speed, user/loc\n"
+            f"（各catalogファイルの .bak バックアップを作成します）\n\n続行しますか？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        base_dir = os.path.dirname(manifest_path)
+        written = 0
+        try:
+            for catalog_file in catalog_files:
+                catalog_path = os.path.join(base_dir, catalog_file)
+                if not os.path.exists(catalog_path):
+                    continue
+
+                with open(catalog_path, 'r', encoding='utf-8') as f:
+                    catalog_lines = f.readlines()
+
+                modified = False
+                new_lines = []
+                for line in catalog_lines:
+                    stripped = line.strip()
+                    if not stripped:
+                        new_lines.append(line)
+                        continue
+                    row = json.loads(stripped)
+                    upd = updates.get(row.get('_index'))
+                    if upd:
+                        row.update(upd)
+                        new_lines.append(json.dumps(row, ensure_ascii=False) + '\n')
+                        modified = True
+                        written += 1
+                    else:
+                        new_lines.append(line)
+
+                if modified:
+                    shutil.copy2(catalog_path, catalog_path + '.bak')
+                    with open(catalog_path, 'w', encoding='utf-8') as f:
+                        f.writelines(new_lines)
+
+            QMessageBox.information(
+                self, "アノテーション上書き保存完了",
+                f"catalogに {written}件 のアノテーションを上書き保存しました。\n"
+                f"（バックアップ: 各catalogファイルの .bak）"
+            )
+            print(f"catalog上書き保存完了: {written}件 -> {base_dir}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "アノテーション上書き保存エラー",
+                                 f"保存中にエラーが発生しました:\n{e}")
+            import traceback
+            traceback.print_exc()
+
+    def check_and_fix_missing_speed(self):
+        """speed欠損（未読込フレーム・speed値なし）を確認し、catalog再取込＋線形補間で修復する"""
+        if not self.images:
+            QMessageBox.warning(self, "speed欠損チェック", "画像が読み込まれていません。")
+            return
+
+        n = len(self.images)
+        missing_ann = [i for i in range(n) if i not in self.annotations]
+        missing_speed = [i for i in range(n)
+                         if i in self.annotations and self.annotations[i].get('speed') is None]
+
+        if not missing_ann and not missing_speed:
+            QMessageBox.information(self, "speed欠損チェック",
+                                    f"speed欠損はありません（全{n}フレームにspeedデータあり）。")
+            return
+
+        def _fmt(lst):
+            names = [os.path.basename(self.images[i]).split('_')[0] + '_' for i in lst[:15]]
+            return ", ".join(names) + ("..." if len(lst) > 15 else "")
+
+        msg = "speed欠損を検出しました。\n\n"
+        if missing_ann:
+            msg += f"・アノテーション未読込: {len(missing_ann)}件\n   {_fmt(missing_ann)}\n"
+        if missing_speed:
+            msg += f"・speed値なし: {len(missing_speed)}件\n   {_fmt(missing_speed)}\n"
+        msg += ("\n修復しますか？\n"
+                "① catalogから該当フレームを再取込\n"
+                "② それでも欠損が残る場合は前後フレームのspeedから線形補間\n"
+                "（修復後は保存メニューの「アノテーション上書き保存」で永続化できます）")
+
+        reply = QMessageBox.question(self, "speed欠損の修復", msg,
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        # ① catalogから再取込（画像ファイル名 → エントリの対応で照合）
+        repaired_from_catalog = 0
+        entries_by_name = {}
+        manifest_path = getattr(self, 'last_manifest_path', None)
+        if manifest_path and os.path.exists(manifest_path):
+            try:
+                with open(manifest_path, 'r', encoding='utf-8') as f:
+                    mlines = f.readlines()
+                catalog_files = json.loads(mlines[4]).get('paths', []) if len(mlines) >= 5 else []
+                base_dir = os.path.dirname(manifest_path)
+                for catalog_file in catalog_files:
+                    catalog_path = os.path.join(base_dir, catalog_file)
+                    if not os.path.exists(catalog_path):
+                        continue
+                    with open(catalog_path, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            stripped = line.strip()
+                            if not stripped:
+                                continue
+                            entry = json.loads(stripped)
+                            for key in entry.keys():
+                                if key.endswith('/image_array'):
+                                    entries_by_name[os.path.basename(entry[key])] = entry
+                                    break
+            except Exception as e:
+                print(f"speed欠損修復: catalog再読込エラー: {e}")
+
+        for i in missing_ann + missing_speed:
+            entry = entries_by_name.get(os.path.basename(self.images[i]))
+            if entry is None:
+                continue
+            # 読込時と同じ優先順でspeedを取得
+            speed = entry.get('user/speed', entry.get('enc/speed'))
+            if speed is None:
+                for _k, _v in entry.items():
+                    if (_k.endswith('/speed') and _k != 'pilot/speed'
+                            and _k != 'user/speed' and _k != 'enc/speed'):
+                        speed = _v
+                        break
+            if speed is None:
+                speed = entry.get('speed', entry.get('pilot/speed', None))
+
+            if i not in self.annotations:
+                # アノテーション自体を復元（読込処理と同じ構成）
+                angle = entry.get('user/angle', entry.get('pilot/angle', 0))
+                throttle = entry.get('user/throttle', entry.get('pilot/throttle', 0))
+                try:
+                    with Image.open(self.images[i]) as img:
+                        iw, ih = img.size
+                except Exception:
+                    iw, ih = 160, 120
+                x = max(0, min(int((angle + 1) / 2 * iw), iw - 1))
+                y = max(0, min(int((1 - throttle) / 2 * ih), ih - 1))
+                self.annotations[i] = {"angle": angle, "throttle": throttle, "x": x, "y": y}
+                if entry.get('_index') is not None:
+                    self.annotations[i]["original_index"] = entry['_index']
+                    if not hasattr(self, '_manifest_image_to_entry'):
+                        self._manifest_image_to_entry = {}
+                    self._manifest_image_to_entry[i] = entry['_index']
+                loc = entry.get('user/loc', entry.get('pilot/loc', None))
+                if loc is not None:
+                    self.annotations[i]['loc'] = loc
+                    self.location_annotations[i] = loc
+
+            if speed is not None and self.annotations[i].get('speed') is None:
+                self.annotations[i]['speed'] = speed
+                repaired_from_catalog += 1
+
+        # ② 残ったspeed欠損を前後フレームから線形補間
+        import bisect
+        interpolated = 0
+        speed_indexes = sorted(i for i in self.annotations
+                               if self.annotations[i].get('speed') is not None)
+        still_missing = [i for i in range(n)
+                         if i in self.annotations and self.annotations[i].get('speed') is None]
+        for i in still_missing:
+            pos = bisect.bisect_left(speed_indexes, i)
+            prev_i = speed_indexes[pos - 1] if pos > 0 else None
+            next_i = speed_indexes[pos] if pos < len(speed_indexes) else None
+            if prev_i is not None and next_i is not None:
+                sp = self.annotations[prev_i]['speed']
+                sn = self.annotations[next_i]['speed']
+                t = (i - prev_i) / (next_i - prev_i)
+                value = sp + (sn - sp) * t
+            elif prev_i is not None:
+                value = self.annotations[prev_i]['speed']
+            elif next_i is not None:
+                value = self.annotations[next_i]['speed']
+            else:
+                continue
+            self.annotations[i]['speed'] = float(value)
+            interpolated += 1
+
+        # 修復結果の集計と表示更新
+        remaining = [i for i in range(n)
+                     if i not in self.annotations or self.annotations[i].get('speed') is None]
+        if hasattr(self, 'speed_seek_graph'):
+            self.speed_seek_graph.update()
+        if hasattr(self, 'speed_gauge'):
+            self.speed_gauge.update()
+        self.display_current_image()
+        self._schedule_distribution_graph_update()
+
+        result = (f"speed欠損の修復が完了しました。\n\n"
+                  f"・catalogから再取込: {repaired_from_catalog}件\n"
+                  f"・線形補間で補完: {interpolated}件\n"
+                  f"・残欠損: {len(remaining)}件")
+        if remaining:
+            result += f"\n   {_fmt(remaining)}"
+        result += "\n\n保存メニューの「アノテーション上書き保存（catalog）」で永続化できます。"
+        QMessageBox.information(self, "speed欠損の修復完了", result)
+        print(f"speed欠損修復: catalog取込={repaired_from_catalog}, 補間={interpolated}, 残={len(remaining)}")
+
+    def _reserve_slider_label_width(self):
+        """再生位置ラベル（x/y）の幅をデータ総数の桁数で固定する
+
+        再生が進んで桁数が増えるとラベルが広がり、speedグラフとスライダーの
+        幅が1文字分ずれるため、最初から "総数/総数" 分の幅を確保しておく。
+        """
+        if not hasattr(self, 'slider_value_label'):
+            return
+        n = len(self.images) if getattr(self, 'images', None) else 0
+        sample = f"{n}/{n}" if n > 0 else "0/0"
+        if getattr(self, '_slider_label_width_sample', None) == sample:
+            return
+        self._slider_label_width_sample = sample
+        fm = self.slider_value_label.fontMetrics()
+        self.slider_value_label.setFixedWidth(fm.horizontalAdvance(sample) + 6)
+
+    def compute_lap_boundaries(self):
+        """speedグラフ表示用のlap境界（lap2以降の開始フレームインデックス）を推定する
+
+        優先1: 位置情報アノテーションの折返し（値が大きく巻き戻る位置 ＝ 周回開始）
+        優先2: 自己位置（fused/slam/pose）のスタート地点への回帰
+        結果はアノテーション数をキーにキャッシュする。
+        """
+        n = len(self.images) if self.images else 0
+        if n == 0:
+            return []
+
+        cache_key = (n, len(self.annotations),
+                     len(getattr(self, 'location_annotations', {}) or {}))
+        cache = getattr(self, '_lap_boundary_cache', None)
+        if cache and cache[0] == cache_key:
+            return cache[1]
+
+        boundaries = []
+
+        # --- 優先1: 位置情報アノテーションの折返し検出 ---
+        locs = getattr(self, 'location_annotations', {}) or {}
+        if len(locs) >= 10:
+            loc_items = sorted(locs.items())
+            max_loc = max(v for _, v in loc_items)
+            if max_loc >= 2:
+                wrap_threshold = max(2, (max_loc + 1) // 2)
+                prev_v = loc_items[0][1]
+                for idx, v in loc_items[1:]:
+                    if prev_v - v >= wrap_threshold:  # 例: 7→0 の巻き戻り
+                        boundaries.append(idx)
+                    prev_v = v
+
+        # --- 優先2: 自己位置のスタート地点回帰 ---
+        if not boundaries:
+            pts = []
+            for i in range(n):
+                ann = self.annotations.get(i)
+                if not ann:
+                    continue
+                for kx, ky in (('fused/x', 'fused/y'), ('slam/x', 'slam/y'),
+                               ('pose/x', 'pose/y')):
+                    if kx in ann and ky in ann:
+                        pts.append((i, ann[kx], ann[ky]))
+                        break
+            if len(pts) >= 50:
+                xs = [p[1] for p in pts]
+                ys = [p[2] for p in pts]
+                diag = ((max(xs) - min(xs)) ** 2 + (max(ys) - min(ys)) ** 2) ** 0.5
+                if diag > 1e-6:
+                    k = min(20, len(pts))
+                    sx = sum(p[1] for p in pts[:k]) / k
+                    sy = sum(p[2] for p in pts[:k]) / k
+                    away_thresh = diag * 0.25
+                    near_thresh = diag * 0.10
+                    armed = False
+                    for i, x, y in pts:
+                        d = ((x - sx) ** 2 + (y - sy) ** 2) ** 0.5
+                        if not armed and d > away_thresh:
+                            armed = True
+                        elif armed and d < near_thresh:
+                            boundaries.append(i)
+                            armed = False
+
+        self._lap_boundary_cache = (cache_key, boundaries)
+        return boundaries
+
     def init_ui(self):
         self.setWindowTitle(get_text('window_title'))
         self.setGeometry(MAIN_WINDOW_X, MAIN_WINDOW_Y, MAIN_WINDOW_WIDTH, MAIN_WINDOW_HEIGHT)
@@ -6034,7 +8129,7 @@ class ImageAnnotationTool(QMainWindow):
         left_scroll_area.setWidgetResizable(True)
         left_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         left_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        left_scroll_area.setMaximumWidth(LEFT_PANEL_MAX_WIDTH + 20)  # スクロールバー分の余裕
+        # 幅はスプリッタのドラッグで決めるので上限は設けず、最小幅だけ守る
         left_scroll_area.setMinimumWidth(LEFT_PANEL_MIN_WIDTH)  # 最小幅を設定
 
         left_panel = QWidget()
@@ -6042,7 +8137,9 @@ class ImageAnnotationTool(QMainWindow):
         left_panel.setMinimumWidth(LEFT_PANEL_MIN_WIDTH - 20)  # スクロールバー分を考慮した最小幅を確保
 
         left_scroll_area.setWidget(left_panel)
-        main_layout.addWidget(left_scroll_area)
+        # get_left_layout がレイアウトのインデックス探索に頼らずに済むよう保持
+        self.left_panel_widget = left_panel
+        self.left_scroll_area = left_scroll_area
 
         # Stats と画像ソース切替はツールバーに移動済み
 
@@ -6062,8 +8159,8 @@ class ImageAnnotationTool(QMainWindow):
         method_layout.addWidget(QLabel(get_text('pilot_model_select')))
         self.auto_method_combo = QComboBox()
 
-        # 利用可能なモデルのリストを取得
-        available_models = list_available_models()
+        # 利用可能なモデルのリストを取得（画像 CNN + LiDAR Policy）
+        available_models = self._driving_model_types()
 
         # コンボボックスのアイテムをモデルリストで初期化
         self.auto_method_combo.addItems(available_models)
@@ -6213,7 +8310,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # 物体検知推論結果表示用ラベルを作成
         self.detection_inference_info_label = QLabel("")
-        self.detection_inference_info_label.setStyleSheet("color: #009999;")
+        set_text_role(self.detection_inference_info_label, 'teal')
         self.detection_inference_info_label.setWordWrap(True)
 
         # 推論実行ボタン
@@ -6298,10 +8395,12 @@ class ImageAnnotationTool(QMainWindow):
 
         obj_detection_layout.addLayout(yolo_model_buttons_layout)
 
-        # YOLOオートアノテーション実行ボタン
+        # YOLOオートアノテーション実行ボタン → モデル選択(未取得ならDL)付きダイアログ。
+        # モデル未読込でもダイアログ内でDL/選択できるため常時有効。
         self.yolo_auto_annotate_btn = QPushButton(get_text('yolo_auto_annotate'))
-        self.yolo_auto_annotate_btn.clicked.connect(self.yolo_auto_annotate)
-        self.yolo_auto_annotate_btn.setEnabled(False)
+        self.yolo_auto_annotate_btn.clicked.connect(self.show_yolo_auto_annotate_dialog)
+        self.yolo_auto_annotate_btn.setEnabled(True)
+        self.yolo_auto_annotate_btn.setToolTip(get_text('yolo_auto_annot_hint'))
         apply_style(self.yolo_auto_annotate_btn, 'special')
         obj_detection_layout.addWidget(self.yolo_auto_annotate_btn)
 
@@ -6321,14 +8420,27 @@ class ImageAnnotationTool(QMainWindow):
         self.segmentation_inference_checkbox.stateChanged.connect(self.toggle_segmentation_inference_display)
         obj_detection_layout.addWidget(self.segmentation_inference_checkbox)
 
+        # 学習に使うアノテーションの範囲（表示中のソースのみ / 全ソース）
+        self.use_all_sources_checkbox = QCheckBox(get_text('chk_use_all_sources'))
+        self.use_all_sources_checkbox.setChecked(False)
+        self.use_all_sources_checkbox.setToolTip(get_text('tip_use_all_sources'))
+        self.use_all_sources_checkbox.toggled.connect(self.toggle_use_all_sources_for_training)
+        obj_detection_layout.addWidget(self.use_all_sources_checkbox)
+
+        # ソース別のアノテーション件数（どのソースに何枚あるか一目で分かるように）
+        self.source_annotation_summary_label = QLabel("")
+        set_text_role(self.source_annotation_summary_label, 'muted')
+        self.source_annotation_summary_label.setWordWrap(True)
+        obj_detection_layout.addWidget(self.source_annotation_summary_label)
+
         # 物体検知コンテナを追加
         left_layout.addWidget(self.object_detection_container)
 
         # 位置推論モデル追加
         self.add_location_model_section()
 
-        # ウェイポイントモデル追加
-        self.add_waypoint_model_section()
+        # ウェイポイントモデルの項は UI から削除（add_waypoint_model_section は
+        # 未使用のまま保持。waypoint_inference_checkbox 参照は hasattr ガード済み）
 
         # --- モデル管理セクションは右上ツールバーに移動済み ---
         # 内部で使用する変数のみ初期化（UIには表示しない）
@@ -6369,10 +8481,17 @@ class ImageAnnotationTool(QMainWindow):
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 5)  # 下部マージンを削減
         right_layout.setSpacing(3)  # スペーシングを削減
-        main_layout.addWidget(right_panel)
-        
-        # メイン画像と位置情報パネルを横に並べるレイアウト - 1:4:1の比率に変更
-        main_panel_layout = QHBoxLayout()
+
+        # 左パネルと画像側の境界をドラッグで動かせるようにする
+        # （左は初期幅を保ち、ウィンドウ拡大分は画像側が受け取る）
+        # 初期配分は初回表示時に _apply_default_splitter_sizes で確定させる
+        self.main_splitter = make_panel_splitter(
+            (left_scroll_area, right_panel), (0, 1))
+        main_layout.addWidget(self.main_splitter)
+
+        # 情報パネル / メイン画像 / 位置情報パネルは QSplitter で横に並べ、
+        # 各境界をドラッグして幅を調整できるようにする（初期比 1:4:1）。
+        # 3枚のウィジェットはこの後それぞれ組み立て、最後にまとめて追加する。
         
         # 1. 左側の情報パネル（アノテーション情報表示用）- 追加
         info_panel = QWidget()
@@ -6383,7 +8502,8 @@ class ImageAnnotationTool(QMainWindow):
         
         # 情報パネルの内容
         self.current_image_info = QLabel(get_text('image_info'))
-        self.current_image_info.setStyleSheet("color: #333333; font-weight: bold;")
+        self.current_image_info.setStyleSheet("font-weight: bold;")
+        set_text_role(self.current_image_info, 'strong')
         info_layout.addWidget(self.current_image_info)
 
         self.annotation_info_label = QLabel("")
@@ -6393,13 +8513,21 @@ class ImageAnnotationTool(QMainWindow):
 
         self.inference_info_label = QLabel("")
         self.inference_info_label.setWordWrap(True)
-        self.inference_info_label.setStyleSheet("color: #009999;")
+        set_text_role(self.inference_info_label, 'teal')
         self.inference_info_label.setMinimumHeight(45)
         # 垂直は Minimum（内容に応じて伸びる）。Fixed だと sizeHint 分しか高さが
         # 確保されず、TogiVAD 予測表（見出し+複数行）の最終行（=pred_seconds の
         # 3.0s 行など）がクリップされて表示されない不具合があった。
         self.inference_info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         info_layout.addWidget(self.inference_info_label)
+
+        # TogiVAD の angle/throttle 推論表示（自動運転モデルの推論とは独立・濃紫）
+        self.togivad_control_info_label = QLabel("")
+        self.togivad_control_info_label.setWordWrap(True)
+        set_text_role(self.togivad_control_info_label, 'accent')
+        self.togivad_control_info_label.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Minimum)
+        info_layout.addWidget(self.togivad_control_info_label)
 
         # 追加モデル用推論結果表示ラベルのコンテナ
         self.extra_inference_info_layout = QVBoxLayout()
@@ -6408,7 +8536,7 @@ class ImageAnnotationTool(QMainWindow):
         # 位置推論結果表示ラベル（推論結果の直下）
         self.location_inference_info_label = QLabel("")
         self.location_inference_info_label.setWordWrap(True)
-        self.location_inference_info_label.setStyleSheet("color: purple;")
+        set_text_role(self.location_inference_info_label, 'accent')
         self.location_inference_info_label.setMinimumHeight(25)
         self.location_inference_info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         info_layout.addWidget(self.location_inference_info_label)
@@ -6416,7 +8544,7 @@ class ImageAnnotationTool(QMainWindow):
         # 物体検知推論結果表示ラベル（位置推論結果の下）
         self.detection_inference_info_label = QLabel("")
         self.detection_inference_info_label.setWordWrap(True)
-        self.detection_inference_info_label.setStyleSheet("color: #009999;")
+        set_text_role(self.detection_inference_info_label, 'teal')
         self.detection_inference_info_label.setMinimumHeight(40)
         self.detection_inference_info_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         info_layout.addWidget(self.detection_inference_info_label)
@@ -6429,7 +8557,8 @@ class ImageAnnotationTool(QMainWindow):
         # 分布タイトルとデータ分析ボタン
         graph_title_layout = QHBoxLayout()
         self.graph_title = QLabel(get_text('data_distribution'))
-        self.graph_title.setStyleSheet("font-weight: bold; color: #333333;")
+        self.graph_title.setStyleSheet("font-weight: bold;")
+        set_text_role(self.graph_title, 'strong')
         graph_title_layout.addWidget(self.graph_title)
 
         self.data_analysis_button = QPushButton("📊")
@@ -6452,7 +8581,7 @@ class ImageAnnotationTool(QMainWindow):
         self.distribution_label = QLabel()
         self.distribution_label.setAlignment(Qt.AlignCenter)
         self.distribution_label.setFixedHeight(360)
-        self.distribution_label.setStyleSheet("background-color: #f8f8f8; border: 1px solid #dddddd; border-radius: 4px;")
+        set_panel_role(self.distribution_label, 'box')
 
         # 初期表示テキストの設定
         no_data_font = QFont()
@@ -6471,11 +8600,12 @@ class ImageAnnotationTool(QMainWindow):
         
         # パネルのサイズ設定
         # info_panel.setMinimumWidth(200)  # 最小幅
-        main_panel_layout.addWidget(info_panel, 1)  # 比率1
-        
+
         # 2. 中央の画像パネル - 既存のmain_image_containerをそのまま利用
         # メインイメージの周りにマージンを調整 - 左側マージンを0に変更（情報パネルを別ウィジェットにしたため）
-        main_image_container = QVBoxLayout()
+        # QSplitter に載せるためコンテナウィジェットで包む
+        self.image_area_widget = QWidget()
+        main_image_container = QVBoxLayout(self.image_area_widget)
         main_image_container.setContentsMargins(0, 0, 0, 0)  # マージンを0に変更
 
         # 画像とズームスライダーを横に並べるレイアウト
@@ -6495,12 +8625,12 @@ class ImageAnnotationTool(QMainWindow):
 
         self.image_size_label = QLabel("---")
         self.image_size_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.image_size_label.setStyleSheet("color: #666;")
+        set_text_role(self.image_size_label, 'muted')
         resolution_row.addWidget(self.image_size_label)
 
         self.model_input_size_label = QLabel("")
         self.model_input_size_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.model_input_size_label.setStyleSheet("color: #4a9;")
+        set_text_role(self.model_input_size_label, 'teal')
         resolution_row.addWidget(self.model_input_size_label)
 
         resolution_label = QLabel(get_text('label_resolution_scale'))
@@ -6512,8 +8642,6 @@ class ImageAnnotationTool(QMainWindow):
         self.resolution_value_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         resolution_row.addWidget(self.resolution_value_label)
 
-        resolution_row.addStretch(1)  # 左パディング
-
         self.resolution_slider = QSlider(Qt.Horizontal)
         self.resolution_slider.setMinimum(10)
         self.resolution_slider.setMaximum(100)
@@ -6523,13 +8651,49 @@ class ImageAnnotationTool(QMainWindow):
         self.resolution_slider.setSingleStep(5)
         self.resolution_slider.setToolTip(get_text('tooltip_resolution_scale'))
         self.resolution_slider.valueChanged.connect(self._on_resolution_scale_changed)
-        resolution_row.addWidget(self.resolution_slider, 3)  # スライダー幅を縮小
+        resolution_row.addWidget(self.resolution_slider, 1)  # 余白をすべて吸収して行を画像幅いっぱいに広げる
 
-        resolution_row.addStretch(1)  # 右パディング
+        # マスク編集UI: 対象コンボで車両/背景を選び、編集ボタンと表示チェックは選択中のマスクに作用する
+        mask_target_label = QLabel(get_text('label_mask_target'))
+        mask_target_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        resolution_row.addWidget(mask_target_label)
+
+        self.mask_target_combo = QComboBox()
+        self.mask_target_combo.setToolTip(get_text('tip_mask_target'))
+        self.mask_target_combo.currentIndexChanged.connect(self._on_mask_target_changed)
+        resolution_row.addWidget(self.mask_target_combo)
+
+        # 押下でポリゴン編集モードに入り、画像クリックで頂点を追加
+        self.mask_edit_button = QPushButton(get_text('btn_mask_edit'))
+        self.mask_edit_button.setCheckable(True)
+        self.mask_edit_button.setToolTip(get_text('tip_mask_edit'))
+        self.mask_edit_button.toggled.connect(self.toggle_mask_edit)
+        # 既定のボタン高はコンボより大きくなるため、対象コンボの高さに揃える
+        self.mask_edit_button.setFixedHeight(self.mask_target_combo.sizeHint().height())
+        resolution_row.addWidget(self.mask_edit_button)
+
+        # マスクオーバーレイの表示ON/OFF（結合表示中は設定に関わらず自動オフ）
+        self.mask_visible_checkbox = QCheckBox(get_text('chk_mask_visible'))
+        self.mask_visible_checkbox.setChecked(True)
+        self.mask_visible_checkbox.setToolTip(get_text('tip_mask_visible'))
+        self.mask_visible_checkbox.toggled.connect(self.toggle_mask_visible)
+        resolution_row.addWidget(self.mask_visible_checkbox)
+
+        # グリッド（angle/throttle 平面の目盛り）表示。画像ソースと測距ソースの両方に効く
+        self.grid_visible_checkbox = QCheckBox(get_text('chk_grid_visible'))
+        self.grid_visible_checkbox.setChecked(True)
+        self.grid_visible_checkbox.setToolTip(get_text('tip_grid_visible'))
+        self.grid_visible_checkbox.toggled.connect(self.toggle_grid_visible)
+        resolution_row.addWidget(self.grid_visible_checkbox)
+
+        self._rebuild_mask_target_combo()
 
         image_column.addLayout(resolution_row)
 
         self.main_image_view = ImageLabel(main_window=self)
+        # 表示設定（display_settings.json）のキャンバス表示倍率を反映
+        if getattr(self, '_pending_canvas_scale', None):
+            self.main_image_view.canvas_scale = self._pending_canvas_scale
         self.main_image_view.setMinimumSize(800, 600)
         self.main_image_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         image_column.addWidget(self.main_image_view, 1)
@@ -6545,22 +8709,37 @@ class ImageAnnotationTool(QMainWindow):
         zoom_slider_container.setContentsMargins(0, 0, 0, 0)
         zoom_slider_container.setSpacing(1)
 
-        zoom_slider_container.addStretch(1)  # 上パディング（スライダーと同比率）
-
-        zoom_label = QLabel(get_text('canvas_zoom_label'))
+        # 画像は常にキャンバスへフィット表示するため手動ズームは無い。
+        # このスライダーは測距ソース（'__lidar__'）でのレンジ拡大縮小専用で、
+        # それ以外のソースでは非表示にする（_update_zoom_slider_visibility）。
+        zoom_label = QLabel(get_text('canvas_range_label'))
         zoom_label.setAlignment(Qt.AlignCenter)
-        zoom_slider_container.addWidget(zoom_label)  # ラベルをスライダー直上に配置
+        # スピードゲージのラベル（Arial 7pt）と同じ見た目。apply_font_to_children が
+        # QLabel の setFont を上書きするため、スタイルシートでサイズを固定する
+        zoom_label.setStyleSheet("font-family: Arial; font-size: 7pt;")
+        # 上パディング（スライダーと同比率 1/8）の中にラベルを置き、ラベルの下端が
+        # スピードゲージのラベルと同じ高さ（トラック上端 −14px。QSlider の端マージン
+        # ぶんを加える）になるようにする
+        zoom_top_box = QVBoxLayout()
+        zoom_top_box.setContentsMargins(0, 0, 0, 0)
+        zoom_top_box.setSpacing(0)
+        zoom_top_box.addStretch(1)
+        zoom_top_box.addWidget(zoom_label)
+        zoom_top_box.addSpacing(14)
+        zoom_slider_container.addLayout(zoom_top_box, 1)
+        self.zoom_slider_label = zoom_label
 
         self.canvas_zoom_slider = QSlider(Qt.Vertical)
-        self.canvas_zoom_slider.setMinimum(10)   # zoom_factor 1.0
-        self.canvas_zoom_slider.setMaximum(50)   # zoom_factor 5.0
-        self.canvas_zoom_slider.setValue(int(DEFAULT_ZOOM_FACTOR * 10))  # デフォルト値
+        self.canvas_zoom_slider.setMinimum(10)   # レンジ ×1.0
+        self.canvas_zoom_slider.setMaximum(50)   # レンジ ×1/5
+        self.canvas_zoom_slider.setValue(10)
         self.canvas_zoom_slider.setTickPosition(QSlider.TicksLeft)
         self.canvas_zoom_slider.setTickInterval(5)
         self.canvas_zoom_slider.setFixedWidth(30)
-        self.canvas_zoom_slider.setToolTip(get_text('canvas_zoom_tooltip'))
+        self.canvas_zoom_slider.setToolTip(get_text('canvas_range_tooltip'))
         self.canvas_zoom_slider.valueChanged.connect(self._on_canvas_zoom_changed)
         zoom_slider_container.addWidget(self.canvas_zoom_slider, 6)  # 75% 高さ
+        self._update_zoom_slider_visibility()
 
         zoom_slider_container.addStretch(1)  # 下パディング
 
@@ -6577,20 +8756,48 @@ class ImageAnnotationTool(QMainWindow):
         
         # スライダーの配置
         slider_layout = QHBoxLayout()
+
+        # 左側ラベル列: speedグラフ用の小ラベル ＋ シークスライダー横の「画像シーク」ラベル
+        seek_label_column = QVBoxLayout()
+        seek_label_column.setSpacing(1)
+        seek_label_column.setContentsMargins(0, 0, 0, 0)
+
+        speed_graph_label = QLabel("speed")
+        _sg_font = speed_graph_label.font()
+        _sg_font.setPointSize(7)
+        speed_graph_label.setFont(_sg_font)
+        speed_graph_label.setStyleSheet("color: #7A8CA0;")
+        speed_graph_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        speed_graph_label.setFixedHeight(SpeedSeekGraphWidget.GRAPH_HEIGHT)
+        seek_label_column.addWidget(speed_graph_label)
+
         slider_label = QLabel(get_text('image_seek'))
-        slider_layout.addWidget(slider_label)
-        
+        slider_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        seek_label_column.addWidget(slider_label)
+
+        slider_layout.addLayout(seek_label_column)
+
         #self.image_slider = QSlider(Qt.Horizontal)
         self.image_slider = DeletedIndexesSlider()
         self.image_slider.setMinimum(0)
-        self.image_slider.setMaximum(0) 
+        self.image_slider.setMaximum(0)
         self.image_slider.setValue(0)
         self.image_slider.setTickPosition(QSlider.TicksBelow)
         self.image_slider.setTickInterval(10)
         self.image_slider.valueChanged.connect(self.slider_changed)
-        slider_layout.addWidget(self.image_slider)
+
+        # speedグラフ（YouTube風）をシークバーの直上に重ねて配置（幅をスライダーと一致させる）
+        seek_column = QVBoxLayout()
+        seek_column.setSpacing(1)
+        seek_column.setContentsMargins(0, 0, 0, 0)
+        self.speed_seek_graph = SpeedSeekGraphWidget(self)
+        seek_column.addWidget(self.speed_seek_graph)
+        seek_column.addWidget(self.image_slider)
+        slider_layout.addLayout(seek_column, 1)
         
         self.slider_value_label = QLabel("0/0")
+        # 桁数の増加でレイアウト（speedグラフ・スライダー幅）が動かないよう右寄せ＋固定幅にする
+        self.slider_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         slider_layout.addWidget(self.slider_value_label)
         
         nav_container_layout.addLayout(slider_layout)
@@ -6638,6 +8845,13 @@ class ImageAnnotationTool(QMainWindow):
         delete_current_button.clicked.connect(self.delete_current_annotation)
         apply_style(delete_current_button, "destructive")
         delete_layout.addWidget(delete_current_button)
+
+        # 後進時（throttleが負）のフレームを一括削除するボタン
+        delete_reverse_button = QPushButton(get_text('btn_delete_reverse'))
+        delete_reverse_button.clicked.connect(self.delete_reverse_frames)
+        delete_reverse_button.setToolTip(get_text('tip_delete_reverse'))
+        apply_style(delete_reverse_button, "destructive")
+        delete_layout.addWidget(delete_reverse_button)
 
         # 復元ボタンを追加
         restore_button = QPushButton(get_text('restore_deleted'))
@@ -6754,7 +8968,7 @@ class ImageAnnotationTool(QMainWindow):
         downsample_grid.addWidget(self.detect_downsample_button, 0, col); col += 1
 
         self.downsample_count_label = QLabel(get_text('items', 0))
-        self.downsample_count_label.setStyleSheet("color: #3366ff;")
+        set_text_role(self.downsample_count_label, 'info')
         downsample_grid.addWidget(self.downsample_count_label, 0, col); col += 1
 
         # --- Row 1: Throttle ---
@@ -6816,7 +9030,7 @@ class ImageAnnotationTool(QMainWindow):
         downsample_grid.addWidget(self.detect_throttle_downsample_button, 1, col); col += 1
 
         self.throttle_downsample_count_label = QLabel(f"({get_text('items', 0)})")
-        self.throttle_downsample_count_label.setStyleSheet("color: #3366ff;")
+        set_text_role(self.throttle_downsample_count_label, 'info')
         downsample_grid.addWidget(self.throttle_downsample_count_label, 1, col); col += 1
 
         clear_throttle_downsample_button = QPushButton(get_text('clear'))
@@ -6831,59 +9045,63 @@ class ImageAnnotationTool(QMainWindow):
 
         # ナビゲーションコンテナをメイン画像コンテナに追加
         main_image_container.addWidget(nav_container)
-        
-        # 中央パネルをメインパネルに追加 - 比率4に設定
-        main_panel_layout.addLayout(main_image_container, 4)
-        
+
         # 3. 右側の位置情報パネル - 既存のright_layoutをそのまま利用、比率1に設定
         location_panel = QWidget()
         location_layout = QVBoxLayout(location_panel)
         location_layout.setSpacing(5)
         
-        # アノテーションモード ラベル（右にヒントを横並び）
-        mode_header_row = QHBoxLayout()
-        mode_header_row.setSpacing(6)
-        mode_layout_label = QLabel(get_text('label_annotation_mode'))
-        mode_layout_label.setStyleSheet("font-weight: bold;")
-        mode_header_row.addWidget(mode_layout_label)
-        self.mode_hint_label = QLabel(get_text('label_mode_hint'))
-        self.mode_hint_label.setStyleSheet("color: #888; font-style: italic; font-size: 10px;")
-        mode_header_row.addWidget(self.mode_hint_label)
-        mode_header_row.addStretch()
-        location_layout.addLayout(mode_header_row)
+        # ── 群1: アノテーションモード（モード選択＋全モード共通設定）
+        # タイトル付きの群はフォント高に応じた上マージンが要るので
+        # _panel_group_boxes に集めて _refresh_panel_group_styles で一括適用する
+        self._panel_group_boxes = []
+        mode_group = QGroupBox(get_text('label_annotation_mode').rstrip(':：'))
+        self._panel_group_boxes.append(mode_group)
+        mode_group_layout = QVBoxLayout(mode_group)
+        mode_group_layout.setContentsMargins(6, 2, 6, 6)
+        mode_group_layout.setSpacing(4)
 
-        # アノテーションモード切替ボタン
+        # アノテーションモード切替ボタン（排他制御は QButtonGroup に一元化し、
+        # 見た目は位置/コーナー切替と同じセグメンテッドコントロールに揃える）
         mode_layout = QHBoxLayout()
-        
+        mode_layout.setSpacing(2)
+        self.mode_button_group = QButtonGroup(self)
+        self.mode_button_group.setExclusive(True)
+
         self.auto_mode_button = QPushButton(get_text('btn_auto_driving'))
-        self.auto_mode_button.setCheckable(True)
-        self.auto_mode_button.setChecked(True)
-        self.auto_mode_button.clicked.connect(self.toggle_annotation_mode)
         self.auto_mode_button.setToolTip(get_text('tip_auto_driving_mode'))
 
         self.detection_mode_button = QPushButton(get_text('btn_detection'))
-        self.detection_mode_button.setCheckable(True)
-        self.detection_mode_button.clicked.connect(self.toggle_annotation_mode)
         self.detection_mode_button.setToolTip(get_text('tip_detection_mode'))
 
-        # 新規追加: セグメンテーションモードボタン
         self.segmentation_mode_button = QPushButton(get_text('btn_segmentation'))
-        self.segmentation_mode_button.setCheckable(True)
-        self.segmentation_mode_button.clicked.connect(self.toggle_annotation_mode)
         self.segmentation_mode_button.setToolTip(get_text('tip_segmentation_mode'))
 
-        # 新規追加: waypointモードボタン
+        # waypointモードボタン: UI から削除（モード切替ロジックが参照するため
+        # オブジェクトは非表示のまま保持。レイアウトには追加しない）
         self.waypoint_mode_button = QPushButton(get_text('btn_waypoint'))
         self.waypoint_mode_button.setCheckable(True)
-        self.waypoint_mode_button.clicked.connect(self.toggle_annotation_mode)
-        self.waypoint_mode_button.setToolTip(get_text('tip_waypoint_mode'))
+        self.waypoint_mode_button.setVisible(False)
 
-        mode_layout.addWidget(self.auto_mode_button)
-        mode_layout.addWidget(self.detection_mode_button)
-        mode_layout.addWidget(self.segmentation_mode_button)  # 追加
-        mode_layout.addWidget(self.waypoint_mode_button)  # 追加
+        for _mode_id, _mode_btn in ((0, self.auto_mode_button),
+                                    (1, self.detection_mode_button),
+                                    (2, self.segmentation_mode_button)):
+            _mode_btn.setCheckable(True)
+            set_segmented(_mode_btn)
+            self.mode_button_group.addButton(_mode_btn, _mode_id)
+            mode_layout.addWidget(_mode_btn)
+        self.mode_button_group.addButton(self.waypoint_mode_button, 3)
+        self.auto_mode_button.setChecked(True)
+        self.mode_button_group.idClicked.connect(self.toggle_annotation_mode)
 
-        location_layout.addLayout(mode_layout)
+        mode_group_layout.addLayout(mode_layout)
+
+        # モード切替ヒント（独立行にして見切れを防ぐ。フォントを縮めると
+        # 潰れて読めなくなるので、色だけ落として本文サイズを保つ）
+        self.mode_hint_label = QLabel(get_text('label_mode_hint'))
+        set_text_role(self.mode_hint_label, 'muted')
+        self.mode_hint_label.setWordWrap(True)
+        mode_group_layout.addWidget(self.mode_hint_label)
 
         # クリック時の自動スキップ枚数（全モード共通、モードボタン直下）
         skip_layout = QHBoxLayout()
@@ -6896,13 +9114,16 @@ class ImageAnnotationTool(QMainWindow):
         self.skip_count_spin.valueChanged.connect(self.update_skip_button_labels)
         skip_layout.addWidget(self.skip_count_spin)
         skip_layout.addStretch()
-        location_layout.addLayout(skip_layout)
+        mode_group_layout.addLayout(skip_layout)
 
-        # 自動運転走行軌跡制御パネル
-        self.auto_driving_control_widget = QWidget()
+        # パネルへの追加はオーバーレイ群の生成後（表示順は オーバーレイ → モード）
+
+        # ── 群2: 表示オーバーレイ（自動運転モードで画像に重ねて描くもの）
+        self.auto_driving_control_widget = QGroupBox(get_text('label_overlay_group'))
+        self._panel_group_boxes.append(self.auto_driving_control_widget)
         auto_driving_control_layout = QVBoxLayout(self.auto_driving_control_widget)
-        auto_driving_control_layout.setContentsMargins(0, 2, 0, 2)
-        auto_driving_control_layout.setSpacing(3)
+        auto_driving_control_layout.setContentsMargins(6, 2, 6, 6)
+        auto_driving_control_layout.setSpacing(4)
 
         # ラベル/チェックボックスが縦方向に潰れないための高さ（フォント高さ基準）
         _label_h = self.fontMetrics().height() + 4
@@ -6931,16 +9152,27 @@ class ImageAnnotationTool(QMainWindow):
         self.show_recorded_trajectory_checkbox.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.show_recorded_trajectory_checkbox.setMinimumHeight(_label_h)
         rec_row.addWidget(self.show_recorded_trajectory_checkbox)
+        rec_row.addStretch()
+        auto_driving_control_layout.addLayout(rec_row)
+
+        # 行1b-2: 走行軌道のパラメータ（ソース/秒数/点数）。1行に並べると
+        # パネルの最小幅を押し上げるので、チェックボックスの下へ折り返す。
+        rec_param_row = QHBoxLayout()
+        rec_param_row.setSpacing(4)
+        rec_param_row.addSpacing(_INDENT_WIDTH)
 
         # 走行軌道の自己位置ソース（既定 pose。slam はテレポートで補完不可に
         # なるフレームが多く、軌道が途切れやすいため既定にしない）
         self.recorded_traj_source_combo = QComboBox()
         self.recorded_traj_source_combo.addItem("pose", "pose")
         self.recorded_traj_source_combo.addItem("slam", "slam")
+        self.recorded_traj_source_combo.addItem("vslam", "vslam")
+        self.recorded_traj_source_combo.addItem("aruco", "aruco")
+        self.recorded_traj_source_combo.addItem("fused", "fused")
         self.recorded_traj_source_combo.setToolTip(get_text('tip_recorded_traj_source'))
         self.recorded_traj_source_combo.setCurrentIndex(0)   # 既定 pose
         self.recorded_traj_source_combo.currentIndexChanged.connect(self.update_recorded_traj_source)
-        rec_row.addWidget(self.recorded_traj_source_combo)
+        rec_param_row.addWidget(self.recorded_traj_source_combo)
 
         # 走行軌道の表示時間窓 [秒]（0.5秒刻み・小数第1位。TogiVADモデル読込時は
         # モデルの秒数へ同期）。単位「秒」は入力欄の外に別ラベルで表示する
@@ -6954,11 +9186,11 @@ class ImageAnnotationTool(QMainWindow):
         self.recorded_traj_seconds_input.setToolTip(get_text('tip_recorded_traj_seconds'))
         self.recorded_traj_seconds_input.setValue(self.recorded_traj_seconds)
         self.recorded_traj_seconds_input.valueChanged.connect(self.update_recorded_traj_seconds)
-        rec_row.addWidget(self.recorded_traj_seconds_input)
+        rec_param_row.addWidget(self.recorded_traj_seconds_input)
         # 秒数入力の右に単位「秒」ラベル（点数の「点」と同じ扱い）
         self.recorded_traj_seconds_unit = QLabel(get_text('unit_seconds_label'))
         self.recorded_traj_seconds_unit.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        rec_row.addWidget(self.recorded_traj_seconds_unit)
+        rec_param_row.addWidget(self.recorded_traj_seconds_unit)
 
         # 走行軌道の標本点数（プレースホルダーで調整。空欄はデフォルト20点）
         self.recorded_traj_points_input = QLineEdit()
@@ -6967,20 +9199,112 @@ class ImageAnnotationTool(QMainWindow):
         self.recorded_traj_points_input.setFixedWidth(44)
         self.recorded_traj_points_input.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.recorded_traj_points_input.textChanged.connect(self.update_recorded_traj_points)
-        rec_row.addWidget(self.recorded_traj_points_input)
+        rec_param_row.addWidget(self.recorded_traj_points_input)
         # 点数入力の右に単位「点」ラベル
         self.recorded_traj_points_unit = QLabel(get_text('unit_points_label'))
         self.recorded_traj_points_unit.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        rec_row.addWidget(self.recorded_traj_points_unit)
-        rec_row.addStretch()
-        auto_driving_control_layout.addLayout(rec_row)
+        rec_param_row.addWidget(self.recorded_traj_points_unit)
+        rec_param_row.addStretch()
+        auto_driving_control_layout.addLayout(rec_param_row)
 
-        # 行2: 最大舵角 / 俯角 / FOV を横に並べる（各列：ラベルを値の上に配置）
-        #   狭いパネル幅でもラベルが全部見えるよう、1項目=1列(ラベル＋入力欄)とする
-        params_row = QHBoxLayout()
+        # 行1c: BEV(真上図)レイヤのトグル — CAM投影/障害物/境界/他車
+        #       画像ソースが BEV のときにしか効かないので、それ以外では
+        #       無効表示にして「押しても反応しない」状態を作らない
+        self._bev_layer_widgets = []
+        # 4つを1行に並べるとパネルの最小幅を押し上げるので2段に折り返す
+        bev_layer_row = QHBoxLayout()
+        bev_layer_row.setSpacing(6)
+        bev_hint_label = QLabel(get_text('label_bev_layers_only'))
+        set_text_role(bev_hint_label, 'muted')
+        bev_hint_label.setToolTip(get_text('tip_bev_layers_only'))
+        bev_hint_label.setMinimumHeight(_label_h)
+        bev_layer_row.addWidget(bev_hint_label)
+        self._bev_layer_widgets.append(bev_hint_label)
+
+        bev_layer_row2 = QHBoxLayout()
+        bev_layer_row2.setSpacing(6)
+        bev_layer_row2.addSpacing(_INDENT_WIDTH)
+        for index, (attr, key, default) in enumerate((
+                ('show_bev_camera', 'chk_bev_camera', False),
+                ('show_bev_occupancy', 'chk_bev_occupancy', True),
+                ('show_bev_boundary', 'chk_bev_boundary', True),
+                ('show_bev_agents', 'chk_bev_agents', True))):
+            setattr(self, attr, default)
+            cb = QCheckBox(get_text(key))
+            cb.setChecked(default)
+            cb.setMinimumHeight(_label_h)
+            cb.stateChanged.connect(self._make_bev_layer_toggle(attr))
+            # 前半2つはラベルと同じ行、後半2つは折り返した2段目へ
+            (bev_layer_row if index < 2 else bev_layer_row2).addWidget(cb)
+            self._bev_layer_widgets.append(cb)
+        bev_layer_row.addStretch()
+        bev_layer_row2.addStretch()
+        auto_driving_control_layout.addLayout(bev_layer_row)
+        auto_driving_control_layout.addLayout(bev_layer_row2)
+        self._update_bev_layer_enabled()
+
+        # 行1d: LiDAR ビュー（画像ソース '__lidar__'）のレイヤ/表示設定。
+        #       BEV と同様、LiDAR ソース選択時のみ操作可能にする。
+        self._lidar_layer_widgets = []
+        self.lidar_view_range_m = 5.0
+        self.lidar_view_mode = 'polar'
+        lidar_layer_row = QHBoxLayout()
+        lidar_layer_row.setSpacing(6)
+        lidar_hint_label = QLabel(get_text('label_lidar_layers_only'))
+        set_text_role(lidar_hint_label, 'muted')
+        lidar_hint_label.setToolTip(get_text('tip_lidar_layers_only'))
+        lidar_hint_label.setMinimumHeight(_label_h)
+        lidar_layer_row.addWidget(lidar_hint_label)
+        self._lidar_layer_widgets.append(lidar_hint_label)
+        self.lidar_view_mode_combo = QComboBox()
+        self.lidar_view_mode_combo.addItem(get_text('opt_lidar_view_polar'), 'polar')
+        self.lidar_view_mode_combo.addItem(get_text('opt_lidar_view_profile'), 'profile')
+        self.lidar_view_mode_combo.currentIndexChanged.connect(self._on_lidar_view_mode_changed)
+        lidar_layer_row.addWidget(self.lidar_view_mode_combo)
+        self._lidar_layer_widgets.append(self.lidar_view_mode_combo)
+        lidar_range_label = QLabel(get_text('label_lidar_view_range'))
+        lidar_range_label.setMinimumHeight(_label_h)
+        lidar_layer_row.addWidget(lidar_range_label)
+        self._lidar_layer_widgets.append(lidar_range_label)
+        self.lidar_view_range_combo = QComboBox()
+        for rng in (3, 5, 10, 20, 30):
+            self.lidar_view_range_combo.addItem(f"{rng}m", float(rng))
+        self.lidar_view_range_combo.setCurrentIndex(1)
+        self.lidar_view_range_combo.currentIndexChanged.connect(self._on_lidar_view_range_changed)
+        lidar_layer_row.addWidget(self.lidar_view_range_combo)
+        self._lidar_layer_widgets.append(self.lidar_view_range_combo)
+        lidar_layer_row.addStretch()
+
+        lidar_layer_row2 = QHBoxLayout()
+        lidar_layer_row2.setSpacing(6)
+        lidar_layer_row2.addSpacing(_INDENT_WIDTH)
+        for attr, key, default in (
+                ('show_lidar_zones', 'chk_lidar_zones', True),
+                ('show_lidar_points', 'chk_lidar_points', True),
+                ('show_lidar_history', 'chk_lidar_history', True),
+                ('show_lidar_model_input', 'chk_lidar_model_input', True)):
+            setattr(self, attr, default)
+            cb = QCheckBox(get_text(key))
+            cb.setChecked(default)
+            cb.setMinimumHeight(_label_h)
+            cb.setToolTip(get_text('tip_' + key))
+            cb.stateChanged.connect(self._make_bev_layer_toggle(attr))
+            lidar_layer_row2.addWidget(cb)
+            self._lidar_layer_widgets.append(cb)
+        lidar_layer_row2.addStretch()
+        auto_driving_control_layout.addLayout(lidar_layer_row)
+        auto_driving_control_layout.addLayout(lidar_layer_row2)
+        self._update_lidar_layer_enabled()
+
+        # 行2: カメラ幾何（最大舵角/俯角/FOV/カメラ高）
+        #   車両とカメラの物理定数でセッション中はほぼ固定のため、パネルには
+        #   現在値のサマリだけを置き、入力欄は「変更」で開くダイアログへ退避する。
+        #   入力欄ウィジェットはここで生成して既定値を各ハンドラへ流す。
+        self.camera_params_widget = QWidget()
+        params_row = QHBoxLayout(self.camera_params_widget)
         params_row.setSpacing(10)
 
-        def _mk_spin(decimals, lo, hi, width=64):
+        def _mk_spin(decimals, lo, hi, width=76):
             sb = QDoubleSpinBox()
             sb.setRange(lo, hi)
             sb.setSuffix("°")
@@ -7029,7 +9353,7 @@ class ImageAnnotationTool(QMainWindow):
         self.auto_cam_height_spin.setSuffix(" m")
         self.auto_cam_height_spin.setDecimals(2)
         self.auto_cam_height_spin.setSingleStep(0.01)
-        self.auto_cam_height_spin.setFixedWidth(64)
+        self.auto_cam_height_spin.setFixedWidth(76)
         self.auto_cam_height_spin.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.auto_cam_height_spin.setToolTip(get_text('tip_auto_cam_height'))
         self.auto_cam_height_spin.valueChanged.connect(self.update_auto_cam_height)
@@ -7037,12 +9361,33 @@ class ImageAnnotationTool(QMainWindow):
         _add_param_col('label_auto_cam_height', self.auto_cam_height_spin)
 
         params_row.addStretch()
-        auto_driving_control_layout.addLayout(params_row)
+        # パネルには載せず、ダイアログを開いたときに移設する
+        self.camera_params_widget.setVisible(False)
+
+        # カメラ幾何の現在値サマリ ＋ 変更ボタン（パネル上は1行に圧縮）
+        cam_summary_row = QHBoxLayout()
+        cam_summary_row.setSpacing(6)
+        self.camera_geometry_summary_label = QLabel()
+        set_text_role(self.camera_geometry_summary_label, 'muted')
+        cam_summary_row.addWidget(self.camera_geometry_summary_label)
+        cam_summary_row.addStretch()
+        self.camera_geometry_button = QPushButton(get_text('btn_camera_geometry'))
+        self.camera_geometry_button.setToolTip(get_text('tip_camera_geometry'))
+        self.camera_geometry_button.clicked.connect(self.show_camera_geometry_dialog)
+        cam_summary_row.addWidget(self.camera_geometry_button)
+        auto_driving_control_layout.addLayout(cam_summary_row)
+
+        for _cam_spin in (self.auto_max_steering_spin, self.auto_cam_pitch_spin,
+                          self.auto_fov_spin, self.auto_cam_height_spin):
+            _cam_spin.valueChanged.connect(self._update_camera_geometry_summary)
+        self._update_camera_geometry_summary()
 
         # ウィジェット全体が縦方向に圧縮されないようにする（ラベルの潰れ防止）
         self.auto_driving_control_widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         self.auto_driving_control_widget.setVisible(True)  # 初期は自動運転モードで表示
+        # 表示オーバーレイ群をアノテーションモード群より上に置く
         location_layout.addWidget(self.auto_driving_control_widget)
+        location_layout.addWidget(mode_group)
 
         # waypoint制御パネル
         self.waypoint_control_widget = QWidget()
@@ -7051,7 +9396,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # waypoint制御ラベル
         waypoint_label = QLabel(get_text('label_waypoint_control'))
-        waypoint_label.setStyleSheet("font-weight: bold; color: #333;")
+        waypoint_label.setStyleSheet("font-weight: bold;")
+        set_text_role(waypoint_label, 'strong')
         waypoint_control_layout.addWidget(waypoint_label)
 
         # 打点数制御
@@ -7300,7 +9646,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # セグメンテーション制御ラベル
         segmentation_label = QLabel(get_text('label_steering_direction'))
-        segmentation_label.setStyleSheet("font-weight: bold; color: #333;")
+        segmentation_label.setStyleSheet("font-weight: bold;")
+        set_text_role(segmentation_label, 'strong')
         segmentation_control_layout.addWidget(segmentation_label)
 
         # 走行方向矢印表示チェックボックス
@@ -7417,9 +9764,38 @@ class ImageAnnotationTool(QMainWindow):
         self.apply_last_segmentation_checkbox.setVisible(False)  # 初期は非表示（セグメンテーションモード時のみ表示）
         location_layout.addWidget(self.apply_last_segmentation_checkbox)
 
-        location_label = QLabel(get_text('label_location_info'))
+        # ── 群3: コースの位置情報（折り畳み式。既定は畳んでパネル高を空ける）
+        # タイトルはヘッダー行に自前で置くので、枠だけのスタイルを当てる
+        self.location_info_group = QGroupBox()
+        self.location_info_group.setStyleSheet(PANEL_FRAME_QSS)
+        loc_group_layout = QVBoxLayout(self.location_info_group)
+        loc_group_layout.setContentsMargins(6, 6, 6, 6)
+        loc_group_layout.setSpacing(4)
+
+        # ヘッダー: タイトル ＋ 現在値 ＋ 展開ボタン
+        # （畳んだままでも「今どの位置か」が読めるようにヘッダーへ出す）
+        loc_header_row = QHBoxLayout()
+        loc_header_row.setSpacing(6)
+        # タイトル末尾のコロンは「現在: なし」と続けると二重になるので落とす
+        location_label = QLabel(get_text('label_location_info').rstrip(':：'))
         location_label.setStyleSheet("font-weight: bold;")
-        location_layout.addWidget(location_label)
+        loc_header_row.addWidget(location_label)
+        self.current_location_label = QLabel(get_text('label_current_location'))
+        loc_header_row.addWidget(self.current_location_label)
+        loc_header_row.addStretch()
+        self.location_info_expand_button = QPushButton("▶")
+        self.location_info_expand_button.setFixedSize(26, 24)
+        self.location_info_expand_button.setStyleSheet("padding: 0px;")
+        self.location_info_expand_button.setToolTip(get_text('tip_toggle_location_info'))
+        self.location_info_expand_button.clicked.connect(self.toggle_location_info_section)
+        loc_header_row.addWidget(self.location_info_expand_button)
+        loc_group_layout.addLayout(loc_header_row)
+
+        # 折り畳み対象の中身
+        self.location_info_content = QWidget()
+        location_content_layout = QVBoxLayout(self.location_info_content)
+        location_content_layout.setContentsMargins(0, 2, 0, 0)
+        location_content_layout.setSpacing(4)
 
         # 位置 / コーナー 切り替えボタン
         loc_mode_row = QHBoxLayout()
@@ -7430,23 +9806,19 @@ class ImageAnnotationTool(QMainWindow):
         self._loc_pos_btn.setCheckable(True)
         self._loc_pos_btn.setChecked(True)
         self._loc_pos_btn.setFixedHeight(24)
-        self._loc_pos_btn.setStyleSheet(
-            "QPushButton{border:1px solid #aaa;border-radius:3px;padding:2px 8px;background:#f0f0f0;}"
-            "QPushButton:checked{background:#4a90d9;color:white;border-color:#2a70b9;}"
-        )
+        self._loc_pos_btn.setToolTip(get_text('tip_loc_mode_position'))
+        set_segmented(self._loc_pos_btn)
         self._loc_corner_btn = QPushButton("コーナー")
         self._loc_corner_btn.setCheckable(True)
         self._loc_corner_btn.setFixedHeight(24)
-        self._loc_corner_btn.setStyleSheet(
-            "QPushButton{border:1px solid #aaa;border-radius:3px;padding:2px 8px;background:#f0f0f0;}"
-            "QPushButton:checked{background:#4a90d9;color:white;border-color:#2a70b9;}"
-        )
+        self._loc_corner_btn.setToolTip(get_text('tip_loc_mode_corner'))
+        set_segmented(self._loc_corner_btn)
         self._loc_mode_btn_group.addButton(self._loc_pos_btn, 0)
         self._loc_mode_btn_group.addButton(self._loc_corner_btn, 1)
         loc_mode_row.addWidget(self._loc_pos_btn)
         loc_mode_row.addWidget(self._loc_corner_btn)
         loc_mode_row.addStretch()
-        location_layout.addLayout(loc_mode_row)
+        location_content_layout.addLayout(loc_mode_row)
 
         def _on_loc_mode_changed(btn_id):
             self._location_display_mode = 'corner' if btn_id == 1 else 'position'
@@ -7454,45 +9826,65 @@ class ImageAnnotationTool(QMainWindow):
 
         self._loc_mode_btn_group.idClicked.connect(_on_loc_mode_changed)
 
-        # 位置情報の自動適用チェックボックス
+        # 位置情報の自動適用チェックボックス ＋ 位置クラス情報の保存ボタン
+        apply_location_row = QHBoxLayout()
         self.apply_location_checkbox = QCheckBox(get_text('chk_apply_location'))
         self.apply_location_checkbox.setChecked(False)
         self.apply_location_checkbox.setToolTip(get_text('tip_apply_location'))
         self.apply_location_checkbox.stateChanged.connect(self.toggle_auto_apply_location)
-        location_layout.addWidget(self.apply_location_checkbox)
-        
+        apply_location_row.addWidget(self.apply_location_checkbox)
+
+        self.save_location_classes_button = QPushButton(get_text('btn_save_location_classes'))
+        self.save_location_classes_button.setToolTip(get_text('tip_save_location_classes'))
+        self.save_location_classes_button.clicked.connect(self.save_location_classes)
+        apply_location_row.addWidget(self.save_location_classes_button)
+        apply_location_row.addStretch()
+        location_content_layout.addLayout(apply_location_row)
+
         # 位置情報の選択肢を管理するレイアウト
         self.location_buttons_layout = QVBoxLayout()
-        location_layout.addLayout(self.location_buttons_layout)
-        
-        # 位置情報の追加ボタン
+        location_content_layout.addLayout(self.location_buttons_layout)
+
+        # 位置情報の追加ボタン（裸のスピンでは何の値か分からないのでラベルを付ける）
         add_location_layout = QHBoxLayout()
+        add_location_layout.addWidget(QLabel(get_text('label_new_location_id')))
         self.new_location_input = QSpinBox()
         self.new_location_input.setRange(0, 100)
         self.new_location_input.setValue(8)  # 初期値を8に設定（8個作成後）
         add_location_layout.addWidget(self.new_location_input)
-        
+
         add_location_button = QPushButton(get_text('btn_add_location'))
         add_location_button.clicked.connect(self.add_location_button)
         add_location_layout.addWidget(add_location_button)
-        location_layout.addLayout(add_location_layout)
-        
-        # 現在の位置情報表示ラベル
-        self.current_location_label = QLabel(get_text('label_current_location'))
-        location_layout.addWidget(self.current_location_label)
-        
+        add_location_layout.addStretch()
+        location_content_layout.addLayout(add_location_layout)
+
+        # 初期は畳んだ状態（位置アノテーション済みなら自動で開く）
+        self.location_info_content.setVisible(False)
+        loc_group_layout.addWidget(self.location_info_content)
+        location_layout.addWidget(self.location_info_group)
+
+        # 群のタイトル余白をフォント高から算出して適用
+        self._refresh_panel_group_styles()
+
         # スペーサーを追加して上部に配置
         location_layout.addStretch()
         
-        # 位置情報パネルをメインパネルに追加
-        main_panel_layout.addWidget(location_panel, 1)  # 比率1に設定
-        
-        # メインパネルをレイアウトに追加
-        right_layout.addLayout(main_panel_layout)
+        # 情報パネル / 画像 / 位置情報パネルをスプリッタに載せる。
+        # 右パネルはスクロールさせず生のウィジェットのまま載せることで、
+        # 中身の自然幅がそのまま下限になり、ドラッグしても見切れない。
+        self.center_splitter = make_panel_splitter(
+            (info_panel, self.image_area_widget, location_panel), (1, 4, 1))
+        # 縦の余りはギャラリーではなくキャンバス側（この行）に配分する
+        self.center_splitter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        right_layout.addWidget(self.center_splitter, 1)
 
         # Gallery
         gallery_label = QLabel(get_text('label_gallery'))
-        right_layout.addWidget(gallery_label)
+        # 既定の Preferred のままだと余った高さをこのラベルが吸ってしまい、
+        # ウィンドウを広げてもキャンバスが縦に伸びない
+        gallery_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        right_layout.addWidget(gallery_label, 0)
         
         self.gallery_widget = QWidget()
         self.gallery_layout = QGridLayout(self.gallery_widget)
@@ -7504,7 +9896,7 @@ class ImageAnnotationTool(QMainWindow):
         gallery_scroll.setWidget(self.gallery_widget)
         gallery_scroll.setMinimumHeight(GALLERY_MIN_HEIGHT)
         gallery_scroll.setMaximumHeight(GALLERY_MIN_HEIGHT + 20)  # 最大高さを制限
-        right_layout.addWidget(gallery_scroll)
+        right_layout.addWidget(gallery_scroll, 0)
         
         # 位置情報ボタンを初期化（8個作成）
         self.init_location_buttons()
@@ -7602,8 +9994,12 @@ class ImageAnnotationTool(QMainWindow):
                 "last_model_file": self.get_selected_model_filename() if hasattr(self, 'model_combo') and self.model_combo.count() > 0 else "",
                 "last_model_sources": (self._multi_source_config.get('sources') if hasattr(self, '_multi_source_config') and self._multi_source_config else None),
                 "extra_models": extra_models_info,
-                "max_speed": self.main_image_view.max_speed if hasattr(self, 'main_image_view') else MAX_SPEED,
                 "detection_classes": self.classes_input.text() if hasattr(self, 'classes_input') else "",
+                "location_classes": {str(k): v for k, v in getattr(self, 'location_class_names', {}).items() if v.strip()},
+                "masks": [{'id': m['id'], 'name': m['name'], 'visible': m.get('visible', True),
+                           'symmetric': m.get('symmetric', True),
+                           'points': [list(p) for p in m['points']]}
+                          for m in getattr(self, 'masks', [])],
                 "timestamp": int(time.time())
             }
             
@@ -7961,6 +10357,22 @@ class ImageAnnotationTool(QMainWindow):
 
             # 削除キーが押された場合の処理
             elif key in [Qt.Key_Delete, Qt.Key_Backspace]:
+                # マップビュー上にマウスがある間・マップビューがアクティブな間は、
+                # メイン画面のアノテーション（運転・bbox・セグ・waypoint）を誤って
+                # 削除しないよう、削除処理をマップビュー側（位置領域のホバー/選択
+                # 削除）へ委譲して消費する。
+                # ※ underMouse() は enter/leave イベント頼みで最前面ダイアログでは
+                #    取りこぼすため、カーソル座標×ウィンドウ矩形で直接判定する
+                map_dialog = getattr(self, 'map_view_dialog', None)
+                if map_dialog is not None and map_dialog.isVisible():
+                    over_map = map_dialog.frameGeometry().contains(QCursor.pos())
+                    if over_map or QApplication.activeWindow() is map_dialog:
+                        map_dialog.handle_delete_key()
+                        return True
+                # メインウィンドウ以外（別ウィンドウ・ダイアログ）がアクティブな
+                # 間も、後ろにあるメイン画面のアノテーションは削除しない
+                if QApplication.activeWindow() is not self:
+                    return super().eventFilter(obj, event)
                 if self.current_mode == 0:  # 自動運転モードの場合
                     # 現在の画像の自動運転アノテーションを削除
                     self.delete_current_driving_annotation()
@@ -8429,6 +10841,14 @@ class ImageAnnotationTool(QMainWindow):
         if hasattr(self, 'main_image_view'):
             self.main_image_view.update()
 
+    def _make_bev_layer_toggle(self, attr):
+        """BEVレイヤ表示フラグ attr を切り替えるスロットを返す（CAM投影/障害物/境界/他車）。"""
+        def _slot(state):
+            setattr(self, attr, state == Qt.Checked)
+            if hasattr(self, 'main_image_view'):
+                self.main_image_view.update()
+        return _slot
+
     def _sync_recorded_traj_dt(self):
         """走行軌道の dt を 秒数/点数 から再計算し、表示中なら再描画する。"""
         pts = max(1, int(getattr(self, 'recorded_traj_points', 20)))
@@ -8458,7 +10878,7 @@ class ImageAnnotationTool(QMainWindow):
         self._sync_recorded_traj_dt()
 
     def update_recorded_traj_source(self, _idx=None):
-        """走行軌道(緑)の自己位置ソース(pose/slam)を更新して再描画する。"""
+        """走行軌道(緑)の自己位置ソース(pose/slam/vslam)を更新して再描画する。"""
         combo = getattr(self, 'recorded_traj_source_combo', None)
         if combo is not None:
             self.recorded_traj_source = combo.currentData()
@@ -8490,6 +10910,168 @@ class ImageAnnotationTool(QMainWindow):
         self.auto_cam_height_m = value
         if hasattr(self, 'main_image_view') and self.show_recorded_trajectory:
             self.main_image_view.update()
+
+    def _update_camera_geometry_summary(self):
+        """右パネルのカメラ幾何サマリ表示を現在値に合わせる。"""
+        if not hasattr(self, 'camera_geometry_summary_label'):
+            return
+        self.camera_geometry_summary_label.setText(get_text(
+            'label_camera_geometry_summary',
+            f"{self.auto_max_steering_spin.value():.0f}",
+            f"{self.auto_cam_pitch_spin.value():.0f}",
+            f"{self.auto_fov_spin.value():.0f}",
+            f"{self.auto_cam_height_spin.value():.2f}"))
+
+    def show_camera_geometry_dialog(self):
+        """カメラ幾何（最大舵角/俯角/FOV/カメラ高）の設定ダイアログを開く。
+
+        入力欄は起動時に生成済みの self.camera_params_widget をそのまま抱える
+        ため、ダイアログは一度だけ生成して以後は show/hide で使い回す。
+        """
+        if getattr(self, '_camera_geometry_dialog', None) is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle(get_text('dlg_camera_geometry'))
+            dialog_layout = QVBoxLayout(dialog)
+
+            info_label = QLabel(get_text('label_camera_geometry_info'))
+            info_label.setWordWrap(True)
+            set_text_role(info_label, 'muted')
+            dialog_layout.addWidget(info_label)
+
+            self.camera_params_widget.setVisible(True)
+            dialog_layout.addWidget(self.camera_params_widget)
+
+            button_row = QHBoxLayout()
+            button_row.addStretch()
+            close_button = QPushButton(get_text('btn_close'))
+            close_button.clicked.connect(dialog.hide)
+            button_row.addWidget(close_button)
+            dialog_layout.addLayout(button_row)
+
+            self._camera_geometry_dialog = dialog
+
+        self._camera_geometry_dialog.show()
+        self._camera_geometry_dialog.raise_()
+        self._camera_geometry_dialog.activateWindow()
+
+    def _refresh_panel_group_styles(self):
+        """右パネルの群（タイトル付き QGroupBox）のスタイルを現在のフォントで貼り直す。
+
+        タイトル分の上マージンはフォント高から算出しているため、表示設定で
+        フォントサイズを変えたときは作り直さないとタイトルが中身に重なる。
+        """
+        groups = getattr(self, '_panel_group_boxes', None)
+        if not groups:
+            return
+        for group in groups:
+            qss = panel_group_qss(group.fontMetrics())
+            group.setStyleSheet(qss)
+            group.updateGeometry()
+
+    def _update_lidar_layer_enabled(self):
+        """LiDAR ビューの設定は画像ソースが LiDAR のときだけ操作可能にする。"""
+        widgets = getattr(self, '_lidar_layer_widgets', None)
+        if not widgets:
+            return
+        enabled = (getattr(self, 'current_variant', None) == '__lidar__')
+        for widget in widgets:
+            widget.setEnabled(enabled)
+
+    def _on_lidar_view_mode_changed(self, _i=None):
+        self.lidar_view_mode = self.lidar_view_mode_combo.currentData() or 'polar'
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def _on_lidar_view_range_changed(self, _i=None):
+        self.lidar_view_range_m = float(self.lidar_view_range_combo.currentData() or 10.0)
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def _lidar_view_cfg(self):
+        """LiDAR ビューの「モデル入力」表示に使う設定。LiDAR Policy モデル読込中は
+        その学習設定（ビン数・積層・レンジ）、それ以外は config の既定値。"""
+        from managers.lidar_policy_models import LidarPolicyConfig
+        lp = getattr(self, '_lidar_policy', None)
+        if lp and isinstance(lp[1], LidarPolicyConfig):
+            return LidarPolicyConfig.from_dict(lp[1].to_dict())
+        cfg = getattr(self, '_gru_cfg', None)
+        if isinstance(cfg, LidarPolicyConfig):
+            return LidarPolicyConfig.from_dict(cfg.to_dict())
+        return LidarPolicyConfig(
+            num_bins=LIDAR_POLICY_DEFAULT_NUM_BINS,
+            stack_frames=LIDAR_POLICY_DEFAULT_STACK_FRAMES,
+            max_range_mm=LIDAR_POLICY_DEFAULT_MAX_RANGE_MM,
+            max_speed=LIDAR_POLICY_DEFAULT_MAX_SPEED, use_traj=False)
+
+    def _has_lidar_data(self):
+        """測距ソースを出せるか: lidar/*.npy がある、または catalog に測距ゾーン値
+        （lidar/{zone} / ultrasonic/{zone}）がある（先頭画像のセッションで判定・キャッシュ）。"""
+        images = getattr(self, 'images', None)
+        if not images:
+            return False
+        keys = getattr(self, 'available_sensor_keys', None) or ()
+        if any(k.startswith(('lidar/', 'ultrasonic/')) for k in keys):
+            return True
+        session = os.path.dirname(os.path.dirname(images[0]))
+        cache = getattr(self, '_lidar_data_cache', None)
+        if cache is None:
+            cache = self._lidar_data_cache = {}
+        if session not in cache:
+            d = os.path.join(session, 'lidar')
+            try:
+                cache[session] = os.path.isdir(d) and any(
+                    f.endswith('.npy') for f in os.listdir(d))
+            except OSError:
+                cache[session] = False
+        return cache[session]
+
+    def _add_lidar_variant_button(self, variant_layout):
+        """lidar/*.npy があるとき LiDAR（生スキャン）ラジオを画像ソース欄に追加する。
+
+        値は '__lidar__'。選択すると on_variant_changed が lidar_mode を立て、
+        画像の代わりに生スキャンを描き、その上に画像ソースと同じアノテーション点・
+        推論点を重ねる（クリックによるアノテーションも同じ座標系）。
+        """
+        if not self._has_lidar_data():
+            return
+        rb = QRadioButton(get_text('image_source_lidar'))
+        rb.setToolTip(get_text('tip_image_source_lidar'))
+        if getattr(self, 'current_variant', None) == '__lidar__':
+            rb.setChecked(True)
+        rb.toggled.connect(
+            lambda checked: self.on_variant_changed('__lidar__') if checked else None)
+        variant_layout.addWidget(rb)
+        self.variant_button_group.addButton(rb)
+
+    def _update_bev_layer_enabled(self):
+        """BEVレイヤのトグルは画像ソースが BEV のときだけ操作可能にする。"""
+        widgets = getattr(self, '_bev_layer_widgets', None)
+        if not widgets:
+            return
+        enabled = (getattr(self, 'current_variant', None) == '__bev__')
+        for widget in widgets:
+            widget.setEnabled(enabled)
+
+    def toggle_location_info_section(self):
+        """コースの位置情報セクションの展開/折り畳み。"""
+        visible = not self.location_info_content.isVisible()
+        self.location_info_content.setVisible(visible)
+        self.location_info_expand_button.setText("▼" if visible else "▶")
+        # 以後は自動展開でユーザーの意思を上書きしない
+        self._location_section_user_toggled = True
+        self._relayout_location_info_group()
+
+    def _relayout_location_info_group(self):
+        """位置情報グループの高さ変化を親レイアウトへ反映する。
+
+        子を隠しただけでは sizeHint は縮んでも実高さが据え置かれるため、
+        親レイアウトを明示的に再計算させる。
+        """
+        self.location_info_group.updateGeometry()
+        parent = self.location_info_group.parentWidget()
+        parent_layout = parent.layout() if parent is not None else None
+        if parent_layout is not None:
+            parent_layout.activate()
 
     def toggle_seg_driving_direction(self, state):
         """走行方向矢印の表示/非表示を切り替え"""
@@ -8904,7 +11486,7 @@ class ImageAnnotationTool(QMainWindow):
                 return
             
             # 前回のセグメンテーションを適用（ディープコピーで完全に独立させる）
-            self.add_segmentation_annotation(deepcopy(self.last_segmentation))
+            self.add_segmentation_annotation(deepcopy(self.last_segmentation), advance=False)
             
     def calculate_and_store_diff_vector(self, index_or_path):
         """教師データと推論結果の差分ベクトルを計算して保存する"""
@@ -9086,39 +11668,23 @@ class ImageAnnotationTool(QMainWindow):
             color = get_location_color(loc_value)
             if count > 0:
                 # アノテーションがある場合は少し濃い色にする
-                button.setStyleSheet(f"""
-                    QPushButton {{
-                        padding: 8px;
-                        border: 1px solid {color.name()};
-                        border-radius: 4px;
-                        background-color: {color.lighter(140).name()};
-                        color: black;
-                    }}
-                    QPushButton:checked {{
-                        background-color: {color.name()};
-                        color: white;
-                        font-weight: bold;
-                    }}
-                """)
+                button.setStyleSheet(location_button_qss(color))
             else:
                 # アノテーションがない場合はグレーっぽくする
-                button.setStyleSheet(f"""
-                    QPushButton {{
-                        padding: 8px;
-                        border: 1px solid #cccccc;
-                        border-radius: 4px;
-                        background-color: #f0f0f0;
-                        color: #888888;
-                    }}
-                    QPushButton:checked {{
-                        background-color: {color.name()};
-                        color: white;
-                        font-weight: bold;
-                    }}
-                """)
+                button.setStyleSheet(location_button_qss())
 
         # テキスト・アイコンを現在のモードで更新
         self._update_location_button_display()
+
+        # 位置アノテーションが既にあるセッションでは自動で展開する
+        # （ユーザーが自分で開閉した後はその状態を尊重する）
+        if (location_counts
+                and not getattr(self, '_location_section_user_toggled', False)
+                and hasattr(self, 'location_info_content')
+                and not self.location_info_content.isVisible()):
+            self.location_info_content.setVisible(True)
+            self.location_info_expand_button.setText("▼")
+            self._relayout_location_info_group()
 
     def add_location_button(self):
         """位置情報選択ボタンを追加する"""
@@ -9138,22 +11704,10 @@ class ImageAnnotationTool(QMainWindow):
         button.clicked.connect(lambda checked, value=location_value: self.set_location(value))
         
         # スタイルシートを設定
-        button.setStyleSheet("""
-            QPushButton {
-                padding: 8px;
-                border: 1px solid #cccccc;
-                border-radius: 4px;
-                background-color: #f0f0f0;
-            }
-            QPushButton:checked {
-                background-color: #4CAF50;
-                color: white;
-                font-weight: bold;
-            }
-        """)
+        button.setStyleSheet(location_button_qss())
         
-        # レイアウトに追加
-        self.location_buttons_layout.addWidget(button)
+        # クラス内容入力欄付きの行としてレイアウトに追加
+        self._add_location_row(button, location_value)
         self.location_buttons.append(button)
 
         # 現在の表示モードに合わせてテキスト/アイコンを更新
@@ -9162,9 +11716,90 @@ class ImageAnnotationTool(QMainWindow):
         # 次の値にインクリメント
         self.new_location_input.setValue(location_value + 1)
 
-        # 初期ボタンを生成するだけの場合はメッセージを表示しない
+        # 追加のたびにモーダルを出すと連続追加の邪魔になるのでステータスバーで通知
         if len(self.location_buttons) > 1:
-            QMessageBox.information(self, get_text('dlg_add_complete'), get_text('msg_location_added', location_value))
+            self.statusBar().showMessage(get_text('msg_location_added', location_value), 3000)
+
+    def _add_location_row(self, button, location_value):
+        """位置ボタンとクラス内容入力欄を1行にまとめてレイアウトへ追加する"""
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(4)
+        row_layout.addWidget(button, 2)
+
+        class_input = QLineEdit()
+        class_input.setPlaceholderText(get_text('placeholder_location_class'))
+        class_input.setToolTip(get_text('tip_location_class_input'))
+        # 行の再生成時に以前の入力内容を復元
+        saved_name = self.location_class_names.get(location_value, '')
+        if saved_name:
+            class_input.setText(saved_name)
+        class_input.textChanged.connect(
+            lambda text, value=location_value: self.location_class_names.__setitem__(value, text))
+        row_layout.addWidget(class_input, 1)
+
+        self.location_class_inputs[location_value] = class_input
+        self._location_row_widgets.append(row)
+        self.location_buttons_layout.addWidget(row)
+
+    def save_location_classes(self):
+        """位置クラス情報（ID・内容）をtogikaidriveで再利用できるJSONとして保存する"""
+        if not self.location_buttons:
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_location_classes'))
+            return
+
+        classes = []
+        for button in self.location_buttons:
+            value = button.property("location_value")
+            name = self.location_class_names.get(value, '').strip()
+            classes.append({"id": value, "name": name})
+        classes.sort(key=lambda c: c["id"])
+
+        data = {
+            "format": "togikaidrive_location_classes",
+            "version": 1,
+            "saved_at": datetime.now().isoformat(timespec='seconds'),
+            "num_classes": len(classes),
+            "classes": classes,
+            "id_to_name": {str(c["id"]): c["name"] for c in classes},
+        }
+
+        default_dir = self.folder_path if getattr(self, 'folder_path', '') else APP_DIR_PATH
+        default_path = os.path.join(default_dir, "location_classes.json")
+        selected_file, _ = QFileDialog.getSaveFileName(
+            self, get_text('dlg_save_location_classes'), default_path, "JSON Files (*.json)")
+        if not selected_file:
+            return
+
+        try:
+            with open(selected_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            QMessageBox.information(
+                self, get_text('dlg_save_complete'),
+                get_text('msg_location_classes_saved', selected_file))
+        except Exception as e:
+            QMessageBox.critical(
+                self, get_text('dlg_error'),
+                get_text('msg_location_classes_save_failed', e))
+
+    def restore_location_classes(self, id_to_name):
+        """セッション等から読み込んだ位置クラス情報を入力欄へ反映する
+
+        まだボタンが無い位置値の内容も location_class_names に保持され、
+        後からボタンが追加された時点で _add_location_row が自動復元する。
+        """
+        for key, name in id_to_name.items():
+            try:
+                value = int(key)
+            except (TypeError, ValueError):
+                continue
+            if not name:
+                continue
+            self.location_class_names[value] = name
+            class_input = self.location_class_inputs.get(value)
+            if class_input is not None:
+                class_input.setText(name)
 
     def set_location(self, location_value):
         print("set location")
@@ -9206,7 +11841,8 @@ class ImageAnnotationTool(QMainWindow):
             if self.current_index in self.annotations:
                 if "loc" in self.annotations[self.current_index]:
                     del self.annotations[self.current_index]["loc"]
-                
+                self.annotations[self.current_index].pop("loc_auto", None)
+
                 # 位置情報アノテーションからも削除
                 if self.current_index in self.location_annotations:
                     del self.location_annotations[self.current_index]
@@ -9223,7 +11859,7 @@ class ImageAnnotationTool(QMainWindow):
             self.location_annotations[self.current_index] = location_value
             
             # 現在の位置情報ラベルを更新
-            loc_color = get_location_color(location_value)
+            loc_color = location_text_color(location_value)
             self.current_location_label.setText(get_text('label_current_location_value', location_value))
             self.current_location_label.setStyleSheet(f"color: {loc_color.name()}; font-weight: bold;")
             
@@ -9233,6 +11869,8 @@ class ImageAnnotationTool(QMainWindow):
             else:
                 # 運転アノテーションがない場合でも位置アノテーション専用エントリを作成
                 self.annotations[self.current_index] = {"loc": location_value}
+            # 手動で付け直したので自動付与の印（loc_auto）は外す
+            self.annotations[self.current_index].pop("loc_auto", None)
         
         # 保存用のデータ形式を更新するため、アノテーションタイムスタンプも更新
         self.annotation_timestamps[self.current_index] = int(time.time() * 1000)
@@ -9456,7 +12094,10 @@ class ImageAnnotationTool(QMainWindow):
         Returns:
             dict: {index: {angle, throttle, x, y, [attention_weights]}}
         """
-        sources = ms_info.get('selected_sources') or []
+        # 追加スロットはソース選択ダイアログを出さずチェックポイントの
+        # selected_sources をそのまま使うため、ここで現在のデータへ読み替える
+        sources = self._resolve_model_sources_cached(
+            ms_info.get('selected_sources') or [])
         num_sources = ms_info['num_sources']
         image_groups = getattr(self, 'image_groups', {})
 
@@ -9489,6 +12130,8 @@ class ImageAnnotationTool(QMainWindow):
                         img = Image.open(path).convert('RGB')
                         if first_img_size is None:
                             first_img_size = img.size
+                        # 学習時にマスクを使ったモデルは推論時にも同じマスクを適用
+                        img = apply_masks(img, getattr(model, '_mask_polygons', None))
                         if downscale_factor < 1.0:
                             W2, H2 = img.size
                             pw = max(1, int(W2 * downscale_factor))
@@ -9546,6 +12189,9 @@ class ImageAnnotationTool(QMainWindow):
                     img = Image.open(img_path).convert('RGB')
                     W, H = img.size
 
+                    # 学習時にマスクを使ったモデルは推論時にも同じマスクを適用
+                    img = apply_masks(img, getattr(model, '_mask_polygons', None))
+
                     if virtual_type == 'crop':
                         step = W / num_sources
                         overlap = step * 0.15
@@ -9568,7 +12214,8 @@ class ImageAnnotationTool(QMainWindow):
                         source_imgs = []
                         for k in range(num_sources):
                             prev_idx = max(0, idx - k * temporal_interval)
-                            source_imgs.append(Image.open(self.images[prev_idx]).convert('RGB'))
+                            _frame = Image.open(self.images[prev_idx]).convert('RGB')
+                            source_imgs.append(apply_masks(_frame, getattr(model, '_mask_polygons', None)))
                     else:
                         source_imgs = [img] * num_sources
 
@@ -9613,7 +12260,8 @@ class ImageAnnotationTool(QMainWindow):
 
     def _update_model_combo_tooltip(self, index):
         """model_comboの選択変更時にコンボ本体のツールチップを更新"""
-        self.model_combo.setToolTip(self.model_combo.itemText(index))
+        full_name = self.model_combo.itemData(index)
+        self.model_combo.setToolTip(full_name if full_name else self.model_combo.itemText(index))
 
     def _refresh_extra_model_list(self, model_combo, method_combo):
         """追加モデルスロットのモデルリストを更新"""
@@ -9723,19 +12371,20 @@ class ImageAnnotationTool(QMainWindow):
         for model_file in model_files:
             model_full_path = os.path.join(models_dir, model_file)
             ms_info = detect_multi_source_from_checkpoint(model_full_path)
+            short_name = _shorten_model_display_name(model_file, current_arch)
             if ms_info['num_sources'] > 1:
                 marker = get_text('label_multi_source_model_marker',
                                   ms_info['num_sources'],
                                   ms_info['fusion_method'] or '?')
-                display_name = f"{model_file} {marker}"
+                display_name = f"{short_name} {marker}"
             else:
-                display_name = model_file
+                display_name = short_name
             self.model_combo.addItem(display_name, model_file)  # userData=実ファイル名
-            self.model_combo.setItemData(self.model_combo.count() - 1, display_name, Qt.ToolTipRole)
+            self.model_combo.setItemData(self.model_combo.count() - 1, model_file, Qt.ToolTipRole)
 
         # 選択中アイテムのツールチップを同期（折りたたみ状態でもホバー表示）
         if self.model_combo.count() > 0:
-            self.model_combo.setToolTip(self.model_combo.currentText())
+            self.model_combo.setToolTip(self.model_combo.currentData() or self.model_combo.currentText())
         try:
             self.model_combo.currentIndexChanged.disconnect(self._update_model_combo_tooltip)
         except TypeError:
@@ -9850,6 +12499,155 @@ class ImageAnnotationTool(QMainWindow):
         variant_layout.addWidget(rb)
         self.variant_button_group.addButton(rb)
 
+    # --- 画像ソース別のアノテーション/推論結果ストア ---
+
+    def _annotation_source_key(self, variant=None):
+        """アノテーションを紐づける画像ソースキーを返す。
+
+        BEV は直前のカメラソースの画像をそのまま使うので現在のキーを維持し、
+        結合表示はベースソース（先頭バリアント）に解決する。どちらも固有の
+        アノテーションを持たない疑似ソースなので、専用ストアは作らない。
+        """
+        current = variant if variant is not None else getattr(self, 'current_variant', None)
+        if current in ('__bev__', '__lidar__'):
+            return self._active_source_key or current
+        if current == '__combined__':
+            variants = getattr(self, 'available_variants', None)
+            if variants:
+                return list(variants)[0]
+        return current
+
+    def _capture_source_store(self):
+        """現在メモリ上にあるアノテーション/推論結果をひとまとめにして返す。"""
+        return {name: (getattr(self, name, None) or {})
+                for name in SOURCE_SCOPED_STORES}
+
+    def switch_annotation_source(self, variant):
+        """表示ソースの切替に合わせてアノテーション/推論結果を載せ替える。
+
+        これをしないと、cam3 で付けたバウンディングボックスや推論結果が
+        cam0 表示時にもそのまま見えてしまう（フレーム番号だけで引いているため）。
+        """
+        new_key = self._annotation_source_key(variant)
+        old_key = self._active_source_key
+        if new_key is None or old_key == new_key:
+            return
+
+        if old_key is not None:
+            self._source_stores[old_key] = self._capture_source_store()
+
+        store = self._source_stores.get(new_key, {})
+        for name in SOURCE_SCOPED_STORES:
+            setattr(self, name, store.get(name, {}))
+
+        # 「前回のアノテーションを適用」の持ち越しもソースをまたがせない
+        self.last_bbox = None
+        self.last_bboxes = []
+        self.last_segmentation = None
+        self.last_segmentations = []
+
+        self._active_source_key = new_key
+        self.update_source_annotation_summary()
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.selected_bbox_index = None
+            self.main_image_view.hovering_bbox_index = None
+            self.main_image_view.selected_segmentation_index = None
+
+    def toggle_use_all_sources_for_training(self, checked):
+        """学習・エクスポートで全画像ソースのアノテーションを使うかを切り替える。"""
+        self.use_all_sources_for_training = bool(checked)
+        self.update_source_annotation_summary()
+
+    def update_source_annotation_summary(self):
+        """ソース別のアノテーション件数を左パネルに表示する。"""
+        label = getattr(self, 'source_annotation_summary_label', None)
+        if label is None:
+            return
+        bbox_counts = self.count_annotation_sources('bbox_annotations')
+        seg_counts = self.count_annotation_sources('segmentation_annotations')
+        if not bbox_counts and not seg_counts:
+            label.setText("")
+            return
+
+        keys = sorted(set(bbox_counts) | set(seg_counts), key=lambda k: str(k))
+        current = self._annotation_source_key()
+        parts = []
+        for key in keys:
+            detail = []
+            if bbox_counts.get(key):
+                detail.append(get_text('label_source_count_bbox', bbox_counts[key]))
+            if seg_counts.get(key):
+                detail.append(get_text('label_source_count_seg', seg_counts[key]))
+            mark = '*' if key == current else ''
+            parts.append(f"{mark}{key}: {' / '.join(detail)}")
+        scope = get_text('label_scope_all_sources') if self.use_all_sources_for_training \
+            else get_text('label_scope_current_source')
+        label.setText(get_text('label_source_summary', ', '.join(parts), scope))
+
+    def reset_source_stores(self, initial_variant=None):
+        """フォルダ読み込み時などにソース別ストアを初期化する。"""
+        self._source_stores = {}
+        self._active_source_key = self._annotation_source_key(initial_variant)
+
+    def iter_source_annotation_stores(self, store_name, all_sources=None):
+        """(ソースキー, 画像リスト, アノテーション辞書) を順に返す。
+
+        all_sources が False なら表示中のソースだけ、True なら読み込み済みの
+        全ソースを対象にする（学習・エクスポートの対象範囲切替に使う）。
+        """
+        if all_sources is None:
+            all_sources = bool(getattr(self, 'use_all_sources_for_training', False))
+
+        current_key = self._annotation_source_key()
+        current_store = getattr(self, store_name, {}) or {}
+        if not all_sources:
+            yield current_key, list(self.images), current_store
+            return
+
+        variant_images = getattr(self, 'variant_images', {}) or {}
+        seen = set()
+        for key in list(variant_images.keys()):
+            if key == current_key:
+                store = current_store
+            else:
+                store = self._source_stores.get(key, {}).get(store_name, {}) or {}
+            if not store:
+                continue
+            seen.add(key)
+            yield key, list(variant_images.get(key, [])), store
+        if current_key not in seen and current_store:
+            yield current_key, list(self.images), current_store
+
+    def collect_annotation_items(self, store_name, all_sources=None):
+        """学習/エクスポート対象を (画像パス, アノテーションリスト) の一覧で返す。
+
+        削除マーク済みのフレームは除外する。ソースをまたぐと同じインデックスが
+        重複するため、以降の処理はインデックスではなく画像パスで扱う。
+        """
+        deleted = getattr(self, 'deleted_indexes', set()) or set()
+        current_key = self._annotation_source_key()
+        items = []
+        for key, images, store in self.iter_source_annotation_stores(store_name, all_sources):
+            for idx, annotations in store.items():
+                if not annotations:
+                    continue
+                # 削除マークは表示中ソースのフレーム番号に対して付けられている
+                if key == current_key and idx in deleted:
+                    continue
+                if not isinstance(idx, int) or idx >= len(images):
+                    continue
+                items.append((images[idx], annotations))
+        return items
+
+    def count_annotation_sources(self, store_name):
+        """ソース別のアノテーション枚数を {ソース: 枚数} で返す（表示用）。"""
+        counts = {}
+        for key, _images, store in self.iter_source_annotation_stores(store_name, all_sources=True):
+            n = sum(1 for annotations in store.values() if annotations)
+            if n:
+                counts[key] = n
+        return counts
+
     def on_variant_changed(self, variant):
         """
         ラジオボタンで選択された画像ソースキーが変更された時に呼ばれるメソッド
@@ -9861,6 +12659,9 @@ class ImageAnnotationTool(QMainWindow):
         if not hasattr(self, 'available_variants') or not self.available_variants:
             print("キー情報がまだ初期化されていません。load_images後に設定されます。")
             self.current_variant = variant  # キー名だけは保存しておく
+            self._active_source_key = self._annotation_source_key(variant)
+            self._update_bev_layer_enabled()
+            self._update_lidar_layer_enabled()
             return
         
         # 以前と同じキーが選択された場合は何もしない（結合表示は設定変更があるため常に更新）
@@ -9870,12 +12671,26 @@ class ImageAnnotationTool(QMainWindow):
         # 現在のキーを更新
         self.current_variant = variant
         print(f"キーを '{variant}' に変更しました")
+        # アノテーション/推論結果を新しいソースのものに載せ替える
+        self.switch_annotation_source(variant)
+        # BEV/LiDAR レイヤのトグルは各ソース選択時のみ有効
+        self._update_bev_layer_enabled()
+        self._update_lidar_layer_enabled()
 
-        # BEV(真上から見た図)モードの切替。カメラ画像リスト(self.images)は
-        # そのまま保持し、paintEvent が BEV を描く（軌道は ego座標で自己完結）。
+        # BEV(真上から見た図)/LiDAR モードの切替。カメラ画像リスト(self.images)は
+        # そのまま保持し、paintEvent が BEV/LiDAR を描く（軌道は ego座標で自己完結）。
         if hasattr(self, 'main_image_view'):
             self.main_image_view.bev_mode = (variant == '__bev__')
-        if variant == '__bev__':
+            self.main_image_view.lidar_mode = (variant == '__lidar__')
+        # レンジスライダー（測距ソース専用）: 入るたびに ×1.0 へ戻し、他ソースでは隠す
+        if hasattr(self, 'canvas_zoom_slider'):
+            if variant == '__lidar__':
+                self.canvas_zoom_slider.blockSignals(True)
+                self.canvas_zoom_slider.setValue(10)
+                self.canvas_zoom_slider.blockSignals(False)
+            self.lidar_view_zoom = 1.0
+            self._update_zoom_slider_visibility()
+        if variant in ('__bev__', '__lidar__'):
             # 現在フレームの pixmap を保持したまま再描画（BEVはその上に描く）
             self.display_current_image()
             self.update_variant_buttons()
@@ -9887,39 +12702,25 @@ class ImageAnnotationTool(QMainWindow):
             base_variant = self.available_variants[0]
             self.images = self.variant_images[base_variant]
             print(f"結合表示モード: ベースキー '{base_variant}' の画像数: {len(self.images)}")
-            # ズーム自動調整: 列数に応じてスケールダウンしてキャンバス幅に収める
-            if hasattr(self, 'canvas_zoom_slider') and hasattr(self, 'main_image_view'):
+            # 表示はキャンバスへ自動フィットする。合成画像は表示に必要な拡大率ぶん
+            # 高解像度(スーパーサンプル)で焼いて、BEV/測距セルの文字・線が拡大で
+            # ぼやけないようにする（フィット倍率は draw_initial_frame が毎回計算）。
+            if hasattr(self, 'main_image_view'):
+                view = self.main_image_view
                 grid = getattr(self, '_combined_grid', '2x1')
-                cols = {'2x1': 2, '1x2': 1, '3x1': 3, '2x2': 2, '3x3': 3}.get(grid, 2)
-                canvas_w = self.main_image_view.width()
+                cols, rows = {'2x1': (2, 1), '1x2': (1, 2), '3x1': (3, 1),
+                              '2x2': (2, 2), '3x3': (3, 3)}.get(grid, (2, 1))
                 orig_w = getattr(self, 'original_image_width', None)
-                if orig_w and orig_w > 0 and canvas_w > 0:
-                    # combined画像幅 = orig_w * cols。表示に必要な拡大率ぶん
-                    # 高解像度(スーパーサンプル)で焼き、ズームを1/SSに補正する。
-                    # これで BEV セルの文字・線が拡大でぼやけず鮮明になる。
-                    fit_zoom_raw = canvas_w / (orig_w * cols)
-                    # 切り捨て（int）で SS を決めると fit_zoom=raw/SS>=1 が保証され、
-                    # ズーム下限クランプ(1.0)による表示はみ出しを避けられる。
-                    ss = max(1, min(3, int(fit_zoom_raw)))  # 1〜3倍
-                    self._combined_supersample = ss
-                    fit_zoom = fit_zoom_raw / ss
-                    slider_val = max(10, min(50, round(fit_zoom * 10)))
+                orig_h = getattr(self, 'original_image_height', None)
+                if orig_w and orig_h:
+                    fit_zoom_raw = view.fit_zoom_factor(orig_w * cols, orig_h * rows)
+                    self._combined_supersample = max(1, min(3, int(fit_zoom_raw)))
                 else:
-                    # フォールバック: 列数で割るだけ
                     self._combined_supersample = 1
-                    slider_val = max(10, self.canvas_zoom_slider.value() // cols)
-                # 結合表示→結合表示のグリッド変更時は上書きしない
-                if not hasattr(self, '_pre_combined_zoom'):
-                    self._pre_combined_zoom = self.canvas_zoom_slider.value()
-                self.canvas_zoom_slider.setValue(slider_val)
         elif hasattr(self, 'variant_images') and variant in self.variant_images:
             # キー別の画像リストを設定
             self.images = self.variant_images[variant]
             print(f"キー '{variant}' の画像数: {len(self.images)}")
-            # 結合表示から戻る場合はズームを復元
-            if hasattr(self, '_pre_combined_zoom') and hasattr(self, 'canvas_zoom_slider'):
-                self.canvas_zoom_slider.setValue(self._pre_combined_zoom)
-                del self._pre_combined_zoom
         else:
             return
 
@@ -9949,19 +12750,53 @@ class ImageAnnotationTool(QMainWindow):
         # キーボタン群を更新
         self.update_variant_buttons()
 
+    def showEvent(self, event):
+        """初回表示時にスプリッタの初期配分を確定させる。
+
+        構築中は各パネルのレイアウトが未計算で自然幅が取れないため、
+        表示されてから配分し直す。
+        """
+        super().showEvent(event)
+        if not getattr(self, '_splitter_sizes_initialized', False):
+            self._splitter_sizes_initialized = True
+            self._apply_default_splitter_sizes()
+
+    def _apply_default_splitter_sizes(self):
+        """各パネルの自然幅をもとにスプリッタの初期幅を決める。
+
+        右のアノテーションパネルと左の情報パネルは中身が収まる幅を与え、
+        残りを画像エリアに割り当てる（見切れを作らない）。
+        """
+        splitter = getattr(self, 'center_splitter', None)
+        if splitter is None:
+            return
+
+        def natural(index, floor=0):
+            widget = splitter.widget(index)
+            return max(widget.sizeHint().width(),
+                       widget.minimumSizeHint().width(), floor)
+
+        handles = splitter.handleWidth() * (splitter.count() - 1)
+        info_w = natural(0)
+        location_w = natural(2)
+        image_w = max(splitter.width() - info_w - location_w - handles,
+                      natural(1))
+        splitter.setSizes([info_w, image_w, location_w])
+
+        main_splitter = getattr(self, 'main_splitter', None)
+        if main_splitter is not None:
+            left_w = LEFT_PANEL_MAX_WIDTH + 20
+            main_splitter.setSizes(
+                [left_w, max(main_splitter.width() - left_w - main_splitter.handleWidth(), 1)])
+
     def get_left_layout(self):
-        """左パネルのレイアウトを安全に取得するヘルパーメソッド"""
+        """左パネルのレイアウトを安全に取得するヘルパーメソッド
+
+        レイアウト階層をインデックスで辿るとスプリッタ導入のような構造変更で
+        壊れるため、構築時に保持した左パネルの参照を使う。
+        """
         try:
-            central_widget = self.centralWidget()
-            if central_widget is None:
-                return None
-            main_layout = central_widget.layout()
-            if main_layout is None:
-                return None
-            left_scroll_area = main_layout.itemAt(0).widget()  # QScrollArea
-            if left_scroll_area is None:
-                return None
-            left_panel = left_scroll_area.widget()  # QWidget
+            left_panel = getattr(self, 'left_panel_widget', None)
             if left_panel is None:
                 return None
             return left_panel.layout()  # QVBoxLayout
@@ -10037,6 +12872,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # pose/slam があるとき BEV(真上から見た図) ソースを追加
         self._add_bev_variant_button(variant_layout)
+        self._add_lidar_variant_button(variant_layout)
 
         # 複数ソースがある場合は結合表示ボタンを追加
         if len(self.available_variants) >= 2:
@@ -10184,6 +13020,9 @@ class ImageAnnotationTool(QMainWindow):
         # （軌道を俯瞰した合成画像を1セルとして焼き込む。キー名は 'BEV'）
         if self._has_pose_data() and 'BEV' not in all_vars_ordered:
             all_vars_ordered.append('BEV')
+        # lidar/*.npy があるとき LiDAR 生スキャン図もセル候補に加える（キー名 'LIDAR'）
+        if self._has_lidar_data() and 'LIDAR' not in all_vars_ordered:
+            all_vars_ordered.append('LIDAR')
 
         # ---- ヘッダー行 ----
         _COL1_W = 60
@@ -10235,7 +13074,7 @@ class ImageAnnotationTool(QMainWindow):
             row_l.setContentsMargins(6, 2, 6, 2)
             row_l.setSpacing(4)
 
-            chk = QCheckBox(var)
+            chk = QCheckBox(get_text('image_source_lidar') if var == 'LIDAR' else var)
             chk.setChecked(var in current_order)
 
             rb = QRadioButton()
@@ -10395,7 +13234,7 @@ class ImageAnnotationTool(QMainWindow):
                 return
             
             # 前回のバウンディングボックスを適用
-            self.add_bbox_annotation(self.last_bbox.copy())
+            self.add_bbox_annotation(self.last_bbox.copy(), advance=False)
             
             # ステータスバーに表示
             self.statusBar().showMessage(get_text('status_bbox_auto_applied', self.last_bbox['class']), 3000)
@@ -10416,6 +13255,20 @@ class ImageAnnotationTool(QMainWindow):
         
         # 画像表示を更新
         self.display_current_image()
+
+    @staticmethod
+    def _set_rich_text_if_changed(label, text):
+        """ラベル内容が変わった時だけsetTextする
+
+        推論結果パネルはナビゲーションのたびに全文を組み直しているため、
+        同一内容でもsetTextで再描画されてちらつく。内容が同じ場合はスキップし、
+        変わった場合のみ更新することで「同じ文字は残して値だけ更新」を実現する。
+        """
+        if label is None:
+            return
+        if label.text() != text:
+            label.setText(text)
+            label.setTextFormat(Qt.RichText)
 
     def update_driving_info_panel(self):
         """自動運転推論結果の情報パネルを更新する"""
@@ -10439,8 +13292,17 @@ class ImageAnnotationTool(QMainWindow):
 
                 # 推論情報のリッチテキスト
                 inference_text = f"<b>{get_text('label_driving_inference_header')}</b><br>"
-                inference_text += f"angle = <span style='color: #009999;'>{angle:.4f}</span><br>"
-                inference_text += f"throttle = <span style='color: #009999;'>{throttle:.4f}</span>"
+                inference_text += f"angle = <span style='color: {theme_color('teal')};'>{angle:.4f}</span><br>"
+                inference_text += f"throttle = <span style='color: {theme_color('teal')};'>{throttle:.4f}</span>"
+
+                # 速度推論結果（正規化値と実速度[m/s]）を表示
+                infer_speed = inference.get("pilot/speed", inference.get("speed"))
+                if infer_speed is not None:
+                    _snorm = inference.get('speed_normalize') or getattr(self.main_image_view, 'max_speed', MAX_SPEED)
+                    inference_text += (
+                        f"<br>speed = <span style='color: {theme_color('teal')};'>{infer_speed:.4f}</span>"
+                        f" ({infer_speed * _snorm:.2f} m/s)"
+                    )
 
                 # 位置情報を取得
                 location = None
@@ -10457,12 +13319,9 @@ class ImageAnnotationTool(QMainWindow):
                     inference_text += f"<div style='display: inline-block; background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 5px; border-radius: 5px;'>"
                     inference_text += get_text('label_inference_location', location) + "</div></div>"
 
-                # リッチテキストとして設定
+                # リッチテキストとして設定（内容が変わった時だけ更新してちらつきを防ぐ）
                 if hasattr(self, 'inference_info_label'):
-                    self.inference_info_label.setText(inference_text)
-                    self.inference_info_label.setTextFormat(Qt.RichText)
-                    self.inference_info_label.repaint()
-                    QApplication.processEvents()  # UIを即時更新
+                    self._set_rich_text_if_changed(self.inference_info_label, inference_text)
 
                 # ImageLabelに推論ポイントを設定
                 self.main_image_view.inference_point = QPoint(inference['x'], inference['y'])
@@ -10486,7 +13345,7 @@ class ImageAnnotationTool(QMainWindow):
         else:
             # 表示がオフの場合は情報パネルをクリア
             if hasattr(self, 'inference_info_label'):
-                self.inference_info_label.setText(" ")  # スペースで高さを維持
+                self._set_rich_text_if_changed(self.inference_info_label, " ")  # スペースで高さを維持
 
             self.main_image_view.inference_point = None
 
@@ -10579,127 +13438,57 @@ class ImageAnnotationTool(QMainWindow):
             self.auto_method_container.setVisible(False)
             self.object_detection_container.setVisible(True)
 
-    def toggle_annotation_mode(self, checked=None):
-        # 既存のコードを修正して3つのモードに対応
-        sender = self.sender()
-        
+    def toggle_annotation_mode(self, mode=None):
+        """アノテーションモードを切り替える。
+
+        QButtonGroup.idClicked から呼ばれた場合は押されたボタンのモードID、
+        Bキー（引数なし）の場合は次のモードへサイクルする。
+        """
         # モード切り替え前に選択状態をクリア
         self.clear_all_selections()
-        
-        if sender == self.auto_mode_button:
-            self.current_mode = 0
-            self.auto_mode_button.setChecked(True)
-            self.detection_mode_button.setChecked(False)
-            self.segmentation_mode_button.setChecked(False)
-            self.waypoint_mode_button.setChecked(False)
-            self.auto_driving_control_widget.setVisible(True)
-            self.waypoint_control_widget.setVisible(False)
-            self.segmentation_control_widget.setVisible(False)
-            self.apply_last_bbox_checkbox.setVisible(False)
-            self.apply_last_segmentation_checkbox.setVisible(False)
-            self._bbox_fixed_advance_checkbox.setVisible(False)
-            self.statusBar().showMessage(get_text('status_switched_to_auto_driving'), 3000)
-        elif sender == self.detection_mode_button:
-            self.current_mode = 1
-            self.auto_mode_button.setChecked(False)
-            self.detection_mode_button.setChecked(True)
-            self.segmentation_mode_button.setChecked(False)
-            self.waypoint_mode_button.setChecked(False)
-            self.auto_driving_control_widget.setVisible(False)
-            self.waypoint_control_widget.setVisible(False)
-            self.segmentation_control_widget.setVisible(False)
-            self.apply_last_bbox_checkbox.setVisible(True)
-            self.apply_last_segmentation_checkbox.setVisible(False)
-            self._bbox_fixed_advance_checkbox.setVisible(True)
-            self.statusBar().showMessage(get_text('status_switched_to_detection'), 3000)
-        elif sender == self.segmentation_mode_button:
-            self.current_mode = 2
-            self.auto_mode_button.setChecked(False)
-            self.detection_mode_button.setChecked(False)
-            self.segmentation_mode_button.setChecked(True)
-            self.waypoint_mode_button.setChecked(False)
-            self.auto_driving_control_widget.setVisible(False)
-            self.waypoint_control_widget.setVisible(False)
-            self.segmentation_control_widget.setVisible(True)
-            self.apply_last_bbox_checkbox.setVisible(False)
-            self.apply_last_segmentation_checkbox.setVisible(True)
-            self._bbox_fixed_advance_checkbox.setVisible(False)
+
+        # bool は int のサブクラスなので、旧 clicked(checked) 接続が残っていても
+        # モードIDと誤認しないよう明示的に弾く
+        if isinstance(mode, bool) or not isinstance(mode, int) or mode not in _MODE_STATUS_KEYS:
+            # 3モードをサイクル（waypoint は UI から削除済みなので対象外）
+            mode = (self.current_mode + 1) % 3
+
+        self.current_mode = mode
+        self._apply_mode_visibility(mode)
+        self.statusBar().showMessage(get_text(_MODE_STATUS_KEYS[mode]), 3000)
+        self.main_image_view.update()
+
+    def _apply_mode_visibility(self, mode):
+        """モードに応じた制御パネル／チェックボックスの表示を一括で適用する。"""
+        for mode_id, btn in ((0, self.auto_mode_button),
+                             (1, self.detection_mode_button),
+                             (2, self.segmentation_mode_button),
+                             (3, self.waypoint_mode_button)):
+            btn.setChecked(mode_id == mode)
+
+        self.auto_driving_control_widget.setVisible(mode == 0)
+        self.waypoint_control_widget.setVisible(mode == 3)
+        self.segmentation_control_widget.setVisible(mode == 2)
+        self.apply_last_bbox_checkbox.setVisible(mode == 1)
+        self._bbox_fixed_advance_checkbox.setVisible(mode == 1)
+        self.apply_last_segmentation_checkbox.setVisible(mode == 2)
+
+        if mode == 2:
             # ツールをポリゴンにリセット
             self._seg_polygon_btn.setChecked(True)
             self.main_image_view.seg_tool_mode = 'polygon'
             self.main_image_view.is_painting = False
             self.main_image_view.current_paint_strokes = []
             self.main_image_view.setCursor(Qt.ArrowCursor)
-            self.statusBar().showMessage(get_text('status_switched_to_segmentation'), 3000)
-        elif sender == self.waypoint_mode_button:
-            self.current_mode = 3
-            self.auto_mode_button.setChecked(False)
-            self.detection_mode_button.setChecked(False)
-            self.segmentation_mode_button.setChecked(False)
-            self.waypoint_mode_button.setChecked(True)
-            self.auto_driving_control_widget.setVisible(False)
-            self.waypoint_control_widget.setVisible(True)
-            self.segmentation_control_widget.setVisible(False)
-            self.apply_last_bbox_checkbox.setVisible(False)
-            self.apply_last_segmentation_checkbox.setVisible(False)
-            self._bbox_fixed_advance_checkbox.setVisible(False)
-            self.statusBar().showMessage(get_text('status_switched_to_waypoint'), 3000)
-        else:
-            # Bキーでの切り替え（4つのモードをサイクル）
-            self.current_mode = (self.current_mode + 1) % 4
-            if self.current_mode == 0:
-                self.auto_mode_button.setChecked(True)
-                self.detection_mode_button.setChecked(False)
-                self.segmentation_mode_button.setChecked(False)
-                self.waypoint_mode_button.setChecked(False)
-                self.auto_driving_control_widget.setVisible(True)
-                self.waypoint_control_widget.setVisible(False)
-                self.segmentation_control_widget.setVisible(False)
-                self.apply_last_bbox_checkbox.setVisible(False)
-                self.apply_last_segmentation_checkbox.setVisible(False)
-                self._bbox_fixed_advance_checkbox.setVisible(False)
-                self.statusBar().showMessage(get_text('status_switched_to_auto_driving'), 3000)
-            elif self.current_mode == 1:
-                self.auto_mode_button.setChecked(False)
-                self.detection_mode_button.setChecked(True)
-                self.segmentation_mode_button.setChecked(False)
-                self.waypoint_mode_button.setChecked(False)
-                self.auto_driving_control_widget.setVisible(False)
-                self.waypoint_control_widget.setVisible(False)
-                self.segmentation_control_widget.setVisible(False)
-                self.apply_last_bbox_checkbox.setVisible(True)
-                self.apply_last_segmentation_checkbox.setVisible(False)
-                self._bbox_fixed_advance_checkbox.setVisible(True)
-                self.statusBar().showMessage(get_text('status_switched_to_detection'), 3000)
-            elif self.current_mode == 2:
-                self.auto_mode_button.setChecked(False)
-                self.detection_mode_button.setChecked(False)
-                self.segmentation_mode_button.setChecked(True)
-                self.waypoint_mode_button.setChecked(False)
-                self.auto_driving_control_widget.setVisible(False)
-                self.waypoint_control_widget.setVisible(False)
-                self.segmentation_control_widget.setVisible(True)
-                self.apply_last_bbox_checkbox.setVisible(False)
-                self.apply_last_segmentation_checkbox.setVisible(True)
-                self._bbox_fixed_advance_checkbox.setVisible(False)
-                self.statusBar().showMessage(get_text('status_switched_to_segmentation'), 3000)
-            else:  # current_mode == 3
-                self.auto_mode_button.setChecked(False)
-                self.detection_mode_button.setChecked(False)
-                self.segmentation_mode_button.setChecked(False)
-                self.waypoint_mode_button.setChecked(True)
-                self.auto_driving_control_widget.setVisible(False)
-                self.waypoint_control_widget.setVisible(True)
-                self.segmentation_control_widget.setVisible(False)
-                self.apply_last_bbox_checkbox.setVisible(False)
-                self.apply_last_segmentation_checkbox.setVisible(False)
-                self._bbox_fixed_advance_checkbox.setVisible(False)
-                self.statusBar().showMessage(get_text('status_switched_to_waypoint'), 3000)
-        
-        self.main_image_view.update()
-    
+
     def clear_all_selections(self):
         """全ての選択状態をクリア"""
+        # 進行中のドラッグ/描画状態も破棄する。前モードのフラグ（ペイント中・
+        # ウェイポイント描画中・マスク頂点ドラッグ中）が残ると、次モードでの
+        # マウスリリースが早期 return で飲み込まれ、アノテーションが確定できない
+        if hasattr(self.main_image_view, '_reset_interaction_state'):
+            self.main_image_view._reset_interaction_state()
+
         # バウンディングボックスの選択をクリア
         if hasattr(self.main_image_view, 'selected_bbox_index'):
             self.main_image_view.selected_bbox_index = None
@@ -10730,7 +13519,8 @@ class ImageAnnotationTool(QMainWindow):
     
     def update_inference_checkboxes_status(self):
         """各モデルの読み込み状態に応じてチェックボックスの有効/無効を更新"""
-        # 自動運転モデル
+        # 自動運転モデル（TogiVAD の angle/throttle は専用ストア・専用チェック
+        # で独立表示するため、ここでは通常モデルの有無だけを見る）
         if hasattr(self, 'model') and self.model is not None:
             self.inference_checkbox.setEnabled(True)
             self.inference_checkbox.setToolTip(get_text('tip_driving_model_loaded'))
@@ -10817,8 +13607,11 @@ class ImageAnnotationTool(QMainWindow):
                 slot['checkbox'].setEnabled(False)
                 slot['checkbox'].setChecked(False)
 
-    def add_segmentation_annotation(self, polygon_data):
-        """セグメンテーションアノテーションを追加"""
+    def add_segmentation_annotation(self, polygon_data, advance=True):
+        """セグメンテーションアノテーションを追加
+
+        advance=False は自動適用など、ユーザー操作でない追加に使う。
+        """
         if not self.images or not polygon_data:
             return
 
@@ -10859,9 +13652,8 @@ class ImageAnnotationTool(QMainWindow):
                         self.last_segmentations = [deepcopy(s) for s in existing_anns if s is not None]
                         self.main_image_view.update()
                         self.update_gallery()
-                        if getattr(self, '_seg_fixed_class_advance', False):
-                            skip = self.skip_count_spin.value()
-                            QTimer.singleShot(80, lambda: self.skip_images(skip))
+                        if advance and getattr(self, '_seg_fixed_class_advance', False):
+                            self._schedule_fixed_class_advance()
                         return
                 except Exception:
                     pass  # 失敗時は通常追加にフォールスルー
@@ -10876,10 +13668,11 @@ class ImageAnnotationTool(QMainWindow):
         self.main_image_view.update()
         self.update_gallery()
 
+        self.update_source_annotation_summary()
+
         # クラス固定で次に進む
-        if getattr(self, '_seg_fixed_class_advance', False):
-            skip = self.skip_count_spin.value()
-            QTimer.singleShot(80, lambda: self.skip_images(skip))
+        if advance and getattr(self, '_seg_fixed_class_advance', False):
+            self._schedule_fixed_class_advance()
             
     def clear_segmentation_annotations(self):
         """現在の画像のセグメンテーションアノテーションをすべて削除"""
@@ -11025,20 +13818,22 @@ class ImageAnnotationTool(QMainWindow):
             bbox_count = sum(len(bboxes) for bboxes in self.bbox_annotations.values())
             bbox_images = len(self.bbox_annotations)
             bbox_status = QLabel(get_text('label_bbox_status', bbox_count, bbox_images))
-            bbox_status.setStyleSheet("color: #2E7D32; font-weight: bold;")
+            bbox_status.setStyleSheet("font-weight: bold;")
+            set_text_role(bbox_status, 'success')
         else:
             bbox_status = QLabel(get_text('label_bbox_none'))
-            bbox_status.setStyleSheet("color: #D32F2F;")
+            set_text_role(bbox_status, 'error')
         status_layout.addWidget(bbox_status)
 
         if has_seg:
             seg_count = sum(len(segs) for segs in self.segmentation_annotations.values())
             seg_images = len(self.segmentation_annotations)
             seg_status = QLabel(get_text('label_seg_status', seg_count, seg_images))
-            seg_status.setStyleSheet("color: #2E7D32; font-weight: bold;")
+            seg_status.setStyleSheet("font-weight: bold;")
+            set_text_role(seg_status, 'success')
         else:
             seg_status = QLabel(get_text('label_seg_none'))
-            seg_status.setStyleSheet("color: #D32F2F;")
+            set_text_role(seg_status, 'error')
         status_layout.addWidget(seg_status)
 
         task_layout.addWidget(status_group)
@@ -11467,44 +14262,44 @@ class ImageAnnotationTool(QMainWindow):
         class_to_index = {class_name: i for i, class_name in enumerate(classes)}
         print(f"クラス-インデックスマッピング: {class_to_index}")
         
-        # セグメンテーションアノテーションがあるインデックスのみを取得
-        valid_indices = []
-        for idx, segments in self.segmentation_annotations.items():
-            if segments:
-                has_valid_segments = any(
-                    seg is not None and
-                    len(_seg_to_polygon_points(
-                        seg if isinstance(seg, dict) else {'points': getattr(seg, 'points', [])},
-                        1, 1  # img_size は validity チェックのみなので任意の値でよい
-                    )) >= 3
-                    for seg in segments
-                )
-                if has_valid_segments:
-                    valid_indices.append(idx)
-        
-        print(f"有効なセグメンテーションデータがあるインデックス: {len(valid_indices)}個")
-        
-        if len(valid_indices) == 0:
+        # 対象は (画像パス, セグメント群)。設定に応じて全画像ソースを束ねる
+        items = []
+        for img_path, segments in self.collect_annotation_items('segmentation_annotations'):
+            has_valid_segments = any(
+                seg is not None and
+                len(_seg_to_polygon_points(
+                    seg if isinstance(seg, dict) else {'points': getattr(seg, 'points', [])},
+                    1, 1  # img_size は validity チェックのみなので任意の値でよい
+                )) >= 3
+                for seg in segments
+            )
+            if has_valid_segments:
+                items.append((img_path, segments))
+
+        print(f"有効なセグメンテーションデータ: {len(items)}枚 "
+              f"ソース別={self.count_annotation_sources('segmentation_annotations')}")
+
+        if len(items) == 0:
             raise Exception("有効なセグメンテーションアノテーションが見つかりません。")
-        
+
         # データを分割
         import random
-        random.shuffle(valid_indices)
-        
-        split_point = int(len(valid_indices) * 0.8)
-        train_indices = valid_indices[:split_point]
-        val_indices = valid_indices[split_point:]
-        
-        print(f"学習用: {len(train_indices)}枚, 検証用: {len(val_indices)}枚")
-        
+        random.shuffle(items)
+
+        split_point = int(len(items) * 0.8)
+        train_items = items[:split_point]
+        val_items = items[split_point:]
+
+        print(f"学習用: {len(train_items)}枚, 検証用: {len(val_items)}枚")
+
         # 学習用データのエクスポート
-        train_success = self._export_segmentation_subset(train_indices, train_dir, class_to_index)
-        
+        train_success = self._export_segmentation_subset(train_items, train_dir, class_to_index)
+
         # 検証用データのエクスポート
-        val_success = self._export_segmentation_subset(val_indices, val_dir, class_to_index)
+        val_success = self._export_segmentation_subset(val_items, val_dir, class_to_index)
         
         print(f"セグメンテーション専用アノテーションエクスポート完了")
-        print(f"学習用成功: {train_success}/{len(train_indices)}, 検証用成功: {val_success}/{len(val_indices)}")
+        print(f"学習用成功: {train_success}/{len(train_items)}, 検証用成功: {val_success}/{len(val_items)}")
         
         if train_success == 0 or val_success == 0:
             raise Exception("セグメンテーションデータのエクスポートに失敗しました。")
@@ -11518,26 +14313,28 @@ class ImageAnnotationTool(QMainWindow):
         class_to_index = {class_name: i for i, class_name in enumerate(classes)}
         print(f"クラス-インデックスマッピング: {class_to_index}")
         
-        # バウンディングボックスアノテーションがあるインデックスのみを使用
-        valid_indices = list(self.bbox_annotations.keys())
-        
+        # 対象は (画像パス, ボックス群)。設定に応じて全画像ソースを束ねる
+        items = self.collect_annotation_items('bbox_annotations')
+        print(f"対象ソース: {self.count_annotation_sources('bbox_annotations')} "
+              f"(全ソース使用={bool(getattr(self, 'use_all_sources_for_training', False))})")
+
         import random
-        random.shuffle(valid_indices)
-        
-        split_point = int(len(valid_indices) * 0.8)
-        train_indices = valid_indices[:split_point]
-        val_indices = valid_indices[split_point:]
-        
-        print(f"学習用: {len(train_indices)}枚, 検証用: {len(val_indices)}枚")
-        
+        random.shuffle(items)
+
+        split_point = int(len(items) * 0.8)
+        train_items = items[:split_point]
+        val_items = items[split_point:]
+
+        print(f"学習用: {len(train_items)}枚, 検証用: {len(val_items)}枚")
+
         # 学習用データのエクスポート
-        train_success = self._export_bbox_subset(train_indices, train_dir, class_to_index)
-        
+        train_success = self._export_bbox_subset(train_items, train_dir, class_to_index)
+
         # 検証用データのエクスポート
-        val_success = self._export_bbox_subset(val_indices, val_dir, class_to_index)
+        val_success = self._export_bbox_subset(val_items, val_dir, class_to_index)
         
         print(f"バウンディングボックス専用アノテーションエクスポート完了")
-        print(f"学習用成功: {train_success}/{len(train_indices)}, 検証用成功: {val_success}/{len(val_indices)}")
+        print(f"学習用成功: {train_success}/{len(train_items)}, 検証用成功: {val_success}/{len(val_items)}")
 
     # def _export_bbox_subset(self, indices, output_dir, class_to_index):
     #     """バウンディングボックスサブセットのエクスポート"""
@@ -11587,29 +14384,32 @@ class ImageAnnotationTool(QMainWindow):
         
     #     return success_count
 ###
-    def _export_bbox_subset(self, indices, output_dir, class_to_index):
-        """バウンディングボックスサブセットのエクスポート（修正版）"""
-        
+    def _export_bbox_subset(self, items, output_dir, class_to_index):
+        """バウンディングボックスサブセットのエクスポート
+
+        items は (画像パス, ボックス群) の一覧。画像ソースをまたぐとフレーム
+        番号が重複するため、インデックスではなく画像パスで受け取る。
+        """
+
         success_count = 0
-        
-        for idx in indices:
-            if idx in self.bbox_annotations:
+
+        for source_image_path, bboxes in items:
+            if bboxes:
                 try:
-                    # 画像をコピー
-                    source_image_path = self.images[idx]
+                    # 画像をコピー（ファイル名に cam 名が入るのでソース間で衝突しない）
                     image_filename = os.path.basename(source_image_path)
                     dest_image_path = os.path.join(output_dir, "images", image_filename)
-                    
+
                     import shutil
                     shutil.copy2(source_image_path, dest_image_path)
-                    
+
                     # バウンディングボックスアノテーションを処理
                     label_filename = os.path.splitext(image_filename)[0] + ".txt"
                     label_path = os.path.join(output_dir, "labels", label_filename)
                     
                     # ラベルファイルを作成（バウンディングボックス形式のみ）
                     with open(label_path, 'w') as f:
-                        for bbox in self.bbox_annotations[idx]:
+                        for bbox in bboxes:
                             # クラス名の取得（辞書形式とオブジェクト形式の両方に対応）
                             class_name = None
                             if isinstance(bbox, dict):
@@ -11648,84 +14448,12 @@ class ImageAnnotationTool(QMainWindow):
                     success_count += 1
                     
                 except Exception as e:
-                    print(f"バウンディングボックス インデックス {idx} の処理中にエラー: {e}")
+                    print(f"バウンディングボックス エクスポートエラー {source_image_path}: {e}")
                     import traceback
                     traceback.print_exc()
         
         return success_count
 
-    def _export_segmentation_subset(self, indices, output_dir, class_to_index):
-        """セグメンテーションサブセットのエクスポート（修正版）"""
-        
-        success_count = 0
-        
-        for idx in indices:
-            if idx in self.segmentation_annotations:
-                try:
-                    # 画像をコピー
-                    source_image_path = self.images[idx]
-                    image_filename = os.path.basename(source_image_path)
-                    dest_image_path = os.path.join(output_dir, "images", image_filename)
-                    
-                    import shutil
-                    shutil.copy2(source_image_path, dest_image_path)
-                    
-                    # セグメンテーションアノテーションを処理
-                    label_filename = os.path.splitext(image_filename)[0] + ".txt"
-                    label_path = os.path.join(output_dir, "labels", label_filename)
-                    
-                    # 画像サイズを取得
-                    from PIL import Image
-                    with Image.open(source_image_path) as img:
-                        img_width, img_height = img.size
-                    
-                    # ラベルファイルを作成（セグメンテーション形式）
-                    with open(label_path, 'w') as f:
-                        for seg in self.segmentation_annotations[idx]:
-                            # クラス名を取得
-                            if isinstance(seg, dict):
-                                class_name = seg.get('class') or seg.get('class_name')
-                                seg_d = seg
-                            else:
-                                class_name = getattr(seg, 'class', None) or getattr(seg, 'class_name', None)
-                                seg_d = {'points': getattr(seg, 'points', [])}
-
-                            if not class_name or class_name not in class_to_index:
-                                continue
-
-                            # polygon / fill / brush すべて対応した輪郭点取得
-                            points = _seg_to_polygon_points(seg_d, img_width, img_height)
-                            if len(points) < 3:
-                                continue
-
-                            class_id = class_to_index[class_name]
-
-                            # ポイントを正規化座標に変換
-                            normalized_points = []
-                            for point in points:
-                                if isinstance(point, (list, tuple)) and len(point) >= 2:
-                                    x, y = point[0] / img_width, point[1] / img_height
-                                elif isinstance(point, dict):
-                                    x, y = point.get('x', 0) / img_width, point.get('y', 0) / img_height
-                                else:
-                                    x, y = getattr(point, 'x', 0) / img_width, getattr(point, 'y', 0) / img_height
-                                normalized_points.extend([
-                                    max(0.0, min(1.0, x)),
-                                    max(0.0, min(1.0, y))
-                                ])
-
-                            if len(normalized_points) >= 6:  # 最低3点 (6座標)
-                                points_str = ' '.join([f"{coord:.6f}" for coord in normalized_points])
-                                f.write(f"{class_id} {points_str}\n")
-                    
-                    success_count += 1
-                    
-                except Exception as e:
-                    print(f"セグメンテーション インデックス {idx} の処理中にエラー: {e}")
-                    import traceback
-                    traceback.print_exc()
-        
-        return success_count
 
 
     # セグメンテーション学習前のバリデーション強化
@@ -11963,11 +14691,12 @@ class ImageAnnotationTool(QMainWindow):
         stats_label = QLabel(f"<b>{get_text('label_training_stats')}</b><br>"
                            f"{get_text('label_total_loaded_images', total_images)}<br>"
                            f"{get_text('label_annotated_images_count', task_name, total_annotated_images)}<br>"
-                           f"<b style='color: #2E7D32; font-size: 14px;'>{get_text('label_actual_training_count', image_count)}</b><br>"
+                           f"<b style='color: {theme_color('success')}; font-size: 14px;'>{get_text('label_actual_training_count', image_count)}</b><br>"
                            f"{get_text('label_excluded_calculation', total_annotated_images, excluded_count)}<br>"
                            f"{get_text('label_total_annotations_count', task_name, total_count)}<br>"
-                           f"<span style='color: #FF6600;'>{get_text('label_deleted_excluded_note')}</span>")
-        stats_label.setStyleSheet("padding: 10px; background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 5px;")
+                           f"<span style='color: {theme_color('warning')};'>{get_text('label_deleted_excluded_note')}</span>")
+        stats_label.setStyleSheet("padding: 10px; border-radius: 5px;")
+        set_panel_role(stats_label, 'box')
         settings_layout.addWidget(stats_label)
         
         settings_layout.addWidget(QLabel(""))  # スペース追加
@@ -12052,7 +14781,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # 注意書き
         size_note = QLabel(get_text('label_size_note'))
-        size_note.setStyleSheet("color: #888; font-style: italic;")
+        size_note.setStyleSheet("font-style: italic;")
+        set_text_role(size_note, 'faint')
         basic_layout.addWidget(size_note)
 
         # Early Stopping設定
@@ -12244,7 +14974,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # プレフィックス（固定、編集不可）
         prefix_label = QLabel(yolo_prefix)
-        prefix_label.setStyleSheet("background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc; font-family: monospace;")
+        prefix_label.setStyleSheet("padding: 5px; font-family: monospace;")
+        set_panel_role(prefix_label, 'code')
         name_input_layout.addWidget(prefix_label)
 
         # サフィックス（編集可能）
@@ -12259,7 +14990,8 @@ class ImageAnnotationTool(QMainWindow):
         training_settings.model_name_prefix = yolo_prefix
 
         model_name_note = QLabel(get_text('label_model_name_note', model_type))
-        model_name_note.setStyleSheet("color: #888; font-style: italic; font-size: 10px;")
+        model_name_note.setStyleSheet("font-style: italic; font-size: 10px;")
+        set_text_role(model_name_note, 'faint')
         model_name_layout.addWidget(model_name_note)
 
         settings_layout.addWidget(model_name_group)
@@ -12478,6 +15210,7 @@ class ImageAnnotationTool(QMainWindow):
         
         if not unified_model_files:
             self.yolo_unified_model_combo.addItem(get_text('combo_model_not_found'))
+            self._add_yolo_dl_items_unified(selected_model_type)   # DL項目を追加
             self.statusBar().showMessage(get_text('status_yolo_model_not_found', selected_model_type), 3000)
             return
         
@@ -12516,6 +15249,7 @@ class ImageAnnotationTool(QMainWindow):
 
             self.yolo_unified_model_combo.addItem(display_name, model_info['path'])
 
+        self._add_yolo_dl_items_unified(selected_model_type)   # 末尾にDL項目も併記
 
         # 更新完了メッセージ
         detection_count = sum(1 for m in unified_model_files if m['task'] == get_text('label_detection_short'))
@@ -12535,21 +15269,26 @@ class ImageAnnotationTool(QMainWindow):
         current_index = self.yolo_unified_model_combo.currentIndex()
         selected_model_display = self.yolo_unified_model_combo.currentText()
         relative_path = self.yolo_unified_model_combo.itemData(current_index)
-        
-        if not relative_path or get_text('msg_combo_model_not_found') in selected_model_display or "not found" in selected_model_display.lower():
-            QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_no_valid_model'))
-            return
 
-        # タスクタイプを判定
-        is_segmentation = get_text('label_seg_tag_short') in selected_model_display or "[Seg]" in selected_model_display
+        # DL項目（⬇ ダウンロード）が選ばれたら事前学習モデルを取得して models へ保存
+        if isinstance(relative_path, str) and relative_path.startswith('__DL__:'):
+            dl_type = relative_path[len('__DL__:'):]
+            model_path = self.download_pretrained_yolo_model(dl_type)
+            if not model_path or not os.path.exists(model_path):
+                QMessageBox.warning(self, get_text('dlg_warning'),
+                                    get_text('yolo_model_dl_failed'))
+                return
+            is_segmentation = 'seg' in dl_type.lower()
+        else:
+            if not relative_path or get_text('msg_combo_model_not_found') in selected_model_display or "not found" in selected_model_display.lower():
+                QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_no_valid_model'))
+                return
+            is_segmentation = get_text('label_seg_tag_short') in selected_model_display or "[Seg]" in selected_model_display
+            model_path = os.path.join(models_dir, relative_path)
+            if not os.path.exists(model_path):
+                QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_selected_model_not_found', model_path))
+                return
         task_type = get_text('label_segmentation_short') if is_segmentation else get_text('label_detection_short')
-        
-        # モデルパスを構築
-        model_path = os.path.join(models_dir, relative_path)
-        
-        if not os.path.exists(model_path):
-            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_selected_model_not_found', model_path))
-            return
         
         # 信頼度閾値の設定
         confidence, ok = QInputDialog.getDouble(
@@ -12904,7 +15643,8 @@ class ImageAnnotationTool(QMainWindow):
 
             # 説明ラベル
             key_note = QLabel(get_text('label_donkey_key_note'))
-            key_note.setStyleSheet("color: #666; font-style: italic;")
+            key_note.setStyleSheet("font-style: italic;")
+            set_text_role(key_note, 'muted')
             keys_layout.addWidget(key_note)
 
             layout.addWidget(keys_group)
@@ -12912,7 +15652,8 @@ class ImageAnnotationTool(QMainWindow):
         # 削除したインデックスの情報表示
         if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
             deletion_info = QLabel(get_text('label_deleted_indexes_export', len(self.deleted_indexes)))
-            deletion_info.setStyleSheet("color: #666; font-style: italic;")
+            deletion_info.setStyleSheet("font-style: italic;")
+            set_text_role(deletion_info, 'muted')
             layout.addWidget(deletion_info)
         
         # ボタン
@@ -13057,10 +15798,11 @@ class ImageAnnotationTool(QMainWindow):
             bbox_count = sum(len(bboxes) for bboxes in self.bbox_annotations.values())
             bbox_images = len(self.bbox_annotations)
             bbox_status = QLabel(get_text('label_bbox_status', bbox_count, bbox_images))
-            bbox_status.setStyleSheet("color: #2E7D32; font-weight: bold;")
+            bbox_status.setStyleSheet("font-weight: bold;")
+            set_text_role(bbox_status, 'success')
         else:
             bbox_status = QLabel(get_text('label_bbox_none'))
-            bbox_status.setStyleSheet("color: #D32F2F;")
+            set_text_role(bbox_status, 'error')
         status_layout.addWidget(bbox_status)
 
         # セグメンテーション状況
@@ -13068,10 +15810,11 @@ class ImageAnnotationTool(QMainWindow):
             seg_count = sum(len(segs) for segs in self.segmentation_annotations.values())
             seg_images = len(self.segmentation_annotations)
             seg_status = QLabel(get_text('label_seg_status', seg_count, seg_images))
-            seg_status.setStyleSheet("color: #2E7D32; font-weight: bold;")
+            seg_status.setStyleSheet("font-weight: bold;")
+            set_text_role(seg_status, 'success')
         else:
             seg_status = QLabel(get_text('label_seg_none'))
-            seg_status.setStyleSheet("color: #D32F2F;")
+            set_text_role(seg_status, 'error')
         status_layout.addWidget(seg_status)
 
         layout.addWidget(status_group)
@@ -13160,7 +15903,8 @@ class ImageAnnotationTool(QMainWindow):
         # 削除したインデックスの情報表示
         if hasattr(self, 'deleted_indexes') and self.deleted_indexes:
             deletion_info = QLabel(get_text('label_deleted_indexes_info', len(self.deleted_indexes)))
-            deletion_info.setStyleSheet("color: #666; font-style: italic; margin-top: 10px;")
+            deletion_info.setStyleSheet("font-style: italic; margin-top: 10px;")
+            set_text_role(deletion_info, 'muted')
             layout.addWidget(deletion_info)
         
         # ボタン
@@ -13330,18 +16074,13 @@ class ImageAnnotationTool(QMainWindow):
         os.makedirs(images_dir, exist_ok=True)
         os.makedirs(labels_dir, exist_ok=True)
         
-        # 削除されたインデックスを除外
-        deleted_indexes = getattr(self, 'deleted_indexes', set())
-        
-        # アノテーションがあるインデックスのリストを作成
-        annotated_indexes = list(self.bbox_annotations.keys()) if hasattr(self, 'bbox_annotations') else []
-        
-        # 削除されたインデックスを除外
-        valid_indexes = [idx for idx in annotated_indexes if idx not in deleted_indexes]
-        
-        total_images = len(valid_indexes)
-        
-        for i, idx in enumerate(valid_indexes):
+        # 対象は (画像パス, ボックス群)。設定に応じて全画像ソースを束ねる
+        # （削除マークの除外は collect_annotation_items 側で処理済み）
+        items = self.collect_annotation_items('bbox_annotations')
+
+        total_images = len(items)
+
+        for i, (img_path, bboxes) in enumerate(items):
             if progress and progress.wasCanceled():
                 break
             
@@ -13349,11 +16088,6 @@ class ImageAnnotationTool(QMainWindow):
                 progress_value = int((i / total_images) * 100) if total_images > 0 else 100
                 progress.setValue(progress_value)
                 
-            # インデックスから画像パスを取得
-            if not hasattr(self, 'images') or idx >= len(self.images):
-                continue
-                
-            img_path = self.images[idx]
             img_filename = os.path.basename(img_path)
             
             if progress:
@@ -13382,8 +16116,8 @@ class ImageAnnotationTool(QMainWindow):
             
             # バウンディングボックスのラベルを作成
             with open(label_path, 'w') as f:
-                if idx in self.bbox_annotations:
-                    for bbox in self.bbox_annotations[idx]:
+                if bboxes:
+                    for bbox in bboxes:
                         class_name = bbox.get('class', 'unknown')
                         if class_name in classes:
                             class_id = classes.index(class_name)
@@ -13431,18 +16165,13 @@ class ImageAnnotationTool(QMainWindow):
         os.makedirs(images_dir, exist_ok=True)
         os.makedirs(labels_dir, exist_ok=True)
         
-        # 削除されたインデックスを除外
-        deleted_indexes = getattr(self, 'deleted_indexes', set())
-        
-        # アノテーションがあるインデックスのリストを作成
-        annotated_indexes = list(self.segmentation_annotations.keys()) if hasattr(self, 'segmentation_annotations') else []
-        
-        # 削除されたインデックスを除外
-        valid_indexes = [idx for idx in annotated_indexes if idx not in deleted_indexes]
-        
-        total_images = len(valid_indexes)
-        
-        for i, idx in enumerate(valid_indexes):
+        # 対象は (画像パス, セグメント群)。設定に応じて全画像ソースを束ねる
+        # （削除マークの除外は collect_annotation_items 側で処理済み）
+        items = self.collect_annotation_items('segmentation_annotations')
+
+        total_images = len(items)
+
+        for i, (img_path, segments) in enumerate(items):
             if progress and progress.wasCanceled():
                 break
             
@@ -13450,11 +16179,6 @@ class ImageAnnotationTool(QMainWindow):
                 progress_value = int((i / total_images) * 100) if total_images > 0 else 100
                 progress.setValue(progress_value)
                 
-            # インデックスから画像パスを取得
-            if not hasattr(self, 'images') or idx >= len(self.images):
-                continue
-                
-            img_path = self.images[idx]
             img_filename = os.path.basename(img_path)
             
             if progress:
@@ -13483,8 +16207,8 @@ class ImageAnnotationTool(QMainWindow):
             
             # セグメンテーションのラベルを作成
             with open(label_path, 'w') as f:
-                if idx in self.segmentation_annotations:
-                    for seg in self.segmentation_annotations[idx]:
+                if segments:
+                    for seg in segments:
                         class_name = seg.get('class', 'unknown')
                         if class_name in classes:
                             class_id = classes.index(class_name)
@@ -13767,6 +16491,7 @@ class ImageAnnotationTool(QMainWindow):
         
         if not yolo_model_files:
             self.yolo_saved_model_combo.addItem(get_text('combo_model_not_found'))
+            self._add_yolo_dl_items(selected_model_type)   # DL項目を選択肢に追加
             self.statusBar().showMessage(get_text('status_yolo_model_not_found', selected_model_type), 3000)
             return
         
@@ -13802,9 +16527,46 @@ class ImageAnnotationTool(QMainWindow):
             
             # コンボボックスにアイテムを追加し、ユーザーデータとして相対パスを設定
             self.yolo_saved_model_combo.addItem(model_name, model_info['path'])
-        
+
+        self._add_yolo_dl_items(selected_model_type)       # 末尾にDL項目も併記
+
         # 更新完了メッセージ
         self.statusBar().showMessage(get_text('status_models_loaded', len(yolo_model_files), selected_model_type), 3000)
+
+    def _add_yolo_dl_items(self, model_type):
+        """保存済みモデルコンボに「⬇ ダウンロード」項目を追加する。
+
+        選択して「モデル読込」を押すと download_pretrained_yolo_model が事前学習
+        モデルを取得して models/ に保存しロードする。手元にモデルが無くても
+        プルダウンから選んで導入できる（COCO事前学習は car 等を検出）。
+        """
+        mt = (model_type or '').strip().lower()
+        names = []
+        if mt.startswith('yolo'):
+            names.append(mt)
+        for n in ('yolov8n', 'yolo11n', 'yolov8n-seg'):
+            if n not in names:
+                names.append(n)
+        for n in names:
+            self.yolo_saved_model_combo.addItem(
+                f"⬇ {n}.pt ({get_text('yolo_model_dl_tag')})", f"__DL__:{n}")
+
+    def _add_yolo_dl_items_unified(self, model_type):
+        """統合モデルコンボ（yolo_unified_model_combo）に「⬇ ダウンロード」項目を追加。
+
+        選んで「モデル読込」を押すと事前学習モデルを DL→models 保存→ロードする。
+        検出(yolov8n/yolo11n)とセグ(yolov8n-seg)の定番を併記。
+        """
+        mt = (model_type or '').strip().lower()
+        names = []
+        if mt.startswith('yolo'):
+            names.append(mt)
+        for n in ('yolov8n', 'yolo11n', 'yolov8n-seg'):
+            if n not in names:
+                names.append(n)
+        for n in names:
+            self.yolo_unified_model_combo.addItem(
+                f"⬇ {n}.pt ({get_text('yolo_model_dl_tag')})", f"__DL__:{n}")
 
     def download_pretrained_yolo_model(self, model_type):
         """事前学習済みのYOLOモデルをダウンロードしてmodelsフォルダに保存する"""
@@ -13883,19 +16645,25 @@ class ImageAnnotationTool(QMainWindow):
         
         # ユーザーデータからパスを取得（相対パス）
         relative_path = self.yolo_saved_model_combo.itemData(current_index)
-        
-        if not relative_path or selected_model_display == "YOLOget_text('combo_model_not_found')" :
-            QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_no_valid_model'))
-            return
-        
-        # モデルのパスを取得 - 相対パスからフルパスに変換
-        # models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
-        model_path = os.path.join(models_dir, relative_path)
-        
-        # モデルが存在するか確認
-        if not os.path.exists(model_path):
-            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_selected_model_not_found', model_path))
-            return
+
+        # DL項目（⬇ ダウンロード）が選ばれたら事前学習モデルを取得して models へ保存
+        if isinstance(relative_path, str) and relative_path.startswith('__DL__:'):
+            dl_type = relative_path[len('__DL__:'):]
+            model_path = self.download_pretrained_yolo_model(dl_type)
+            if not model_path or not os.path.exists(model_path):
+                QMessageBox.warning(self, get_text('dlg_warning'),
+                                    get_text('yolo_model_dl_failed'))
+                return
+            self.refresh_yolo_model_list()             # 保存済み一覧を更新
+        else:
+            if not relative_path or selected_model_display == "YOLOget_text('combo_model_not_found')":
+                QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_no_valid_model'))
+                return
+            # モデルのパスを取得 - 相対パスからフルパスに変換
+            model_path = os.path.join(models_dir, relative_path)
+            if not os.path.exists(model_path):
+                QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_selected_model_not_found', model_path))
+                return
             
         # 進捗ダイアログを表示
         progress = QProgressDialog(
@@ -14352,6 +17120,10 @@ class ImageAnnotationTool(QMainWindow):
                 # 既存のアノテーションをクリア
                 self.bbox_annotations = {}
                 self.segmentation_annotations = {}
+                # 表示していない画像ソースのぶんも一緒に消す
+                for store in self._source_stores.values():
+                    store['bbox_annotations'] = {}
+                    store['segmentation_annotations'] = {}
                 # 関連する変数もクリア
                 self.last_bbox = None
                 self.last_bboxes = []
@@ -14389,17 +17161,22 @@ class ImageAnnotationTool(QMainWindow):
         print("=" * 60)
 
         # プログレスダイアログ
+        _all_images = getattr(self, 'variant_images', None) or {}
         progress = QProgressDialog(
             get_text('msg_loading_yolo_annotations'),
-            get_text('btn_cancel'), 0, len(self.images), self
+            get_text('btn_cancel'), 0,
+            sum(len(v) for v in _all_images.values()) or len(self.images), self
         )
         progress.setWindowTitle(get_text('dlg_loading'))
         progress.setWindowModality(Qt.WindowModal)
         progress.show()
 
         # 統計情報を記録
+        all_variant_images = getattr(self, 'variant_images', None) or {}
+        total_images = sum(len(v) for v in all_variant_images.values()) or len(self.images)
         loading_stats = {
-            'total_images': len(self.images),
+            'sources_with_annotations': {},
+            'total_images': total_images,
             'processed_images': 0,
             'images_with_annotations': 0,
             'total_bbox_annotations': 0,
@@ -14411,36 +17188,55 @@ class ImageAnnotationTool(QMainWindow):
         }
         
         try:
-            for i, img_path in enumerate(self.images):
+            # ラベルファイルは画像ファイル名（cam名を含む）で対応づくので、
+            # 読み込み済みの全画像ソースぶんをそれぞれのストアへ復元する
+            current_key = self._annotation_source_key()
+            variant_images = getattr(self, 'variant_images', None) or {current_key: self.images}
+            processed = 0
+            for variant, images in variant_images.items():
                 if progress.wasCanceled():
                     break
-                
-                progress.setValue(i)
-                progress.setLabelText(get_text('msg_processing_file', os.path.basename(img_path)))
-                QApplication.processEvents()
-                
-                # 画像ファイル名を基準にアノテーション読み込み
-                bbox_annotations, seg_annotations = self._load_single_image_annotations(
-                    img_path, i, labels_dir, classes, loading_stats
-                )
-                
-                # バウンディングボックスアノテーションを保存（インデックスベース）
-                if bbox_annotations:
-                    if i not in self.bbox_annotations:
-                        self.bbox_annotations[i] = []
-                    self.bbox_annotations[i].extend(bbox_annotations)
-                    loading_stats['images_with_annotations'] += 1
-                
-                # セグメンテーションアノテーションを保存（インデックスベース）
-                if seg_annotations:
-                    if i not in self.segmentation_annotations:
-                        self.segmentation_annotations[i] = []
-                    self.segmentation_annotations[i].extend(seg_annotations)
-                
-                loading_stats['processed_images'] += 1
-            
+                if variant == current_key:
+                    bbox_store = self.bbox_annotations
+                    seg_store = self.segmentation_annotations
+                else:
+                    store = self._source_stores.setdefault(variant, {})
+                    bbox_store = store.setdefault('bbox_annotations', {})
+                    seg_store = store.setdefault('segmentation_annotations', {})
+
+                for i, img_path in enumerate(images):
+                    if progress.wasCanceled():
+                        break
+
+                    processed += 1
+                    progress.setValue(min(processed, loading_stats['total_images']))
+                    progress.setLabelText(get_text('msg_processing_file', os.path.basename(img_path)))
+                    QApplication.processEvents()
+
+                    # 画像ファイル名を基準にアノテーション読み込み
+                    bbox_annotations, seg_annotations = self._load_single_image_annotations(
+                        img_path, i, labels_dir, classes, loading_stats
+                    )
+
+                    # バウンディングボックスアノテーションを保存（インデックスベース）
+                    if bbox_annotations:
+                        bbox_store.setdefault(i, []).extend(bbox_annotations)
+                        loading_stats['images_with_annotations'] += 1
+                        loading_stats['sources_with_annotations'][variant] = (
+                            loading_stats['sources_with_annotations'].get(variant, 0) + 1)
+
+                    # セグメンテーションアノテーションを保存（インデックスベース）
+                    if seg_annotations:
+                        seg_store.setdefault(i, []).extend(seg_annotations)
+                        loading_stats['sources_with_annotations'][variant] = (
+                            loading_stats['sources_with_annotations'].get(variant, 0) + 1)
+
+                    loading_stats['processed_images'] += 1
+
             progress.close()
-            
+
+            self.update_source_annotation_summary()
+
             # 結果の表示と更新
             self._finalize_yolo_annotation_loading(loading_stats, classes)
             
@@ -14779,6 +17575,207 @@ class ImageAnnotationTool(QMainWindow):
         
         return sorted(list(classes))
 
+    def show_yolo_auto_annotate_dialog(self):
+        """学習済みYOLOで他車(opponent)/セグメンテーションを自動アノテーションする設定ダイアログ。
+
+        検出モデル(self.yolo_model) or セグモデル(self.yolo_seg_model)を全/現フレームに
+        走らせ、元クラス(例 car,truck,bus,motorcycle)を target クラス(既定 opponent)へ
+        写像して bbox_annotations / segmentation_annotations に書き込む。
+        opponent 矩形はそのまま②の「他車ラベルを計算して保存」→ togivad/agents に繋がる。
+        """
+        if not self.images:
+            QMessageBox.warning(self, get_text('dlg_warning'),
+                                get_text('msg_load_images_first'))
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle(get_text('yolo_auto_annot_title'))
+        lay = QVBoxLayout(dlg)
+
+        # モデル選択（既存 .pt ＋ DL 可能な事前学習プリセット）
+        model_row = QHBoxLayout()
+        model_row.addWidget(QLabel(get_text('yolo_auto_annot_model')))
+        model_combo = QComboBox()
+        for label, data in self._yolo_model_options():
+            model_combo.addItem(label, data)
+        model_row.addWidget(model_combo)
+        lay.addLayout(model_row)
+
+        src_row = QHBoxLayout()
+        src_row.addWidget(QLabel(get_text('yolo_auto_annot_src')))
+        src_edit = QLineEdit(",".join(DEFAULT_VEHICLE_CLASSES))
+        src_row.addWidget(src_edit)
+        lay.addLayout(src_row)
+
+        tgt_row = QHBoxLayout()
+        tgt_row.addWidget(QLabel(get_text('yolo_auto_annot_tgt')))
+        tgt_edit = QLineEdit("opponent")
+        tgt_row.addWidget(tgt_edit)
+        lay.addLayout(tgt_row)
+
+        conf_row = QHBoxLayout()
+        conf_row.addWidget(QLabel(get_text('yolo_auto_annot_conf')))
+        conf_spin = QDoubleSpinBox()
+        conf_spin.setRange(0.01, 1.0)
+        conf_spin.setSingleStep(0.05)
+        conf_spin.setValue(float(getattr(self, 'yolo_confidence_threshold', 0.5)))
+        conf_row.addWidget(conf_spin)
+        lay.addLayout(conf_row)
+
+        all_check = QCheckBox(get_text('yolo_auto_annot_all'))
+        all_check.setChecked(True)
+        lay.addWidget(all_check)
+        replace_check = QCheckBox(get_text('yolo_auto_annot_replace'))
+        replace_check.setChecked(True)
+        lay.addWidget(replace_check)
+
+        lay.addWidget(QLabel(get_text('yolo_auto_annot_hint')))
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+        if not dlg.exec_():
+            return
+
+        model, task = self._resolve_yolo_model(model_combo.currentData())
+        if model is None:
+            return
+        src = [c.strip() for c in src_edit.text().split(',') if c.strip()]
+        target = tgt_edit.text().strip() or 'opponent'
+        class_map = {c: target for c in src} if src else None
+        conf = float(conf_spin.value())
+        scope_all = all_check.isChecked()
+        replace = replace_check.isChecked()
+        self.auto_annotate_with_yolo(task, class_map, conf, scope_all, replace)
+
+    def _yolo_model_options(self):
+        """自動アノテのモデル選択肢: (表示名, データ) のリスト。
+
+        データ: 'loaded_det'/'loaded_seg'（読込済み）/ .pt のフルパス（既存ファイル）/
+        'dl:<name>'（未取得の事前学習プリセット。選択時に DL して models へ保存）。
+        事前学習(COCO)は car/truck/bus/motorcycle を検出でき、他車→opponent に使える。
+        """
+        opts = []
+        if getattr(self, 'yolo_model', None) is not None:
+            opts.append((get_text('yolo_model_loaded_det'), 'loaded_det'))
+        if getattr(self, 'yolo_seg_model', None) is not None:
+            opts.append((get_text('yolo_model_loaded_seg'), 'loaded_seg'))
+        try:
+            for f in sorted(os.listdir(models_dir)):
+                if f.endswith('.pt'):
+                    opts.append((f, os.path.join(models_dir, f)))
+        except Exception:
+            pass
+        for name in ('yolov8n', 'yolov8s', 'yolo11n'):
+            opts.append((f"{name}.pt ({get_text('yolo_model_dl_tag')})", f"dl:{name}"))
+        opts.append((f"yolov8n-seg.pt ({get_text('yolo_model_dl_tag')})",
+                     "dl:yolov8n-seg"))
+        if not opts:
+            opts.append((get_text('yolo_model_dl_tag') + " yolov8n", "dl:yolov8n"))
+        return opts
+
+    def _resolve_yolo_model(self, spec):
+        """モデル選択データ → (model, task)。必要なら DL/ロードして self にキャッシュ。
+
+        task: 'segment'（モデル名に seg を含む）| 'detect'。失敗時 (None, None)。
+        """
+        try:
+            if spec == 'loaded_det':
+                return self.yolo_model, 'detect'
+            if spec == 'loaded_seg':
+                return self.yolo_seg_model, 'segment'
+            if isinstance(spec, str) and spec.startswith('dl:'):
+                path = self.download_pretrained_yolo_model(spec[3:])
+                if not path:
+                    QMessageBox.warning(self, get_text('yolo_auto_annot_title'),
+                                        get_text('yolo_model_dl_failed'))
+                    return None, None
+            else:
+                path = spec
+            task = 'segment' if 'seg' in os.path.basename(path).lower() else 'detect'
+            model = YOLO(path)
+            if task == 'segment':
+                self.yolo_seg_model = model
+            else:
+                self.yolo_model = model
+            return model, task
+        except Exception as e:
+            QMessageBox.critical(self, get_text('yolo_auto_annot_title'),
+                                 get_text('yolo_model_dl_failed') + f"\n{e}")
+            return None, None
+
+    def auto_annotate_with_yolo(self, task, class_map, conf, scope_all, replace):
+        """学習済みYOLOをフレームに走らせ、検出/セグをアノテーションへ変換する。"""
+        model = getattr(self, 'yolo_model', None) if task == 'detect' \
+            else getattr(self, 'yolo_seg_model', None)
+        if model is None:
+            QMessageBox.information(self, get_text('yolo_auto_annot_title'),
+                                    get_text('yolo_auto_annot_no_model'))
+            return
+        indices = list(range(len(self.images))) if scope_all else [self.current_index]
+        progress = QProgressDialog(get_text('yolo_auto_annot_running'),
+                                   get_text('btn_cancel'), 0, len(indices), self)
+        progress.setWindowTitle(get_text('yolo_auto_annot_title'))
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        n_items, n_frames = 0, 0
+        for k, idx in enumerate(indices):
+            if k % 5 == 0:
+                progress.setValue(k)
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    break
+            try:
+                img_path = self.images[idx]
+                results = model(img_path, conf=conf, verbose=False)
+                img = Image.open(img_path)
+                wh = img.size
+                added = 0
+                if task == 'detect':
+                    if replace:
+                        self.bbox_annotations[idx] = [
+                            b for b in self.bbox_annotations.get(idx, [])
+                            if 'confidence' not in b]      # 手動分は残しAI分のみ置換
+                    for result in results:
+                        boxes = getattr(result, 'boxes', None)
+                        if boxes is None:
+                            continue
+                        bbs = dets_to_bboxes(boxes.data.cpu().numpy(),
+                                             result.names, wh, class_map, conf,
+                                             ego_region=DEFAULT_EGO_REGION)  # 自車除外
+                        for bb in bbs:
+                            self.bbox_annotations.setdefault(idx, []).append(bb)
+                            added += 1
+                else:  # segment
+                    if replace and idx in self.segmentation_annotations:
+                        self.segmentation_annotations[idx] = [
+                            s for s in self.segmentation_annotations.get(idx, [])
+                            if 'confidence' not in s]
+                    for result in results:
+                        masks = getattr(result, 'masks', None)
+                        boxes = getattr(result, 'boxes', None)
+                        if masks is None or boxes is None:
+                            continue
+                        bd = boxes.data.cpu().numpy()
+                        classes = [result.names[int(d[5])] if int(d[5]) in result.names
+                                   else f"class_{int(d[5])}" for d in bd]
+                        confs = [float(d[4]) for d in bd]
+                        segs = masks_to_segments(masks.data.cpu().numpy(),
+                                                 classes, confs, class_map, conf,
+                                                 ego_region=DEFAULT_EGO_REGION)
+                        for s in segs:
+                            self.segmentation_annotations.setdefault(idx, []).append(s)
+                            added += 1
+                if added:
+                    n_frames += 1
+                    n_items += added
+            except Exception as e:
+                print(f"auto_annotate idx={idx}: {e}")
+        progress.setValue(len(indices))
+        self.main_image_view.update()
+        QMessageBox.information(
+            self, get_text('yolo_auto_annot_title'),
+            get_text('yolo_auto_annot_result', n_items, n_frames))
+
     def run_single_yolo_inference(self):
         """現在表示中の画像に対してYOLO推論を実行"""
         if not self.images or not hasattr(self, 'yolo_model'):
@@ -14795,40 +17792,19 @@ class ImageAnnotationTool(QMainWindow):
             if current_index in self.detection_inference_results:
                 del self.detection_inference_results[current_index]
             
-            # 検出結果を保存
-            bboxes = []
-            
-            # 画像サイズを取得
+            # 検出結果を保存（dets_to_bboxes を共有。自車領域は除外）
             img = Image.open(current_img_path)
             img_width, img_height = img.size
-            
+            bboxes = []
             for result in results:
-                for det in result.boxes.data.cpu().numpy():
-                    if len(det) >= 6:  # x1, y1, x2, y2, confidence, class_id
-                        x1, y1, x2, y2, conf, class_id = det[:6]
-                        
-                        # 画像サイズで正規化（0-1の範囲に）
-                        x1_norm = x1 / img_width
-                        y1_norm = y1 / img_height
-                        x2_norm = x2 / img_width
-                        y2_norm = y2 / img_height
-                        
-                        # クラス名を取得
-                        class_id = int(class_id)
-                        class_name = result.names[class_id] if class_id in result.names else f"class_{class_id}"
-                        
-                        # バウンディングボックスを追加
-                        bbox = {
-                            'x1': x1_norm,
-                            'y1': y1_norm,
-                            'x2': x2_norm,
-                            'y2': y2_norm,
-                            'class': class_name,
-                            'confidence': float(conf)
-                        }
-                        
-                        bboxes.append(bbox)
-            
+                boxes = getattr(result, 'boxes', None)
+                if boxes is None:
+                    continue
+                bboxes.extend(dets_to_bboxes(
+                    boxes.data.cpu().numpy(), result.names,
+                    (img_width, img_height), class_map=None, conf_min=0.0,
+                    ego_region=DEFAULT_EGO_REGION))
+
             # 推論結果を保存（インデックスベース）
             if bboxes:
                 self.detection_inference_results[current_index] = bboxes
@@ -15311,6 +18287,10 @@ class ImageAnnotationTool(QMainWindow):
             "COCO基本": "person,bicycle,car,motorcycle,airplane,bus,train,truck",
             "自動運転基本": "car,person,bicycle,motorcycle,truck,bus,traffic_light,stop_sign,cone",
             "ミニカー用": "car,person,sign,cone,obstacle,barrier",
+            # ② TogiVAD 他車動き予測(agent motion)の GT 用。相手車を opponent で、
+            # 静的障害物を obstacle で矩形アノテーションする。box→ego 投影＋追跡で
+            # togivad/agents（他車の ego 位置＋将来軌道）に変換して②の学習に使う。
+            "TogiVAD他車(E2E)": "opponent,obstacle",
             "屋内ロボット": "person,chair,table,laptop,cell_phone,book,bottle,cup",
             "建設現場": "person,truck,excavator,cone,barrier,hard_hat,safety_vest",
         }
@@ -15624,6 +18604,31 @@ class ImageAnnotationTool(QMainWindow):
         
         layout.addWidget(font_group)
 
+        # キャンバス表示倍率（画像/結合画像/測距図をキャンバスにフィットさせた
+        # 大きさに対する割合。100% = キャンバスいっぱい）
+        scale_group = QGroupBox(get_text('section_canvas_scale'))
+        scale_layout = QVBoxLayout(scale_group)
+        scale_row = QHBoxLayout()
+        scale_row.addWidget(QLabel(get_text('label_canvas_scale')))
+        self.canvas_scale_slider = QSlider(Qt.Horizontal)
+        self.canvas_scale_slider.setRange(30, 100)
+        self.canvas_scale_slider.setSingleStep(5)
+        self.canvas_scale_slider.setTickPosition(QSlider.TicksBelow)
+        self.canvas_scale_slider.setTickInterval(10)
+        cur_pct = int(round(float(getattr(self.main_image_view, 'canvas_scale', 1.0)) * 100))
+        self.canvas_scale_slider.setValue(max(30, min(100, cur_pct)))
+        self.canvas_scale_value_label = QLabel(f"{self.canvas_scale_slider.value()}%")
+        self.canvas_scale_slider.valueChanged.connect(
+            lambda v: self.canvas_scale_value_label.setText(f"{v}%"))
+        scale_row.addWidget(self.canvas_scale_slider)
+        scale_row.addWidget(self.canvas_scale_value_label)
+        scale_layout.addLayout(scale_row)
+        scale_hint = QLabel(get_text('tip_canvas_scale'))
+        set_text_role(scale_hint, 'muted')
+        scale_hint.setWordWrap(True)
+        scale_layout.addWidget(scale_hint)
+        layout.addWidget(scale_group)
+
         # ダークモード設定
         self.dark_mode_check = QCheckBox(get_text('dark_mode'))
         self.dark_mode_check.setChecked(getattr(self, 'is_dark_mode', False))
@@ -15679,7 +18684,15 @@ class ImageAnnotationTool(QMainWindow):
         
         # すべての子ウィジェットにフォントを適用
         self.apply_font_to_children(self, font)
-        
+
+        # 群のタイトル余白はフォント高依存なので貼り直す
+        self._refresh_panel_group_styles()
+
+        # キャンバス表示倍率
+        if hasattr(self, 'canvas_scale_slider') and hasattr(self, 'main_image_view'):
+            self.main_image_view.canvas_scale = self.canvas_scale_slider.value() / 100.0
+            self.main_image_view.update()
+
         # 設定を保存
         if self.save_settings_check.isChecked():
             self.save_display_settings(new_width, new_height, new_font_size, self.is_dark_mode)
@@ -15715,6 +18728,9 @@ class ImageAnnotationTool(QMainWindow):
             settings["dark_mode"] = dark_mode
         elif hasattr(self, 'is_dark_mode'):
             settings["dark_mode"] = self.is_dark_mode
+        if hasattr(self, 'main_image_view'):
+            settings["canvas_scale"] = int(round(
+                float(getattr(self.main_image_view, 'canvas_scale', 1.0)) * 100))
             
         try:
             with open(settings_path, 'w', encoding='utf-8') as f:
@@ -15742,10 +18758,16 @@ class ImageAnnotationTool(QMainWindow):
                     self.setFont(font)
                     self.apply_font_to_children(self, font)
                 
-                # ダークモード設定を適用
+                # ダークモード設定（適用は呼び出し元の __init__ でまとめて行う）
                 if "dark_mode" in settings:
                     self.is_dark_mode = settings["dark_mode"]
-                    self.apply_dark_mode(self.is_dark_mode)
+
+                # キャンバス表示倍率（%）。main_image_view 生成前なら保留して後で適用
+                if "canvas_scale" in settings:
+                    pct = max(30, min(100, int(settings["canvas_scale"])))
+                    self._pending_canvas_scale = pct / 100.0
+                    if hasattr(self, 'main_image_view'):
+                        self.main_image_view.canvas_scale = pct / 100.0
                     
             except Exception as e:
                 print(f"表示設定の読み込みエラー: {e}")
@@ -15827,17 +18849,21 @@ class ImageAnnotationTool(QMainWindow):
 
         if backend_info["type"] == "databricks+local":
             self.databricks_status_label.setText(get_text('label_databricks_combined'))
-            self.databricks_status_label.setStyleSheet("color: green; font-size: 10px;")
+            self.databricks_status_label.setStyleSheet("font-size: 10px;")
+            set_text_role(self.databricks_status_label, 'success')
         elif backend_info["type"] == "databricks":
             if backend_info["status"] == get_text('status_disconnected'):
                 self.databricks_status_label.setText(get_text('label_databricks_disconnected'))
-                self.databricks_status_label.setStyleSheet("color: orange; font-size: 10px;")
+                self.databricks_status_label.setStyleSheet("font-size: 10px;")
+                set_text_role(self.databricks_status_label, 'warning')
             else:
                 self.databricks_status_label.setText(f"✓ Databricks: {backend_info['host'][:30]}...")
-                self.databricks_status_label.setStyleSheet("color: green; font-size: 10px;")
+                self.databricks_status_label.setStyleSheet("font-size: 10px;")
+                set_text_role(self.databricks_status_label, 'success')
         else:
             self.databricks_status_label.setText(get_text('label_local_mlflow'))
-            self.databricks_status_label.setStyleSheet("color: gray; font-size: 10px;")
+            self.databricks_status_label.setStyleSheet("font-size: 10px;")
+            set_text_role(self.databricks_status_label, 'faint')
 
     def _open_local_mlflow_ui(self):
         """ローカルMLflow UIを開く"""
@@ -15895,25 +18921,55 @@ class ImageAnnotationTool(QMainWindow):
             )
 
     def _ensure_databricks_enabled(self):
-        """Databricks連携が無効なら有効化を提案し、有効化する。成功でTrue、キャンセルでFalse"""
-        if self.mlflow_manager.use_databricks:
+        """Databricks連携を有効化し、SDK接続を確立する。成功でTrue、失敗/キャンセルでFalse
+
+        初回の転送・学習からでも接続できるよう、MLflow接続の前にまずSDK接続
+        （接続テスト相当）を確立してトークンをキャッシュする。OAuthの場合は
+        ここでブラウザ認証が走る。
+        """
+        # 既に有効かつ接続済みなら何もしない
+        if self.mlflow_manager.use_databricks and \
+                self.mlflow_manager._databricks_connected:
             return True
 
-        reply = QMessageBox.question(
-            self,
-            get_text('dlg_databricks_not_enabled'),
-            get_text('msg_databricks_enable_confirm'),
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes
-        )
-        if reply != QMessageBox.Yes:
+        # 未有効なら有効化を確認
+        if not self.mlflow_manager.use_databricks:
+            reply = QMessageBox.question(
+                self,
+                get_text('dlg_databricks_not_enabled'),
+                get_text('msg_databricks_enable_confirm'),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+            if reply != QMessageBox.Yes:
+                return False
+
+        # 1. SDK接続を先に確立（OAuthはブラウザ認証→トークンキャッシュ、PATは検証）
+        self.statusBar().showMessage(get_text('db_connecting'), 0)
+        QApplication.processEvents()
+        try:
+            ok, message = DatabricksTransferManager().test_connection()
+        except Exception as e:
+            ok, message = False, str(e)
+        self.statusBar().clearMessage()
+        if not ok:
+            QMessageBox.warning(
+                self,
+                get_text('dlg_databricks_connection_failed'),
+                get_text('db_connect_failed', message))
             return False
 
-        # Databricks連携を有効化
-        self.databricks_checkbox.setChecked(True)
-        # _on_databricks_toggle が接続を試みる。失敗時はチェックが外される
+        # 2. MLflowモードを有効化（トークンキャッシュ済みなので接続成功する）
         if not self.mlflow_manager.use_databricks:
-            return False
+            # _on_databricks_toggle が MLflow 接続を行う（失敗時はチェックが外れる）
+            self.databricks_checkbox.setChecked(True)
+            if not self.mlflow_manager.use_databricks:
+                return False
+        elif not self.mlflow_manager._databricks_connected:
+            self.mlflow_manager.is_initialized = False
+            self.mlflow_manager.initialize(
+                self.mlflow_manager.folder_path, parent_widget=self)
+            self._update_databricks_status_label()
         return True
 
     def _open_databricks_ui(self):
@@ -15980,7 +19036,7 @@ class ImageAnnotationTool(QMainWindow):
         status_layout.addWidget(QLabel(get_text('label_unsynced_runs', sync_status['unsynced_runs'])))
         if orphaned_count > 0:
             orphaned_label = QLabel(get_text('label_orphaned_runs', orphaned_count))
-            orphaned_label.setStyleSheet("color: orange;")
+            set_text_role(orphaned_label, 'warning')
             status_layout.addWidget(orphaned_label)
         status_group.setLayout(status_layout)
         layout.addWidget(status_group)
@@ -16005,7 +19061,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # 警告ラベル
         warning_label = QLabel(get_text('msg_sync_delete_warning'))
-        warning_label.setStyleSheet("color: red; font-size: 10px;")
+        warning_label.setStyleSheet("font-size: 10px;")
+        set_text_role(warning_label, 'error')
         options_layout.addWidget(warning_label)
 
         options_group.setLayout(options_layout)
@@ -16213,6 +19270,39 @@ class ImageAnnotationTool(QMainWindow):
         compute_combo.setCurrentIndex(1 if cluster_id_cur else 0)
         train_form.addRow(get_text('db_field_compute'), compute_combo)
 
+        # サーバーレス環境（アクセラレータ/環境バージョン/GPUベース環境）
+        # ノートブックに紐づく環境を上書きし、GPU/CPU不整合を回避する
+        accel_combo = QComboBox()
+        accel_combo.addItem(get_text('db_accel_cpu'), 'cpu')
+        accel_combo.addItem(get_text('db_accel_gpu'), 'gpu')
+        accel_label = QLabel(get_text('db_field_accelerator'))
+        train_form.addRow(accel_label, accel_combo)
+
+        env_version_edit = QLineEdit("2")
+        env_version_edit.setToolTip(get_text('db_tip_env_version'))
+        env_version_label = QLabel(get_text('db_field_env_version'))
+        train_form.addRow(env_version_label, env_version_edit)
+
+        base_env_edit = QLineEdit()
+        base_env_edit.setPlaceholderText(get_text('db_base_env_placeholder'))
+        base_env_edit.setToolTip(get_text('db_tip_base_env'))
+        base_env_label = QLabel(get_text('db_field_base_env'))
+        train_form.addRow(base_env_label, base_env_edit)
+
+        def _on_compute_or_accel_changed():
+            is_serverless = compute_combo.currentData() == 'serverless'
+            is_gpu = accel_combo.currentData() == 'gpu'
+            # サーバーレス時のみ環境指定を表示
+            for w in (accel_label, accel_combo,
+                      env_version_label, env_version_edit):
+                w.setVisible(is_serverless)
+            # GPUベース環境名はサーバーレス＋GPU時のみ
+            base_env_label.setVisible(is_serverless and is_gpu)
+            base_env_edit.setVisible(is_serverless and is_gpu)
+        compute_combo.currentIndexChanged.connect(_on_compute_or_accel_changed)
+        accel_combo.currentIndexChanged.connect(_on_compute_or_accel_changed)
+        _on_compute_or_accel_changed()
+
         deploy_checkbox = QCheckBox(get_text('db_chk_deploy_notebooks'))
         deploy_checkbox.setChecked(True)
         deploy_checkbox.setToolTip(get_text('db_tip_deploy'))
@@ -16275,6 +19365,11 @@ class ImageAnnotationTool(QMainWindow):
             QMessageBox.warning(self, get_text('dlg_transfer_confirm'),
                                 get_text('tip_auto_train_cluster_required'))
             return
+        # サーバーレス環境の指定（GPU/CPU不整合の回避）
+        serverless_env_version = env_version_edit.text().strip() if use_serverless else ""
+        serverless_base_environment = (
+            base_env_edit.text().strip()
+            if use_serverless and accel_combo.currentData() == 'gpu' else "")
         train_model_type = model_combo.currentData()
         train_params = {
             "epochs": epochs_spin.value(),
@@ -16414,6 +19509,8 @@ class ImageAnnotationTool(QMainWindow):
                             model_type=train_model_type,
                             train_params=train_params,
                             use_serverless=use_serverless,
+                            serverless_env_version=serverless_env_version,
+                            serverless_base_environment=serverless_base_environment,
                         )
                         # ジョブ監視ダイアログを起動（完了時にモデル取込を案内）
                         self._monitor_databricks_run(
@@ -16472,7 +19569,8 @@ class ImageAnnotationTool(QMainWindow):
 
         hint_label = QLabel(get_text('db_monitor_hint'))
         hint_label.setWordWrap(True)
-        hint_label.setStyleSheet("color: gray; font-size: 11px;")
+        hint_label.setStyleSheet("font-size: 11px;")
+        set_text_role(hint_label, 'faint')
         v.addWidget(hint_label)
 
         btn_row = QHBoxLayout()
@@ -16922,7 +20020,8 @@ class ImageAnnotationTool(QMainWindow):
 
         oauth_hint = QLabel(get_text('db_auth_oauth_hint'))
         oauth_hint.setWordWrap(True)
-        oauth_hint.setStyleSheet("color: gray; font-size: 11px;")
+        oauth_hint.setStyleSheet("font-size: 11px;")
+        set_text_role(oauth_hint, 'faint')
         form.addRow("", oauth_hint)
 
         def _on_auth_changed():
@@ -16971,7 +20070,7 @@ class ImageAnnotationTool(QMainWindow):
 
         def set_msg(text, color="gray"):
             msg_label.setText(text)
-            msg_label.setStyleSheet(f"color: {color};")
+            set_text_role(msg_label, {'green': 'success', 'red': 'error'}.get(color, 'faint'))
             QApplication.processEvents()
 
         def gather():
@@ -17146,16 +20245,16 @@ class ImageAnnotationTool(QMainWindow):
             if status['enabled']:
                 if status.get('authenticated'):
                     self.colab_status_label.setText(get_text('label_colab_authenticated'))
-                    self.colab_status_label.setStyleSheet("color: green;")
+                    set_text_role(self.colab_status_label, 'success')
                 else:
                     self.colab_status_label.setText(get_text('label_colab_not_authenticated'))
-                    self.colab_status_label.setStyleSheet("color: orange;")
+                    set_text_role(self.colab_status_label, 'warning')
             else:
                 self.colab_status_label.setText(get_text('label_colab_disabled'))
-                self.colab_status_label.setStyleSheet("color: gray;")
+                set_text_role(self.colab_status_label, 'faint')
         except ImportError:
             self.colab_status_label.setText(get_text('label_colab_no_config'))
-            self.colab_status_label.setStyleSheet("color: red;")
+            set_text_role(self.colab_status_label, 'error')
 
     def _open_colab_ui(self):
         """Google Colabを開く"""
@@ -17245,7 +20344,8 @@ class ImageAnnotationTool(QMainWindow):
             "注意: 初回転送時はGoogleアカウントの認証が必要です。\n"
             "ブラウザが開きますので、アカウントを選択して認証してください。"
         )
-        note_label.setStyleSheet("color: gray; font-size: 10px;")
+        note_label.setStyleSheet("font-size: 10px;")
+        set_text_role(note_label, 'faint')
         note_label.setWordWrap(True)
         layout.addWidget(note_label)
 
@@ -18146,115 +21246,41 @@ class ImageAnnotationTool(QMainWindow):
             )
 
     def apply_dark_mode(self, is_dark):
-        """ダークモードのスタイルシートを適用"""
-        if is_dark:
-            # ダークモードのスタイル（色のみ変更、padding/borderはデフォルト維持）
-            dark_style = """
-            QMainWindow {
-                background-color: #2b2b2b;
-                color: #ffffff;
-            }
-            QWidget {
-                background-color: #2b2b2b;
-                color: #ffffff;
-            }
-            QPushButton {
-                background-color: #404040;
-                color: #ffffff;
-            }
-            QPushButton:hover {
-                background-color: #505050;
-            }
-            QPushButton:pressed {
-                background-color: #606060;
-            }
-            QPushButton:checked {
-                background-color: #0078d4;
-            }
-            QLabel {
-                background-color: transparent;
-                color: #ffffff;
-            }
-            QLineEdit {
-                background-color: #404040;
-                color: #ffffff;
-            }
-            QComboBox {
-                background-color: #404040;
-                color: #ffffff;
-            }
-            QComboBox QAbstractItemView {
-                background-color: #404040;
-                selection-background-color: #0078d4;
-                color: #ffffff;
-            }
-            QScrollArea {
-                background-color: #2b2b2b;
-            }
-            QGroupBox {
-                color: #ffffff;
-            }
-            QGroupBox::title {
-                color: #ffffff;
-            }
-            QSpinBox {
-                background-color: #404040;
-                color: #ffffff;
-            }
-            QDialog {
-                background-color: #2b2b2b;
-                color: #ffffff;
-            }
-            QTabWidget::pane {
-                background-color: #2b2b2b;
-            }
-            QTabBar::tab {
-                background-color: #404040;
-                color: #ffffff;
-            }
-            QTabBar::tab:selected {
-                background-color: #0078d4;
-            }
-            """
-            # 現在のウィンドウサイズを保持
-            current_size = self.size()
+        """ダーク/ライトモードをアプリ全体に適用する。
 
-            self.setStyleSheet(dark_style)
+        色は styles.apply_app_theme() のアプリ全体QSSで決まる。個々のウィジェットは
+        固定色を持たず役割（set_text_role 等）だけを持つので、貼り直すだけで追従する。
+        作成時にモードを見て色を決めている位置ボタンだけは作り直す。
+        """
+        current_size = self.size()
+        apply_app_theme(is_dark)
+        if hasattr(self, 'update_location_button_counts'):
+            self.update_location_button_counts()
+        # ウィンドウサイズを維持
+        self.resize(current_size)
 
-            # ラベルの色を明示的に更新
-            if hasattr(self, 'idx_label'):
-                self.idx_label.update()
-            if hasattr(self, 'current_image_label'):
-                self.current_image_label.update()
-            if hasattr(self, 'current_image_info'):
-                self.current_image_info.setStyleSheet("color: #ffffff; font-weight: bold;")
-            if hasattr(self, 'graph_title'):
-                self.graph_title.setStyleSheet("font-weight: bold; color: #ffffff;")
+    def _schedule_fixed_class_advance(self):
+        """「クラス固定で次に進む」の自動送りを予約する。
 
-            # ウィンドウサイズを維持
-            self.resize(current_size)
-        else:
-            # ライトモードのスタイル（デフォルト）
-            # 現在のウィンドウサイズを保持
-            current_size = self.size()
+        1フレームに複数のアノテーションを追加しても送りは1回だけにする。
+        """
+        if getattr(self, '_fixed_advance_pending', False):
+            return
+        self._fixed_advance_pending = True
+        skip = self.skip_count_spin.value()
 
-            self.setStyleSheet("")
+        def _advance():
+            self._fixed_advance_pending = False
+            self.skip_images(skip)
 
-            # ラベルの色を明示的に更新
-            if hasattr(self, 'idx_label'):
-                self.idx_label.update()
-            if hasattr(self, 'current_image_label'):
-                self.current_image_label.update()
-            if hasattr(self, 'current_image_info'):
-                self.current_image_info.setStyleSheet("color: #333333; font-weight: bold;")
-            if hasattr(self, 'graph_title'):
-                self.graph_title.setStyleSheet("font-weight: bold; color: #333333;")
+        QTimer.singleShot(80, _advance)
 
-            # ウィンドウサイズを維持
-            self.resize(current_size)
+    def add_bbox_annotation(self, bbox, advance=True):
+        """バウンディングボックスアノテーションを追加
 
-    def add_bbox_annotation(self, bbox):
-        """バウンディングボックスアノテーションを追加"""
+        advance=False は自動適用など、ユーザー操作でない追加に使う。
+        （自動適用でも送ってしまうと「送る→自動適用→また送る」で暴走する）
+        """
         if not self.images:
             return
         
@@ -18282,10 +21308,11 @@ class ImageAnnotationTool(QMainWindow):
         self.main_image_view.update()
         self.update_gallery()
 
+        self.update_source_annotation_summary()
+
         # クラス固定で次に進む
-        if getattr(self, '_bbox_fixed_class_advance', False):
-            skip = self.skip_count_spin.value()
-            QTimer.singleShot(80, lambda: self.skip_images(skip))
+        if advance and getattr(self, '_bbox_fixed_class_advance', False):
+            self._schedule_fixed_class_advance()
 
     def add_session_check_to_init_ui(self):
         """init_uiメソッドの最後に追加する初期セッション確認コード"""
@@ -18298,14 +21325,20 @@ class ImageAnnotationTool(QMainWindow):
         session_info = self.load_session_info()
         self._pending_session_info = session_info  # モデル復元のために保持
 
-        # max_speedの復元
-        if session_info and "max_speed" in session_info:
-            self.main_image_view.max_speed = session_info["max_speed"]
+        # max_speed は config.MAX_SPEED を唯一の設定元とする（セッションからは復元しない）
+
+        # マスクの復元（旧形式の vehicle_mask / background_mask も読み込む）
+        if session_info:
+            self._restore_masks_from_session(session_info)
 
         # 検知クラスの復元
         if session_info and "detection_classes" in session_info and session_info["detection_classes"]:
             if hasattr(self, 'classes_input'):
                 self.classes_input.setText(session_info["detection_classes"])
+
+        # 位置クラス情報（プリセット）の復元
+        if session_info and session_info.get("location_classes"):
+            self.restore_location_classes(session_info["location_classes"])
 
         # 複数フォルダを優先的に使用
         has_folders = False
@@ -18555,6 +21588,66 @@ class ImageAnnotationTool(QMainWindow):
             f"\n{marked_as_deleted_count}個の画像を削除済みとしてマークしました。"
             f"\nアノテーションデータは保持されています。"
             f"\n\n削除済みインデックスの合計数: {len(self.deleted_indexes)}"
+        )
+
+    def delete_reverse_frames(self):
+        """後進時（throttleが負）のフレームを削除済みとしてマークする"""
+        if not self.images:
+            return
+
+        if not self.annotations:
+            QMessageBox.warning(self, "警告", "アノテーションが読み込まれていません。")
+            return
+
+        # throttleが負の未削除フレームを検出
+        deleted_set = set(self.deleted_indexes)
+        target_indexes = [
+            idx for idx, ann in self.annotations.items()
+            if isinstance(idx, int) and 0 <= idx < len(self.images)
+            and ann.get('throttle', 0.0) < 0
+            and idx not in deleted_set
+        ]
+
+        if not target_indexes:
+            QMessageBox.information(
+                self,
+                "後進フレーム削除",
+                "throttleが負（後進）の未削除フレームは見つかりませんでした。"
+            )
+            return
+
+        # 確認ダイアログ
+        reply = QMessageBox.question(
+            self,
+            "後進フレーム削除確認",
+            f"throttleが負（後進）のフレーム {len(target_indexes)}個を"
+            f"\n削除済みとしてマークします。"
+            f"\n\nこの操作は「全フレームを復元」ボタンで元に戻せます。続行しますか？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply == QMessageBox.No:
+            return
+
+        # 削除したインデックスを記録してソート・重複排除
+        self.deleted_indexes.extend(target_indexes)
+        self.deleted_indexes = sorted(set(self.deleted_indexes))
+
+        # UI更新 - 重い処理は遅延実行
+        self.display_current_image()
+        self._schedule_gallery_update()  # 遅延更新
+        if hasattr(self, 'update_location_button_counts'):
+            self.update_location_button_counts()
+        self._schedule_distribution_graph_update()  # 遅延更新
+        self.update_slider_deleted_indexes()
+
+        QMessageBox.information(
+            self,
+            "後進フレーム削除完了",
+            f"{len(target_indexes)}個の後進フレームを削除済みとしてマークしました。"
+            f"\nアノテーションデータは保持されています。"
+            f"\n\n削除済みインデックス数: {len(self.deleted_indexes)}"
         )
 
     def detect_downsampling_targets(self):
@@ -18951,30 +22044,382 @@ class ImageAnnotationTool(QMainWindow):
                     button.setText("⏵")
 
     def _update_canvas_zoom_slider_max(self):
-        """画像がキャンバスからはみ出ない最大ズーム値を計算してスライダーに設定"""
-        if not hasattr(self, 'main_image_view') or not self.main_image_view.pixmap():
-            return
-        pix_w = self.main_image_view.pixmap().width()
-        pix_h = self.main_image_view.pixmap().height()
-        canvas_w = self.main_image_view.width()
-        canvas_h = self.main_image_view.height()
-        if pix_w <= 0 or pix_h <= 0:
-            return
-        max_zoom = min(canvas_w / pix_w, canvas_h / pix_h)
-        max_slider = max(10, int(max_zoom * 10))  # 最低1.0x
-        self.canvas_zoom_slider.blockSignals(True)
-        self.canvas_zoom_slider.setMaximum(max_slider)
-        # 現在値が最大値を超えている場合はクランプ
-        if self.canvas_zoom_slider.value() > max_slider:
-            self.canvas_zoom_slider.setValue(max_slider)
-            self.main_image_view.zoom_factor = max_slider / 10.0
-        self.canvas_zoom_slider.blockSignals(False)
+        """（互換のため残置）画像は常にフィット表示なのでズーム上限の調整は不要。"""
+        return
+
+    def toggle_grid_visible(self, checked):
+        """グリッド表示の ON/OFF（画像ソース・測距ソース共通）"""
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.show_grid = bool(checked)
+            self.main_image_view.update()
+
+    def _update_zoom_slider_visibility(self):
+        """レンジスライダーは測距ソースのときだけ表示する。"""
+        show = (getattr(self, 'current_variant', None) == '__lidar__')
+        for w in (getattr(self, 'zoom_slider_label', None),
+                  getattr(self, 'canvas_zoom_slider', None)):
+            if w is not None:
+                w.setVisible(show)
 
     def _on_canvas_zoom_changed(self, value):
-        """キャンバスズームスライダーの値が変更されたときの処理"""
-        zoom = value / 10.0
-        self.main_image_view.zoom_factor = zoom
-        self.main_image_view.update()
+        """レンジスライダー（測距ソース専用）: 上=拡大=レンジ縮小（×1.0〜×1/5）。"""
+        self.lidar_view_zoom = max(0.2, value / 10.0)
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    # ------------------------------------------------------------------
+    # マスク（指定領域を学習・推論入力から無視するポリゴン）
+    # 先頭2つ（車両・背景）は組み込み。プルダウンから任意個を追加できる。
+    # ------------------------------------------------------------------
+    def mask_display_name(self, mask):
+        """マスクの表示名（組み込みマスクは言語設定に追従させるため都度解決する）"""
+        if mask.get('name'):
+            return mask['name']
+        return get_text('opt_mask_target_background' if mask['id'] == 'background'
+                        else 'opt_mask_target_vehicle')
+
+    def current_mask_index(self):
+        """プルダウンで選択中のマスクindex（範囲外なら0に丸める）"""
+        if not self.masks:
+            return 0
+        return min(max(0, self._mask_target_index), len(self.masks) - 1)
+
+    def editing_mask(self):
+        """編集中のマスクdict（非編集ならNone）"""
+        i = self.mask_edit_index
+        if i is None or not (0 <= i < len(self.masks)):
+            return None
+        return self.masks[i]
+
+    def get_mask_polygon(self, index):
+        """マスクの閉ポリゴンを正規化座標で返す（頂点不足ならNone）
+
+        symmetric=True の場合はユーザー頂点＋中央線に対する鏡像で左右対称に閉じる。
+        """
+        if not (0 <= index < len(self.masks)):
+            return None
+        mask = self.masks[index]
+        pts = mask['points']
+        if mask.get('symmetric', True):
+            if len(pts) < 2:
+                return None
+            return list(pts) + [(1.0 - x, y) for x, y in reversed(pts)]
+        if len(pts) < 3:
+            return None
+        return list(pts)
+
+    def get_mask_polygons_with_names(self):
+        """ポリゴンが成立している全マスクを [(index, 表示名, polygon), ...] で返す"""
+        result = []
+        for i, mask in enumerate(self.masks):
+            polygon = self.get_mask_polygon(i)
+            if polygon:
+                result.append((i, self.mask_display_name(mask), polygon))
+        return result
+
+    def get_vehicle_mask_bbox(self):
+        """車両マスクポリゴンの外接矩形を正規化座標 (x, y, w, h) で返す（未設定時None）
+
+        画像埋込の「車両マスク位置」モードで埋込領域として使用する。
+        """
+        polygon = None
+        for i, mask in enumerate(self.masks):
+            if mask['id'] == 'vehicle':
+                polygon = self.get_mask_polygon(i)
+                break
+        if not polygon:
+            return None
+        xs = [p[0] for p in polygon]
+        ys = [p[1] for p in polygon]
+        x0, y0 = min(xs), min(ys)
+        w, h = max(xs) - x0, max(ys) - y0
+        if w <= 0 or h <= 0:
+            return None
+        return [round(x0, 4), round(y0, 4), round(w, 4), round(h, 4)]
+
+    def _restore_masks_from_session(self, session_info):
+        """セッションからマスク定義を復元する（旧形式の単独キーにも対応）"""
+        saved = session_info.get("masks")
+        if saved:
+            restored = []
+            for entry in saved:
+                mask_id = entry.get('id')
+                if not mask_id:
+                    continue
+                restored.append({
+                    'id': mask_id,
+                    'name': entry.get('name'),
+                    'points': [tuple(p) for p in entry.get('points', [])],
+                    'visible': entry.get('visible', True),
+                    'symmetric': entry.get('symmetric', True),
+                })
+            # 組み込みマスクは常に先頭2つとして存在させる
+            for pos, builtin_id in enumerate(BUILTIN_MASK_IDS):
+                if not any(m['id'] == builtin_id for m in restored):
+                    restored.insert(pos, {'id': builtin_id, 'name': None, 'points': [],
+                                          'visible': True, 'symmetric': True})
+            self.masks = restored
+        else:
+            for mask in self.masks:
+                legacy = session_info.get(f"{mask['id']}_mask")
+                if legacy:
+                    mask['points'] = [tuple(p) for p in legacy]
+
+        if hasattr(self, 'mask_target_combo'):
+            self._rebuild_mask_target_combo(select_index=0)
+
+    # --- プルダウン（対象選択 / 新規追加 / 削除） ---
+    def _rebuild_mask_target_combo(self, select_index=None):
+        """マスク一覧＋「新規追加」「削除」項目でプルダウンを作り直す"""
+        if select_index is not None:
+            self._mask_target_index = select_index
+        target = self.current_mask_index()
+
+        self._mask_combo_updating = True
+        try:
+            self.mask_target_combo.clear()
+            for i, mask in enumerate(self.masks):
+                self.mask_target_combo.addItem(self.mask_display_name(mask), i)
+            self.mask_target_combo.insertSeparator(self.mask_target_combo.count())
+            self.mask_target_combo.addItem(get_text('opt_mask_add'), '__add__')
+            self.mask_target_combo.addItem(get_text('opt_mask_delete'), '__delete__')
+            self.mask_target_combo.setCurrentIndex(target)
+        finally:
+            self._mask_combo_updating = False
+
+        self._sync_mask_controls()
+
+    def _sync_mask_controls(self):
+        """選択中マスクに合わせて表示チェック・ツールチップ・削除項目の有効/無効を更新"""
+        if not self.masks:
+            return
+        mask = self.masks[self.current_mask_index()]
+
+        self.mask_visible_checkbox.blockSignals(True)
+        self.mask_visible_checkbox.setChecked(mask.get('visible', True))
+        self.mask_visible_checkbox.blockSignals(False)
+
+        self.mask_edit_button.setToolTip(
+            get_text('tip_mask_edit_named', self.mask_display_name(mask)))
+
+        # 組み込みマスクは削除不可なので「削除」項目をグレーアウトする
+        model = self.mask_target_combo.model()
+        delete_row = self.mask_target_combo.findData('__delete__')
+        if delete_row >= 0 and hasattr(model, 'item'):
+            model.item(delete_row).setEnabled(mask['id'] not in BUILTIN_MASK_IDS)
+
+    def _on_mask_target_changed(self):
+        """プルダウン選択の変更（対象切替 / 新規追加 / 削除）"""
+        if self._mask_combo_updating:
+            return
+        data = self.mask_target_combo.currentData()
+        # 追加・削除はモーダルダイアログを開くため、コンボのシグナル処理を抜けてから実行する
+        if data == '__add__':
+            QTimer.singleShot(0, self._add_new_mask)
+        elif data == '__delete__':
+            QTimer.singleShot(0, self._delete_current_mask)
+        elif isinstance(data, int):
+            self._mask_target_index = data
+            self._sync_mask_controls()
+
+    def _add_new_mask(self):
+        """新規マスクを追加する（名前と左右対称の有無をダイアログで入力）"""
+        name, symmetric, ok = self._prompt_new_mask()
+        if not ok:
+            self._rebuild_mask_target_combo()  # 選択を元のマスクに戻す
+            return
+
+        existing = {self.mask_display_name(m) for m in self.masks}
+        if name in existing:
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_mask_name_duplicate', name))
+            self._rebuild_mask_target_combo()
+            return
+
+        # idは既存と重複しない連番にする（セッション・チェックポイントの識別用）
+        used_ids = {m['id'] for m in self.masks}
+        n = len(self.masks)
+        while f'mask{n}' in used_ids:
+            n += 1
+        self.masks.append({'id': f'mask{n}', 'name': name, 'points': [],
+                           'visible': True, 'symmetric': symmetric})
+
+        self._rebuild_mask_target_combo(select_index=len(self.masks) - 1)
+        self.statusBar().showMessage(get_text('status_mask_added', name), 4000)
+        # 追加直後はそのまま頂点を打てるよう編集モードに入る
+        self.mask_edit_button.setChecked(True)
+
+    def _prompt_new_mask(self):
+        """新規マスクの名前と左右対称フラグを尋ねる → (name, symmetric, ok)"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle(get_text('dlg_add_mask_title'))
+        layout = QVBoxLayout(dialog)
+
+        layout.addWidget(QLabel(get_text('label_new_mask_name')))
+        name_input = QLineEdit()
+        name_input.setPlaceholderText(get_text('placeholder_new_mask_name'))
+        layout.addWidget(name_input)
+
+        symmetric_check = QCheckBox(get_text('chk_new_mask_symmetric'))
+        symmetric_check.setChecked(True)
+        symmetric_check.setToolTip(get_text('tip_new_mask_symmetric'))
+        layout.addWidget(symmetric_check)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return '', True, False
+        name = name_input.text().strip()
+        if not name:
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_mask_name_required'))
+            return '', True, False
+        return name, symmetric_check.isChecked(), True
+
+    def _delete_current_mask(self):
+        """選択中の追加マスクを削除する（組み込みマスクは削除不可）"""
+        index = self.current_mask_index()
+        mask = self.masks[index]
+        if mask['id'] in BUILTIN_MASK_IDS:
+            self.statusBar().showMessage(get_text('status_mask_builtin_undeletable'), 4000)
+            self._rebuild_mask_target_combo()
+            return
+
+        name = self.mask_display_name(mask)
+        reply = QMessageBox.question(
+            self, get_text('dlg_confirm'), get_text('msg_confirm_delete_mask', name),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            self._rebuild_mask_target_combo()
+            return
+
+        if self.mask_edit_index == index:
+            self.mask_edit_button.setChecked(False)  # 編集中なら先に解除
+        self.masks.pop(index)
+        self.mask_edit_index = None
+        self._rebuild_mask_target_combo(select_index=min(index, len(self.masks) - 1))
+        self.statusBar().showMessage(get_text('status_mask_deleted', name), 4000)
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    # --- 表示・編集 ---
+    def toggle_mask_visible(self, checked):
+        """マスクオーバーレイの表示ON/OFF切替（プルダウンで選択中のマスク）"""
+        if self.masks:
+            self.masks[self.current_mask_index()]['visible'] = checked
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def toggle_mask_edit(self, checked):
+        """マスク編集ボタンのトグル処理（選択中マスクの編集モードの開始/確定）"""
+        index = self.current_mask_index()
+
+        # 結合表示中は座標系が単一画像と一致せずズレるため編集不可
+        if checked and getattr(self, 'current_variant', None) == '__combined__':
+            self.mask_edit_button.blockSignals(True)
+            self.mask_edit_button.setChecked(False)
+            self.mask_edit_button.blockSignals(False)
+            self.statusBar().showMessage(get_text('status_mask_combined_blocked'), 4000)
+            return
+
+        # 編集中に対象が変わると確定先を取り違えるためプルダウンを固定する
+        self.mask_target_combo.setEnabled(not checked)
+        self.mask_edit_index = index if checked else None
+
+        # 編集終了時に頂点ドラッグ状態が残ると、以後のリリースを飲み込む
+        if not checked and hasattr(self, 'main_image_view'):
+            self.main_image_view._mask_drag_index = None
+            self.main_image_view._mask_drag_mirrored = False
+
+        mask = self.masks[index]
+        name = self.mask_display_name(mask)
+        points = mask['points']
+        # 左右対称マスクは2点（鏡像を足して4点）、自由形状は3点でポリゴンが成立する
+        min_points = 2 if mask.get('symmetric', True) else 3
+
+        if checked:
+            self.statusBar().showMessage(get_text('status_mask_edit_on', name))
+        elif len(points) >= min_points:
+            polygon = self.get_mask_polygon(index)
+            self.statusBar().showMessage(
+                get_text('status_mask_set', name, len(points), len(polygon)), 5000)
+        else:
+            points.clear()  # 頂点が足りずポリゴンにならないためクリア
+            self.statusBar().showMessage(get_text('status_mask_cleared', name), 3000)
+
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    # --- 頂点操作（編集中のマスクに対して行う） ---
+    @staticmethod
+    def _snap_mask_point(rel_x, rel_y, symmetric=True):
+        """マスク頂点のスナップ処理（下端・中央線付近を吸着し0-1にクランプ）"""
+        # 下端付近は画像下端にスナップ（車体マスクは下辺に接することが多いため）
+        if rel_y > 0.97:
+            rel_y = 1.0
+        # 中央線付近は中央にスナップ（鏡像と重なって対称形が閉じる）
+        if symmetric and abs(rel_x - 0.5) < 0.02:
+            rel_x = 0.5
+        return (max(0.0, min(1.0, rel_x)), max(0.0, min(1.0, rel_y)))
+
+    def add_mask_point(self, rel_x, rel_y):
+        """編集中マスクに頂点を追加する（正規化座標）"""
+        mask = self.editing_mask()
+        if mask is None:
+            return
+        mask['points'].append(self._snap_mask_point(rel_x, rel_y, mask.get('symmetric', True)))
+        self.statusBar().showMessage(
+            get_text('status_mask_point_added', self.mask_display_name(mask),
+                     len(mask['points'])), 3000)
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def move_mask_point(self, index, rel_x, rel_y):
+        """編集中マスクの指定頂点をドラッグ移動する"""
+        mask = self.editing_mask()
+        if mask is None or not (0 <= index < len(mask['points'])):
+            return
+        mask['points'][index] = self._snap_mask_point(rel_x, rel_y, mask.get('symmetric', True))
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def remove_mask_point(self, index):
+        """編集中マスクの指定頂点を削除する"""
+        mask = self.editing_mask()
+        if mask is None:
+            return
+        if 0 <= index < len(mask['points']):
+            mask['points'].pop(index)
+            self.statusBar().showMessage(
+                get_text('status_mask_point_removed', self.mask_display_name(mask),
+                         len(mask['points'])), 3000)
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def remove_last_mask_point(self):
+        """編集中マスクの直前に追加した頂点を削除する"""
+        mask = self.editing_mask()
+        if mask is None:
+            return
+        if mask['points']:
+            mask['points'].pop()
+            self.statusBar().showMessage(
+                get_text('status_mask_point_removed', self.mask_display_name(mask),
+                         len(mask['points'])), 3000)
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def clear_mask_points(self):
+        """編集中マスクの頂点を全消去する"""
+        mask = self.editing_mask()
+        if mask is None:
+            return
+        mask['points'].clear()
+        self.statusBar().showMessage(
+            get_text('status_mask_cleared', self.mask_display_name(mask)), 3000)
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
 
     def _on_resolution_scale_changed(self, value):
         """解像度スライダーの値が変更されたときの処理"""
@@ -19021,6 +22466,14 @@ class ImageAnnotationTool(QMainWindow):
 
     def slider_changed(self, value):
         """スライダーの値が変更されたときの処理"""
+        # speedグラフの現在位置マーカーとスピードゲージを更新
+        # （ゲージはpaintEvent駆動をやめたため、フレーム移動時にここで明示更新する）
+        if hasattr(self, 'speed_seek_graph'):
+            self.speed_seek_graph.update()
+        if hasattr(self, 'speed_gauge'):
+            self.speed_gauge.update()
+        # ラベル幅を総数分で固定（別経路で画像リストが変わった場合の保険。同一総数なら即return）
+        self._reserve_slider_label_width()
         if self.images and value != self.current_index:
             # waypointモードの場合、現在の画像のwaypoint数をチェック
             if not self._check_waypoint_count_before_transition():
@@ -19106,6 +22559,9 @@ class ImageAnnotationTool(QMainWindow):
         show_future = (state == Qt.Checked)
         self.main_image_view.show_future_annotations = show_future
         self.main_image_view.update()
+        # スピードゲージの将来マーカー表示も連動
+        if hasattr(self, 'speed_gauge'):
+            self.speed_gauge.update()
 
         if show_future:
             self.statusBar().showMessage(get_text('status_future_annotation_on'), 3000)
@@ -19254,11 +22710,58 @@ class ImageAnnotationTool(QMainWindow):
             traceback.print_exc()
             self.statusBar().showMessage(get_text('status_cam_error', e), 5000)
 
+    def _toggle_togivad_control_infer_display(self, state):
+        """TogiVAD の angle/throttle 推論表示トグル（自動運転モデルの推論表示
+        とは**独立**。専用ストア togivad_control_results と濃紫の推論円を使う）。
+        """
+        self.update_togivad_control_display()
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.update()
+
+    def update_togivad_control_display(self):
+        """TogiVAD の制御推論（angle/throttle）表示を更新する。
+
+        自動運転モデルの推論表示（inference_results / シアン円）とは独立の
+        専用ストア togivad_control_results を読み、専用ラベルと**濃い紫の円**
+        （main_image_view.togivad_control_point）に反映する。
+        """
+        view = getattr(self, 'main_image_view', None)
+        label = getattr(self, 'togivad_control_info_label', None)
+        cb = getattr(self, 'togivad_control_infer_checkbox', None)
+        if view is None:
+            return
+        show = cb is not None and cb.isChecked()
+        view.show_togivad_control = show
+        if show and getattr(self, '_gru_is_togivad', False):
+            # 軌道表示チェックが OFF でも angle/throttle 単独で逐次推論できる
+            # ようにここで現在フレームの推論を保証する（未推論なら実行）
+            try:
+                self._ensure_gru_current_prediction(
+                    getattr(self, 'current_index', 0))
+            except Exception:
+                pass
+        res = getattr(self, 'togivad_control_results', {}).get(
+            getattr(self, 'current_index', -1)) if show else None
+        if res is None:
+            view.togivad_control_point = None
+            if label is not None:
+                label.setText(" ")
+            return
+        view.togivad_control_point = QPoint(res['x'], res['y'])
+        if label is not None:
+            text = (f"<b>{get_text('label_togivad_control_infer')}</b><br>"
+                    f"angle = <span style='color: {theme_color('accent')};'>"
+                    f"{res['angle']:.4f}</span><br>"
+                    f"throttle = <span style='color: {theme_color('accent')};'>"
+                    f"{res['throttle']:.4f}</span>")
+            label.setText(text)
+            label.setTextFormat(Qt.RichText)
+
     def toggle_inference_display(self, state):
         """自動運転推論表示の切り替え"""
         show_inference = (state == Qt.Checked)
         self.main_image_view.show_inference = show_inference
-        
+
         # 画面更新
         #if hasattr(self, 'main_image_view'):
         self.main_image_view.update()
@@ -19291,6 +22794,23 @@ class ImageAnnotationTool(QMainWindow):
         if hasattr(self, 'model_combo'):
             self.refresh_model_list()    
     
+    def _build_pip_map(self):
+        """画像埋込モデルの推論用: 画像パス → {ソース名: パス} の対応表を構築する
+
+        image_groups（インデックス→バリアント別パス）から、どのバリアント画像を
+        ベースに推論しても埋込ソースを解決できるよう全パスをキーにする。
+        """
+        groups = getattr(self, 'image_groups', None)
+        if not groups:
+            return None
+        pip_map = {}
+        for group in groups.values():
+            if not isinstance(group, dict):
+                continue
+            for path in group.values():
+                pip_map[path] = group
+        return pip_map or None
+
     def run_inference_check(self, all_images=False):
         """推論を実行するメソッド - モデル情報表示を強化、推論実行後に推論表示をオン"""
         if not self.images:
@@ -19364,7 +22884,32 @@ class ImageAnnotationTool(QMainWindow):
             ms_config = getattr(self, '_multi_source_config', None)
             vs_config = getattr(self, '_virtual_source_config', None)
 
-            if vs_config and model_path:
+            if model_type == self.LIDAR_POLICY_MODEL_TYPE and model_path:
+                # LiDAR Policy: 点群 + 車速で推論（キーはインデックス）
+                if force_reload or getattr(self, '_lidar_policy_path', None) != model_path \
+                        or not getattr(self, '_lidar_policy', None):
+                    self._load_lidar_policy_model(model_path)
+                target_indices = (list(range(len(self.images))) if all_images
+                                  else [self.current_index])
+                inference_results = {}
+                total = len(target_indices)
+                progress = None
+                if all_images:
+                    progress = QProgressDialog(progress_title, "キャンセル", 0, 100, self)
+                    progress.setWindowModality(Qt.WindowModal)
+                    progress.show()
+                for i, idx in enumerate(target_indices):
+                    if progress is not None and i % 20 == 0:
+                        progress.setValue(int(i * 100 / max(total, 1)))
+                        QApplication.processEvents()
+                        if progress.wasCanceled():
+                            break
+                    res = self._lidar_policy_result(idx)
+                    if res is not None:
+                        inference_results[idx] = res
+                if progress is not None:
+                    progress.close()
+            elif vs_config and model_path:
                 # 仮想ソース推論 (crop/scale/temporal)
                 if all_images:
                     target_indices = list(range(len(self.images)))
@@ -19390,7 +22935,8 @@ class ImageAnnotationTool(QMainWindow):
                     model_type=model_type,
                     model_path=model_path,
                     force_reload=force_reload,
-                    downscale_factor=getattr(self.main_image_view, 'resolution_scale', 1.0)
+                    downscale_factor=getattr(self.main_image_view, 'resolution_scale', 1.0),
+                    pip_map=self._build_pip_map()
                 )
             else:
                 QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_inference_method_not_supported'))
@@ -19477,7 +23023,10 @@ class ImageAnnotationTool(QMainWindow):
             print("マルチソース推論設定がありません")
             return {}
 
-        sources = config['sources']
+        # セッション復元やデータ切替でソース名が現在のデータと食い違うことが
+        # あるため読み替える（不一致のままだと下の missing_source で全フレーム
+        # スキップされ、無言で結果が空になる）
+        sources = self._resolve_model_sources_cached(config['sources'])
         num_sources = config['num_sources']
         image_groups = getattr(self, 'image_groups', {})
         variant_images = getattr(self, 'variant_images', {})
@@ -19521,6 +23070,8 @@ class ImageAnnotationTool(QMainWindow):
                         img = Image.open(path).convert('RGB')
                         if first_img_size is None:
                             first_img_size = img.size  # (width, height)
+                        # 学習時にマスクを使ったモデルは推論時にも同じマスクを適用
+                        img = apply_masks(img, getattr(model, '_mask_polygons', None))
                         t = transform(img)
                         tensors.append(t)
 
@@ -19568,10 +23119,16 @@ class ImageAnnotationTool(QMainWindow):
 
                     if speed is not None:
                         results[idx]["speed"] = float(speed)
+                        # 学習時のspeed正規化値（m/s換算・表示位置の計算用）
+                        _speed_norm = getattr(model, '_speed_normalize', None)
+                        if _speed_norm:
+                            results[idx]["speed_normalize"] = float(_speed_norm)
 
-                    # 将来予測の出力
+                    # 将来予測の出力（フレームオフセットは学習時の設定、既定は5,10）
+                    _future_offsets = (getattr(model, '_future_offsets', None) or [5, 10])[:2]
                     if num_out >= 9:
-                        for fi, offset in enumerate([5, 10]):
+                        results[idx]["future_offsets"] = list(_future_offsets)
+                        for fi, offset in enumerate(_future_offsets):
                             base = 3 + fi * 3
                             f_angle = output_values[base]
                             f_throttle = output_values[base + 1]
@@ -19587,7 +23144,8 @@ class ImageAnnotationTool(QMainWindow):
                                 "x": f_x, "y": f_y
                             }
                     elif num_out == 6:
-                        for fi, offset in enumerate([5, 10]):
+                        results[idx]["future_offsets"] = list(_future_offsets)
+                        for fi, offset in enumerate(_future_offsets):
                             base = 2 + fi * 2
                             f_angle = output_values[base]
                             f_throttle = output_values[base + 1]
@@ -19643,6 +23201,9 @@ class ImageAnnotationTool(QMainWindow):
                     img = Image.open(img_path).convert('RGB')
                     W, H = img.size
 
+                    # 学習時にマスクを使ったモデルは推論時にも同じマスクを適用
+                    img = apply_masks(img, getattr(model, '_mask_polygons', None))
+
                     # 仮想ソース生成
                     if virtual_type == 'crop':
                         n = num_sources
@@ -19667,7 +23228,8 @@ class ImageAnnotationTool(QMainWindow):
                         source_imgs = []
                         for k in range(num_sources):
                             prev_idx = max(0, idx - k * temporal_interval)
-                            source_imgs.append(Image.open(self.images[prev_idx]).convert('RGB'))
+                            _frame = Image.open(self.images[prev_idx]).convert('RGB')
+                            source_imgs.append(apply_masks(_frame, getattr(model, '_mask_polygons', None)))
                     else:
                         source_imgs = [img] * num_sources
 
@@ -20083,13 +23645,20 @@ class ImageAnnotationTool(QMainWindow):
         """推論結果の表示を更新する"""
         if not self.images:
             return
+
+        # TogiVAD の angle/throttle 表示は独立系だが、ナビゲーション毎の
+        # 更新経路を共有する（チェック OFF/結果なしなら内部でクリアされる）
+        try:
+            self.update_togivad_control_display()
+        except Exception:
+            pass
                 
         current_index = self.current_index
         
         # 自動運転推論表示がOFFの場合は自動運転推論をクリア（GRU予測は独立処理）
         if not hasattr(self, 'inference_checkbox') or not self.inference_checkbox.isChecked():
             if hasattr(self, 'inference_info_label'):
-                self.inference_info_label.setText(" ")  # スペースで高さを維持
+                self._set_rich_text_if_changed(self.inference_info_label, " ")  # スペースで高さを維持
 
             # 推論ポイントをクリア
             if hasattr(self, 'main_image_view'):
@@ -20115,9 +23684,17 @@ class ImageAnnotationTool(QMainWindow):
 
             # 推論情報のリッチテキスト
             inference_text = f"<b>{get_text('label_inference_result_header')}</b><br>"
-            inference_text += f"angle = <span style='color: #009999;'>{angle:.4f}</span><br>"
-            inference_text += f"throttle = <span style='color: #009999;'>{throttle:.4f}</span>"
+            inference_text += f"angle = <span style='color: {theme_color('teal')};'>{angle:.4f}</span><br>"
+            inference_text += f"throttle = <span style='color: {theme_color('teal')};'>{throttle:.4f}</span>"
 
+            # 速度推論結果（正規化値と実速度[m/s]）を表示
+            infer_speed = inference.get("pilot/speed", inference.get("speed"))
+            if infer_speed is not None:
+                _snorm = inference.get('speed_normalize') or getattr(self.main_image_view, 'max_speed', MAX_SPEED)
+                inference_text += (
+                    f"<br>speed = <span style='color: {theme_color('teal')};'>{infer_speed:.4f}</span>"
+                    f" ({infer_speed * _snorm:.2f} m/s)"
+                )
 
             # 追加: 差分ベクトルの計算と表示
             if current_index in self.annotations:
@@ -20156,19 +23733,22 @@ class ImageAnnotationTool(QMainWindow):
                         f" {score:.0%}</font><br>"
                     )
 
-            # リッチテキストとして設定
-            self.inference_info_label.setText(inference_text)
-            self.inference_info_label.setTextFormat(Qt.RichText)
+            # リッチテキストとして設定（内容が変わった時だけ更新してちらつきを防ぐ）
+            self._set_rich_text_if_changed(self.inference_info_label, inference_text)
 
             # ImageLabelに推論ポイントを設定
             self.main_image_view.inference_point = QPoint(inference['x'], inference['y'])
         else:
             # 推論結果がない場合はクリア（スペースで高さを維持）
-            self.inference_info_label.setText(" ")
+            self._set_rich_text_if_changed(self.inference_info_label, " ")
             self.main_image_view.inference_point = None
         
         # 推論表示のチェック状態を反映
         self.main_image_view.show_inference = self.inference_checkbox.isChecked()
+
+        # スピードゲージの推論横線を更新（推論結果が変わった時のみ呼ばれる経路）
+        if hasattr(self, 'speed_gauge'):
+            self.speed_gauge.update()
 
         # 追加モデルの推論結果も更新
         self._update_extra_inference_info_panels()
@@ -20482,6 +24062,9 @@ class ImageAnnotationTool(QMainWindow):
                 self.current_variant = self.available_variants[0]
                 print(f"[INFO] 新しいフォルダ読み込み: '{self.current_variant}' バリアントを選択 (cam なし)")
 
+        # 画像ソース別のアノテーションストアを初期化（前フォルダの残骸を持ち越さない）
+        self.reset_source_stores(self.current_variant)
+
         # 現在のキーの画像を選択
         images = self.variant_images[self.current_variant]
         print(f"画像データのキー: {self.available_variants}")
@@ -20515,6 +24098,8 @@ class ImageAnnotationTool(QMainWindow):
         self.annotation_timestamps = {}
         self.inference_results = {}
         self.location_annotations = {}
+        # 位置推論結果もセッションと一緒に破棄（別データの結果が残らないように）
+        self.location_inference_results = {}
         self.pose_manager.reset()
 
         if hasattr(self, 'deleted_indexes'):
@@ -20529,6 +24114,9 @@ class ImageAnnotationTool(QMainWindow):
             self.image_slider.setMaximum(0)
             self.image_slider.setValue(0)
             self.slider_value_label.setText("0/0")
+
+        # データ総数分の表示幅（"6728/6728" 相当）を最初から確保する
+        self._reserve_slider_label_width()
         
         # 最終的な処理
         progress.setLabelText(get_text('msg_updating_display'))
@@ -20985,6 +24573,41 @@ class ImageAnnotationTool(QMainWindow):
             QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_selected_model_not_found', selected_model))
             return
 
+        # LiDAR Policy: 点群入力モデル。画像系の読込経路（マルチソース検出・
+        # 入力サイズ検出・batch_inference）は通らず、専用ローダで読み込んで
+        # 現フレームを推論する。
+        if model_type == self.LIDAR_POLICY_MODEL_TYPE:
+            try:
+                if self.inference_results:
+                    reply = QMessageBox.question(
+                        self, get_text('dlg_clear_inference_confirm'),
+                        get_text('msg_clear_inference_prompt', len(self.inference_results)),
+                        QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel, QMessageBox.Yes)
+                    if reply == QMessageBox.Cancel:
+                        return
+                    if reply == QMessageBox.Yes:
+                        self.inference_results = {}
+                model, cfg, meta = self._load_lidar_policy_model(model_path)
+                res = self._lidar_policy_result(self.current_index)
+                if res is not None:
+                    self.inference_results[self.current_index] = res
+                    self.calculate_and_store_diff_vector(self.current_index)
+                self._last_model_info = (model_type, model_path)
+                self.inference_checkbox.setChecked(True)
+                self.update_inference_display()
+                self.main_image_view.update()
+                self.update_gallery()
+                self.save_session_info()
+                self.statusBar().showMessage(
+                    f"LiDAR Policy を読み込みました: {os.path.basename(model_path)} "
+                    f"(preset={cfg.preset}, bins={cfg.num_bins}, K={cfg.stack_frames})", 5000)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                QMessageBox.critical(self, get_text('dlg_error'),
+                                     get_text('msg_inference_processing_error', str(e)))
+            return
+
         # マルチソースモデル検出
         from model_catalog import detect_multi_source_from_checkpoint
         ms_info = detect_multi_source_from_checkpoint(model_path, verbose=True)
@@ -21019,7 +24642,8 @@ class ImageAnnotationTool(QMainWindow):
             if ms_info['selected_sources']:
                 trained_label = QLabel(get_text('label_multi_source_trained_sources',
                                                 ', '.join(ms_info['selected_sources'])))
-                trained_label.setStyleSheet("color: #888; font-style: italic;")
+                trained_label.setStyleSheet("font-style: italic;")
+                set_text_role(trained_label, 'faint')
                 ms_layout.addWidget(trained_label)
 
             # ソース選択
@@ -21039,7 +24663,7 @@ class ImageAnnotationTool(QMainWindow):
             # 選択数の表示ラベル
             count_label = QLabel(get_text('msg_multi_source_need_sources',
                                           ms_info['num_sources'], 0))
-            count_label.setStyleSheet("color: #cc6600;")
+            set_text_role(count_label, 'warning')
             ms_layout.addWidget(count_label)
 
             def update_count():
@@ -21047,9 +24671,9 @@ class ImageAnnotationTool(QMainWindow):
                 count_label.setText(get_text('msg_multi_source_need_sources',
                                              ms_info['num_sources'], checked))
                 if checked == ms_info['num_sources']:
-                    count_label.setStyleSheet("color: #00aa00;")
+                    set_text_role(count_label, 'success')
                 else:
-                    count_label.setStyleSheet("color: #cc6600;")
+                    set_text_role(count_label, 'warning')
 
             for cb in ms_checkboxes:
                 cb.toggled.connect(lambda _: update_count())
@@ -21270,7 +24894,8 @@ class ImageAnnotationTool(QMainWindow):
                     method="model",
                     model_type=model_type,
                     model_path=model_path,
-                    force_reload=True
+                    force_reload=True,
+                    pip_map=self._build_pip_map()
                 )
             
             # モデルの入力サイズに合わせて解像度スライダーを同期
@@ -21440,13 +25065,6 @@ class ImageAnnotationTool(QMainWindow):
             self.update_variant_buttons()
             self.update_ui()
             
-            # ダークモードの状態を再適用（モデル読み込み後のスタイルリセット対策）
-            if hasattr(self, 'is_dark_mode') and self.is_dark_mode:
-                if hasattr(self, 'current_image_info'):
-                    self.current_image_info.setStyleSheet("color: #ffffff; font-weight: bold;")
-                if hasattr(self, 'graph_title'):
-                    self.graph_title.setStyleSheet("font-weight: bold; color: #ffffff;")
-
             progress.setValue(100)
             QApplication.processEvents()
             
@@ -21863,7 +25481,13 @@ class ImageAnnotationTool(QMainWindow):
             
             # 読み込んだmanifest.jsonのパスを保存
             self.last_manifest_path = manifest_path
-            
+
+            # speedグラフとスピードゲージを更新
+            if hasattr(self, 'speed_seek_graph'):
+                self.speed_seek_graph.update()
+            if hasattr(self, 'speed_gauge'):
+                self.speed_gauge.update()
+
             # ギャラリー更新
             progress.setLabelText(get_text('msg_updating_gallery'))
             progress.setValue(90)
@@ -21942,6 +25566,8 @@ class ImageAnnotationTool(QMainWindow):
         self.annotation_timestamps = {}
         self.inference_results = {}
         self.location_annotations = {}
+        # 位置推論結果もセッションと一緒に破棄（別データの結果が残らないように）
+        self.location_inference_results = {}
         self.pose_manager.reset()
 
         if hasattr(self, 'deleted_indexes'):
@@ -22026,6 +25652,32 @@ class ImageAnnotationTool(QMainWindow):
 
         return bbox_info
 
+    def _render_lidar_to_pil(self, w, h):
+        """LiDAR 生スキャン図を (w,h) の PIL.Image として描画する（結合表示セル用）。"""
+        view = getattr(self, 'main_image_view', None)
+        if view is None or not hasattr(view, 'draw_lidar_view'):
+            return None
+        try:
+            w, h = int(w), int(h)
+            qimg = QImage(w, h, QImage.Format_RGB888)
+            qimg.fill(QColor(244, 246, 248))
+            painter = QPainter(qimg)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            try:
+                view.draw_lidar_view(painter, QRect(0, 0, w, h))
+            finally:
+                painter.end()
+            qimg = qimg.convertToFormat(QImage.Format_RGB888)
+            bpl = qimg.bytesPerLine()
+            ptr = qimg.constBits()
+            ptr.setsize(qimg.height() * bpl)
+            arr = np.frombuffer(ptr, np.uint8)[:qimg.height() * bpl].reshape(qimg.height(), bpl)
+            arr = arr[:, :w * 3].reshape(h, w, 3)
+            return Image.fromarray(arr.copy(), 'RGB')
+        except Exception as e:
+            print(f"LiDAR 合成画像の描画に失敗: {e}")
+            return None
+
     def _render_bev_to_pil(self, w, h):
         """BEV(真上から見た図)を (w,h) の PIL.Image として描画する（結合表示セル用）。
 
@@ -22094,6 +25746,8 @@ class ImageAnnotationTool(QMainWindow):
                 # 真上から見た図を PIL 画像として焼き込む（1セル）。セルの実解像度
                 # (base × SS) で直接描くことで、paste 時の再拡大を避け鮮明に保つ。
                 cell_slots.append((var, self._render_bev_to_pil(base_w * ss, base_h * ss)))
+            elif var == 'LIDAR':
+                cell_slots.append((var, self._render_lidar_to_pil(base_w * ss, base_h * ss)))
             elif var in group:
                 img = load_image_safely(group[var])
                 if img is not None:
@@ -22441,9 +26095,10 @@ class ImageAnnotationTool(QMainWindow):
 
             # 削除済みの場合は赤字で表示
             if is_deleted:
-                self.current_image_info.setStyleSheet("color: #FF5555; font-weight: bold;")
+                set_text_role(self.current_image_info, 'error')
             else:
-                self.current_image_info.setStyleSheet("color: #333333; font-weight: bold;")
+                self.current_image_info.setStyleSheet("font-weight: bold;")
+                set_text_role(self.current_image_info, 'strong')
 
         # アノテーション情報の表示
         self._update_annotation_info_display(current_index, is_deleted)
@@ -22478,6 +26133,11 @@ class ImageAnnotationTool(QMainWindow):
                     annotation_text += f"throttle = <span style='color: #FF6666;'>{anno['throttle']:.4f}</span>"
                 else:
                     annotation_text += f"throttle = <span style='color: #999999;'>未設定</span>"
+
+                # 速度情報（m/s）があれば表示（データセットと同じキー優先順）
+                _ann_speed = anno.get('enc/speed', anno.get('speed', anno.get('user/speed', anno.get('pilot/speed'))))
+                if _ann_speed is not None:
+                    annotation_text += f"<br>speed = <span style='color: #FF6666;'>{_ann_speed:.2f} m/s</span>"
 
                 # 位置情報があれば追加して強調表示
                 if 'loc' in anno:
@@ -22523,7 +26183,7 @@ class ImageAnnotationTool(QMainWindow):
             # 削除済みの場合のメッセージ
             self.annotation_info_label.setText(
                 "<span style='color: #FF5555;'>この画像は削除済みです。<br>"
-                "画像をクリックするか「削除状態を復元」ボタンを押して<br>"
+                "画像をクリックするか「現在のフレームを復元」ボタンを押して<br>"
                 "再度アノテーションを行えます。</span>"
             )
             self.annotation_info_label.setTextFormat(Qt.RichText)
@@ -22549,7 +26209,7 @@ class ImageAnnotationTool(QMainWindow):
             self.current_location_label.setText(get_text('label_current_location_value', location_value))
 
             # 位置情報に基づいた色を取得
-            loc_color = get_location_color(location_value)
+            loc_color = location_text_color(location_value)
             self.current_location_label.setStyleSheet(f"color: {loc_color.name()}; font-weight: bold;")
 
             # ボタンの選択状態を更新
@@ -22810,14 +26470,14 @@ class ImageAnnotationTool(QMainWindow):
                 if hasattr(self, 'last_bboxes') and self.last_bboxes:
                     # すべてのボックスを適用
                     for bbox in self.last_bboxes:
-                        self.add_bbox_annotation(bbox.copy())
+                        self.add_bbox_annotation(bbox.copy(), advance=False)
                     
                     # ステータスバーに表示
                     self.statusBar().showMessage(get_text('status_bboxes_auto_applied', len(self.last_bboxes)), 3000)
                 
                 elif hasattr(self, 'last_bbox') and self.last_bbox is not None:
                     # 後方互換性のため、単一ボックスの場合も処理
-                    self.add_bbox_annotation(self.last_bbox.copy())
+                    self.add_bbox_annotation(self.last_bbox.copy(), advance=False)
                     self.statusBar().showMessage(get_text('status_bbox_auto_applied', self.last_bbox['class']), 3000)
 
         # 前回のセグメンテーションを自動適用（最後に追加）
@@ -22829,14 +26489,14 @@ class ImageAnnotationTool(QMainWindow):
                 if hasattr(self, 'last_segmentations') and self.last_segmentations:
                     # すべてのセグメンテーションを適用
                     for seg in self.last_segmentations:
-                        self.add_segmentation_annotation(seg.copy())
+                        self.add_segmentation_annotation(seg.copy(), advance=False)
                     
                     # ステータスバーに表示
                     self.statusBar().showMessage(get_text('status_segs_auto_applied', len(self.last_segmentations)), 3000)
                 
                 elif hasattr(self, 'last_segmentation') and self.last_segmentation:
                     # 後方互換性のため、単一セグメンテーションの場合も処理
-                    self.add_segmentation_annotation(self.last_segmentation.copy())
+                    self.add_segmentation_annotation(self.last_segmentation.copy(), advance=False)
                     self.statusBar().showMessage(get_text('status_seg_auto_applied', self.last_segmentation['class']), 3000)
 
         # 前回waypoint自動適用機能
@@ -22861,8 +26521,8 @@ class ImageAnnotationTool(QMainWindow):
         
         # ここから追加: 位置推論表示チェックボックスがONの場合、自動的に推論実行
         if hasattr(self, 'location_inference_checkbox') and self.location_inference_checkbox.isChecked():
-            # 推論結果がまだない場合のみ推論を実行
-            if new_img_path not in self.location_inference_results:
+            # 推論結果がまだない場合のみ推論を実行（結果はインデックスをキーに保持）
+            if new_index not in self.location_inference_results:
                 self.run_location_inference()
             # 表示を更新
             self.update_location_inference_display()
@@ -22948,12 +26608,15 @@ class ImageAnnotationTool(QMainWindow):
         current_timestamp = int(time.time() * 1000)
         self.annotation_timestamps[self.current_index] = current_timestamp
 
-        self.annotations[self.current_index] = {
-            "angle": angle,
-            "throttle": throttle,
-            "x": x,
-            "y": y
-        }
+        # 既存のアノテーション辞書を丸ごと置き換えると、catalog 由来のセンサ値
+        # （speed, lidar/*, ultrasonic/*, pose/*, original_index 等）が消え、
+        # 測距ソースの扇形や速度表示・学習用の車速がそのフレームだけ欠落する。
+        # angle/throttle/x/y だけを更新して他のキーは保持する。
+        ann = self.annotations.get(self.current_index)
+        if not isinstance(ann, dict):
+            ann = {}
+            self.annotations[self.current_index] = ann
+        ann.update({"angle": angle, "throttle": throttle, "x": x, "y": y})
 
         # 位置情報があれば追加
         if self.current_location is not None:
@@ -23579,7 +27242,8 @@ class ImageAnnotationTool(QMainWindow):
         
         # 複数ソース選択時の説明
         multi_source_info = QLabel(get_text('label_multi_source_note'))
-        multi_source_info.setStyleSheet("color: #666; font-style: italic;")
+        multi_source_info.setStyleSheet("font-style: italic;")
+        set_text_role(multi_source_info, 'muted')
         output_mode_layout.addWidget(multi_source_info)
         
         dialog_layout.addWidget(output_mode_group)
@@ -24023,8 +27687,13 @@ class ImageAnnotationTool(QMainWindow):
         left_column = QVBoxLayout()
         right_column = QVBoxLayout()
 
+        # 各設定パネルを薄い色で塗り分けてスクロール中でも区別しやすくする
+        def _tint_group(group, bg_color, border_color):
+            group.setStyleSheet(tint_group_qss(bg_color, border_color))
+
         # 初期化設定グループ（モデル選択と重みの読み込み）
         init_group = QGroupBox(get_text('label_init_settings'))
+        _tint_group(init_group, "#EAF3FB", "#B9D4EC")
         init_layout = QVBoxLayout()
 
         # モデルアーキテクチャ選択（初期化設定の先頭に配置）
@@ -24033,8 +27702,8 @@ class ImageAnnotationTool(QMainWindow):
         model_type_combo = QComboBox()
         model_type_combo.setMinimumWidth(200)
 
-        # 利用可能なモデルアーキテクチャのリストを取得
-        available_architectures = list_available_models()
+        # 利用可能なモデルアーキテクチャのリストを取得（画像 CNN + LiDAR Policy）
+        available_architectures = self._driving_model_types()
         model_type_combo.addItems(available_architectures)
 
         # 現在選択されているモデルタイプをデフォルトにする
@@ -24144,11 +27813,13 @@ class ImageAnnotationTool(QMainWindow):
 
             finetune_model_combo.clear()
             if filtered:
-                finetune_model_combo.addItems(filtered)
+                for f in filtered:
+                    finetune_model_combo.addItem(_shorten_model_display_name(f, selected_type), f)
                 # 現在選択されているモデルがリストにあればデフォルトにする
                 current_model = self.get_selected_model_filename()
-                if current_model in filtered:
-                    finetune_model_combo.setCurrentText(current_model)
+                idx = finetune_model_combo.findData(current_model)
+                if idx >= 0:
+                    finetune_model_combo.setCurrentIndex(idx)
                 # ファインチューニングオプションを有効化
                 weights_radio_finetune.setEnabled(True)
                 weights_radio_finetune.setToolTip(get_text('tip_finetune'))
@@ -24169,10 +27840,12 @@ class ImageAnnotationTool(QMainWindow):
 
         # 初期リストを設定
         if has_valid_models:
-            finetune_model_combo.addItems(filtered_models)
+            for f in filtered_models:
+                finetune_model_combo.addItem(_shorten_model_display_name(f, model_type), f)
             current_model = self.get_selected_model_filename()
-            if current_model in filtered_models:
-                finetune_model_combo.setCurrentText(current_model)
+            idx = finetune_model_combo.findData(current_model)
+            if idx >= 0:
+                finetune_model_combo.setCurrentIndex(idx)
         else:
             finetune_model_combo.addItem(get_text('msg_no_model_for_type', model_type))
 
@@ -24203,8 +27876,16 @@ class ImageAnnotationTool(QMainWindow):
         init_group.setLayout(init_layout)
         left_column.addWidget(init_group)
 
+        # LiDAR Policy 入力設定（モデル種別が lidar_policy のときだけ表示。
+        # 入力は画像ではなく lidar/*.npy の点群 + 車速）
+        lidar_group, lidar_read_config = self._build_lidar_policy_group()
+        _tint_group(lidar_group, "#EEF7EE", "#B9DEB9")
+        left_column.addWidget(lidar_group)
+        lidar_group.setVisible(False)
+
         # 出力設定グループ（Speed出力と将来予測を統合）
         output_settings_group = QGroupBox(get_text('label_output_settings'))
+        _tint_group(output_settings_group, "#EAF7EC", "#BCE0C3")
         output_settings_layout = QVBoxLayout()
 
         # Speed出力オプション（データにspeedがある場合のみ表示）
@@ -24232,14 +27913,14 @@ class ImageAnnotationTool(QMainWindow):
             speed_row_layout.addWidget(speed_normalize_spin)
 
             speed_normalize_info = QLabel(get_text('label_speed_normalize_note'))
-            speed_normalize_info.setStyleSheet("color: #666;")
+            set_text_role(speed_normalize_info, 'muted')
             speed_row_layout.addWidget(speed_normalize_info)
 
             speed_row_layout.addStretch()
             output_settings_layout.addLayout(speed_row_layout)
 
             speed_info_label = QLabel(get_text('label_speed_data_info', speed_count))
-            speed_info_label.setStyleSheet("color: #666;")
+            set_text_role(speed_info_label, 'muted')
             output_settings_layout.addWidget(speed_info_label)
 
             # セクション間のスペース
@@ -24251,13 +27932,41 @@ class ImageAnnotationTool(QMainWindow):
         output_settings_layout.addWidget(future_output_check)
 
         future_info_label = QLabel(get_text('label_future_info'))
-        future_info_label.setStyleSheet("color: #666;")
+        set_text_role(future_info_label, 'muted')
         output_settings_layout.addWidget(future_info_label)
 
         future_detail_label = QLabel(get_text('label_future_detail'))
-        future_detail_label.setStyleSheet("color: #888;")
+        set_text_role(future_detail_label, 'faint')
         future_detail_label.setWordWrap(True)
         output_settings_layout.addWidget(future_detail_label)
+
+        # 予測フレーム指定（何フレーム先のangle/throttle/speedを予測するか）
+        future_frames_row = QHBoxLayout()
+        future_frames_row.setSpacing(6)
+        custom_future_check = QCheckBox(get_text('chk_custom_future_frames'))
+        custom_future_check.setChecked(False)
+        custom_future_check.setEnabled(False)  # 将来予測がONの場合のみ有効
+        custom_future_check.setToolTip(get_text('tip_custom_future_frames'))
+        future_frames_row.addWidget(custom_future_check)
+
+        future_frames_edit = QLineEdit()
+        future_frames_edit.setPlaceholderText('5,10')
+        future_frames_edit.setToolTip(get_text('tip_custom_future_frames'))
+        future_frames_edit.setFixedWidth(90)
+        future_frames_edit.setEnabled(False)
+        future_frames_row.addWidget(future_frames_edit)
+
+        future_frames_row.addWidget(QLabel(get_text('label_future_frames_unit')))
+        future_frames_row.addStretch()
+        output_settings_layout.addLayout(future_frames_row)
+
+        def _update_future_frames_enabled():
+            use_future = future_output_check.isChecked()
+            custom_future_check.setEnabled(use_future)
+            future_frames_edit.setEnabled(use_future and custom_future_check.isChecked())
+
+        future_output_check.toggled.connect(_update_future_frames_enabled)
+        custom_future_check.toggled.connect(_update_future_frames_enabled)
 
         output_settings_layout.addSpacing(10)
 
@@ -24282,23 +27991,200 @@ class ImageAnnotationTool(QMainWindow):
         output_settings_layout.addLayout(future_label_row)
 
         future_label_info_label = QLabel(get_text('label_future_label_info'))
-        future_label_info_label.setStyleSheet("color: #666;")
+        set_text_role(future_label_info_label, 'muted')
         future_label_info_label.setWordWrap(True)
         output_settings_layout.addWidget(future_label_info_label)
 
         future_label_check.toggled.connect(future_label_spin.setEnabled)
 
+        output_settings_layout.addSpacing(10)
+
+        # マスク適用オプション（ポリゴンが成立しているマスクごとにチェックを出す）
+        _mask_entries_for_training = self.get_mask_polygons_with_names()
+        mask_checks = []  # [(チェックボックス, 表示名, polygon), ...]
+        if _mask_entries_for_training:
+            for _mi, _mname, _mpolygon in _mask_entries_for_training:
+                _check = QCheckBox(get_text('chk_use_mask', _mname))
+                _check.setChecked(True)
+                _check.setToolTip(get_text('tip_use_mask'))
+                output_settings_layout.addWidget(_check)
+                _info = QLabel(get_text('label_mask_info', len(_mpolygon)))
+                set_text_role(_info, 'muted')
+                _info.setWordWrap(True)
+                output_settings_layout.addWidget(_info)
+                mask_checks.append((_check, _mname, _mpolygon))
+        else:
+            _no_mask_label = QLabel(get_text('label_mask_not_set'))
+            set_text_role(_no_mask_label, 'muted')
+            _no_mask_label.setWordWrap(True)
+            output_settings_layout.addWidget(_no_mask_label)
+
         output_settings_layout.addStretch()
         output_settings_group.setLayout(output_settings_layout)
         left_column.addWidget(output_settings_group)
 
+        # ------------------------------------------------------------------
+        # オフライン重み付け (RL) グループ — dev/SPEC_offline_rl_throttle.md §4.7
+        # 走行ログの報酬から求めたサンプル重みを speed/throttle 列の損失に掛ける
+        # ------------------------------------------------------------------
+        from managers.offline_reward import RewardConfig as _RewardConfig
+        _rl_def = _RewardConfig.from_dict(globals().get('RL_WEIGHT_DEFAULTS', {}))
+        rl_group = QGroupBox(get_text('label_rl_weight_settings'))
+        _tint_group(rl_group, "#FBF1E6", "#E8C9A8")
+        rl_layout = QVBoxLayout()
+
+        rl_enable_check = QCheckBox(get_text('chk_rl_weight_enable'))
+        rl_enable_check.setChecked(False)
+        rl_enable_check.setToolTip(get_text('tip_rl_weight_enable'))
+        rl_layout.addWidget(rl_enable_check)
+
+        rl_info_label = QLabel(get_text('label_rl_weight_info'))
+        set_text_role(rl_info_label, 'muted')
+        rl_info_label.setWordWrap(True)
+        rl_layout.addWidget(rl_info_label)
+
+        rl_widgets = []  # 有効化チェックで一括 enable/disable する部品
+
+        def _rl_spin(minv, maxv, val, decimals=2, step=None, width=70):
+            sp = QDoubleSpinBox()
+            sp.setRange(minv, maxv)
+            sp.setDecimals(decimals)
+            if step is not None:
+                sp.setSingleStep(step)
+            sp.setValue(val)
+            sp.setFixedWidth(width)
+            rl_widgets.append(sp)
+            return sp
+
+        def _rl_row(*pairs):
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            for label_text, widget in pairs:
+                if label_text:
+                    lb = QLabel(label_text)
+                    rl_widgets.append(lb)
+                    row.addWidget(lb)
+                if widget is not None:
+                    row.addWidget(widget)
+            row.addStretch()
+            return row
+
+        rl_method_combo = QComboBox()
+        rl_method_combo.addItem(get_text('rl_method_awr'), 'awr')
+        rl_method_combo.addItem(get_text('rl_method_filtered'), 'filtered')
+        rl_method_combo.setCurrentIndex(0 if _rl_def.method == 'awr' else 1)
+        rl_widgets.append(rl_method_combo)
+        rl_target_combo = QComboBox()
+        if has_speed_data:
+            rl_target_combo.addItem(get_text('rl_target_speed'), 'speed')
+        rl_target_combo.addItem(get_text('rl_target_throttle'), 'throttle')
+        if has_speed_data:
+            rl_target_combo.addItem(get_text('rl_target_both'), 'both')
+            _rl_ti = rl_target_combo.findData(_rl_def.target_head)
+            rl_target_combo.setCurrentIndex(_rl_ti if _rl_ti >= 0 else 0)
+        rl_widgets.append(rl_target_combo)
+        rl_layout.addLayout(_rl_row((get_text('label_rl_method'), rl_method_combo),
+                                    (get_text('label_rl_target'), rl_target_combo)))
+        if not has_speed_data:
+            _rl_nospeed = QLabel(get_text('label_rl_no_speed'))
+            set_text_role(_rl_nospeed, 'warning')
+            _rl_nospeed.setWordWrap(True)
+            rl_widgets.append(_rl_nospeed)
+            rl_layout.addWidget(_rl_nospeed)
+
+        rl_gamma_spin = _rl_spin(0.5, 0.999, _rl_def.gamma, 3, 0.01)
+        rl_beta_spin = _rl_spin(0.05, 5.0, _rl_def.beta, 2, 0.1)
+        rl_wmin_spin = _rl_spin(0.0, 1.0, _rl_def.w_min, 2, 0.05)
+        rl_wmax_spin = _rl_spin(1.0, 20.0, _rl_def.w_max, 1, 0.5)
+        rl_topk_spin = _rl_spin(1.0, 100.0, _rl_def.top_k * 100.0, 0, 5.0, 60)
+        rl_layout.addLayout(_rl_row(('γ', rl_gamma_spin), ('β', rl_beta_spin),
+                                    (get_text('label_rl_clip'), rl_wmin_spin), ('〜', rl_wmax_spin),
+                                    (get_text('label_rl_topk'), rl_topk_spin)))
+
+        rl_baseline_combo = QComboBox()
+        rl_baseline_combo.addItem(get_text('rl_baseline_speed_bin'), 'speed_bin')
+        rl_baseline_combo.addItem(get_text('rl_baseline_global'), 'global')
+        rl_baseline_combo.setCurrentIndex(0 if _rl_def.baseline_mode == 'speed_bin' else 1)
+        rl_widgets.append(rl_baseline_combo)
+        rl_gap_spin = _rl_spin(0.1, 10.0, _rl_def.episode_gap_s, 1, 0.1)
+        rl_layout.addLayout(_rl_row((get_text('label_rl_baseline'), rl_baseline_combo),
+                                    (get_text('label_rl_gap'), rl_gap_spin)))
+
+        rl_c_speed = _rl_spin(0.0, 10.0, _rl_def.c_speed, 2, 0.1, 60)
+        rl_c_wall = _rl_spin(0.0, 10.0, _rl_def.c_wall, 2, 0.1, 60)
+        rl_c_side = _rl_spin(0.0, 10.0, _rl_def.c_side, 2, 0.1, 60)
+        rl_c_slip = _rl_spin(0.0, 10.0, _rl_def.c_slip, 2, 0.1, 60)
+        rl_c_stuck = _rl_spin(0.0, 10.0, _rl_def.c_stuck, 2, 0.1, 60)
+        rl_c_yaw = _rl_spin(0.0, 10.0, _rl_def.c_yaw, 2, 0.1, 60)
+        rl_layout.addLayout(_rl_row((get_text('label_rl_coeffs'), None),
+                                    ('speed', rl_c_speed), ('wall', rl_c_wall), ('side', rl_c_side),
+                                    ('slip', rl_c_slip), ('stuck', rl_c_stuck), ('yaw', rl_c_yaw)))
+
+        rl_wall_spin = _rl_spin(0.0, 5000.0, _rl_def.wall_mm, 0, 100.0, 70)
+        rl_side_spin = _rl_spin(0.0, 5000.0, _rl_def.side_mm, 0, 100.0, 70)
+        rl_layout.addLayout(_rl_row((get_text('label_rl_thresholds'), None),
+                                    ('FrFR', rl_wall_spin), ('FrLH/FrRH', rl_side_spin)))
+
+        rl_preview_btn = QPushButton(get_text('btn_rl_preview'))
+        rl_widgets.append(rl_preview_btn)
+        rl_stats_label = QLabel('')
+        set_text_role(rl_stats_label, 'muted')
+        rl_stats_label.setWordWrap(True)
+        rl_widgets.append(rl_stats_label)
+        rl_layout.addLayout(_rl_row((None, rl_preview_btn), (None, rl_stats_label)))
+
+        rl_group.setLayout(rl_layout)
+        left_column.addWidget(rl_group)
+
+        def _rl_set_enabled(on):
+            for _w in rl_widgets:
+                _w.setEnabled(bool(on))
+        rl_enable_check.toggled.connect(_rl_set_enabled)
+        _rl_set_enabled(False)
+
+        def _build_rl_config():
+            _sn = MAX_SPEED
+            if speed_normalize_spin is not None:
+                _sn = speed_normalize_spin.value()
+            return _RewardConfig(
+                method=rl_method_combo.currentData(),
+                target_head=rl_target_combo.currentData(),
+                gamma=rl_gamma_spin.value(), beta=rl_beta_spin.value(),
+                w_min=rl_wmin_spin.value(), w_max=rl_wmax_spin.value(),
+                top_k=rl_topk_spin.value() / 100.0,
+                baseline_mode=rl_baseline_combo.currentData(),
+                episode_gap_s=rl_gap_spin.value(),
+                c_speed=rl_c_speed.value(), c_wall=rl_c_wall.value(), c_side=rl_c_side.value(),
+                c_slip=rl_c_slip.value(), c_stuck=rl_c_stuck.value(), c_yaw=rl_c_yaw.value(),
+                speed_norm=float(_sn), wall_mm=rl_wall_spin.value(), side_mm=rl_side_spin.value())
+
+        def _rl_source_annotations():
+            """重み計算の対象（削除済みを除く全アノテーション、時系列 = インデックス順）"""
+            _del = set(getattr(self, 'deleted_indexes', []))
+            return {i: a for i, a in self.annotations.items()
+                    if isinstance(i, int) and i not in _del and 0 <= i < len(self.images)}
+
+        def _rl_preview():
+            from managers.offline_reward import compute_offline_weights, summarize_stats
+            _src = _rl_source_annotations()
+            if not _src:
+                QMessageBox.warning(training_settings, get_text('dlg_warning'),
+                                    get_text('msg_rl_no_annotations'))
+                return
+            _cfg = _build_rl_config()
+            _w, _stats = compute_offline_weights(_src, getattr(self, 'annotation_timestamps', {}), _cfg)
+            rl_stats_label.setText(summarize_stats(_stats))
+            self._show_rl_weight_preview(_stats, _cfg, parent=training_settings)
+        rl_preview_btn.clicked.connect(_rl_preview)
+
         # 入力画像ソース選択グループ
         image_source_group = QGroupBox(get_text('label_training_image_sources'))
+        _tint_group(image_source_group, "#FDF4E7", "#ECD3AC")
         image_source_layout = QVBoxLayout()
 
         # 説明ラベル
         image_source_info = QLabel(get_text('label_training_image_sources_info'))
-        image_source_info.setStyleSheet("color: #666;")
+        set_text_role(image_source_info, 'muted')
         image_source_info.setWordWrap(True)
         image_source_layout.addWidget(image_source_info)
 
@@ -24337,7 +28223,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # 選択状況ラベル
         training_sources_count_label = QLabel("")
-        training_sources_count_label.setStyleSheet("color: #2E7D32; font-weight: bold;")
+        training_sources_count_label.setStyleSheet("font-weight: bold;")
+        set_text_role(training_sources_count_label, 'success')
         image_source_layout.addWidget(training_sources_count_label)
 
         def update_training_sources_count():
@@ -24374,10 +28261,11 @@ class ImageAnnotationTool(QMainWindow):
 
         # 特徴融合設定グループ（マルチソース時のみ表示）
         fusion_group = QGroupBox(get_text('label_fusion_settings'))
+        _tint_group(fusion_group, "#FBF7EE", "#E3D6B8")
         fusion_layout = QVBoxLayout()
 
         fusion_info = QLabel(get_text('label_fusion_info'))
-        fusion_info.setStyleSheet("color: #666;")
+        set_text_role(fusion_info, 'muted')
         fusion_info.setWordWrap(True)
         fusion_layout.addWidget(fusion_info)
 
@@ -24392,7 +28280,8 @@ class ImageAnnotationTool(QMainWindow):
         fusion_layout.addLayout(fusion_method_layout)
 
         fusion_note = QLabel(get_text('label_multi_source_note'))
-        fusion_note.setStyleSheet("color: #E65100; font-weight: bold;")
+        fusion_note.setStyleSheet("font-weight: bold;")
+        set_text_role(fusion_note, 'warning')
         fusion_note.setWordWrap(True)
         fusion_layout.addWidget(fusion_note)
 
@@ -24410,6 +28299,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # 仮想ソース生成設定グループ（単一ソース選択時のみ表示）
         virtual_group = QGroupBox(get_text('label_virtual_source_settings'))
+        _tint_group(virtual_group, "#F2F0FB", "#CFC8EC")
         virtual_layout = QVBoxLayout()
 
         virtual_type_row = QHBoxLayout()
@@ -24450,9 +28340,81 @@ class ImageAnnotationTool(QMainWindow):
         virtual_layout.addWidget(temporal_interval_row_widget)
 
         virtual_note = QLabel(get_text('label_virtual_source_note'))
-        virtual_note.setStyleSheet("color: #1565C0; font-style: italic;")
+        virtual_note.setStyleSheet("font-style: italic;")
+        set_text_role(virtual_note, 'info')
         virtual_note.setWordWrap(True)
         virtual_layout.addWidget(virtual_note)
+
+        # --- 画像埋込（別ソース画像をベース画像へ縮小合成して1枚として学習）---
+        virtual_layout.addSpacing(8)
+        pip_embed_check = QCheckBox(get_text('chk_pip_embed'))
+        pip_embed_check.setChecked(False)
+        pip_embed_check.setToolTip(get_text('tip_pip_embed'))
+        virtual_layout.addWidget(pip_embed_check)
+
+        pip_settings_widget = QWidget()
+        pip_settings_layout = QVBoxLayout(pip_settings_widget)
+        pip_settings_layout.setContentsMargins(18, 0, 0, 0)
+        pip_settings_layout.setSpacing(4)
+
+        # 埋め込む画像ソースの選択
+        pip_source_row = QHBoxLayout()
+        pip_source_row.addWidget(QLabel(get_text('label_pip_source')))
+        pip_source_combo = QComboBox()
+        _pip_source_names = list(training_source_checkboxes.keys())
+        pip_source_combo.addItems(_pip_source_names)
+        # lidar系ソースがあればデフォルトにする
+        for _si, _sname in enumerate(_pip_source_names):
+            if 'lidar' in _sname.lower():
+                pip_source_combo.setCurrentIndex(_si)
+                break
+        pip_source_row.addWidget(pip_source_combo)
+        pip_source_row.addStretch()
+        pip_settings_layout.addLayout(pip_source_row)
+
+        # 埋込位置の設定（車両マスク位置 / 座標指定）
+        pip_pos_row = QHBoxLayout()
+        pip_pos_row.addWidget(QLabel(get_text('label_pip_position')))
+        pip_pos_combo = QComboBox()
+        pip_pos_combo.addItem(get_text('opt_pip_pos_mask'), 'mask')
+        pip_pos_combo.addItem(get_text('opt_pip_pos_coords'), 'coords')
+        pip_pos_row.addWidget(pip_pos_combo)
+        pip_pos_row.addStretch()
+        pip_settings_layout.addLayout(pip_pos_row)
+
+        # 座標指定行（x, y, w, h 正規化座標）
+        pip_rect_row_widget = QWidget()
+        pip_rect_row = QHBoxLayout(pip_rect_row_widget)
+        pip_rect_row.setContentsMargins(0, 0, 0, 0)
+        pip_rect_row.addWidget(QLabel(get_text('label_pip_rect')))
+        pip_rect_spins = []
+        for _default in (0.30, 0.60, 0.40, 0.40):  # x, y, w, h
+            _sp = QDoubleSpinBox()
+            _sp.setRange(0.0, 1.0)
+            _sp.setSingleStep(0.05)
+            _sp.setDecimals(2)
+            _sp.setValue(_default)
+            _sp.setFixedWidth(62)
+            pip_rect_row.addWidget(_sp)
+            pip_rect_spins.append(_sp)
+        pip_rect_row.addStretch()
+        pip_settings_layout.addWidget(pip_rect_row_widget)
+
+        pip_note = QLabel(get_text('label_pip_note'))
+        set_text_role(pip_note, 'muted')
+        pip_note.setWordWrap(True)
+        pip_settings_layout.addWidget(pip_note)
+
+        virtual_layout.addWidget(pip_settings_widget)
+
+        def _update_pip_visibility():
+            enabled = pip_embed_check.isChecked()
+            pip_settings_widget.setVisible(enabled)
+            pip_rect_row_widget.setVisible(pip_pos_combo.currentData() == 'coords')
+
+        pip_embed_check.toggled.connect(_update_pip_visibility)
+        pip_pos_combo.currentIndexChanged.connect(_update_pip_visibility)
+        _update_pip_visibility()
 
         def _update_virtual_nsrc_label():
             from model_catalog import VirtualSourceDataset
@@ -24480,6 +28442,7 @@ class ImageAnnotationTool(QMainWindow):
         _main_slider = getattr(self, 'resolution_slider', None)
         res_val = _main_slider.value() if _main_slider else 100
         resolution_mode_group = QGroupBox(get_text('label_resolution_mode_group'))
+        _tint_group(resolution_mode_group, "#FBF0F4", "#E8C6D4")
         resolution_mode_layout = QVBoxLayout()
 
         # 解像度スライダー（メインキャンバスのスライダーと双方向連動）
@@ -24550,6 +28513,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # 学習パラメータグループ
         training_params_group = QGroupBox(get_text('label_training_params'))
+        _tint_group(training_params_group, "#F3EEFA", "#D3C4EC")
         training_params_layout = QVBoxLayout()
 
         # エポック数・学習率設定（同じ行に配置）
@@ -24666,6 +28630,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # 学習対象データ選択グループボックス
         data_selection_group = QGroupBox(get_text('label_training_data_selection'))
+        _tint_group(data_selection_group, "#FFFBE5", "#E4DBA6")
         data_selection_layout = QVBoxLayout()
 
         # データ選択オプション
@@ -24759,7 +28724,8 @@ class ImageAnnotationTool(QMainWindow):
                 if exclude_downsampled and ds_count > 0:
                     exclude_info += get_text('label_excluded_ds', ds_count)
                 data_sample_label.setText(get_text('label_data_count_all_detail', sample_count, total_annotations, exclude_info))
-                data_sample_label.setStyleSheet("color: #2E7D32; font-weight: bold; font-size: 13px;")
+                data_sample_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+                set_text_role(data_sample_label, 'success')
             elif data_radio_skip.isChecked():
                 skip = custom_skip_spin.value()
                 total_skipped = 0
@@ -24780,7 +28746,8 @@ class ImageAnnotationTool(QMainWindow):
                 if exclude_downsampled and ds_count > 0:
                     exclude_info += get_text('label_excluded_ds', ds_count)
                 data_sample_label.setText(get_text('label_data_count_skip_detail', sample_count, skip, total_skipped, exclude_info))
-                data_sample_label.setStyleSheet("color: #2E7D32; font-weight: bold; font-size: 13px;")
+                data_sample_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+                set_text_role(data_sample_label, 'success')
             elif data_radio_range.isChecked():
                 start = range_start_spin.value()
                 end = range_end_spin.value()
@@ -24802,7 +28769,8 @@ class ImageAnnotationTool(QMainWindow):
                 if exclude_downsampled and ds_count > 0:
                     exclude_info += get_text('label_excluded_ds', ds_count)
                 data_sample_label.setText(get_text('label_data_count_range_detail', sample_count, start, end, total_in_range, exclude_info))
-                data_sample_label.setStyleSheet("color: #2E7D32; font-weight: bold; font-size: 13px;")
+                data_sample_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+                set_text_role(data_sample_label, 'success')
 
         # ラジオボタンの状態変更イベントを接続
         data_radio_all.toggled.connect(update_data_selection_ui)
@@ -24976,6 +28944,7 @@ class ImageAnnotationTool(QMainWindow):
         # ドメインランダマイゼーション グループ (A-D)
         # =====================================================================
         dr_group = QGroupBox(get_text('group_domain_randomization'))
+        _tint_group(dr_group, "#EFF7F7", "#BFDCDC")
         dr_layout = QVBoxLayout()
 
         def _dr_row(check_key, checked_default, *param_widgets):
@@ -25074,6 +29043,7 @@ class ImageAnnotationTool(QMainWindow):
         # 強光・路面グレア グループ
         # =====================================================================
         sun_group = QGroupBox(get_text('group_sunlight'))
+        _tint_group(sun_group, "#FDF6EC", "#ECD9B8")
         sun_layout = QVBoxLayout()
 
         def _sun_row(check_key, checked_default, *param_widgets):
@@ -25217,6 +29187,23 @@ class ImageAnnotationTool(QMainWindow):
         tabs.addTab(aug_tab, get_text('tab_data_augmentation'))
 
         # タブをレイアウトに追加（残りスペースを全て使う）
+        # LiDAR Policy 選択時: 画像入力にしか意味のない設定群を無効化し、
+        # LiDAR 入力設定を表示する（学習パラメータ・データ選択・モデル名は共通）
+        _image_only_groups = (output_settings_group, rl_group, image_source_group,
+                              fusion_group, virtual_group, resolution_mode_group)
+
+        def update_lidar_mode(_i=None):
+            is_lidar = (model_type_combo.currentText() == self.LIDAR_POLICY_MODEL_TYPE)
+            lidar_group.setVisible(is_lidar)
+            for g in _image_only_groups:
+                g.setEnabled(not is_lidar)
+            for rb in (weights_radio_pretrained, weights_radio_random, weights_radio_finetune):
+                rb.setEnabled(not is_lidar)
+            tabs.setTabEnabled(1, not is_lidar)
+
+        model_type_combo.currentIndexChanged.connect(update_lidar_mode)
+        update_lidar_mode()
+
         settings_layout.addWidget(tabs, 1)
 
         # ===== 固定フッターエリア（モデル名・コメント・ボタン）=====
@@ -25228,10 +29215,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # 固定エリアコンテナ（わずかに暗い背景で視覚的に区別）
         _footer = QFrame()
-        _footer.setStyleSheet(
-            "QFrame { background-color: #e8eaed; border-radius: 0px; }"
-            "QGroupBox { background-color: transparent; }"
-        )
+        _footer.setStyleSheet("QGroupBox { background-color: transparent; }")
+        set_panel_role(_footer, 'footer')
         _footer_layout = QVBoxLayout(_footer)
         _footer_layout.setContentsMargins(8, 6, 8, 6)
         _footer_layout.setSpacing(6)
@@ -25241,6 +29226,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # モデル名編集欄
         model_name_group = QGroupBox(get_text('label_model_name_settings'))
+        _tint_group(model_name_group, "#EEF6F3", "#BFDCCF")
         model_name_layout = QVBoxLayout(model_name_group)
 
         # プレフィックス（固定）とサフィックス（編集可能）を分離
@@ -25253,7 +29239,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # プレフィックス（固定、編集不可）- 動的に更新される
         prefix_label = QLabel(f"{model_type}_")
-        prefix_label.setStyleSheet("background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc; font-family: monospace;")
+        prefix_label.setStyleSheet("padding: 5px; font-family: monospace;")
+        set_panel_role(prefix_label, 'code')
         name_input_layout.addWidget(prefix_label)
 
         # サフィックス（編集可能）
@@ -25265,7 +29252,8 @@ class ImageAnnotationTool(QMainWindow):
         model_name_layout.addLayout(name_input_layout)
 
         model_name_note = QLabel(get_text('label_model_name_note_pth', model_type))
-        model_name_note.setStyleSheet("color: #888; font-style: italic;")
+        model_name_note.setStyleSheet("font-style: italic;")
+        set_text_role(model_name_note, 'faint')
         model_name_layout.addWidget(model_name_note)
 
         # モデルタイプ・ソース数・融合方法が変わったらプレフィックスと注釈を更新
@@ -25291,6 +29279,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # コメント欄
         comment_group = QGroupBox(get_text('label_training_comment'))
+        _tint_group(comment_group, "#F4F4F4", "#CFCFCF")
         comment_layout = QVBoxLayout(comment_group)
 
         comment_layout.addWidget(QLabel(get_text('label_comment')))
@@ -25312,13 +29301,92 @@ class ImageAnnotationTool(QMainWindow):
 
         settings_layout.addWidget(_footer)
 
-        # ダイアログを表示
+        # ダイアログを表示（中身が横スクロール無しで収まる大きさに広げる）
+        QTimer.singleShot(0, lambda: fit_dialog_to_scroll_content(
+            training_settings, [basic_scroll, aug_scroll]))
         if not training_settings.exec_():
             return
         
         # 設定値の取得
         # ダイアログで選択されたモデルタイプを使用
         model_type = model_type_combo.currentText()
+
+        if model_type == self.LIDAR_POLICY_MODEL_TYPE:
+            # LiDAR Policy: 入力は lidar/*.npy 点群 + 車速（画像ソース設定は使わない）。
+            # 共通の学習パラメータ・データ選択・モデル名をそのまま渡す。
+            use_all = data_radio_all.isChecked()
+            use_skip = data_radio_skip.isChecked()
+            use_range = data_radio_range.isChecked()
+            skip_count = custom_skip_spin.value() if use_skip else 1
+            range_start = range_start_spin.value() if use_range else 0
+            range_end = range_end_spin.value() if use_range else (len(self.images) - 1)
+            downsampled_set = (set(getattr(self, 'downsampled_indexes', []))
+                               if exclude_downsampled_check.isChecked() else set())
+            deleted_set = set(getattr(self, 'deleted_indexes', []))
+            valid_indexes = []
+            for idx in self.annotations.keys():
+                if not isinstance(idx, int) or idx < 0 or idx >= len(self.images):
+                    continue
+                if idx in deleted_set or idx in downsampled_set:
+                    continue
+                if use_all or (use_skip and idx % skip_count == 0) \
+                        or (use_range and range_start <= idx <= range_end):
+                    valid_indexes.append(idx)
+            if not valid_indexes:
+                QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_training_data'))
+                return
+            lidar_cfg = dict(lidar_read_config())
+            lidar_cfg.update({
+                'epochs': epoch_spin.value(),
+                'batch_size': int(batch_size_combo.currentText()),
+                'learning_rate': float(lr_combo.currentText()),
+                'val_split': val_split_spin.value(),
+                'use_early_stopping': early_stopping_check.isChecked(),
+                'patience': patience_spin.value() if early_stopping_check.isChecked() else 0,
+                'augment': True,
+                'model_name': f"{model_type}_" + model_name_suffix_input.text().strip(),
+                'comment': comment_input.toPlainText().strip(),
+            })
+            try:
+                result = self._train_lidar_policy(
+                    valid_indexes, lidar_cfg, f"モデル '{model_type}' の学習中...")
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                QMessageBox.critical(self, get_text('dlg_error'),
+                                     get_text('msg_inference_processing_error', str(e)))
+                return
+            if result.get('status') == 'cancelled':
+                self.statusBar().showMessage(get_text('status_training_cancelled'), 5000)
+                return
+            if result.get('status') != 'completed':
+                err = result.get('message') or 'Unknown error'
+                QMessageBox.warning(self, get_text('dlg_warning'),
+                                    get_text(f'msg_{err}') if err in ('lidar_no_scans', 'no_sequences',
+                                                                      'togivad_bad_horizon') else err)
+                return
+            ade_txt = (f" | Val ADE: {result.get('val_ade_m', 0):.3f} m"
+                       if result.get('use_traj') else "")
+            QMessageBox.information(
+                self, get_text('dlg_model_training'),
+                f"{get_text('msg_traj_training_complete')}\n\n"
+                f"Model type: {model_type}\n"
+                f"Preset: {lidar_cfg.get('preset')} | bins: {lidar_cfg.get('num_bins')} | "
+                f"K: {lidar_cfg.get('stack_frames')}\n"
+                f"Best Val Loss: {result.get('best_val_loss', 0):.6f} | "
+                f"Epochs: {result.get('epochs_trained', 0)}\n"
+                f"Val steer MAE: {result.get('val_steer_mae', 0):.4f} | "
+                f"Val throttle MAE: {result.get('val_speed_mae', 0):.4f}{ade_txt}\n"
+                f"Samples: {result.get('total_sequences', 0)} "
+                f"(Train: {result.get('train_samples', 0)}, Val: {result.get('val_samples', 0)})\n"
+                f"Skipped (no scan / mode): {result.get('n_no_scan', 0)} / "
+                f"{result.get('n_mode_skipped', 0)}\n"
+                f"Time: {result.get('total_time', 0):.1f}s\n"
+                f"Model: {os.path.basename(result.get('model_path', ''))}\n"
+                f"ONNX: {os.path.basename(result.get('onnx_path') or '-')}")
+            self.refresh_model_list()
+            return
+
         # マルチソース時はソース数と融合方法をプレフィックスに含める
         _checked_sources = [n for n, cb in training_source_checkboxes.items() if cb.isChecked()]
         if len(_checked_sources) > 1:
@@ -25354,7 +29422,7 @@ class ImageAnnotationTool(QMainWindow):
         use_pretrained = weights_radio_pretrained.isChecked()  # 事前学習済みの重みを使用
         use_random_init = weights_radio_random.isChecked()  # ランダム初期化
         load_weights = weights_radio_finetune.isChecked()  # ファインチューニング
-        selected_finetune_model = finetune_model_combo.currentText() if load_weights else None
+        selected_finetune_model = finetune_model_combo.currentData() if load_weights else None
         # ファインチューニング用モデルが有効かどうかを確認
         filtered_models_for_check = get_filtered_models(model_type)
         has_valid_finetune_models = len(filtered_models_for_check) > 0 and selected_finetune_model in filtered_models_for_check
@@ -25371,9 +29439,30 @@ class ImageAnnotationTool(QMainWindow):
         # 将来予測出力設定の取得
         use_future_output = future_output_check.isChecked()
 
+        # 予測フレーム（何フレーム先を予測するか）の取得。デフォルトは5,10フレーム先
+        future_offsets_value = [5, 10]
+        if use_future_output and custom_future_check.isChecked():
+            _frames_text = future_frames_edit.text().strip().replace('、', ',').replace(' ', ',')
+            _frames_vals = [v for v in _frames_text.split(',') if v]
+            if _frames_vals:
+                try:
+                    _offsets = sorted({int(v) for v in _frames_vals})
+                except ValueError:
+                    _offsets = []
+                if len(_offsets) == 2 and all(o > 0 for o in _offsets):
+                    future_offsets_value = _offsets
+                else:
+                    QMessageBox.warning(self, get_text('dlg_warning'),
+                                        get_text('msg_invalid_future_frames'))
+                    return
+
         # 将来フレームラベル設定の取得
         use_future_label = future_label_check.isChecked()
         future_label_offset = future_label_spin.value() if use_future_label else 0
+
+        # オフライン重み付け (RL) 設定の取得
+        rl_weight_enabled = rl_enable_check.isChecked()
+        rl_reward_cfg = _build_rl_config() if rl_weight_enabled else None
 
         # データ選択設定の取得
         use_all = data_radio_all.isChecked()
@@ -25409,11 +29498,37 @@ class ImageAnnotationTool(QMainWindow):
         training_num_sources = (training_virtual_nsrc if is_virtual_source
                                 else len(selected_sources) if is_multi_source else 1)
 
+        # 画像埋込設定の取得とバリデーション
+        pip_embed_config = None
+        if pip_embed_check.isChecked():
+            if is_multi_source or is_virtual_source:
+                QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_pip_requires_single'))
+                return
+            _pip_source = pip_source_combo.currentText()
+            if not _pip_source:
+                QMessageBox.warning(self, get_text('dlg_warning'),
+                                    get_text('msg_pip_no_source_images', _pip_source))
+                return
+            if pip_pos_combo.currentData() == 'mask':
+                _pip_rect = self.get_vehicle_mask_bbox()
+                if not _pip_rect:
+                    QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_pip_no_mask'))
+                    return
+            else:
+                _px, _py, _pw, _ph = [sp.value() for sp in pip_rect_spins]
+                if _pw <= 0.0 or _ph <= 0.0:
+                    QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_pip_invalid_rect'))
+                    return
+                _pip_rect = [round(_px, 4), round(_py, 4), round(_pw, 4), round(_ph, 4)]
+            pip_embed_config = {'source': _pip_source, 'rect': _pip_rect,
+                                'position_mode': pip_pos_combo.currentData()}
+
         try:
             # 学習データの準備（データ選択設定を適用）
             image_paths = []
             annotation_values = []
             multi_source_paths = []  # マルチソースモード用: [[src1, src2, ...], ...]
+            pip_embed_paths = []     # 画像埋込用: image_pathsと同順の埋込画像パス（Noneは埋込なし）
             downsampled_set = set(getattr(self, 'downsampled_indexes', []))
             has_image_groups = hasattr(self, 'image_groups') and self.image_groups
 
@@ -25441,6 +29556,15 @@ class ImageAnnotationTool(QMainWindow):
                     if range_start <= idx <= range_end:
                         valid_indexes.append(idx)
 
+            # オフライン重み付け: 全フレームで重みを計算（スキップ/範囲指定の前に時系列で計算）
+            rl_weights = None
+            rl_weight_stats = None
+            if rl_weight_enabled:
+                from managers.offline_reward import compute_offline_weights, summarize_stats
+                rl_weights, rl_weight_stats = compute_offline_weights(
+                    _rl_source_annotations(), getattr(self, 'annotation_timestamps', {}), rl_reward_cfg)
+                print(f"[オフライン重み付け] {summarize_stats(rl_weight_stats)}")
+
             # 各有効インデックスについて画像パスを収集
             deleted_indexes_set = set(getattr(self, 'deleted_indexes', []))
             for idx in valid_indexes:
@@ -25454,6 +29578,8 @@ class ImageAnnotationTool(QMainWindow):
                     if label_idx not in self.annotations:
                         continue
                 ann = deepcopy(self.annotations[label_idx])
+                if rl_weights is not None:
+                    ann['_rl_weight'] = float(rl_weights.get(label_idx, 1.0))
 
                 if is_multi_source and has_image_groups:
                     # マルチソースモード: 全ソースの画像が揃っているインデックスのみ使用
@@ -25477,24 +29603,32 @@ class ImageAnnotationTool(QMainWindow):
                     if source in group:
                         image_paths.append(group[source])
                         annotation_values.append(deepcopy(ann))
+                        pip_embed_paths.append(
+                            group.get(pip_embed_config['source']) if pip_embed_config else None)
                     elif source == getattr(self, 'current_variant', None):
                         image_paths.append(self.images[idx])
                         annotation_values.append(deepcopy(ann))
+                        pip_embed_paths.append(
+                            group.get(pip_embed_config['source']) if pip_embed_config else None)
                 else:
-                    # image_groupsがない場合は従来どおり
+                    # image_groupsがない場合は従来どおり（画像埋込のソース解決は不可）
                     image_paths.append(self.images[idx])
                     annotation_values.append(deepcopy(ann))
+                    pip_embed_paths.append(None)
 
             if not image_paths:
                 QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_training_data'))
                 return
 
-            # Speed値の正規化（speedが含まれている場合）
-            if use_speed_output and speed_normalize_value > 0:
-                for annotation in annotation_values:
-                    if 'speed' in annotation:
-                        # speed値を正規化値で除算
-                        annotation['speed'] = annotation['speed'] / speed_normalize_value
+            # 画像埋込: 埋込ソースの画像が1枚も見つからない場合は中断
+            if pip_embed_config and not any(pip_embed_paths):
+                QMessageBox.warning(self, get_text('dlg_warning'),
+                                    get_text('msg_pip_no_source_images', pip_embed_config['source']))
+                return
+
+            # Speed値の正規化はデータセット側（_get_annotation_values）で一元的に行う。
+            # ここで事前に除算するとデータセット側と合わせて二重正規化になり、
+            # 推論speedが実際より小さく出力される（スライダー位置のずれの原因）。
 
             # データ数の確認とバッチサイズの調整
             batch_size = min(user_batch_size, len(image_paths))
@@ -25526,9 +29660,17 @@ class ImageAnnotationTool(QMainWindow):
                 print(f"  忍耐エポック数: {patience}")
                 print(f"  最小改善量: {min_delta}")
             print(f"[出力設定]")
+            print(f"  画像埋込: {pip_embed_config if pip_embed_config else 'なし'}")
             print(f"  Speed出力: {use_speed_output}")
             print(f"  将来予測出力: {use_future_output}")
             print(f"  将来フレームラベル: {use_future_label}" + (f", +{future_label_offset}フレーム先" if use_future_label else ""))
+            print(f"[オフライン重み付け (RL)]")
+            print(f"  有効: {rl_weight_enabled}")
+            if rl_weight_enabled and rl_weight_stats:
+                print(f"  設定: {rl_reward_cfg.to_dict()}")
+                print(f"  重み統計: mean={rl_weight_stats['weight_mean']:.2f} median={rl_weight_stats['weight_median']:.2f} "
+                      f"p95={rl_weight_stats['weight_p95']:.2f} max={rl_weight_stats['weight_max']:.2f} "
+                      f"episodes={rl_weight_stats['n_episodes']}")
             print(f"[データ設定]")
             print(f"  画像ソース: {selected_sources}")
             if is_multi_source:
@@ -25579,6 +29721,28 @@ class ImageAnnotationTool(QMainWindow):
             else:
                 num_outputs = base_outputs
 
+            # オフライン重み付け: サンプル重みを掛ける出力列とチェックポイント用メタデータ
+            rl_weight_columns = None
+            rl_weighting_meta = None
+            if rl_weight_enabled and rl_weights:
+                from managers.offline_reward import rl_weight_column_indices
+                rl_weight_columns = rl_weight_column_indices(num_outputs, use_speed_output,
+                                                             rl_reward_cfg.target_head)
+                rl_weighting_meta = {
+                    'enabled': True,
+                    'config': rl_reward_cfg.to_dict(),
+                    'weight_columns': rl_weight_columns,
+                    'weight_stats': {k: v for k, v in rl_weight_stats.items()
+                                     if not k.startswith('series_')},
+                }
+                print(f"[オフライン重み付け] 対象列={rl_weight_columns} "
+                      f"(num_outputs={num_outputs}, head={rl_reward_cfg.target_head})")
+
+            # マスク（ダイアログでチェックされたものだけ、指定領域を黒塗りで無視）
+            _selected_masks = [{'name': name, 'points': polygon}
+                               for check, name, polygon in mask_checks if check.isChecked()]
+            _mask_polygons = [m['points'] for m in _selected_masks]
+
             # データセットの作成（バッチサイズと詳細オーグメンテーション設定を明示的に指定）
             train_loader, val_loader, dataset_info = create_datasets(
                 image_paths=image_paths,
@@ -25588,7 +29752,12 @@ class ImageAnnotationTool(QMainWindow):
                 batch_size=batch_size,  # バッチサイズ
                 val_split=val_split,  # 検証データ割合
                 use_speed=use_speed_output,  # Speed出力を使用するかどうか
+                speed_normalize=speed_normalize_value if use_speed_output else None,  # speed正規化値
+                mask_polygons=_mask_polygons,  # マスク（指定領域を無視）
+                pip_paths=pip_embed_paths if pip_embed_config else None,  # 画像埋込パス
+                pip_rect=pip_embed_config['rect'] if pip_embed_config else None,  # 画像埋込領域
                 use_future=use_future_output,  # 将来予測出力を使用するかどうか
+                future_offsets=future_offsets_value if use_future_output else None,  # 予測フレーム
                 num_outputs=num_outputs,  # 出力数を指定
                 multi_source_paths=multi_source_paths if is_multi_source else None,
                 num_sources=training_num_sources,
@@ -25637,9 +29806,15 @@ class ImageAnnotationTool(QMainWindow):
                     (selected_sources if is_multi_source else selected_sources)
                 ),
                 virtual_source_type=training_virtual_type if is_virtual_source else None,
-                temporal_interval=training_temporal_interval
+                temporal_interval=training_temporal_interval,
+                speed_normalize=speed_normalize_value if use_speed_output else None,
+                masks=_selected_masks,
+                future_offsets=future_offsets_value if use_future_output else None,
+                pip_embed=pip_embed_config,
+                rl_weight_columns=rl_weight_columns,
+                rl_weighting=rl_weighting_meta
             )
-            
+
             progress.close()
 
             # キャンセルされた場合の処理
@@ -25679,10 +29854,21 @@ class ImageAnnotationTool(QMainWindow):
                     "data_folder": self.folder_path if hasattr(self, 'folder_path') and self.folder_path else "unknown",
                     "model_name": model_name,
                     "comment": comment,
+                    "use_speed_output": use_speed_output,
+                    "speed_normalize": speed_normalize_value if use_speed_output else None,
+                    "use_future_output": use_future_output,
+                    "future_offsets": ",".join(map(str, future_offsets_value)) if use_future_output else None,
+                    "masks_enabled": ", ".join(m['name'] for m in _selected_masks) or None,
+                    "pip_embed_source": pip_embed_config['source'] if pip_embed_config else None,
                     "is_multi_source": is_multi_source,
                     "num_sources": training_num_sources,
                     "fusion_method": training_fusion_method if is_multi_source else None,
-                    "selected_sources": selected_sources if is_multi_source else None,
+                    # 単一カメラでもカメラ名を残す（推論時にモデルとデータの
+                    # キーが食い違った際、学習時の構成を辿れるようにするため）
+                    "selected_sources": selected_sources,
+                    "virtual_source_type": training_virtual_type if is_virtual_source else None,
+                    "input_size": list(input_size) if input_size else None,
+                    "rl_weighting": rl_weighting_meta,
                 },
                 dataset_info={
                     "total_annotations": len(self.annotations),
@@ -25771,7 +29957,13 @@ class ImageAnnotationTool(QMainWindow):
             header = get_text('label_togivad_inference_result')
         else:
             header = get_text('label_traj_inference_result')
-        header_color = '#00A0A0' if is_togivad else '#00C800'
+        if is_dark_mode():
+            cyan_cols = ('#4DD0E1', '#26C6DA', '#80DEEA')
+            green_cols = ('#69F0AE', '#81C784')
+        else:
+            cyan_cols = ('#00A0A0', '#008C8C', '#006A6A')
+            green_cols = ('#00C800', '#008000')
+        header_color = cyan_cols[0] if is_togivad else green_cols[0]
         gru_text = f"<b style='color:{header_color};'>{header}</b>"
         gru_text += "<table style='margin:0; padding:0; border-spacing:0;'>"
         if is_togivad:
@@ -25788,16 +29980,16 @@ class ImageAnnotationTool(QMainWindow):
             for step in steps:
                 x, y = trajectory[step]
                 gru_text += (
-                    f"<tr><td style='color:#00A0A0;'>{(step+1)*dt:.2f}&nbsp;</td>"
-                    f"<td style='color:#008C8C;'>{x:+.2f}&nbsp;</td>"
-                    f"<td style='color:#006A6A;'>{y:+.2f}</td></tr>"
+                    f"<tr><td style='color:{cyan_cols[0]};'>{(step+1)*dt:.2f}&nbsp;</td>"
+                    f"<td style='color:{cyan_cols[1]};'>{x:+.2f}&nbsp;</td>"
+                    f"<td style='color:{cyan_cols[2]};'>{y:+.2f}</td></tr>"
                 )
         else:
             for step, (s, t) in enumerate(trajectory):
                 gru_text += (
                     f"<tr><td>t+{step+1}:&nbsp;</td>"
-                    f"<td style='color:#00C800;'>{s:+.3f},&nbsp;</td>"
-                    f"<td style='color:#008000;'>{t:+.3f}</td></tr>"
+                    f"<td style='color:{green_cols[0]};'>{s:+.3f},&nbsp;</td>"
+                    f"<td style='color:{green_cols[1]};'>{t:+.3f}</td></tr>"
                 )
         gru_text += "</table>"
 
@@ -25848,6 +30040,226 @@ class ImageAnnotationTool(QMainWindow):
 
         self.main_image_view.update()
 
+    LIDAR_POLICY_MODEL_TYPE = 'lidar_policy'
+
+    def _driving_model_types(self):
+        """自動運転モデル種別の一覧（画像 CNN + LiDAR Policy）。"""
+        return list(list_available_models()) + [self.LIDAR_POLICY_MODEL_TYPE]
+
+    def _build_lidar_policy_group(self):
+        """LiDAR Policy の学習パラメータ群（時系列ダイアログ・自動運転ダイアログ共通）。
+
+        Returns:
+            (QGroupBox, read_config) — read_config() は config 辞書に入れるキーを返す
+        """
+        lidar_group = QGroupBox(get_text('label_lidar_policy_params'))
+        lidar_layout = QVBoxLayout()
+
+        lidar_row1 = QHBoxLayout()
+        lidar_row1.addWidget(QLabel(get_text('label_lidar_preset')))
+        lidar_preset_combo = QComboBox()
+        lidar_preset_combo.addItem(get_text('opt_lidar_preset_base'), 'base')
+        lidar_preset_combo.addItem(get_text('opt_lidar_preset_tiny'), 'tiny')
+        j = lidar_preset_combo.findData(LIDAR_POLICY_DEFAULT_PRESET)
+        lidar_preset_combo.setCurrentIndex(max(j, 0))
+        lidar_row1.addWidget(lidar_preset_combo)
+        lidar_row1.addWidget(QLabel(get_text('label_lidar_num_bins')))
+        lidar_bins_combo = QComboBox()
+        for b in (1081, 541, 271, 108):
+            lidar_bins_combo.addItem(str(b), b)
+        j = lidar_bins_combo.findData(LIDAR_POLICY_DEFAULT_NUM_BINS)
+        lidar_bins_combo.setCurrentIndex(max(j, 0))
+        lidar_row1.addWidget(lidar_bins_combo)
+        lidar_row1.addStretch()
+        lidar_layout.addLayout(lidar_row1)
+
+        lidar_row2 = QHBoxLayout()
+        lidar_row2.addWidget(QLabel(get_text('label_lidar_downsample')))
+        lidar_ds_combo = QComboBox()
+        lidar_ds_combo.addItem(get_text('opt_lidar_ds_minpool'), 'minpool')
+        lidar_ds_combo.addItem(get_text('opt_lidar_ds_index'), 'index')
+        lidar_row2.addWidget(lidar_ds_combo)
+        lidar_row2.addWidget(QLabel(get_text('label_lidar_stack')))
+        lidar_stack_spin = QSpinBox()
+        lidar_stack_spin.setRange(1, 8)
+        lidar_stack_spin.setValue(LIDAR_POLICY_DEFAULT_STACK_FRAMES)
+        lidar_row2.addWidget(lidar_stack_spin)
+        lidar_row2.addStretch()
+        lidar_layout.addLayout(lidar_row2)
+
+        lidar_row3 = QHBoxLayout()
+        lidar_row3.addWidget(QLabel(get_text('label_lidar_max_range')))
+        lidar_range_spin = QSpinBox()
+        lidar_range_spin.setRange(1000, 60000)
+        lidar_range_spin.setSingleStep(500)
+        lidar_range_spin.setValue(int(LIDAR_POLICY_DEFAULT_MAX_RANGE_MM))
+        lidar_row3.addWidget(lidar_range_spin)
+        lidar_row3.addWidget(QLabel(get_text('label_lidar_max_speed')))
+        lidar_speed_spin = QDoubleSpinBox()
+        lidar_speed_spin.setRange(0.5, 20.0)
+        lidar_speed_spin.setSingleStep(0.5)
+        lidar_speed_spin.setValue(LIDAR_POLICY_DEFAULT_MAX_SPEED)
+        lidar_row3.addWidget(lidar_speed_spin)
+        lidar_row3.addStretch()
+        lidar_layout.addLayout(lidar_row3)
+
+        # 補助軌道ヘッド: pred_seconds / pred_points（togivad と同じ意味論）
+        lidar_row4 = QHBoxLayout()
+        lidar_traj_check = QCheckBox(get_text('chk_lidar_traj'))
+        lidar_traj_check.setChecked(True)
+        lidar_traj_check.setToolTip(get_text('tip_lidar_traj'))
+        lidar_row4.addWidget(lidar_traj_check)
+        lidar_row4.addWidget(QLabel(get_text('label_togivad_pred_seconds')))
+        lidar_seconds_spin = QDoubleSpinBox()
+        lidar_seconds_spin.setRange(0.1, 5.0)
+        lidar_seconds_spin.setSingleStep(0.1)
+        lidar_seconds_spin.setDecimals(2)
+        lidar_seconds_spin.setValue(LIDAR_POLICY_DEFAULT_PRED_SECONDS)
+        lidar_row4.addWidget(lidar_seconds_spin)
+        lidar_row4.addWidget(QLabel(get_text('label_togivad_pred_points')))
+        lidar_points_spin = QSpinBox()
+        lidar_points_spin.setRange(1, 100)
+        lidar_points_spin.setValue(LIDAR_POLICY_DEFAULT_PRED_POINTS)
+        lidar_row4.addWidget(lidar_points_spin)
+        lidar_row4.addStretch()
+        lidar_layout.addLayout(lidar_row4)
+
+        def _sync_lidar_traj_enable(on):
+            for w in (lidar_seconds_spin, lidar_points_spin, lidar_pose_combo):
+                w.setEnabled(bool(on))
+
+        lidar_traj_check.toggled.connect(_sync_lidar_traj_enable)
+
+        lidar_row5 = QHBoxLayout()
+        lidar_row5.addWidget(QLabel(get_text('label_lidar_pose_source')))
+        lidar_pose_combo = QComboBox()
+        lidar_pose_combo.addItem(get_text('opt_pose_source_pose'), 'pose')
+        lidar_pose_combo.addItem(get_text('opt_pose_source_slam'), 'slam')
+        lidar_row5.addWidget(lidar_pose_combo)
+        lidar_row5.addWidget(QLabel(get_text('label_lidar_mode_filter')))
+        lidar_mode_combo = QComboBox()
+        lidar_mode_combo.addItem(get_text('opt_lidar_mode_all'), 'all')
+        lidar_mode_combo.addItem(get_text('opt_lidar_mode_auto'), 'auto')
+        lidar_mode_combo.addItem(get_text('opt_lidar_mode_user'), 'user')
+        lidar_row5.addWidget(lidar_mode_combo)
+        lidar_row5.addStretch()
+        lidar_layout.addLayout(lidar_row5)
+
+        lidar_row6 = QHBoxLayout()
+        lidar_row6.addWidget(QLabel(get_text('label_lidar_split')))
+        lidar_split_combo = QComboBox()
+        lidar_split_combo.addItem(get_text('opt_lidar_split_block'), 'block')
+        lidar_split_combo.addItem(get_text('opt_lidar_split_random'), 'random')
+        lidar_split_combo.setToolTip(get_text('tip_lidar_split'))
+        lidar_row6.addWidget(lidar_split_combo)
+        lidar_valid_check = QCheckBox(get_text('chk_lidar_valid_ch'))
+        lidar_valid_check.setChecked(True)
+        lidar_valid_check.setToolTip(get_text('tip_lidar_valid_ch'))
+        lidar_row6.addWidget(lidar_valid_check)
+        lidar_row6.addStretch()
+        lidar_layout.addLayout(lidar_row6)
+
+        lidar_mirror_check = QCheckBox(get_text('chk_lidar_mirror'))
+        lidar_mirror_check.setChecked(False)
+        lidar_mirror_check.setToolTip(get_text('tip_lidar_mirror'))
+        lidar_layout.addWidget(lidar_mirror_check)
+        lidar_balance_check = QCheckBox(get_text('chk_lidar_steer_balance'))
+        lidar_balance_check.setChecked(True)
+        lidar_layout.addWidget(lidar_balance_check)
+
+        lidar_info_label = QLabel(get_text('label_lidar_info'))
+        set_text_role(lidar_info_label, 'muted')
+        lidar_info_label.setWordWrap(True)
+        lidar_layout.addWidget(lidar_info_label)
+
+        lidar_group.setLayout(lidar_layout)
+
+        def read_config():
+            return {
+                'preset': lidar_preset_combo.currentData(),
+                'num_bins': int(lidar_bins_combo.currentData()),
+                'downsample_mode': lidar_ds_combo.currentData(),
+                'stack_frames': lidar_stack_spin.value(),
+                'use_valid_ch': lidar_valid_check.isChecked(),
+                'max_range_mm': float(lidar_range_spin.value()),
+                'max_speed': lidar_speed_spin.value(),
+                'use_traj': lidar_traj_check.isChecked(),
+                'pred_seconds': lidar_seconds_spin.value(),
+                'pred_points': lidar_points_spin.value(),
+                'pose_source': lidar_pose_combo.currentData(),
+                'mode_filter': lidar_mode_combo.currentData(),
+                'split_mode': lidar_split_combo.currentData(),
+                'mirror': lidar_mirror_check.isChecked(),
+                'steer_balance': lidar_balance_check.isChecked(),
+            }
+
+        return lidar_group, read_config
+
+    def _train_lidar_policy(self, valid_indexes, config, progress_title):
+        """LiDAR Policy を学習し結果辞書を返す（進捗ダイアログ付き。共通）。"""
+        progress = QProgressDialog(progress_title, "キャンセル", 0, 100, self)
+        progress.setWindowTitle(get_text('dlg_model_training'))
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+
+        def update_progress(current, total, message=None):
+            progress.setValue(int(current * 100 / total) if total > 0 else 0)
+            if message:
+                progress.setLabelText(message)
+            QApplication.processEvents()
+            return not progress.wasCanceled()
+
+        try:
+            manager = LidarPolicyTrainingManager(
+                models_dir, mlflow_manager=getattr(self, 'mlflow_manager', None))
+            result = manager.train(
+                valid_indexes=valid_indexes, annotations=self.annotations,
+                images=self.images, pose_manager=self.pose_manager,
+                config=config, progress_callback=update_progress)
+        finally:
+            progress.close()
+        return result
+
+    def _lidar_policy_result(self, idx):
+        """読込済み LiDAR Policy で 1 フレーム推論し、自動運転モデルと同じ結果辞書を返す。"""
+        lp = getattr(self, '_lidar_policy', None)
+        if not lp:
+            return None
+        model, cfg, manager = lp
+        out = manager.predict_current(model, cfg, None, [], idx, self.images, None,
+                                      self.annotations, pose_manager=self.pose_manager,
+                                      pose_source='pose')
+        if out is None:
+            return None
+        a, t = out["control"]
+        W = int(getattr(self, 'original_image_width', 0) or 160)
+        H = int(getattr(self, 'original_image_height', 0) or 120)
+        x = max(0, min(int((a + 1) / 2 * W), W - 1))
+        y = max(0, min(int((1 - t) / 2 * H), H - 1))
+        res = {"angle": float(a), "throttle": float(t), "x": x, "y": y}
+        if out.get("best") is not None:
+            res["traj"] = out["best"].tolist()
+        return res
+
+    def _load_lidar_policy_model(self, model_path):
+        """LiDAR Policy チェックポイントを読み込んで self._lidar_policy に保持する。"""
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model, cfg, meta = LidarPolicyTrainingManager.load_model(model_path, device)
+        manager = LidarPolicyTrainingManager(models_dir)
+        self._lidar_policy = (model, cfg, manager)
+        self._lidar_policy_path = model_path
+        self.model = model
+        self._multi_source_config = None
+        self._virtual_source_config = None
+        if hasattr(self, 'main_image_view'):
+            self.main_image_view.crop_overlay_config = None
+        # 測距ビューの「モデル入力」表示をこのモデルの前処理設定に合わせる
+        self._lidar_frame_key = None
+        if hasattr(self, 'model_input_size_label'):
+            self.model_input_size_label.setText(
+                f"入力:{cfg.num_bins}bin×K{cfg.stack_frames}")
+        return model, cfg, meta
+
     def train_sequence_model(self):
         """時系列モデルの学習設定ダイアログを表示し学習を実行"""
         if not self.annotations:
@@ -25881,6 +30293,7 @@ class ImageAnnotationTool(QMainWindow):
         arch_combo.addItem("TCN", "tcn")
         arch_combo.addItem("CausalCNN", "causal_cnn")
         arch_combo.addItem("TogiVAD", "togivad")
+        arch_combo.addItem("LiDAR Policy", "lidar_policy")
 
         # パネルで選択中のモデルタイプを初期値に連動
         if hasattr(self, 'traj_arch_combo'):
@@ -26023,7 +30436,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # dt と MPPI互換の目安を動的表示
         togivad_dt_label = QLabel("")
-        togivad_dt_label.setStyleSheet("color: #666;")
+        set_text_role(togivad_dt_label, 'muted')
         horizon_layout.addWidget(togivad_dt_label)
         horizon_layout.addStretch()
         togivad_layout.addLayout(horizon_layout)
@@ -26060,13 +30473,81 @@ class ImageAnnotationTool(QMainWindow):
         vocab_layout.addStretch()
         togivad_layout.addLayout(vocab_layout)
 
+        # T1-b: 残差回帰（脱量子化）。既定 OFF で従来の語彙分類のみ。
+        residual_check = QCheckBox(get_text('chk_togivad_residual'))
+        residual_check.setChecked(False)
+        residual_check.setToolTip(get_text('tip_togivad_residual'))
+        togivad_layout.addWidget(residual_check)
+
+        # T1-a: 時系列BEV融合（pose-warp）。既定 OFF で単一フレーム。
+        temporal_check = QCheckBox(get_text('chk_togivad_temporal'))
+        temporal_check.setChecked(False)
+        temporal_check.setToolTip(get_text('tip_togivad_temporal'))
+        togivad_layout.addWidget(temporal_check)
+
+        # Fusion: LiDAR占有をBEV融合。既定 OFF（LiDAR記録セッションで有効化）。
+        lidar_check = QCheckBox(get_text('chk_togivad_lidar'))
+        lidar_check.setChecked(False)
+        lidar_check.setToolTip(get_text('tip_togivad_lidar'))
+        togivad_layout.addWidget(lidar_check)
+
+        # Pilot: 制御入出力（angle/throttle 直接出力）。既定 OFF。
+        control_check = QCheckBox(get_text('chk_togivad_control'))
+        control_check.setChecked(False)
+        control_check.setToolTip(get_text('tip_togivad_control'))
+        togivad_layout.addWidget(control_check)
+
+        # Pilot-Trj: 最終軌道入力の学習トラッカー。既定 OFF。Pilot と排他
+        control_trj_check = QCheckBox(get_text('chk_togivad_control_trj'))
+        control_trj_check.setChecked(False)
+        control_trj_check.setToolTip(get_text('tip_togivad_control_trj'))
+        togivad_layout.addWidget(control_trj_check)
+        # 排他制御: 片方を ON にするともう片方は自動 OFF
+        control_check.toggled.connect(
+            lambda on: control_trj_check.setChecked(False) if on else None)
+        control_trj_check.toggled.connect(
+            lambda on: control_check.setChecked(False) if on else None)
+
+        # T2-a: 世界モデル自己教師（学習専用・推論コスト0）。既定 OFF。
+        wm_check = QCheckBox(get_text('chk_togivad_world'))
+        wm_check.setChecked(False)
+        wm_check.setToolTip(get_text('tip_togivad_world'))
+        togivad_layout.addWidget(wm_check)
+
+        # ②: 他車動き予測（togivad/agents GT が必要）。既定 OFF。
+        agent_motion_check = QCheckBox(get_text('chk_togivad_agent_motion'))
+        agent_motion_check.setChecked(False)
+        agent_motion_check.setToolTip(get_text('tip_togivad_agent_motion'))
+        togivad_layout.addWidget(agent_motion_check)
+
+        # T2-b: agent 追跡強化。②と T1-a（時系列）が前提 — 両方 ON のときのみ
+        # 有効化し、前提が外れたら自動 OFF する。
+        track_check = QCheckBox(get_text('chk_togivad_track'))
+        track_check.setChecked(False)
+        track_check.setEnabled(False)
+        track_check.setToolTip(get_text('tip_togivad_track'))
+        togivad_layout.addWidget(track_check)
+
+        def _sync_track_enable():
+            ok = agent_motion_check.isChecked() and temporal_check.isChecked()
+            track_check.setEnabled(ok)
+            if not ok:
+                track_check.setChecked(False)
+
+        agent_motion_check.toggled.connect(_sync_track_enable)
+        temporal_check.toggled.connect(_sync_track_enable)
+
         togivad_info_label = QLabel(get_text('label_togivad_info'))
-        togivad_info_label.setStyleSheet("color: #666;")
+        set_text_role(togivad_info_label, 'muted')
         togivad_info_label.setWordWrap(True)
         togivad_layout.addWidget(togivad_info_label)
 
         togivad_group.setLayout(togivad_layout)
         arch_layout.addWidget(togivad_group)
+
+        # --- LiDAR Policy 固有パラメータ（arch=lidar_policy のときのみ表示。共通ビルダー） ---
+        lidar_group, lidar_read_config = self._build_lidar_policy_group()
+        arch_layout.addWidget(lidar_group)
 
         def update_arch_widgets():
             arch = arch_combo.currentData()
@@ -26079,17 +30560,22 @@ class ImageAnnotationTool(QMainWindow):
             # TogiVAD: 単一フレーム入力・軌道語彙分類のため
             # シーケンス/隠れ層/融合の設定は使わない（無効化して明示）
             is_togivad = (arch == "togivad")
+            is_lidar = (arch == "lidar_policy")
             togivad_group.setVisible(is_togivad)
+            lidar_group.setVisible(is_lidar)
             for w in (seq_len_spin, pred_horizon_spin, stride_spin,
-                      hidden_dim_combo, dropout_spin, fusion_combo,
-                      attn_heads_spin, aug_check):
-                w.setEnabled(not is_togivad)
+                      hidden_dim_combo, fusion_combo, attn_heads_spin):
+                w.setEnabled(not (is_togivad or is_lidar))
+            # LiDAR Policy は dropout / 拡張を使う（画像ソースは使わない）
+            dropout_spin.setEnabled(not is_togivad)
+            aug_check.setEnabled(not is_togivad)
+            source_group.setEnabled(not is_lidar)
 
         arch_combo.currentIndexChanged.connect(update_arch_widgets)
 
         # シーケンス情報ラベル
         seq_info_label = QLabel(get_text('label_traj_seq_info', SEQ_DEFAULT_SEQ_LEN, SEQ_DEFAULT_PRED_HORIZON))
-        seq_info_label.setStyleSheet("color: #666;")
+        set_text_role(seq_info_label, 'muted')
         arch_layout.addWidget(seq_info_label)
 
         def update_seq_info():
@@ -26136,11 +30622,11 @@ class ImageAnnotationTool(QMainWindow):
             count = len(checked)
             if count > MAX_IMAGE_SOURCES:
                 sources_label.setText(get_text('label_sources_max_exceeded', MAX_IMAGE_SOURCES))
-                sources_label.setStyleSheet("color: red;")
+                set_text_role(sources_label, 'error')
                 start_button.setEnabled(False)
             else:
                 sources_label.setText(get_text('label_sources_selected', count))
-                sources_label.setStyleSheet("")
+                set_text_role(sources_label, None)
                 start_button.setEnabled(count > 0)
 
         for cb in source_checkboxes.values():
@@ -26289,7 +30775,8 @@ class ImageAnnotationTool(QMainWindow):
                 deleted = sum(1 for idx in self.annotations if start <= idx <= end and hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes)
                 sample_count = total_in_range - deleted
                 data_sample_label.setText(get_text('label_data_count_range_detail', sample_count, start, end, total_in_range, get_text('label_excluded_deleted', deleted)))
-            data_sample_label.setStyleSheet("color: #2E7D32; font-weight: bold; font-size: 13px;")
+            data_sample_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+            set_text_role(data_sample_label, 'success')
 
         data_radio_all.toggled.connect(update_data_selection_ui)
         data_radio_skip.toggled.connect(update_data_selection_ui)
@@ -26323,7 +30810,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # === 設定値の取得 ===
         selected_sources = [name for name, cb in source_checkboxes.items() if cb.isChecked()]
-        if not selected_sources:
+        if not selected_sources and arch_combo.currentData() != 'lidar_policy':
             QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_select_at_least_one_source'))
             return
 
@@ -26388,6 +30875,14 @@ class ImageAnnotationTool(QMainWindow):
             config['vocab_k'] = int(vocab_k_combo.currentText())
             config['vocab_from_logs'] = vocab_from_logs_check.isChecked()
             config['ego_dropout'] = ego_dropout_spin.value()
+            config['use_residual'] = residual_check.isChecked()  # T1-b
+            config['use_temporal'] = temporal_check.isChecked()  # T1-a
+            config['use_lidar'] = lidar_check.isChecked()        # Fusion
+            config['use_control'] = control_check.isChecked()    # Pilot
+            config['use_control_trj'] = control_trj_check.isChecked()  # Pilot-Trj
+            config['use_world_model'] = wm_check.isChecked()     # T2-a
+            config['use_agent_motion'] = agent_motion_check.isChecked()  # ②
+            config['use_track'] = track_check.isChecked()        # T2-b
             # 事前バリデーション: カメラ台数プリセットと自己位置の有無
             if len(selected_sources) not in TogivadTrainingManager.SUPPORTED_CAMERA_COUNTS:
                 QMessageBox.warning(self, get_text('dlg_warning'),
@@ -26397,10 +30892,15 @@ class ImageAnnotationTool(QMainWindow):
                 QMessageBox.warning(self, get_text('dlg_warning'),
                                     get_text('msg_togivad_no_pose'))
                 return
+        elif selected_arch == 'lidar_policy':
+            config.update(lidar_read_config())
 
         # マルチカメラ融合パラメータ
         config['fusion_method'] = fusion_combo.currentData()
         config['attn_heads'] = attn_heads_spin.value()
+        # MLflow 用: 学習に使ったデータフォルダ（マネージャ側は models ディレクトリ
+        # しか知らないため、ここで渡さないと data_folder=models になる）
+        config['data_folder'] = getattr(self, 'folder_path', None) or "unknown"
 
         try:
             # 進捗ダイアログ
@@ -26424,7 +30924,17 @@ class ImageAnnotationTool(QMainWindow):
             if hasattr(self, 'mlflow_manager'):
                 mlflow_mgr = self.mlflow_manager
 
-            if selected_arch == 'togivad':
+            if selected_arch == 'lidar_policy':
+                manager = LidarPolicyTrainingManager(models_dir, mlflow_manager=mlflow_mgr)
+                result = manager.train(
+                    valid_indexes=valid_indexes,
+                    annotations=self.annotations,
+                    images=self.images,
+                    pose_manager=self.pose_manager,
+                    config=config,
+                    progress_callback=update_progress
+                )
+            elif selected_arch == 'togivad':
                 manager = TogivadTrainingManager(models_dir, mlflow_manager=mlflow_mgr)
                 result = manager.train(
                     valid_indexes=valid_indexes,
@@ -26455,7 +30965,8 @@ class ImageAnnotationTool(QMainWindow):
                 if err == 'no_sequences':
                     QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_traj_no_sequences'))
                 elif err in ('togivad_bad_source_count', 'togivad_no_pose',
-                             'togivad_bad_horizon'):
+                             'togivad_bad_horizon', 'togivad_track_prereq',
+                             'togivad_no_agents', 'lidar_no_scans'):
                     QMessageBox.warning(self, get_text('dlg_warning'), get_text(f'msg_{err}'))
                 else:
                     QMessageBox.warning(self, get_text('dlg_warning'), err or 'Unknown error')
@@ -26467,7 +30978,7 @@ class ImageAnnotationTool(QMainWindow):
 
             # 学習曲線グラフを保存
             # （togivad はマネージャ側で ADE 付き曲線を保存済みのためスキップ）
-            if selected_arch != 'togivad' and result.get('model_path') \
+            if selected_arch not in ('togivad', 'lidar_policy') and result.get('model_path') \
                     and result.get('train_losses') and result.get('val_losses'):
                 self._save_traj_training_curve(
                     result['model_path'],
@@ -26483,6 +30994,18 @@ class ImageAnnotationTool(QMainWindow):
                     f"Pose Source: {config.get('pose_source', 'pose')}\n"
                     f"Val top1: {result.get('val_top1', 0):.1%} | "
                     f"Val ADE: {result.get('val_ade_m', 0):.3f} m\n"
+                )
+            elif selected_arch == 'lidar_policy':
+                ade_txt = (f" | Val ADE: {result.get('val_ade_m', 0):.3f} m"
+                           if result.get('use_traj') else "")
+                togivad_line = (
+                    f"Preset: {config.get('preset')} | bins: {config.get('num_bins')} | "
+                    f"K: {config.get('stack_frames')}\n"
+                    f"Val steer MAE: {result.get('val_steer_mae', 0):.4f} | "
+                    f"Val throttle MAE: {result.get('val_speed_mae', 0):.4f}{ade_txt}\n"
+                    f"Skipped (no scan / mode): {result.get('n_no_scan', 0)} / "
+                    f"{result.get('n_mode_skipped', 0)}\n"
+                    f"ONNX: {os.path.basename(result.get('onnx_path') or '-')}\n"
                 )
             msg = (
                 f"{get_text('msg_traj_training_complete')}\n\n"
@@ -26545,6 +31068,154 @@ class ImageAnnotationTool(QMainWindow):
             import traceback
             traceback.print_exc()
 
+    @staticmethod
+    def _normalize_source_key(name):
+        """カメラキー比較用の正規化（大小文字・記号・末尾連番を無視）。
+
+        'cam3' / 'Cam_3' / 'cam' → 'cam'、'camera_3' → 'camera'。
+        学習時と収録時でカメラ名の付け方が違う（cam3 で学習したモデルを
+        cam しか無いデータで推論する等）ケースを吸収するための下ごしらえ。
+        """
+        base = ''.join(ch for ch in str(name).lower() if ch.isalnum())
+        return base.rstrip('0123456789') or base
+
+    def _resolve_model_sources(self, model_sources, warn=True):
+        """モデルに記録されたカメラキーを、現在のデータのキーへ読み替える。
+
+        TogiVAD/時系列モデルのチェックポイントには学習時の selected_sources
+        （例 ['cam3']）が入っているが、推論対象データのキー（variant_images の
+        キー。例 'cam'）と違うと managers 側の _image_path が None を返し、
+        **例外も出さずに推論結果が空**になる（表示されない原因）。
+        ここで不一致を検出して警告し、可能なら読み替えたキー列を返す。
+
+        Args:
+            model_sources (list[str]): モデル側のキー列
+            warn (bool): 不一致時に警告ダイアログを出すか
+
+        Returns:
+            list[str] — 現在のデータで使うキー列（解決できなければ元名のまま）
+        """
+        sources = [s for s in (model_sources or []) if s]
+        available = list((getattr(self, 'source_images_map', None) or {}).keys())
+        # データを切り替えたときに再解決できるよう、元のキー列と解決時の
+        # データキーを覚えておく（_refresh_gru_sources_for_current_data）
+        self._gru_sources_raw = list(sources)
+        self._gru_sources_data_keys = list(available)
+        if not sources or not available:
+            return sources
+
+        norm_avail = {}
+        for key in available:
+            norm_avail.setdefault(self._normalize_source_key(key), []).append(key)
+        lower_avail = {str(k).lower(): k for k in available}
+
+        resolved = list(sources)
+        notes = []          # 読み替え内容（ユーザー向け表示用）
+        unresolved = []     # 読み替え先が見つからなかったキー
+        used = set()
+
+        for i, src in enumerate(sources):
+            if src in available:                       # ① 完全一致
+                used.add(src)
+                continue
+            # 既に別のソースへ割り当てたキーは候補から外す。4カメラのモデルを
+            # 1カメラのデータへ流し込んで同じ画像を4枚与える、といった
+            # 「一見動くが中身が誤り」な読み替えを防ぐ
+            hit = lower_avail.get(str(src).lower())    # ② 大小文字違い
+            if hit in used:
+                hit = None
+            if hit is None:                            # ③ 末尾連番・記号違い
+                cands = [k for k in norm_avail.get(self._normalize_source_key(src), [])
+                         if k not in used]
+                if len(cands) == 1:
+                    hit = cands[0]
+            if hit is None:                            # ④ 前方一致（cam ⇔ camera）
+                nsrc = self._normalize_source_key(src)
+                cands = [k for k in available
+                         if k not in used
+                         and len(nsrc) >= 3 and len(self._normalize_source_key(k)) >= 3
+                         and (self._normalize_source_key(k).startswith(nsrc)
+                              or nsrc.startswith(self._normalize_source_key(k)))]
+                if len(cands) == 1:
+                    hit = cands[0]
+            if hit is None:
+                unresolved.append((i, src))
+                continue
+            resolved[i] = hit
+            used.add(hit)
+            notes.append(f"{src} → {hit}")
+
+        # ⑤ 残りが1対1で対応づく場合のみ、並び順で推定する
+        remaining = [k for k in available if k not in used]
+        if unresolved and len(unresolved) == len(remaining):
+            for (i, src), key in zip(unresolved, remaining):
+                resolved[i] = key
+                notes.append(f"{src} → {key} (順序による推定)")
+            unresolved = []
+
+        if not notes and not unresolved:
+            return resolved
+
+        summary = "\n".join(f"  {n}" for n in notes) if notes else "  (なし)"
+        print(f"[WARN] カメラキー不一致: model={sources} data={available}")
+        for n in notes:
+            print(f"[WARN]   読み替え: {n}")
+        for _, src in unresolved:
+            print(f"[WARN]   読み替え不可: {src}")
+
+        if warn:
+            msg = get_text('msg_model_source_mismatch',
+                           ", ".join(sources), ", ".join(available), summary)
+            if unresolved:
+                msg += "\n\n" + get_text(
+                    'msg_model_source_unresolved',
+                    ", ".join(src for _, src in unresolved))
+            QMessageBox.warning(self, get_text('dlg_warning'), msg)
+        if notes:
+            self.statusBar().showMessage(
+                get_text('status_model_source_remapped', " / ".join(notes)),
+                8000)
+        return resolved
+
+    def _resolve_model_sources_cached(self, model_sources):
+        """_resolve_model_sources のキャッシュ版（フレーム毎に呼ぶ経路向け）。
+
+        位置推論や追加スロットの推論は全フレームで走るため、素で呼ぶと
+        警告ダイアログが毎フレーム出てしまう。(モデル側キー, データ側キー) が
+        同じ組み合わせなら最初の1回だけ解決・警告し、以後は結果を使い回す。
+        """
+        sources = [s for s in (model_sources or []) if s]
+        if not sources:
+            return sources
+        available = tuple((getattr(self, 'source_images_map', None) or {}).keys())
+        cache = getattr(self, '_source_remap_cache', None)
+        if cache is None:
+            cache = self._source_remap_cache = {}
+        key = (tuple(sources), available)
+        if key not in cache:
+            # ここでの解決結果は _gru_sources_raw を上書きしてしまうため退避する
+            saved = (getattr(self, '_gru_sources_raw', None),
+                     getattr(self, '_gru_sources_data_keys', None))
+            cache[key] = self._resolve_model_sources(sources)
+            self._gru_sources_raw, self._gru_sources_data_keys = saved
+        return list(cache[key])
+
+    def _refresh_gru_sources_for_current_data(self):
+        """モデル読込後にデータを切り替えた場合、カメラキーを解決し直す。
+
+        _load_gru_model は同一モデルなら早期 return するため、ここを通さないと
+        前のデータで解決した読み替え結果が残り、また推論が空になる。
+        データキーが変わっていないときは何もしない（警告の再表示を避ける）。
+        """
+        raw = getattr(self, '_gru_sources_raw', None)
+        if not raw:
+            return
+        available = list((getattr(self, 'source_images_map', None) or {}).keys())
+        if available == list(getattr(self, '_gru_sources_data_keys', []) or []):
+            return
+        self._gru_sources = self._resolve_model_sources(raw)
+        self._togivad_miss_reported = False
+
     def _load_gru_model(self):
         """コンボボックスで選択された時系列モデルをロードしてキャッシュする。
 
@@ -26555,7 +31226,7 @@ class ImageAnnotationTool(QMainWindow):
             QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_need_annotations_to_train'))
             return False
 
-        selected_model_name = self.traj_model_combo.currentText()
+        selected_model_name = self.traj_model_combo.currentData() or self.traj_model_combo.currentText()
         if not selected_model_name or selected_model_name == get_text('combo_model_not_found'):
             QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_traj_models'))
             return False
@@ -26565,8 +31236,10 @@ class ImageAnnotationTool(QMainWindow):
             QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_traj_models'))
             return False
 
-        # 既に同じモデルをロード済みなら再利用
+        # 既に同じモデルをロード済みなら再利用（ただしモデル読込後にデータを
+        # 切り替えた場合はカメラキーの読み替えをやり直す）
         if self._gru_model is not None and self._gru_model_path == selected_model_path:
+            self._refresh_gru_sources_for_current_data()
             return True
 
         try:
@@ -26574,12 +31247,43 @@ class ImageAnnotationTool(QMainWindow):
             # togivad モデルは別マネージャ・別チェックポイント形式
             # （state_dict/config(TogiVADConfig)/vocab、単一フレーム軌道分類）
             is_togivad = os.path.basename(selected_model_path).startswith("togivad_")
-            if is_togivad:
+            # LiDAR Policy は入出力が togivad と同型（ego 軌道 + angle/throttle）なので
+            # 表示系は togivad 経路を共用する（_gru_is_togivad=True, vocab=None）
+            is_lidar = os.path.basename(selected_model_path).startswith(
+                LidarPolicyTrainingManager.MODEL_PREFIX)
+            if is_lidar:
+                model, cfg, meta = LidarPolicyTrainingManager.load_model(
+                    selected_model_path, device)
+                self._gru_vocab = None
+                self._gru_pose_source = meta.get('pose_source') or 'pose'
+                self._gru_sources = []
+                self._gru_sources_raw = []      # LiDAR Policy は画像を使わない
+                self._gru_manager = LidarPolicyTrainingManager(models_dir)
+                if cfg.use_traj:
+                    total_seconds = float(cfg.horizon) * float(cfg.dt)
+                    self.recorded_traj_points = int(cfg.horizon)
+                    self.recorded_traj_seconds = total_seconds
+                    self.recorded_traj_dt = float(cfg.dt)
+                    self.recorded_traj_source = self._gru_pose_source
+                    if hasattr(self, 'recorded_traj_seconds_input'):
+                        self.recorded_traj_seconds_input.blockSignals(True)
+                        self.recorded_traj_seconds_input.setValue(total_seconds)
+                        self.recorded_traj_seconds_input.blockSignals(False)
+                    if hasattr(self, 'recorded_traj_points_input'):
+                        self.recorded_traj_points_input.blockSignals(True)
+                        self.recorded_traj_points_input.setText(str(int(cfg.horizon)))
+                        self.recorded_traj_points_input.blockSignals(False)
+                is_togivad = True
+            elif is_togivad:
                 model, cfg, vocab, meta = TogivadTrainingManager.load_model(
                     selected_model_path, device)
                 self._gru_vocab = vocab
                 self._gru_pose_source = meta.get('pose_source', 'pose')
-                self._gru_sources = meta.get('selected_sources', ['cam'])
+                # 学習時のカメラキー（例 cam3）が現在のデータのキー（例 cam）と
+                # 違うと _image_path が None を返して**無言で推論結果が空**に
+                # なるため、ここで検出・警告して読み替える
+                self._gru_sources = self._resolve_model_sources(
+                    meta.get('selected_sources', ['cam']))
                 self._gru_manager = TogivadTrainingManager(models_dir)
                 # 緑の実測走行軌道（学習データGT）を読込モデルの時間窓へ同期する。
                 # 秒数・点数・dt・pose_source を合わせることで、推論軌道（シアン）と
@@ -26613,7 +31317,7 @@ class ImageAnnotationTool(QMainWindow):
             else:
                 model, cfg, sources = SequenceTrainingManager.load_model(
                     selected_model_path, device)
-                self._gru_sources = sources
+                self._gru_sources = self._resolve_model_sources(sources)
                 self._gru_vocab = None
                 self._gru_pose_source = None
                 self._gru_manager = SequenceTrainingManager(models_dir)
@@ -26625,7 +31329,13 @@ class ImageAnnotationTool(QMainWindow):
             self._gru_model_path = selected_model_path
             # モデルが変わったので予測キャッシュをクリア
             self.gru_predictions = {}
-            self.gru_prediction_config = cfg
+            self.togivad_control_results = {}
+            self._togivad_miss_reported = False
+            # togivad の cfg は dataclass（.get 無し）— 消費側は dict 前提の
+            # ため表示用 dict に変換して保持する
+            self.gru_prediction_config = (
+                {"seq_len": 1, "pred_horizon": int(getattr(cfg, 'horizon', 0))}
+                if is_togivad else cfg)
             return True
         except Exception as e:
             QMessageBox.critical(
@@ -26652,7 +31362,11 @@ class ImageAnnotationTool(QMainWindow):
                     pose_manager=getattr(self, 'pose_manager', None),
                     pose_source=self._gru_pose_source, device=self._gru_device)
                 if out is not None:
-                    self.gru_predictions[current_index] = out["best"].tolist()
+                    if out.get("best") is not None:
+                        self.gru_predictions[current_index] = out["best"].tolist()
+                    self._store_togivad_control_result(current_index, out)
+                else:
+                    self._report_togivad_predict_miss(current_index)
             else:
                 deleted = getattr(self, 'deleted_indexes', set())
                 traj = self._gru_manager.predict_current(
@@ -26666,6 +31380,48 @@ class ImageAnnotationTool(QMainWindow):
         except Exception as e:
             print(f"時系列逐次推論エラー: {e}")
 
+    def _report_togivad_predict_miss(self, idx):
+        """predict_current が None（=画像を1枚も引けなかった）ときの診断。
+
+        predict_current は画像パスが引けないと例外を出さず None を返すため、
+        「モデルは読めたのに推論だけ出ない」状態になる。どのキーで落ちたかを
+        ステータスバーとコンソールに出す（初回のみ）。
+        """
+        if getattr(self, '_togivad_miss_reported', False):
+            return
+        self._togivad_miss_reported = True
+        smap = getattr(self, 'source_images_map', None) or {}
+        missing = [s for s in (self._gru_sources or [])
+                   if s not in smap and s != 'cam']
+        detail = (f"未解決のカメラキー={missing}" if missing
+                  else f"index={idx} に対応する画像がありません")
+        print(f"[WARN] TogiVAD 推論なし: {detail} "
+              f"(model sources={self._gru_sources}, data keys={list(smap)})")
+        self.statusBar().showMessage(
+            f"TogiVAD 推論結果を取得できません: {detail}", 8000)
+
+    def _store_togivad_control_result(self, idx, out):
+        """TogiVAD の制御量を**専用ストア**に格納する（自動運転モデルの
+        inference_results とは独立。表示は濃紫の円＋専用ラベル）。
+
+        Pilot(use_control) は ControlHead の (angle, throttle) を直接、非 Pilot
+        は選択軌道の pure pursuit を使う。推論点座標は通常モデルと同じ写像
+        （x=(angle+1)/2·W, y=(1−throttle)/2·H）。
+        """
+        ctrl = out.get("control") or out.get("pursuit")
+        if ctrl is None:
+            return
+        a, t = float(ctrl[0]), float(ctrl[1])
+        W = int(getattr(self, 'original_image_width', 0) or 160)
+        H = int(getattr(self, 'original_image_height', 0) or 120)
+        x = max(0, min(int((a + 1) / 2 * W), W - 1))
+        y = max(0, min(int((1 - t) / 2 * H), H - 1))
+        if not hasattr(self, 'togivad_control_results'):
+            self.togivad_control_results = {}
+        self.togivad_control_results[idx] = {
+            "angle": a, "throttle": t, "x": x, "y": y,
+        }
+
     def run_gru_prediction(self):
         """時系列モデルを読み込み、読み込み直後に現在フレームの推論結果を表示する。
         以降はナビゲーション時に現在画像へ逐次推論する（自動運転モデルと同じ挙動）。"""
@@ -26673,6 +31429,10 @@ class ImageAnnotationTool(QMainWindow):
             return
 
         self._gru_infer_enabled = True
+        # togivad(Pilot 含む): angle/throttle 表示（独立表示）を自動 ON にする
+        if getattr(self, '_gru_is_togivad', False) \
+                and hasattr(self, 'togivad_control_infer_checkbox'):
+            self.togivad_control_infer_checkbox.setChecked(True)
         self.show_gru_predictions = True
         if hasattr(self, 'gru_prediction_checkbox'):
             self.gru_prediction_checkbox.setChecked(True)
@@ -26743,9 +31503,17 @@ class ImageAnnotationTool(QMainWindow):
                         pose_source=self._gru_pose_source,
                         device=self._gru_device)
                     if out is not None:
-                        predictions[idx] = out["best"].tolist()
+                        if out.get("best") is not None:
+                            predictions[idx] = out["best"].tolist()
+                        self._store_togivad_control_result(idx, out)
+                # config は完了メッセージ側が dict(.get) 前提のため表示用 dict に
+                # 変換して渡す（TogiVADConfig を生で入れると .get が無く例外）
                 result = {"status": "cancelled" if cancelled else "completed",
-                          "predictions": predictions, "config": self._gru_cfg}
+                          "predictions": predictions,
+                          "total_predictions": len(predictions),
+                          "config": {"seq_len": 1,
+                                     "pred_horizon":
+                                         int(self._gru_cfg.horizon)}}
             else:
                 result = self._gru_manager.predict(
                     model_path=self._gru_model_path,
@@ -26803,6 +31571,96 @@ class ImageAnnotationTool(QMainWindow):
                 f"時系列推論中にエラーが発生しました: {str(e)}"
             )
 
+    def _show_rl_weight_preview(self, stats, cfg, parent=None):
+        """オフライン重み付けの重み分布・上位/下位フレームを表示（dev/SPEC_offline_rl_throttle.md §4.7）"""
+        from managers.offline_reward import summarize_stats
+        dlg = QDialog(parent or self)
+        dlg.setWindowTitle(get_text('dlg_rl_preview'))
+        dlg.resize(1150, 820)
+        outer = QVBoxLayout(dlg)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+
+        summary = QLabel(summarize_stats(stats))
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+        contrib = stats.get('term_contrib', {}) or {}
+        contrib_label = QLabel(get_text('label_rl_term_contrib') + ': ' +
+                               ', '.join(f"{k}={v:+.3f}" for k, v in contrib.items()))
+        contrib_label.setWordWrap(True)
+        layout.addWidget(contrib_label)
+
+        # グラフ（Agg で描画して QPixmap に変換）
+        try:
+            w = np.asarray(stats.get('series_weight', []), dtype=float)
+            idxs = np.asarray(stats.get('series_idx', []))
+            spd = np.asarray(stats.get('series_speed', []), dtype=float)
+            fig, axes = plt.subplots(2, 1, figsize=(10.5, 5.5))
+            axes[0].hist(w, bins=50, color='#d98c3f')
+            axes[0].set_title(f"weight histogram (method={cfg.method}, target={cfg.target_head}, "
+                              f"gamma={cfg.gamma}, beta={cfg.beta})")
+            axes[0].set_xlabel('weight')
+            axes[0].set_ylabel('frames')
+            ax1 = axes[1]
+            ax1.plot(idxs, w, color='#d98c3f', lw=0.8, label='weight')
+            ax1.set_xlabel('frame index')
+            ax1.set_ylabel('weight')
+            ax2 = ax1.twinx()
+            ax2.plot(idxs, spd, color='#3f7fd9', lw=0.6, alpha=0.7, label='speed [m/s]')
+            ax2.set_ylabel('speed [m/s]')
+            fig.tight_layout()
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=100)
+            plt.close(fig)
+            pix = QPixmap()
+            pix.loadFromData(buf.getvalue())
+            graph_label = QLabel()
+            graph_label.setPixmap(pix)
+            layout.addWidget(graph_label)
+        except Exception as e:
+            layout.addWidget(QLabel(f"graph error: {e}"))
+
+        # 上位 / 下位フレームのサムネイル（何が「良い」と判定されたかを目視確認）
+        wmap = dict(zip(stats.get('series_idx', []), stats.get('series_weight', [])))
+        for title_key, key in (('label_rl_top_frames', 'top_frames'),
+                               ('label_rl_bottom_frames', 'bottom_frames')):
+            layout.addWidget(QLabel(f"<b>{get_text(title_key)}</b>"))
+            grid = QGridLayout()
+            for col, idx in enumerate(stats.get(key, []) or []):
+                cell = QVBoxLayout()
+                thumb = QLabel()
+                try:
+                    pm = QPixmap(self.images[idx]).scaled(140, 105, Qt.KeepAspectRatio,
+                                                          Qt.SmoothTransformation)
+                    thumb.setPixmap(pm)
+                except Exception:
+                    thumb.setText('N/A')
+                cell.addWidget(thumb)
+                ann = self.annotations.get(idx, {}) or {}
+                spd_v = ann.get('speed', ann.get('enc/speed', 0.0)) or 0.0
+                try:
+                    spd_v = float(spd_v)
+                except (TypeError, ValueError):
+                    spd_v = 0.0
+                cell.addWidget(QLabel(f"#{idx} w={wmap.get(idx, 1.0):.2f}\n"
+                                      f"v={spd_v:.2f} th={float(ann.get('throttle', 0.0) or 0.0):.2f}"))
+                wrap = QWidget()
+                wrap.setLayout(cell)
+                grid.addWidget(wrap, 0, col)
+            grid_widget = QWidget()
+            grid_widget.setLayout(grid)
+            layout.addWidget(grid_widget)
+
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
+        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.rejected.connect(dlg.reject)
+        btns.accepted.connect(dlg.accept)
+        outer.addWidget(btns)
+        dlg.exec_()
+
     def _log_autonomous_driving_training(self, model_type, training_results, training_params, dataset_info, image_paths):
         """自動運転モデルの学習結果をMLflowに記録"""
         
@@ -26821,6 +31679,24 @@ class ImageAnnotationTool(QMainWindow):
                 "status": "early_stopped" if training_results.get('early_stopped', False) else "completed"
             }
             
+            # 重み付き学習時の重み無し学習損失（比較用）
+            if training_results.get('train_losses_unweighted'):
+                metrics["final_train_loss_unweighted"] = training_results['train_losses_unweighted'][-1]
+
+            # 学習時間・エポック（他モデルでは記録しているが自動運転だけ欠けていた）
+            for key in ('completed_epochs', 'stopped_epoch',
+                        'total_training_time', 'avg_epoch_time'):
+                if isinstance(training_results.get(key), (int, float)):
+                    metrics[key] = training_results[key]
+            # ヘッド別の最終損失（steering と throttle のどちらが効いたかの比較用）
+            for src, dst in (('train_steering_losses', 'final_train_steering_loss'),
+                             ('train_throttle_losses', 'final_train_throttle_loss'),
+                             ('val_steering_losses', 'final_val_steering_loss'),
+                             ('val_throttle_losses', 'final_val_throttle_loss')):
+                seq = training_results.get(src)
+                if seq:
+                    metrics[dst] = seq[-1]
+
             # 自動運転特有のメトリクスを追加（可能であれば）
             if 'steering_accuracy' in training_results:
                 metrics["steering_accuracy"] = training_results['steering_accuracy']
@@ -28086,42 +32962,33 @@ class ImageAnnotationTool(QMainWindow):
         # 位置ボタン数
         num_buttons = 8
         
-        # 既存のボタンをクリア
-        for button in self.location_buttons:
-            if button.parent():
-                button.setParent(None)
+        # 既存の行（ボタン＋クラス入力欄）をクリア。
+        # 行ウィジェットを捨てると子のボタン／入力欄も C++ 側で破棄されるため、
+        # 破棄済みオブジェクトに触らないよう参照リストを先に空にする。
         self.location_buttons.clear()
-        
+        self.location_class_inputs = {}
+        for row in getattr(self, '_location_row_widgets', []):
+            row.setParent(None)
+            row.deleteLater()
+        self._location_row_widgets = []
+
         # 8つの位置情報ボタンを作成
         for i in range(num_buttons):
             button = QPushButton(get_text('btn_location_with_count', 0, i))  # カウント0で初期化
             button.setProperty("location_value", i)
             button.setCheckable(True)  # チェック可能に設定
             button.clicked.connect(lambda checked, value=i: self.set_location(value))
-            
+
             # 対応する色を取得
             color = get_location_color(i)
-            
+
             # ボタンのスタイルを設定
-            button.setStyleSheet(f"""
-                QPushButton {{
-                    padding: 8px;
-                    border: 1px solid #cccccc;
-                    border-radius: 4px;
-                    background-color: #f0f0f0;
-                    color: #888888;
-                }}
-                QPushButton:checked {{
-                    background-color: {color.name()};
-                    color: white;
-                    font-weight: bold;
-                }}
-            """)
-            
+            button.setStyleSheet(location_button_qss())
+
             # カウントをプロパティとして保持（表示更新用）
             button.setProperty("location_count", 0)
-            # レイアウトに追加
-            self.location_buttons_layout.addWidget(button)
+            # クラス内容入力欄付きの行としてレイアウトに追加
+            self._add_location_row(button, i)
             self.location_buttons.append(button)
 
         # 初期表示を適用
@@ -28156,17 +33023,26 @@ class ImageAnnotationTool(QMainWindow):
         # 位置推論モデルコンテナを作成
         self.location_model_container = QWidget()
         location_model_layout = QVBoxLayout(self.location_model_container)
-        
-        # ヘッダータイトル
+
+        # ヘッダー: タイトルのみ（このセクションは常時展開）
+        location_header_layout = QHBoxLayout()
         location_model_label = QLabel(get_text('label_location_model'))
         location_model_label.setStyleSheet("font-weight: bold")
-        location_model_layout.addWidget(location_model_label)
+        location_header_layout.addWidget(location_model_label)
+        location_header_layout.addStretch()
+        location_model_layout.addLayout(location_header_layout)
+
+        # 中身コンテナ
+        self.location_content_widget = QWidget()
+        location_model_layout_outer = location_model_layout
+        location_model_layout = QVBoxLayout(self.location_content_widget)
+        location_model_layout.setContentsMargins(0, 0, 0, 0)
 
         # モデル選択
         model_type_layout = QHBoxLayout()
         model_type_layout.addWidget(QLabel(get_text('label_model_type')))
         self.location_model_combo = QComboBox()
-        self.location_model_combo.addItems(["donkey_location", "resnet18_location"])
+        self.location_model_combo.addItems(list_available_location_models())
         # イベントハンドラを接続（追加）
         self.location_model_combo.currentIndexChanged.connect(self.on_location_model_type_changed)
         model_type_layout.addWidget(self.location_model_combo)
@@ -28204,8 +33080,46 @@ class ImageAnnotationTool(QMainWindow):
         self.location_inference_checkbox.setToolTip(get_text('tip_location_model_not_loaded'))
         self.location_inference_checkbox.stateChanged.connect(self.toggle_location_inference_display)
         location_inference_layout.addWidget(self.location_inference_checkbox)
+
+        # 全画像を推論（走行軌跡マップに推定位置・推論クラスを重ねて確認するため）
+        self.location_infer_all_button = QPushButton(get_text('btn_location_inference_all'))
+        self.location_infer_all_button.setToolTip(get_text('tip_location_inference_all'))
+        self.location_infer_all_button.clicked.connect(self.run_location_inference_all)
+        location_inference_layout.addWidget(self.location_infer_all_button)
         location_model_layout.addLayout(location_inference_layout)
-        
+
+        # 格子分類の表示設定: Top-N 件数と、位置の決め方（Top1 セル / Top1〜N の重み付き平均）
+        self.location_topn = 3
+        self.location_grid_display = 'weighted'
+        grid_disp_layout = QHBoxLayout()
+        grid_disp_layout.addWidget(QLabel(get_text('label_location_topn')))
+        self.location_topn_spin = QSpinBox()
+        self.location_topn_spin.setRange(1, LocationModelManager.GRID_TOP_KEEP)
+        self.location_topn_spin.setValue(self.location_topn)
+        self.location_topn_spin.setToolTip(get_text('tip_location_topn'))
+        self.location_topn_spin.valueChanged.connect(self._on_location_grid_display_changed)
+        grid_disp_layout.addWidget(self.location_topn_spin)
+        self.location_grid_mode_combo = QComboBox()
+        self.location_grid_mode_combo.addItem(get_text('opt_location_grid_top1'), 'top1')
+        self.location_grid_mode_combo.addItem(get_text('opt_location_grid_weighted'), 'weighted')
+        self.location_grid_mode_combo.setCurrentIndex(1)
+        self.location_grid_mode_combo.setToolTip(get_text('tip_location_grid_mode'))
+        self.location_grid_mode_combo.currentIndexChanged.connect(self._on_location_grid_display_changed)
+        grid_disp_layout.addWidget(self.location_grid_mode_combo)
+        grid_disp_layout.addStretch()
+        location_model_layout.addLayout(grid_disp_layout)
+
+        # 履歴入力ありのモデルで、過去フレームの推論結果を履歴として使う（実機動作の模擬）
+        self.location_history_from_inference = False
+        self.location_history_source_check = QCheckBox(get_text('chk_location_history_from_inference'))
+        self.location_history_source_check.setChecked(False)
+        self.location_history_source_check.setToolTip(get_text('tip_location_history_from_inference'))
+        self.location_history_source_check.stateChanged.connect(self._on_location_history_source_changed)
+        location_model_layout.addWidget(self.location_history_source_check)
+
+        # 中身をコンテナへ格納（常時展開）
+        location_model_layout_outer.addWidget(self.location_content_widget)
+
         left_layout.addWidget(self.location_model_container)
         
         # 推論結果格納用の辞書を初期化
@@ -28363,7 +33277,7 @@ class ImageAnnotationTool(QMainWindow):
         traj_method_layout = QHBoxLayout()
         traj_method_layout.addWidget(QLabel(get_text('label_model_arch')))
         self.traj_arch_combo = QComboBox()
-        self.traj_arch_combo.addItems(["GRU", "TCN", "CausalCNN", "TogiVAD"])
+        self.traj_arch_combo.addItems(["GRU", "TCN", "CausalCNN", "TogiVAD", "LiDAR Policy"])
         self.traj_arch_combo.setCurrentIndex(0)  # デフォルト: GRU
         self.traj_arch_combo.currentIndexChanged.connect(self.refresh_traj_model_list)
         traj_method_layout.addWidget(self.traj_arch_combo)
@@ -28403,6 +33317,19 @@ class ImageAnnotationTool(QMainWindow):
         self.gru_prediction_checkbox.stateChanged.connect(self._toggle_gru_prediction_display)
         gru_content_layout.addWidget(self.gru_prediction_checkbox)
 
+        # TogiVAD の自動運転推論結果（angle/throttle・Pilot/pure pursuit）表示。
+        # 表示自体は自動運転モデルの推論表示（inference_checkbox → 情報パネル＋
+        # シアン推論点）と同じ経路を使うため、状態を双方向に同期する。
+        gru_infer_label = QLabel(get_text('label_togivad_control_infer'))
+        set_text_role(gru_infer_label, 'muted')
+        gru_content_layout.addWidget(gru_infer_label)
+        self.togivad_control_infer_checkbox = QCheckBox(
+            get_text('chk_show_togivad_control_infer'))
+        self.togivad_control_infer_checkbox.setChecked(False)
+        self.togivad_control_infer_checkbox.stateChanged.connect(
+            self._toggle_togivad_control_infer_display)
+        gru_content_layout.addWidget(self.togivad_control_infer_checkbox)
+
         gru_model_layout.addWidget(self.gru_content_widget)
 
         # 初期状態: 折りたたみ
@@ -28419,6 +33346,8 @@ class ImageAnnotationTool(QMainWindow):
         self._gru_model = None
         self._gru_cfg = None
         self._gru_sources = None
+        self._gru_sources_raw = None        # モデルに記録された生のカメラキー
+        self._gru_sources_data_keys = None  # 読み替えを解決したときのデータキー
         self._gru_model_path = None
         self._gru_device = None
         self._gru_infer_enabled = False  # 逐次推論(現在画像)が有効か
@@ -28447,6 +33376,7 @@ class ImageAnnotationTool(QMainWindow):
             "tcn": "tcn_",
             "causalcnn": "causal_cnn_",
             "togivad": "togivad_",
+            "lidar policy": "lidar_policy_",
         }
         filter_prefix = arch_to_prefix.get(arch_filter, "")
 
@@ -28465,7 +33395,8 @@ class ImageAnnotationTool(QMainWindow):
         model_files.sort(key=lambda f: os.path.getmtime(os.path.join(models_dir, f)), reverse=True)
 
         for model_file in model_files:
-            self.traj_model_combo.addItem(model_file)
+            display_name = _shorten_model_display_name(model_file, filter_prefix)
+            self.traj_model_combo.addItem(display_name, model_file)
 
     def _toggle_gru_section(self):
         """時系列セクションの展開/折りたたみ"""
@@ -28505,7 +33436,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # モデルファイルをコンボボックスに追加
         for model_file in model_files:
-            display_name = os.path.basename(model_file).replace('.pth', '')
+            display_name = _shorten_model_display_name(model_file, selected_model_type)
             self.waypoint_saved_model_combo.addItem(display_name, model_file)
 
         self.statusBar().showMessage(get_text('status_waypoint_models_found', len(model_files)), 2000)
@@ -28708,7 +33639,7 @@ class ImageAnnotationTool(QMainWindow):
 
         # コンボボックスに追加（モデル名のみを表示、フルパスはユーザーデータとして保持）
         for model_file in model_files:
-            display_name = os.path.basename(model_file).replace('.pth', '')
+            display_name = _shorten_model_display_name(model_file, selected_model_type)
             self.location_saved_model_combo.addItem(display_name, model_file)
 
         # 更新完了メッセージ
@@ -28760,6 +33691,7 @@ class ImageAnnotationTool(QMainWindow):
         
         try:
             # マネージャーを使用してモデルをロード
+            self._location_source_fallback_reported = False
             success, result = self.location_model_manager.load_model(
                 model_type, model_path, update_progress
             )
@@ -28774,11 +33706,19 @@ class ImageAnnotationTool(QMainWindow):
                 return
             
             num_classes = result
-            
+
+            # 前に読み込んでいたモデルの推論結果を破棄する（入出力構成・格子定義が
+            # 異なるため、残すと情報パネルやマップに旧モデルの結果が混ざる）
+            self.location_inference_results = {}
+            if hasattr(self, 'main_image_view'):
+                self.main_image_view.location_inference_result = None
+
             update_progress(80, get_text('msg_running_initial_inference'))
-            
+
             # 現在の画像に対して推論を実行
             self.run_location_inference()
+            # マップを全体再描画して旧モデルの〇・格子線を消す
+            self._refresh_map_view_inference(self.current_index, full=True)
             
             update_progress(90, get_text('msg_updating_inference_display'))
             
@@ -28826,51 +33766,312 @@ class ImageAnnotationTool(QMainWindow):
         # モデルリストを更新
         self.refresh_location_model_list()
 
+    def _location_pose_history_measured(self, index, steps, interval, pose_source=None):
+        """フレーム index より前の実測自己位置を新しい順に steps 件返す（欠損は None）"""
+        history = []
+        for k in range(1, int(steps) + 1):
+            past = index - k * int(interval)
+            pose = self.pose_manager.get_pose(past, prefer=pose_source) if past >= 0 else None
+            history.append([float(pose.x), float(pose.y), float(pose.theta)] if pose is not None else None)
+        return history
+
+    def _location_lidar_npy_path(self, index):
+        """フレーム index の画像パスから同セッションの LiDAR npy パスを返す（無ければ None）
+
+        画像パス <session>/images/{_index}_..jpg からセッションと _index を導出する規約は
+        BEV プレビュー（_bev_gt_data）と同じ。
+        """
+        if not (0 <= index < len(self.images)):
+            return None
+        img_path = self.images[index]
+        session = os.path.dirname(os.path.dirname(img_path))
+        prefix = os.path.basename(img_path).split('_')[0]
+        npy = os.path.join(session, 'lidar', f'{prefix}_lidar_distance_array_.npy')
+        return npy if os.path.exists(npy) else None
+
+    def _location_lidar_scan(self, index, cache=None):
+        """フレーム index の生距離スキャン[mm]（np.ndarray）を返す（無ければ None）。
+
+        cache は npy パス→配列の辞書。積層で同じファイルを繰り返し読むため
+        呼び出し側（データ準備ループ）で使い回すと高速化できる。
+        """
+        npy = self._location_lidar_npy_path(index)
+        if npy is None:
+            return None
+        if cache is not None and npy in cache:
+            return cache[npy]
+        try:
+            arr = np.load(npy)
+        except Exception:
+            arr = None
+        if cache is not None:
+            cache[npy] = arr
+        return arr
+
+    def _location_lidar_scans_for_index(self, index, stack_frames, interval, cache=None):
+        """フレーム index の LiDAR 積層（新しい順: t, t-interval, t-2*interval, ...）を返す。
+
+        現フレーム(k=0)にスキャンが無ければ None（学習ではサンプル自体を除外する用途）。
+        過去ステップ(k>=1)の欠損は None のまま返す（stack_lidar_scans が 0 埋め=無効値にする）。
+        """
+        current = self._location_lidar_scan(index, cache)
+        if current is None:
+            return None
+        scans = [current]
+        for k in range(1, int(stack_frames)):
+            prev = max(0, index - k * int(interval))
+            scans.append(self._location_lidar_scan(prev, cache))
+        return scans
+
+    def _location_result_position(self, result):
+        """推論結果から推定座標・姿勢 [x, y, theta] を取り出す（pose ヘッド → 格子の順。無ければ None）"""
+        if not result:
+            return None
+        pose = result.get('pose')
+        if pose and pose.get('x') is not None:
+            th = pose.get('theta')
+            return [float(pose['x']), float(pose['y']), float(th) if th is not None else 0.0]
+        grid = result.get('grid')
+        if grid and grid.get('top'):
+            from model_catalog import grid_weighted_position
+            if getattr(self, 'location_grid_display', 'weighted') == 'top1':
+                t1 = grid['top'][0]
+                return [float(t1['x']), float(t1['y']), 0.0]
+            wxy = grid_weighted_position(grid['top'], n=int(getattr(self, 'location_topn', 3)))
+            if wxy is not None:
+                return [float(wxy[0]), float(wxy[1]), 0.0]
+        return None
+
+    def _location_inference_history(self, index):
+        """履歴入力ありのモデル向けに、フレーム index の過去の座標・姿勢を組み立てる
+
+        既定は学習時と同じ実測の自己位置。「履歴に推論結果を使用」が ON のときは
+        過去フレームの推論結果（推定座標）を優先し、無いフレームは実測で補う
+        （実機のように自己の推定を積み上げる動作を模擬する）。
+        """
+        manager = self.location_model_manager
+        cfg = getattr(manager, 'location_config', None) or {}
+        steps = int(cfg.get('pose_history_steps', 0) or 0)
+        if steps <= 0:
+            return None
+        interval = int(cfg.get('pose_history_interval', 10) or 10)
+        measured = self._location_pose_history_measured(index, steps, interval, cfg.get('pose_source'))
+        if not getattr(self, 'location_history_from_inference', False):
+            return measured
+        history = []
+        for k in range(1, steps + 1):
+            past = index - k * interval
+            est = self._location_result_position(self.location_inference_results.get(past)) if past >= 0 else None
+            history.append(est if est is not None else measured[k - 1])
+        return history
+
+    def _location_inference_lidar_scans(self, index):
+        """LiDAR入力ありのモデル向けに、フレーム index の積層スキャンを組み立てる（無ければ None）"""
+        manager = self.location_model_manager
+        cfg = getattr(manager, 'location_config', None) or {}
+        lidar_cfg = cfg.get('lidar_config')
+        if not lidar_cfg:
+            return None
+        stack_frames = int(lidar_cfg.get('stack_frames', 1) or 1)
+        interval = int(cfg.get('lidar_interval', 10) or 10)
+        if not hasattr(self, '_location_lidar_inference_cache'):
+            # npy パス→配列のキャッシュ（記録内容は不変なのでセッション中はクリア不要）
+            self._location_lidar_inference_cache = {}
+        return self._location_lidar_scans_for_index(
+            index, stack_frames, interval, self._location_lidar_inference_cache)
+
+    def _location_inference_inputs(self, index):
+        """位置モデルの入力構成（学習時に保存）に従って、フレーム index の入力画像パスを返す"""
+        manager = self.location_model_manager
+        cfg = getattr(manager, 'location_config', None) or {}
+        selected_sources = cfg.get('selected_sources') or []
+        num_sources = int(cfg.get('num_sources', 1) or 1)
+        virtual_type = cfg.get('virtual_source_type')
+        if num_sources <= 1 and not selected_sources:
+            return self.images[index]
+        # 学習時のカメラキー（例 cam0..cam3）が現在のデータのキーと違うと
+        # 下の paths が None になり、現在画像1枚で代替 → run_inference が
+        # それを num_sources 枚に複製するため、**誤った結果が表示されてしまう**。
+        # まず読み替えを試みる
+        selected_sources = self._resolve_model_sources_cached(selected_sources)
+        paths = self._location_source_paths_for_index(
+            index, selected_sources, virtual_type, num_sources,
+            int(cfg.get('temporal_interval', 10) or 10))
+        if not paths:
+            # 学習時のソースが揃わない場合は現在の画像で代替する
+            self._report_location_source_fallback(selected_sources, num_sources,
+                                                  virtual_type)
+            return self.images[index]
+        return paths
+
+    def _report_location_source_fallback(self, sources, num_sources, virtual_type):
+        """位置推論が学習時のカメラを揃えられず現在画像で代替したことを通知（初回のみ）。
+
+        仮想ソース(crop/scale/temporal)は1枚から生成するので代替は正常動作。
+        実カメラが複数必要なモデルで代替した場合は、同じ画像が複製されて
+        推論されるため結果は信用できない旨を明示する。
+        """
+        if virtual_type or getattr(self, '_location_source_fallback_reported', False):
+            return
+        self._location_source_fallback_reported = True
+        keys = list((getattr(self, 'source_images_map', None) or {}).keys())
+        print(f"[WARN] 位置推論: 学習時のカメラ {sources} を現在のデータ {keys} で"
+              f"揃えられず、現在画像で代替します")
+        if num_sources > 1:
+            self.statusBar().showMessage(
+                f"位置推論: カメラ{num_sources}枚分を揃えられず同じ画像を複製して"
+                f"います（結果は不正確）。学習時={sources} / データ={keys}", 10000)
+        else:
+            self.statusBar().showMessage(
+                f"位置推論: 学習時のカメラ{sources}が無いため現在画像で代替します"
+                f"（データ={keys}）", 8000)
+
     def run_location_inference(self):
         """現在の画像に対して位置推論を実行"""
         if not self.images or not hasattr(self, 'location_model_manager'):
             return
-        
-        current_img_path = self.images[self.current_index]
+
         current_index = self.current_index
-        
+        current_img_path = self._location_inference_inputs(current_index)
+
         # マネージャーを使用して推論を実行
-        result = self.location_model_manager.run_inference(current_img_path)
-        
+        result = self.location_model_manager.run_inference(
+            current_img_path, pose_history=self._location_inference_history(current_index),
+            lidar_scan=self._location_inference_lidar_scans(current_index))
+
         if result:
             # 推論結果を保存（インデックスベース）
             self.location_inference_results[current_index] = result
-            
+
+            # 走行軌跡マップが開いていれば現在フレームの推定位置マーカーを更新
+            # （フレーム移動時のハイライトは推論より先に走るため、ここで描き直す）
+            self._refresh_map_view_inference(current_index)
+
             # 表示更新は呼び出し元で行うため、ここでは呼ばない
-            
+
             return True
-        
+
         return False
 
-    def train_and_save_location_model(self):
-        """位置推論モデルの学習"""
-        
-        if not self.images or not self.location_annotations:
-            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_need_location_annotations'))
+    def _on_location_history_source_changed(self, _s=None):
+        """履歴入力のソース切替（実測 / 推論結果）。以後の推論から反映する"""
+        self.location_history_from_inference = self.location_history_source_check.isChecked()
+        mgr = getattr(self, 'location_model_manager', None)
+        if mgr is not None and mgr.is_model_loaded() and getattr(mgr, 'has_history_input', False):
+            # 現在フレームだけ再推論して表示を更新（全体は「全画像を推論」で）
+            self.run_location_inference()
+            if hasattr(self, 'location_inference_checkbox') and self.location_inference_checkbox.isChecked():
+                self.update_location_inference_display()
+
+    def _on_location_grid_display_changed(self, _v=None):
+        """格子分類の表示設定（Top-N / Top1 / 重み付き）変更 → 情報パネルとマップを更新"""
+        self.location_topn = int(self.location_topn_spin.value())
+        self.location_grid_display = self.location_grid_mode_combo.currentData() or 'weighted'
+        if hasattr(self, 'location_inference_checkbox') and self.location_inference_checkbox.isChecked():
+            self.update_location_inference_display()
+        self._refresh_map_view_inference(getattr(self, 'current_index', None), full=True)
+
+    def location_inference_settings(self):
+        """マップビュー等が参照する位置推論の表示設定"""
+        mgr = getattr(self, 'location_model_manager', None)
+        cfg = getattr(mgr, 'location_config', None) or {}
+        return {
+            'top_n': int(getattr(self, 'location_topn', 3)),
+            'grid_mode': getattr(self, 'location_grid_display', 'weighted'),
+            'grid_config': cfg.get('grid_config'),
+        }
+
+    def _refresh_map_view_inference(self, index=None, full=False):
+        """走行軌跡マップに位置推論結果を反映する（開いていなければ何もしない）"""
+        dlg = getattr(self, 'map_view_dialog', None)
+        if dlg is None or not dlg.isVisible():
+            return
+        if full:
+            dlg.map_widget.refresh()
+        if index is not None:
+            dlg.highlight_frame(index)
+
+    def run_location_inference_all(self):
+        """読み込み済みの位置モデルで全画像を推論し、走行軌跡マップへ反映する"""
+        if not self.images:
+            QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_no_images'))
+            return
+        manager = getattr(self, 'location_model_manager', None)
+        if manager is None or not manager.is_model_loaded():
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('tip_location_model_not_loaded'))
             return
 
-        # 使用可能な位置情報のユニークなリストを取得
-        unique_locations = sorted(list(set(self.location_annotations.values())))
+        deleted = set(getattr(self, 'deleted_indexes', []) or [])
+        targets = [i for i in range(len(self.images)) if i not in deleted]
+        total = len(targets)
+        progress = QProgressDialog(get_text('msg_location_inference_all_progress', 0, total),
+                                   get_text('btn_cancel'), 0, total, self)
+        progress.setWindowTitle(get_text('msg_location_inference_all_running'))
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QApplication.processEvents()
+
+        done = 0
+        cancelled = False
+        for n, idx in enumerate(targets):
+            if n % 10 == 0:
+                progress.setValue(n)
+                progress.setLabelText(get_text('msg_location_inference_all_progress', n, total))
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    cancelled = True
+                    break
+            result = manager.run_inference(self._location_inference_inputs(idx),
+                                           pose_history=self._location_inference_history(idx),
+                                           lidar_scan=self._location_inference_lidar_scans(idx))
+            if result:
+                self.location_inference_results[idx] = result
+                done += 1
+        progress.setValue(total)
+        progress.close()
+
+        # 表示を更新（情報パネル・マップ）
+        if hasattr(self, 'location_inference_checkbox') and not self.location_inference_checkbox.isChecked():
+            self.location_inference_checkbox.setChecked(True)
+        self.show_location_inference = True
+        self.update_location_inference_display()
+        self._refresh_map_view_inference(self.current_index, full=True)
+        self.statusBar().showMessage(
+            get_text('status_location_inference_all_done', done, total)
+            + (get_text('status_location_inference_all_cancelled') if cancelled else ""), 5000)
+
+    def _location_pose_available(self):
+        """座標・姿勢の教師データ（pose/slam 等の自己位置）がセッションにあるか"""
+        pm = getattr(self, 'pose_manager', None)
+        return pm is not None and pm.has_any_pose() and bool(pm.available_sources())
+
+    def train_and_save_location_model(self):
+        """位置推論モデルの学習（クラス分類 / 座標・姿勢回帰 / 両方、複数画像入力対応）"""
+
+        if not self.images:
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_images'))
+            return
+
+        has_class_labels = bool(self.location_annotations)
+        has_pose = self._location_pose_available()
+        if not has_class_labels and not has_pose:
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_need_location_or_pose'))
+            return
+
+        # 使用可能な位置情報のユニークなリストを取得（pose のみ学習の場合は空でも可）
+        unique_locations = sorted(list(set(self.location_annotations.values()))) if has_class_labels else []
         actual_classes = len(unique_locations)
 
-        if actual_classes < 2:
-            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_need_at_least_2_locations', actual_classes))
-            return
-        
         # 常に8クラスを使用（実際のクラス数に関わらず）
         num_classes = LOCATION_DEFAULT_NUM_CLASSES
-        
+
         # 選択されたモデル
         model_type = self.location_model_combo.currentText()
-        
+
         # アノテーション統計情報を収集（削除済みマークを考慮）
         total_images = len(self.images)
-        
+
         # 削除済みでない位置アノテーションをカウント
         valid_location_annotations = 0
         deleted_count = 0
@@ -28882,24 +34083,42 @@ class ImageAnnotationTool(QMainWindow):
             valid_location_annotations += 1
 
         annotated_images = len(self.location_annotations)  # 全体数
-        
+
         # 学習設定ダイアログを表示
         training_settings = self._create_location_training_dialog(model_type, actual_classes, unique_locations, num_classes, total_images, annotated_images, valid_location_annotations, deleted_count)
-        
+
         if not training_settings.exec_():
             return
-        
+
         # 設定値の取得
         training_config = self._get_location_training_config(training_settings)
-        
+        output_mode = training_config['output_mode']
+        heads = output_mode.split('_')
+        use_class = 'class' in heads
+        use_pose = 'pose' in heads
+        use_grid = 'grid' in heads
+        use_history = bool(training_config.get('use_pose_history'))
+        use_lidar = bool(training_config.get('use_lidar'))
+        needs_pose = use_pose or use_grid or use_history
+
+        if use_class and actual_classes < 2:
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_need_at_least_2_locations', actual_classes))
+            return
+        if needs_pose and not has_pose:
+            QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_need_pose_for_regression'))
+            return
+
         try:
-            # データの準備（インデックスベース修正版）
-            image_data = self._prepare_location_training_data(unique_locations)
-            
+            # データの準備（インデックスベース、複数画像入力・pose ターゲット対応）
+            image_data = self._prepare_location_training_data(unique_locations, training_config)
+
             if not image_data['image_paths']:
                 QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_valid_location_annotations'))
                 return
-            
+            if len(image_data['image_paths']) < 4:
+                QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_insufficient_data'))
+                return
+
             # 進捗ダイアログを表示
             progress = QProgressDialog(
                 get_text('msg_preparing_location_training', model_type),
@@ -28909,29 +34128,55 @@ class ImageAnnotationTool(QMainWindow):
             progress.setWindowModality(Qt.WindowModal)
             progress.show()
             QApplication.processEvents()
-            
+
+            # LiDAR 点群の入出力構成（推論時にも同じ前処理設定でスキャンを組み立てるため保持）
+            lidar_config = None
+            if use_lidar:
+                lidar_config = {
+                    'num_beams_raw': image_data.get('lidar_num_beams_raw') or 1081,
+                    'num_bins': training_config.get('lidar_num_bins') or LIDAR_POLICY_DEFAULT_NUM_BINS,
+                    'stack_frames': training_config.get('lidar_stack_frames', 1),
+                    'downsample_mode': training_config.get('lidar_downsample_mode') or 'minpool',
+                    'max_range_mm': training_config.get('lidar_max_range_mm') or LIDAR_POLICY_DEFAULT_MAX_RANGE_MM,
+                    'min_range_mm': 50.0,
+                }
+
             # データセット作成
             train_loader, val_loader, dataset_info = create_location_datasets(
                 image_paths=image_data['image_paths'],
-                location_labels=image_data['location_indices'],
+                location_labels=image_data['location_indices'] if use_class else None,
                 val_split=0.2,
                 model_name=model_type,
-                batch_size=training_config['batch_size'],
-                use_augmentation=training_config['use_augmentation']
+                batch_size=min(training_config['batch_size'], len(image_data['image_paths'])),
+                use_augmentation=training_config['use_augmentation'],
+                grouped_image_paths=image_data['grouped_paths'],
+                pose_targets=image_data['pose_targets'] if needs_pose else None,
+                output_mode=output_mode,
+                num_sources=training_config['num_sources'],
+                virtual_source_type=training_config['virtual_source_type'],
+                include_heading=training_config['include_heading'],
+                include_attitude=training_config.get('include_attitude', False),
+                downscale_factor=training_config.get('downscale_factor', 1.0),
+                downscale_mode=training_config.get('downscale_mode', 'resize'),
+                grid_cell_size=training_config.get('grid_cell_size') or 0.5,
+                pose_history=image_data.get('pose_history') if use_history else None,
+                pose_history_steps=training_config.get('pose_history_steps', 0) if use_history else 0,
+                lidar_scans=image_data.get('lidar_scans') if use_lidar else None,
+                lidar_config=lidar_config,
             )
-            
+
             progress.setValue(20)
             progress.setLabelText(get_text('msg_init_location_model', model_type, num_classes))
             QApplication.processEvents()
-            
+
             # 進捗コールバック関数
             def update_progress(current, total, message=None):
                 if message:
                     progress.setLabelText(message)
-                progress.setValue(20 + int(current * 70 / total))
+                progress.setValue(20 + int(current * 70 / max(1, total)))
                 QApplication.processEvents()
                 return not progress.wasCanceled()
-            
+
             # モデル学習（統合版）
             training_results = self._train_location_model_internal(
                 model_type=model_type,
@@ -28939,9 +34184,15 @@ class ImageAnnotationTool(QMainWindow):
                 val_loader=val_loader,
                 num_classes=num_classes,
                 training_config=training_config,
-                progress_callback=update_progress
+                progress_callback=update_progress,
+                dataset_info=dataset_info,
             )
-            
+
+            if training_results.get('cancelled') or not training_results.get('best_model_path'):
+                progress.close()
+                self.statusBar().showMessage(get_text('status_training_cancelled'), 5000)
+                return
+
             # モデルのメタデータ保存
             self._save_location_model_metadata(
                 training_results['best_model_path'],
@@ -28949,11 +34200,11 @@ class ImageAnnotationTool(QMainWindow):
                 actual_classes,
                 image_data['location_to_index']
             )
-            
+
             progress.setValue(95)
             progress.setLabelText("MLflowに学習結果を記録中...")
             QApplication.processEvents()
-            
+
             # MLflowに結果を記録
             mlflow_info = self._log_location_training(
                 model_type=model_type,
@@ -28968,16 +34219,34 @@ class ImageAnnotationTool(QMainWindow):
                     "num_classes": num_classes,
                     "actual_classes": actual_classes,
                     "unique_locations": unique_locations,
-                    "location_mapping": image_data['location_to_index']
+                    "location_mapping": image_data['location_to_index'],
+                    "output_mode": output_mode,
+                    "num_sources": training_config['num_sources'],
+                    "selected_sources": training_config['selected_sources'],
+                    "virtual_source_type": training_config['virtual_source_type'],
+                    "pose_source": training_config['pose_source'] if needs_pose else None,
+                    "pose_norm": dataset_info.get('pose_norm'),
+                    "grid_cell_size": training_config.get('grid_cell_size') if use_grid else None,
+                    "num_grid_classes": dataset_info.get('num_grid_classes', 0),
+                    "pose_history_steps": training_config.get('pose_history_steps', 0) if use_history else 0,
+                    "pose_history_interval": training_config.get('pose_history_interval') if use_history else None,
+                    "skipped_no_pose": image_data.get('skipped_no_pose', 0),
+                    "skipped_no_source": image_data.get('skipped_no_source', 0),
+                    "skipped_no_attitude": image_data.get('skipped_no_attitude', 0),
+                    "heading_from_pose": training_config.get('heading_from_pose', False),
+                    "skipped_no_pose_heading": image_data.get('skipped_no_pose_heading', 0),
+                    "lidar_config": dataset_info.get('lidar_config') if use_lidar else None,
+                    "lidar_interval": training_config.get('lidar_interval') if use_lidar else None,
+                    "skipped_no_lidar": image_data.get('skipped_no_lidar', 0),
                 }
             )
-            
+
             # モデルリストを更新
             self.refresh_location_model_list()
-            
+
             progress.setValue(100)
             progress.close()
-            
+
             # 学習完了メッセージ
             self._show_location_training_success(
                 model_type=model_type,
@@ -28986,11 +34255,18 @@ class ImageAnnotationTool(QMainWindow):
                 dataset_info={
                     "image_paths_count": len(image_data['image_paths']),
                     "num_classes": num_classes,
-                    "actual_classes": actual_classes
+                    "actual_classes": actual_classes,
+                    "skipped_no_pose": image_data.get('skipped_no_pose', 0),
+                    "skipped_no_source": image_data.get('skipped_no_source', 0),
+                    "skipped_no_attitude": image_data.get('skipped_no_attitude', 0),
+                    "skipped_no_pose_heading": image_data.get('skipped_no_pose_heading', 0),
+                    "skipped_no_lidar": image_data.get('skipped_no_lidar', 0),
+                    "input_size": dataset_info.get('actual_image_size'),
+                    "raw_image_size": dataset_info.get('raw_image_size'),
                 },
                 mlflow_info=mlflow_info
             )
-            
+
         except Exception as e:
             if 'progress' in locals():
                 progress.close()
@@ -29006,13 +34282,31 @@ class ImageAnnotationTool(QMainWindow):
         
         training_settings = QDialog(self)
         training_settings.setWindowTitle(get_text('dlg_location_training_settings'))
-        training_settings.setMinimumWidth(500)
+        # 自動運転モデルの学習ダイアログと同様に横長の2カラム構成（縦に収まらない場合はスクロール）
+        training_settings.setMinimumSize(1100, 600)
+        training_settings.resize(1250, 780)
+        training_settings.setSizeGripEnabled(True)
 
-        settings_layout = QVBoxLayout(training_settings)
+        outer_layout = QVBoxLayout(training_settings)
+        body_scroll = QScrollArea()
+        body_scroll.setWidgetResizable(True)
+        body_scroll.setFrameShape(QScrollArea.NoFrame)
+        body_widget = QWidget()
+        columns_layout = QHBoxLayout(body_widget)
+        left_column = QVBoxLayout()
+        right_column = QVBoxLayout()
+
+        # 各設定パネルを薄い色で塗り分けて区別しやすくする（自動運転ダイアログと同じ）
+        def _tint_group(group, bg_color, border_color):
+            group.setStyleSheet(tint_group_qss(bg_color, border_color))
+
+        # 左カラム: データ統計 / 入力画像ソース / 出力（教師データ）
+        settings_layout = left_column
 
         # アノテーション統計情報を表示（削除済みマークを考慮）
         stats_label = QLabel(get_text('label_location_stats', total_images, annotated_images, valid_location_annotations, deleted_count, get_text('label_deleted_excluded_note')))
-        stats_label.setStyleSheet("padding: 10px; background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 5px;")
+        stats_label.setStyleSheet("padding: 10px; border-radius: 5px;")
+        set_panel_role(stats_label, 'box')
         settings_layout.addWidget(stats_label)
         
         settings_layout.addWidget(QLabel(""))  # スペース追加
@@ -29023,9 +34317,525 @@ class ImageAnnotationTool(QMainWindow):
 
         # 固定クラス数の情報表示
         fixed_class_label = QLabel(get_text('label_fixed_class_note', num_classes))
-        fixed_class_label.setStyleSheet("color: #666666; font-style: italic;")
+        fixed_class_label.setStyleSheet("font-style: italic;")
+        set_text_role(fixed_class_label, 'muted')
         settings_layout.addWidget(fixed_class_label)
-        
+
+        # ---------------------------------------------------------------
+        # 入力画像ソース（複数選択でマルチソース入力 / 単一選択で仮想ソース）
+        # ---------------------------------------------------------------
+        source_group = QGroupBox(get_text('label_location_input_sources'))
+        _tint_group(source_group, "#EEF6EE", "#BFDABF")
+        source_layout = QVBoxLayout(source_group)
+        source_info = QLabel(get_text('label_location_input_sources_info'))
+        set_text_role(source_info, 'muted')
+        source_info.setWordWrap(True)
+        source_layout.addWidget(source_info)
+
+        training_settings.source_checkboxes = {}
+        available_sources = {}
+        if hasattr(self, 'variant_images') and self.variant_images:
+            available_sources = self.variant_images
+        current_var = getattr(self, 'current_variant', None)
+        if available_sources:
+            for variant, img_list in available_sources.items():
+                if variant == current_var:
+                    label_text = get_text('label_current_source_marker', variant, len(img_list))
+                else:
+                    label_text = get_text('label_other_source_marker', variant, len(img_list))
+                cb = QCheckBox(label_text)
+                cb.setProperty("variant", variant)
+                cb.setChecked(variant == current_var)
+                training_settings.source_checkboxes[variant] = cb
+                source_layout.addWidget(cb)
+        else:
+            cb = QCheckBox(get_text('label_current_source_marker', current_var or 'cam', len(self.images)))
+            cb.setProperty("variant", current_var or 'cam')
+            cb.setChecked(True)
+            cb.setEnabled(False)
+            training_settings.source_checkboxes[current_var or 'cam'] = cb
+            source_layout.addWidget(cb)
+
+        # 融合方法（複数ソース選択時のみ表示）
+        fusion_row_widget = QWidget()
+        fusion_row = QHBoxLayout(fusion_row_widget)
+        fusion_row.setContentsMargins(0, 0, 0, 0)
+        fusion_row.addWidget(QLabel(get_text('label_fusion_method')))
+        training_settings.fusion_combo = QComboBox()
+        training_settings.fusion_combo.addItem(get_text('fusion_concat'), 'concat')
+        training_settings.fusion_combo.addItem(get_text('fusion_attention'), 'attention')
+        training_settings.fusion_combo.setCurrentIndex(1)
+        fusion_row.addWidget(training_settings.fusion_combo)
+        fusion_row.addStretch()
+        source_layout.addWidget(fusion_row_widget)
+
+        # 仮想ソース（単一ソース選択時のみ表示）
+        virtual_row_widget = QWidget()
+        virtual_rows = QVBoxLayout(virtual_row_widget)
+        virtual_rows.setContentsMargins(0, 0, 0, 0)
+        virtual_type_row = QHBoxLayout()
+        virtual_type_row.addWidget(QLabel(get_text('label_virtual_source_type')))
+        training_settings.virtual_type_combo = QComboBox()
+        training_settings.virtual_type_combo.addItem(get_text('opt_virtual_none'), None)
+        training_settings.virtual_type_combo.addItem(get_text('opt_virtual_crop'), 'crop')
+        training_settings.virtual_type_combo.addItem(get_text('opt_virtual_scale'), 'scale')
+        training_settings.virtual_type_combo.addItem(get_text('opt_virtual_temporal'), 'temporal')
+        virtual_type_row.addWidget(training_settings.virtual_type_combo)
+        virtual_type_row.addStretch()
+        virtual_rows.addLayout(virtual_type_row)
+
+        virtual_nsrc_row = QHBoxLayout()
+        virtual_nsrc_row.addWidget(QLabel(get_text('label_virtual_num_sources')))
+        training_settings.virtual_nsrc_spin = QSpinBox()
+        training_settings.virtual_nsrc_spin.setRange(2, 4)
+        training_settings.virtual_nsrc_spin.setValue(3)
+        virtual_nsrc_row.addWidget(training_settings.virtual_nsrc_spin)
+        virtual_nsrc_row.addWidget(QLabel(get_text('label_temporal_interval')))
+        training_settings.temporal_interval_spin = QSpinBox()
+        training_settings.temporal_interval_spin.setRange(1, 300)
+        training_settings.temporal_interval_spin.setValue(getattr(self, '_temporal_interval', 10))
+        training_settings.temporal_interval_spin.setSuffix(' frames')
+        virtual_nsrc_row.addWidget(training_settings.temporal_interval_spin)
+        virtual_nsrc_row.addStretch()
+        virtual_rows.addLayout(virtual_nsrc_row)
+        source_layout.addWidget(virtual_row_widget)
+
+        # 過去の座標・姿勢の時系列を入力に加える（自己位置データがあるときのみ）
+        has_pose_input = self._location_pose_available()
+        training_settings.history_check = QCheckBox(get_text('chk_location_pose_history'))
+        training_settings.history_check.setChecked(False)
+        training_settings.history_check.setEnabled(has_pose_input)
+        training_settings.history_check.setToolTip(
+            get_text('tip_location_pose_history') if has_pose_input else get_text('tip_location_output_pose_disabled'))
+        source_layout.addWidget(training_settings.history_check)
+
+        history_opts_widget = QWidget()
+        history_opts = QVBoxLayout(history_opts_widget)
+        history_opts.setContentsMargins(20, 0, 0, 0)
+        hist_row1 = QHBoxLayout()
+        hist_row1.addWidget(QLabel(get_text('label_location_history_steps')))
+        training_settings.history_steps_spin = QSpinBox()
+        training_settings.history_steps_spin.setRange(1, 20)
+        training_settings.history_steps_spin.setValue(5)
+        hist_row1.addWidget(training_settings.history_steps_spin)
+        hist_row1.addWidget(QLabel(get_text('label_location_history_interval')))
+        training_settings.history_interval_spin = QSpinBox()
+        training_settings.history_interval_spin.setRange(1, 300)
+        training_settings.history_interval_spin.setValue(10)
+        training_settings.history_interval_spin.setSuffix(' frames')
+        hist_row1.addWidget(training_settings.history_interval_spin)
+        hist_row1.addStretch()
+        history_opts.addLayout(hist_row1)
+        hist_row2 = QHBoxLayout()
+        hist_row2.addWidget(QLabel(get_text('label_location_history_noise')))
+        training_settings.history_noise_xy_spin = QDoubleSpinBox()
+        training_settings.history_noise_xy_spin.setRange(0.0, 5.0)
+        training_settings.history_noise_xy_spin.setSingleStep(0.05)
+        training_settings.history_noise_xy_spin.setDecimals(2)
+        training_settings.history_noise_xy_spin.setSuffix(' m')
+        training_settings.history_noise_xy_spin.setValue(0.1)
+        hist_row2.addWidget(training_settings.history_noise_xy_spin)
+        training_settings.history_noise_th_spin = QDoubleSpinBox()
+        training_settings.history_noise_th_spin.setRange(0.0, 90.0)
+        training_settings.history_noise_th_spin.setSingleStep(1.0)
+        training_settings.history_noise_th_spin.setDecimals(1)
+        training_settings.history_noise_th_spin.setSuffix(' °')
+        training_settings.history_noise_th_spin.setValue(5.0)
+        hist_row2.addWidget(training_settings.history_noise_th_spin)
+        hist_row2.addWidget(QLabel(get_text('label_location_history_drop')))
+        training_settings.history_drop_spin = QDoubleSpinBox()
+        training_settings.history_drop_spin.setRange(0.0, 1.0)
+        training_settings.history_drop_spin.setSingleStep(0.05)
+        training_settings.history_drop_spin.setDecimals(2)
+        training_settings.history_drop_spin.setValue(0.1)
+        hist_row2.addWidget(training_settings.history_drop_spin)
+        hist_row2.addStretch()
+        history_opts.addLayout(hist_row2)
+        history_note = QLabel(get_text('label_location_history_note'))
+        history_note.setStyleSheet("font-style: italic;")
+        set_text_role(history_note, 'info')
+        history_note.setWordWrap(True)
+        history_opts.addWidget(history_note)
+        source_layout.addWidget(history_opts_widget)
+        history_opts_widget.setVisible(False)
+        training_settings.history_check.stateChanged.connect(
+            lambda s: history_opts_widget.setVisible(training_settings.history_check.isChecked()))
+
+        # LiDAR 点群（距離スキャン）を追加入力にする（記録に lidar/*.npy があるセッションのみ）
+        has_lidar_data = self._has_lidar_data()
+        training_settings.lidar_check = QCheckBox(get_text('chk_location_lidar'))
+        training_settings.lidar_check.setChecked(False)
+        training_settings.lidar_check.setEnabled(has_lidar_data)
+        training_settings.lidar_check.setToolTip(
+            get_text('tip_location_lidar') if has_lidar_data else get_text('tip_location_lidar_disabled'))
+        source_layout.addWidget(training_settings.lidar_check)
+
+        lidar_opts_widget = QWidget()
+        lidar_opts = QVBoxLayout(lidar_opts_widget)
+        lidar_opts.setContentsMargins(20, 0, 0, 0)
+        lidar_row1 = QHBoxLayout()
+        lidar_row1.addWidget(QLabel(get_text('label_lidar_num_bins')))
+        training_settings.lidar_bins_combo = QComboBox()
+        for b in (1081, 541, 271, 108):
+            training_settings.lidar_bins_combo.addItem(str(b), b)
+        j = training_settings.lidar_bins_combo.findData(LIDAR_POLICY_DEFAULT_NUM_BINS)
+        training_settings.lidar_bins_combo.setCurrentIndex(max(j, 0))
+        lidar_row1.addWidget(training_settings.lidar_bins_combo)
+        lidar_row1.addWidget(QLabel(get_text('label_lidar_downsample')))
+        training_settings.lidar_ds_combo = QComboBox()
+        training_settings.lidar_ds_combo.addItem(get_text('opt_lidar_ds_minpool'), 'minpool')
+        training_settings.lidar_ds_combo.addItem(get_text('opt_lidar_ds_index'), 'index')
+        lidar_row1.addWidget(training_settings.lidar_ds_combo)
+        lidar_row1.addStretch()
+        lidar_opts.addLayout(lidar_row1)
+
+        lidar_row2 = QHBoxLayout()
+        lidar_row2.addWidget(QLabel(get_text('label_lidar_stack')))
+        training_settings.lidar_stack_spin = QSpinBox()
+        training_settings.lidar_stack_spin.setRange(1, 8)
+        training_settings.lidar_stack_spin.setValue(1)
+        lidar_row2.addWidget(training_settings.lidar_stack_spin)
+        lidar_row2.addWidget(QLabel(get_text('label_location_history_interval')))
+        training_settings.lidar_interval_spin = QSpinBox()
+        training_settings.lidar_interval_spin.setRange(1, 300)
+        training_settings.lidar_interval_spin.setValue(10)
+        training_settings.lidar_interval_spin.setSuffix(' frames')
+        lidar_row2.addWidget(training_settings.lidar_interval_spin)
+        lidar_row2.addWidget(QLabel(get_text('label_lidar_max_range')))
+        training_settings.lidar_range_spin = QSpinBox()
+        training_settings.lidar_range_spin.setRange(1000, 60000)
+        training_settings.lidar_range_spin.setSingleStep(500)
+        training_settings.lidar_range_spin.setValue(int(LIDAR_POLICY_DEFAULT_MAX_RANGE_MM))
+        lidar_row2.addWidget(training_settings.lidar_range_spin)
+        lidar_row2.addStretch()
+        lidar_opts.addLayout(lidar_row2)
+
+        def _update_lidar_stack_enabled(_i=None):
+            training_settings.lidar_interval_spin.setEnabled(training_settings.lidar_stack_spin.value() > 1)
+        training_settings.lidar_stack_spin.valueChanged.connect(_update_lidar_stack_enabled)
+        _update_lidar_stack_enabled()
+
+        lidar_note = QLabel(get_text('label_location_lidar_note'))
+        set_text_role(lidar_note, 'info')
+        lidar_note.setWordWrap(True)
+        lidar_opts.addWidget(lidar_note)
+        source_layout.addWidget(lidar_opts_widget)
+        lidar_opts_widget.setVisible(False)
+        training_settings.lidar_check.stateChanged.connect(
+            lambda s: lidar_opts_widget.setVisible(training_settings.lidar_check.isChecked()))
+
+        training_settings.source_count_label = QLabel("")
+        training_settings.source_count_label.setStyleSheet("font-weight: bold;")
+        set_text_role(training_settings.source_count_label, 'success')
+        source_layout.addWidget(training_settings.source_count_label)
+        settings_layout.addWidget(source_group)
+
+        def _update_source_ui():
+            checked = [v for v, cb in training_settings.source_checkboxes.items() if cb.isChecked()]
+            multi = len(checked) > 1
+            fusion_row_widget.setVisible(multi)
+            virtual_row_widget.setVisible(len(checked) == 1)
+            vtype = training_settings.virtual_type_combo.currentData()
+            training_settings.virtual_nsrc_spin.setEnabled(vtype is not None)
+            training_settings.temporal_interval_spin.setEnabled(vtype == 'temporal')
+            if multi:
+                n = len(checked)
+            elif vtype:
+                n = training_settings.virtual_nsrc_spin.value()
+            else:
+                n = 1
+            training_settings.source_count_label.setText(
+                get_text('label_location_source_count', len(checked), n))
+
+        for cb in training_settings.source_checkboxes.values():
+            cb.stateChanged.connect(lambda _s: _update_source_ui())
+        training_settings.virtual_type_combo.currentIndexChanged.connect(lambda _i: _update_source_ui())
+        training_settings.virtual_nsrc_spin.valueChanged.connect(lambda _v: _update_source_ui())
+
+        # ---------------------------------------------------------------
+        # 出力（教師データ）: クラス分類 / 座標・姿勢回帰
+        # ---------------------------------------------------------------
+        output_group = QGroupBox(get_text('label_location_output_settings'))
+        _tint_group(output_group, "#FBF7EE", "#E3D6B8")
+        output_layout = QVBoxLayout(output_group)
+        output_info = QLabel(get_text('label_location_output_info'))
+        set_text_role(output_info, 'muted')
+        output_info.setWordWrap(True)
+        output_layout.addWidget(output_info)
+
+        has_class = actual_classes >= 2
+        has_pose = self._location_pose_available()
+
+        training_settings.class_output_check = QCheckBox(get_text('chk_location_output_class', actual_classes))
+        training_settings.class_output_check.setChecked(has_class)
+        training_settings.class_output_check.setEnabled(has_class)
+        if not has_class:
+            training_settings.class_output_check.setToolTip(get_text('tip_location_output_class_disabled'))
+        output_layout.addWidget(training_settings.class_output_check)
+
+        pose_count = len(self.pose_manager.known_indexes()) if has_pose else 0
+        training_settings.pose_output_check = QCheckBox(get_text('chk_location_output_pose', pose_count))
+        training_settings.pose_output_check.setChecked(has_pose and not has_class)
+        training_settings.pose_output_check.setEnabled(has_pose)
+        if not has_pose:
+            training_settings.pose_output_check.setToolTip(get_text('tip_location_output_pose_disabled'))
+        output_layout.addWidget(training_settings.pose_output_check)
+
+        pose_opts_widget = QWidget()
+        pose_opts = QVBoxLayout(pose_opts_widget)
+        pose_opts.setContentsMargins(20, 0, 0, 0)
+        pose_src_row = QHBoxLayout()
+        pose_src_row.addWidget(QLabel(get_text('label_location_pose_source')))
+        training_settings.pose_source_combo = QComboBox()
+        training_settings.pose_source_combo.setToolTip(get_text('tip_location_pose_source'))
+        if has_pose:
+            # 各ソースの ok フレーム数を併記（学習に使えるフレーム数の目安）
+            for src in self.pose_manager.available_sources():
+                n_ok = self.pose_manager.source_frame_count(src, ok_only=True)
+                training_settings.pose_source_combo.addItem(
+                    get_text('label_location_pose_source_item', src, n_ok), src)
+            # 既定は slam（map 座標系の絶対位置。無ければ優先順位の先頭）
+            idx = training_settings.pose_source_combo.findData('slam')
+            training_settings.pose_source_combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+        def _update_pose_count_label(_i=None):
+            src = training_settings.pose_source_combo.currentData()
+            n = self.pose_manager.source_frame_count(src, ok_only=True) if (has_pose and src) else pose_count
+            training_settings.pose_output_check.setText(get_text('chk_location_output_pose', n))
+
+        training_settings.pose_source_combo.currentIndexChanged.connect(_update_pose_count_label)
+        _update_pose_count_label()
+        pose_src_row.addWidget(training_settings.pose_source_combo)
+        pose_src_row.addStretch()
+        pose_opts.addLayout(pose_src_row)
+
+        training_settings.heading_check = QCheckBox(get_text('chk_location_include_heading'))
+        training_settings.heading_check.setChecked(True)
+        training_settings.heading_check.setToolTip(get_text('tip_location_include_heading'))
+        pose_opts.addWidget(training_settings.heading_check)
+
+        # 方位(θ)の教師データソース: 既定は座標(x,y)と同じ自己位置ソース（例 slam）だが、
+        # pose（デッドレコニング＋IMU）は再ローカライズのテレポートが無く連続的なため、
+        # 座標は slam、方位だけ pose から取りたい場合に上書きできるようにする
+        has_pose_sensor_data = has_pose and self.pose_manager.source_frame_count('pose', ok_only=False) > 0
+        heading_src_row = QHBoxLayout()
+        heading_src_row.setContentsMargins(20, 0, 0, 0)
+        training_settings.heading_from_pose_check = QCheckBox(get_text('chk_location_heading_from_pose'))
+        training_settings.heading_from_pose_check.setChecked(False)
+        training_settings.heading_from_pose_check.setEnabled(has_pose_sensor_data)
+        training_settings.heading_from_pose_check.setToolTip(
+            get_text('tip_location_heading_from_pose') if has_pose_sensor_data
+            else get_text('tip_location_heading_from_pose_disabled'))
+        heading_src_row.addWidget(training_settings.heading_from_pose_check)
+        pose_opts.addLayout(heading_src_row)
+
+        def _update_heading_source_enabled():
+            training_settings.heading_from_pose_check.setEnabled(
+                has_pose_sensor_data and training_settings.heading_check.isChecked()
+                and training_settings.heading_check.isEnabled())
+        training_settings.heading_check.stateChanged.connect(lambda _s: _update_heading_source_enabled())
+        _update_heading_source_enabled()
+
+        # 車体姿勢角（roll, pitch）: pose センサー（IMU デッドレコニング）特有のデータ。
+        # slam/vslam/aruco には無いため、有効かどうかは pose ソースの記録内容で判定する
+        has_attitude_data = has_pose and self.pose_manager.has_extra_field('pose', 'roll') \
+            and self.pose_manager.has_extra_field('pose', 'pitch')
+        training_settings.attitude_check = QCheckBox(get_text('chk_location_include_attitude'))
+        training_settings.attitude_check.setChecked(False)
+        training_settings.attitude_check.setEnabled(has_attitude_data)
+        training_settings.attitude_check.setToolTip(
+            get_text('tip_location_include_attitude') if has_attitude_data
+            else get_text('tip_location_include_attitude_disabled'))
+        pose_opts.addWidget(training_settings.attitude_check)
+
+        pose_w_row = QHBoxLayout()
+        pose_w_row.addWidget(QLabel(get_text('label_location_pose_loss_weight')))
+        training_settings.pose_weight_spin = QDoubleSpinBox()
+        training_settings.pose_weight_spin.setRange(0.01, 100.0)
+        training_settings.pose_weight_spin.setSingleStep(0.5)
+        training_settings.pose_weight_spin.setValue(1.0)
+        training_settings.pose_weight_spin.setToolTip(get_text('tip_location_pose_loss_weight'))
+        pose_w_row.addWidget(training_settings.pose_weight_spin)
+        pose_w_row.addStretch()
+        pose_opts.addLayout(pose_w_row)
+        output_layout.addWidget(pose_opts_widget)
+
+        # 格子分類: x, y を一辺 cell_size [m] の格子に離散化し、どのセルにいるかを分類する
+        training_settings.grid_output_check = QCheckBox(get_text('chk_location_output_grid'))
+        training_settings.grid_output_check.setChecked(False)
+        training_settings.grid_output_check.setEnabled(has_pose)
+        training_settings.grid_output_check.setToolTip(
+            get_text('tip_location_output_grid') if has_pose else get_text('tip_location_output_pose_disabled'))
+        output_layout.addWidget(training_settings.grid_output_check)
+
+        grid_opts_widget = QWidget()
+        grid_opts = QVBoxLayout(grid_opts_widget)
+        grid_opts.setContentsMargins(20, 0, 0, 0)
+        grid_row = QHBoxLayout()
+        grid_row.addWidget(QLabel(get_text('label_location_grid_cell_size')))
+        training_settings.grid_cell_spin = QDoubleSpinBox()
+        training_settings.grid_cell_spin.setRange(0.05, 20.0)
+        training_settings.grid_cell_spin.setSingleStep(0.1)
+        training_settings.grid_cell_spin.setDecimals(2)
+        training_settings.grid_cell_spin.setSuffix(' m')
+        training_settings.grid_cell_spin.setValue(0.5)
+        grid_row.addWidget(training_settings.grid_cell_spin)
+        grid_row.addWidget(QLabel(get_text('label_location_grid_loss_weight')))
+        training_settings.grid_weight_spin = QDoubleSpinBox()
+        training_settings.grid_weight_spin.setRange(0.01, 100.0)
+        training_settings.grid_weight_spin.setSingleStep(0.5)
+        training_settings.grid_weight_spin.setValue(1.0)
+        grid_row.addWidget(training_settings.grid_weight_spin)
+        grid_row.addStretch()
+        grid_opts.addLayout(grid_row)
+        # 学習の安定化: 近傍セルへのラベル平滑化と、セル出現頻度による重み付け
+        grid_row2 = QHBoxLayout()
+        grid_row2.addWidget(QLabel(get_text('label_location_grid_sigma')))
+        training_settings.grid_sigma_spin = QDoubleSpinBox()
+        training_settings.grid_sigma_spin.setRange(0.0, 5.0)
+        training_settings.grid_sigma_spin.setSingleStep(0.25)
+        training_settings.grid_sigma_spin.setDecimals(2)
+        training_settings.grid_sigma_spin.setValue(1.0)
+        training_settings.grid_sigma_spin.setToolTip(get_text('tip_location_grid_sigma'))
+        grid_row2.addWidget(training_settings.grid_sigma_spin)
+        training_settings.grid_balance_check = QCheckBox(get_text('chk_location_grid_balance'))
+        training_settings.grid_balance_check.setChecked(True)
+        training_settings.grid_balance_check.setToolTip(get_text('tip_location_grid_balance'))
+        grid_row2.addWidget(training_settings.grid_balance_check)
+        grid_row2.addStretch()
+        grid_opts.addLayout(grid_row2)
+        training_settings.grid_size_label = QLabel("")
+        set_text_role(training_settings.grid_size_label, 'success')
+        grid_opts.addWidget(training_settings.grid_size_label)
+        output_layout.addWidget(grid_opts_widget)
+
+        pose_note = QLabel(get_text('label_location_pose_note'))
+        pose_note.setStyleSheet("font-style: italic;")
+        set_text_role(pose_note, 'info')
+        pose_note.setWordWrap(True)
+        output_layout.addWidget(pose_note)
+        settings_layout.addWidget(output_group)
+
+        # 格子サイズのプレビュー（自己位置の範囲からセル数を見積もる）
+        pose_bounds = None
+        if has_pose:
+            xs, ys = [], []
+            for p in self.pose_manager.get_trajectory():
+                xs.append(p.x)
+                ys.append(p.y)
+            if xs:
+                pose_bounds = (min(xs), max(xs), min(ys), max(ys))
+
+        def _update_grid_preview(_v=None):
+            if pose_bounds is None:
+                training_settings.grid_size_label.setText("")
+                return
+            c = training_settings.grid_cell_spin.value()
+            nx = max(1, int(math.ceil((pose_bounds[1] - pose_bounds[0]) / c)) + 1)
+            ny = max(1, int(math.ceil((pose_bounds[3] - pose_bounds[2]) / c)) + 1)
+            training_settings.grid_size_label.setText(
+                get_text('label_location_grid_preview', nx, ny, nx * ny))
+
+        training_settings.grid_cell_spin.valueChanged.connect(_update_grid_preview)
+        _update_grid_preview()
+
+        def _update_output_ui():
+            pose_on = training_settings.pose_output_check.isChecked()
+            class_on = training_settings.class_output_check.isChecked()
+            grid_on = training_settings.grid_output_check.isChecked()
+            pose_opts_widget.setVisible(pose_on)
+            grid_opts_widget.setVisible(grid_on)
+            training_settings.pose_weight_spin.setEnabled(pose_on and (class_on or grid_on))
+            training_settings.grid_weight_spin.setEnabled(grid_on and (class_on or pose_on))
+            # 格子分類のみでも自己位置ソースは必要なので、pose 系オプションは格子でも表示する
+            if grid_on and not pose_on:
+                pose_opts_widget.setVisible(True)
+                training_settings.heading_check.setEnabled(False)
+                training_settings.pose_weight_spin.setEnabled(False)
+            else:
+                training_settings.heading_check.setEnabled(True)
+            _update_heading_source_enabled()
+            # 出力が1つも選ばれていない場合は学習を開始できない
+            ok_btn = button_box.button(QDialogButtonBox.Ok)
+            if ok_btn is not None:
+                ok_btn.setEnabled(pose_on or class_on or grid_on)
+
+        training_settings.class_output_check.stateChanged.connect(lambda _s: _update_output_ui())
+        training_settings.pose_output_check.stateChanged.connect(lambda _s: _update_output_ui())
+        training_settings.grid_output_check.stateChanged.connect(lambda _s: _update_output_ui())
+
+        # 右カラム: 解像度 / 学習パラメータ / モデル名 / コメント
+        settings_layout = right_column
+
+        # ---------------------------------------------------------------
+        # 解像度モード（自動運転モデルと同じ: 実画像サイズで学習し、スライダーで縮小 / 劣化）
+        # ---------------------------------------------------------------
+        _main_slider = getattr(self, 'resolution_slider', None)
+        res_val = _main_slider.value() if _main_slider else 100
+        resolution_group = QGroupBox(get_text('label_resolution_mode_group'))
+        _tint_group(resolution_group, "#FBF0F4", "#E8C6D4")
+        resolution_layout = QVBoxLayout(resolution_group)
+        res_info = QLabel(get_text('label_location_resolution_info'))
+        set_text_role(res_info, 'muted')
+        res_info.setWordWrap(True)
+        resolution_layout.addWidget(res_info)
+
+        res_slider_row = QHBoxLayout()
+        res_dlg_label = QLabel(get_text('label_resolution_scale'))
+        res_dlg_label.setFixedWidth(50)
+        res_slider_row.addWidget(res_dlg_label)
+        training_settings.res_slider = QSlider(Qt.Horizontal)
+        training_settings.res_slider.setMinimum(10)
+        training_settings.res_slider.setMaximum(100)
+        training_settings.res_slider.setValue(res_val)
+        training_settings.res_slider.setTickPosition(QSlider.TicksBelow)
+        training_settings.res_slider.setTickInterval(10)
+        training_settings.res_slider.setSingleStep(5)
+        res_slider_row.addWidget(training_settings.res_slider, 1)
+        res_value_label = QLabel(f"{res_val}%")
+        res_value_label.setFixedWidth(38)
+        res_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        res_slider_row.addWidget(res_value_label)
+        resolution_layout.addLayout(res_slider_row)
+
+        training_settings.pixelate_radio = QRadioButton(get_text('opt_resolution_pixelate'))
+        training_settings.resize_radio = QRadioButton(get_text('opt_resolution_resize'))
+        if res_val < 100:
+            training_settings.resize_radio.setChecked(True)
+        else:
+            training_settings.pixelate_radio.setChecked(True)
+        resolution_layout.addWidget(training_settings.pixelate_radio)
+        resolution_layout.addWidget(training_settings.resize_radio)
+
+        training_settings.res_size_label = QLabel("")
+        set_text_role(training_settings.res_size_label, 'success')
+        resolution_layout.addWidget(training_settings.res_size_label)
+        settings_layout.addWidget(resolution_group)
+
+        def _update_resolution_ui(v=None):
+            v = training_settings.res_slider.value()
+            res_value_label.setText(f"{v}%")
+            if _main_slider and _main_slider.value() != v:
+                _main_slider.setValue(v)  # メインキャンバスのスライダーと連動
+            raw_h = getattr(self, 'original_image_height', None) or 0
+            raw_w = getattr(self, 'original_image_width', None) or 0
+            if raw_h and raw_w:
+                if training_settings.resize_radio.isChecked() and v < 100:
+                    h, w = max(1, int(raw_h * v / 100)), max(1, int(raw_w * v / 100))
+                else:
+                    h, w = raw_h, raw_w
+                training_settings.res_size_label.setText(
+                    get_text('label_location_resolution_size', raw_w, raw_h, w, h))
+
+        training_settings.res_slider.valueChanged.connect(_update_resolution_ui)
+        training_settings.resize_radio.toggled.connect(lambda _c: _update_resolution_ui())
+        _update_resolution_ui()
+
+        # 学習パラメータ（エポック / バッチ / オーグメンテーション / Early Stopping / 学習率）
+        params_group = QGroupBox(get_text('label_training_params'))
+        _tint_group(params_group, "#EAF3FB", "#B9D4EC")
+        params_layout = QVBoxLayout(params_group)
+
         # エポック数設定
         epoch_layout = QHBoxLayout()
         epoch_layout.addWidget(QLabel(get_text('label_epochs')))
@@ -29033,8 +34843,8 @@ class ImageAnnotationTool(QMainWindow):
         training_settings.epoch_spin.setRange(1, 1000)
         training_settings.epoch_spin.setValue(30)
         epoch_layout.addWidget(training_settings.epoch_spin)
-        settings_layout.addLayout(epoch_layout)
-        
+        params_layout.addLayout(epoch_layout)
+
         # バッチサイズ設定
         batch_layout = QHBoxLayout()
         batch_layout.addWidget(QLabel(get_text('label_batch_size')))
@@ -29042,26 +34852,26 @@ class ImageAnnotationTool(QMainWindow):
         training_settings.batch_spin.setRange(1, 128)
         training_settings.batch_spin.setValue(16)
         batch_layout.addWidget(training_settings.batch_spin)
-        settings_layout.addLayout(batch_layout)
-        
+        params_layout.addLayout(batch_layout)
+
         # データオーグメンテーション設定
         training_settings.aug_check = QCheckBox(get_text('chk_data_augmentation'))
         training_settings.aug_check.setChecked(True)
-        settings_layout.addWidget(training_settings.aug_check)
-        
+        params_layout.addWidget(training_settings.aug_check)
+
         # Early Stopping設定
         training_settings.early_stopping_check = QCheckBox(get_text('chk_early_stopping'))
         training_settings.early_stopping_check.setChecked(True)
-        settings_layout.addWidget(training_settings.early_stopping_check)
-        
+        params_layout.addWidget(training_settings.early_stopping_check)
+
         patience_layout = QHBoxLayout()
         patience_layout.addWidget(QLabel(get_text('label_patience')))
         training_settings.patience_spin = QSpinBox()
         training_settings.patience_spin.setRange(1, 20)
         training_settings.patience_spin.setValue(5)
         patience_layout.addWidget(training_settings.patience_spin)
-        settings_layout.addLayout(patience_layout)
-        
+        params_layout.addLayout(patience_layout)
+
         # 学習率設定
         lr_layout = QHBoxLayout()
         lr_layout.addWidget(QLabel(get_text('label_learning_rate')))
@@ -29070,13 +34880,13 @@ class ImageAnnotationTool(QMainWindow):
         training_settings.lr_combo.addItems(learning_rates)
         training_settings.lr_combo.setCurrentIndex(0)
         lr_layout.addWidget(training_settings.lr_combo)
-        settings_layout.addLayout(lr_layout)
+        params_layout.addLayout(lr_layout)
 
-        # モデル名とコメント欄を追加
-        settings_layout.addWidget(QLabel(""))  # スペース追加
+        settings_layout.addWidget(params_group)
 
         # モデル名編集欄
         model_name_group = QGroupBox(get_text('label_model_name_settings'))
+        _tint_group(model_name_group, "#F2F0FB", "#CFC8EC")
         model_name_layout = QVBoxLayout(model_name_group)
 
         # プレフィックス（固定）とサフィックス（編集可能）を分離
@@ -29090,7 +34900,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # プレフィックス（固定、編集不可）
         prefix_label = QLabel(location_prefix)
-        prefix_label.setStyleSheet("background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc; font-family: monospace;")
+        prefix_label.setStyleSheet("padding: 5px; font-family: monospace;")
+        set_panel_role(prefix_label, 'code')
         name_input_layout.addWidget(prefix_label)
 
         # サフィックス（編集可能）
@@ -29105,7 +34916,8 @@ class ImageAnnotationTool(QMainWindow):
         training_settings.model_name_prefix = location_prefix
 
         model_name_note = QLabel(get_text('label_model_name_note_pth', model_type))
-        model_name_note.setStyleSheet("color: #888; font-style: italic; font-size: 10px;")
+        model_name_note.setStyleSheet("font-style: italic; font-size: 10px;")
+        set_text_role(model_name_note, 'faint')
         model_name_layout.addWidget(model_name_note)
 
         settings_layout.addWidget(model_name_group)
@@ -29126,7 +34938,20 @@ class ImageAnnotationTool(QMainWindow):
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(training_settings.accept)
         button_box.rejected.connect(training_settings.reject)
-        settings_layout.addWidget(button_box)
+        # カラムを組み立て（幅は左右均等、余りは下に寄せる）
+        left_column.addStretch()
+        right_column.addStretch()
+        columns_layout.addLayout(left_column, 1)
+        columns_layout.addLayout(right_column, 1)
+        body_scroll.setWidget(body_widget)
+        outer_layout.addWidget(body_scroll, 1)
+        outer_layout.addWidget(button_box)
+
+        _update_source_ui()
+        _update_output_ui()
+
+        # 表示直後に中身が横スクロール無しで収まる大きさへ広げる
+        QTimer.singleShot(0, lambda: fit_dialog_to_scroll_content(training_settings, [body_scroll]))
 
         return training_settings
 
@@ -29141,7 +34966,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # アノテーション統計情報を表示
         stats_label = QLabel(get_text('label_waypoint_stats', total_images, annotated_images, valid_waypoint_count, deleted_count, get_text('label_deleted_excluded_note')))
-        stats_label.setStyleSheet("padding: 10px; background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 5px;")
+        stats_label.setStyleSheet("padding: 10px; border-radius: 5px;")
+        set_panel_role(stats_label, 'box')
         settings_layout.addWidget(stats_label)
 
         settings_layout.addWidget(QLabel(""))  # スペース追加
@@ -29219,7 +35045,8 @@ class ImageAnnotationTool(QMainWindow):
 
         # プレフィックス（固定、編集不可）
         prefix_label = QLabel(waypoint_prefix)
-        prefix_label.setStyleSheet("background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc; font-family: monospace;")
+        prefix_label.setStyleSheet("padding: 5px; font-family: monospace;")
+        set_panel_role(prefix_label, 'code')
         name_input_layout.addWidget(prefix_label)
 
         # サフィックス（編集可能）
@@ -29234,7 +35061,8 @@ class ImageAnnotationTool(QMainWindow):
         training_settings.model_name_prefix = waypoint_prefix
 
         model_name_note = QLabel(get_text('label_model_name_note_pth', model_type))
-        model_name_note.setStyleSheet("color: #888; font-style: italic; font-size: 10px;")
+        model_name_note.setStyleSheet("font-style: italic; font-size: 10px;")
+        set_text_role(model_name_note, 'faint')
         model_name_layout.addWidget(model_name_note)
 
         settings_layout.addWidget(model_name_group)
@@ -29328,6 +35156,25 @@ class ImageAnnotationTool(QMainWindow):
     def _get_location_training_config(self, dialog):
         """学習設定ダイアログから設定値を取得"""
 
+        selected_sources = [v for v, cb in dialog.source_checkboxes.items() if cb.isChecked()]
+        is_multi_source = len(selected_sources) > 1
+        virtual_type = dialog.virtual_type_combo.currentData() if not is_multi_source else None
+        if is_multi_source:
+            num_sources = len(selected_sources)
+        elif virtual_type:
+            num_sources = dialog.virtual_nsrc_spin.value()
+        else:
+            num_sources = 1
+
+        use_class = dialog.class_output_check.isChecked()
+        use_pose = dialog.pose_output_check.isChecked()
+        use_grid = dialog.grid_output_check.isChecked()
+        from model_catalog import make_output_mode
+        output_mode = make_output_mode(use_class=use_class, use_pose=use_pose, use_grid=use_grid)
+        use_history = dialog.history_check.isChecked() and dialog.history_check.isEnabled()
+        use_lidar = dialog.lidar_check.isChecked() and dialog.lidar_check.isEnabled()
+        needs_pose = use_pose or use_grid or use_history   # 自己位置を教師データ / 入力に使うか
+
         return {
             'num_epochs': dialog.epoch_spin.value(),
             'batch_size': dialog.batch_spin.value(),
@@ -29336,228 +35183,303 @@ class ImageAnnotationTool(QMainWindow):
             'patience': dialog.patience_spin.value() if dialog.early_stopping_check.isChecked() else 0,
             'learning_rate': float(dialog.lr_combo.currentText()),
             'model_name': dialog.model_name_prefix + dialog.model_name_suffix_input.text().strip(),
-            'comment': dialog.comment_input.toPlainText().strip()
+            'comment': dialog.comment_input.toPlainText().strip(),
+            # 入力画像ソース
+            'selected_sources': selected_sources,
+            'num_sources': num_sources,
+            'fusion_method': dialog.fusion_combo.currentData() if is_multi_source else 'concat',
+            'virtual_source_type': virtual_type,
+            'temporal_interval': dialog.temporal_interval_spin.value() if virtual_type == 'temporal' else 10,
+            # 出力（教師データ）
+            'output_mode': output_mode,
+            'pose_source': dialog.pose_source_combo.currentData() if needs_pose else None,
+            'include_heading': dialog.heading_check.isChecked() if use_pose else False,
+            'heading_from_pose': (dialog.heading_from_pose_check.isChecked()
+                                  if (use_pose and dialog.heading_check.isChecked()
+                                      and dialog.heading_from_pose_check.isEnabled()) else False),
+            'include_attitude': dialog.attitude_check.isChecked() if (use_pose and dialog.attitude_check.isEnabled()) else False,
+            'pose_loss_weight': dialog.pose_weight_spin.value() if use_pose else 1.0,
+            # 格子分類
+            'grid_cell_size': dialog.grid_cell_spin.value() if use_grid else None,
+            'grid_loss_weight': dialog.grid_weight_spin.value() if use_grid else 1.0,
+            'grid_label_sigma': dialog.grid_sigma_spin.value() if use_grid else 1.0,
+            'grid_class_balance': dialog.grid_balance_check.isChecked() if use_grid else True,
+            # 過去の座標・姿勢の時系列入力
+            'use_pose_history': use_history,
+            'pose_history_steps': dialog.history_steps_spin.value() if use_history else 0,
+            'pose_history_interval': dialog.history_interval_spin.value() if use_history else 10,
+            'history_noise_xy_m': dialog.history_noise_xy_spin.value() if use_history else 0.0,
+            'history_noise_theta_deg': dialog.history_noise_th_spin.value() if use_history else 0.0,
+            'history_drop_prob': dialog.history_drop_spin.value() if use_history else 0.0,
+            # LiDAR 点群（距離スキャン）の追加入力
+            'use_lidar': use_lidar,
+            'lidar_num_bins': dialog.lidar_bins_combo.currentData() if use_lidar else None,
+            'lidar_downsample_mode': dialog.lidar_ds_combo.currentData() if use_lidar else None,
+            'lidar_stack_frames': dialog.lidar_stack_spin.value() if use_lidar else 1,
+            'lidar_interval': dialog.lidar_interval_spin.value() if use_lidar else 10,
+            'lidar_max_range_mm': float(dialog.lidar_range_spin.value()) if use_lidar else None,
+            # 解像度（自動運転モデルと同じ: 実画像サイズ × 係数 / ピクセレーション）
+            'downscale_factor': dialog.res_slider.value() / 100.0,
+            'downscale_mode': 'resize' if dialog.resize_radio.isChecked() else 'pixelate',
         }
 
-    def _prepare_location_training_data(self, unique_locations):
-        """位置学習データの準備（インデックスベース修正版）"""
-        
+    def _location_source_paths_for_index(self, idx, selected_sources, virtual_type=None,
+                                         num_sources=1, temporal_interval=10):
+        """フレーム idx の位置モデル入力画像パスの組を返す（無ければ None）
+
+        - 複数ソース（実カメラ）: image_groups[idx] から選択ソース順に取得
+        - 仮想ソース temporal: 現在＋過去フレーム（先頭でクランプ）を組にする
+        - それ以外（単一 / crop / scale）: 1枚（crop/scale はデータセット側で生成）
+        """
+        groups = getattr(self, 'image_groups', None) or {}
+        current_var = getattr(self, 'current_variant', None)
+
+        def _path_for(i, source):
+            group = groups.get(i, {})
+            if source in group:
+                return group[source]
+            if source == current_var or not groups:
+                return self.images[i] if 0 <= i < len(self.images) else None
+            return None
+
+        sources = list(selected_sources) if selected_sources else [current_var]
+        if len(sources) > 1:
+            paths = [_path_for(idx, s) for s in sources]
+            return paths if all(paths) else None
+
+        base = _path_for(idx, sources[0])
+        if base is None:
+            return None
+        if virtual_type == 'temporal' and num_sources > 1:
+            paths = [base]
+            for k in range(1, num_sources):
+                prev = max(0, idx - k * temporal_interval)
+                p = _path_for(prev, sources[0])
+                paths.append(p if p else base)
+            return paths
+        return [base]
+
+    def _prepare_location_training_data(self, unique_locations, training_config=None):
+        """位置学習データの準備（インデックスベース、複数画像入力・pose ターゲット対応）
+
+        Returns:
+            dict: image_paths（代表パス）, grouped_paths（入力画像の組）, location_indices,
+                  pose_targets([x, y, theta])、スキップ件数など
+        """
+        cfg = training_config or {}
+        output_mode = cfg.get('output_mode', 'class')
+        heads = str(output_mode).split('_')
+        use_class = 'class' in heads
+        use_history = bool(cfg.get('use_pose_history'))
+        history_steps = int(cfg.get('pose_history_steps', 0) or 0) if use_history else 0
+        history_interval = int(cfg.get('pose_history_interval', 10) or 10)
+        # 格子分類・履歴入力も自己位置（教師データ / 正規化）を使う
+        use_pose = 'pose' in heads or 'grid' in heads or use_history
+        # 車体姿勢角（roll, pitch）: 座標・姿勢回帰ヘッドのみで有効。pose センサー（IMU）
+        # 特有のデータのため、選択中の pose_source に関わらず 'pose' ソースから別途取得する
+        include_attitude = 'pose' in heads and bool(cfg.get('include_attitude'))
+        # 方位(θ)の教師データソース上書き: 既定は x,y と同じ選択ソース（例 slam）だが、
+        # ON のときは pose（デッドレコニング）の theta を使う（テレポートが無く連続的なため）
+        heading_from_pose = 'pose' in heads and bool(cfg.get('include_heading')) and bool(cfg.get('heading_from_pose'))
+        selected_sources = cfg.get('selected_sources') or [getattr(self, 'current_variant', None)]
+        virtual_type = cfg.get('virtual_source_type')
+        num_sources = cfg.get('num_sources', 1)
+        temporal_interval = cfg.get('temporal_interval', 10)
+        pose_source = cfg.get('pose_source')
+        use_lidar = bool(cfg.get('use_lidar'))
+        lidar_stack_frames = int(cfg.get('lidar_stack_frames', 1) or 1) if use_lidar else 0
+        lidar_interval = int(cfg.get('lidar_interval', 10) or 10)
+        lidar_cache = {} if use_lidar else None
+        deleted = set(getattr(self, 'deleted_indexes', []) or [])
+
         # 位置ラベルのマッピングを作成（実際の位置値をインデックスに変換）
         location_to_index = {loc: i for i, loc in enumerate(unique_locations)}
-        
-        # データを準備（インデックスベースに修正）
+
+        # 対象フレーム: クラス分類ありなら位置アノテーション済み、pose のみなら自己位置のあるフレーム
+        if use_class:
+            candidate_indexes = sorted(k for k in self.location_annotations.keys() if isinstance(k, int))
+        else:
+            candidate_indexes = list(self.pose_manager.known_indexes())
+
         image_paths = []
+        grouped_paths = []
         location_labels = []
-        
-        for idx, location in self.location_annotations.items():
-            # インデックスが有効範囲内かチェック
-            if isinstance(idx, int) and 0 <= idx < len(self.images):
-                # 削除マークされたアノテーションは学習データから除外（actual_indexで判定）
-                is_deleted = False
-                if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
-                    is_deleted = True
-                
-                # 削除マークされていない場合のみ学習データに追加
-                if not is_deleted:
-                    # インデックスから画像パスを取得
-                    img_path = self.images[idx]
-                    image_paths.append(img_path)
-                    location_labels.append(location)
-        
-        # ラベルをインデックスに変換
-        location_indices = [location_to_index[label] for label in location_labels]
-        
+        location_indices = []
+        pose_targets = []
+        pose_history = []
+        lidar_scans = []
+        skipped_no_pose = 0
+        skipped_no_source = 0
+        skipped_no_attitude = 0
+        skipped_no_pose_heading = 0
+        skipped_no_lidar = 0
+
+        for idx in candidate_indexes:
+            if not (0 <= idx < len(self.images)) or idx in deleted:
+                continue
+
+            paths = self._location_source_paths_for_index(
+                idx, selected_sources, virtual_type, num_sources, temporal_interval)
+            if not paths:
+                skipped_no_source += 1
+                continue
+
+            scans = None
+            if use_lidar:
+                scans = self._location_lidar_scans_for_index(idx, lidar_stack_frames, lidar_interval, lidar_cache)
+                if scans is None:
+                    skipped_no_lidar += 1
+                    continue
+
+            pose_value = None
+            if use_pose:
+                # 学習ラベルは選択したソースの値だけを使う（他ソースへはフォールバックしない。
+                # 欠損フレームは除外して、slam のテレポート補完不可区間に pose が混ざらないようにする）
+                if pose_source:
+                    pose = self.pose_manager.get_source_pose(idx, pose_source, require_ok=True)
+                else:
+                    pose = self.pose_manager.get_pose(idx)
+                if pose is None:
+                    skipped_no_pose += 1
+                    continue
+                pose_value = [float(pose.x), float(pose.y), float(pose.theta)]
+
+                # roll/pitch（姿勢角度）・方位(θ)上書きはどちらも選択中の pose_source に
+                # 関わらず 'pose'（IMU デッドレコニング）センサーから取得するため、
+                # どちらか一方でも必要なら一度だけ取得して使い回す
+                pose_sensor_sample = None
+                if include_attitude or heading_from_pose:
+                    pose_sensor_sample = self.pose_manager.get_source_pose(idx, 'pose', require_ok=True)
+
+                if heading_from_pose:
+                    if pose_sensor_sample is None:
+                        skipped_no_pose_heading += 1
+                        continue
+                    pose_value[2] = float(pose_sensor_sample.theta)
+
+                if include_attitude:
+                    roll = pose_sensor_sample.extra.get('roll') if pose_sensor_sample is not None else None
+                    pitch = pose_sensor_sample.extra.get('pitch') if pose_sensor_sample is not None else None
+                    if roll is None or pitch is None:
+                        skipped_no_attitude += 1
+                        continue
+                    pose_value.extend([float(roll), float(pitch)])
+
+            if use_class:
+                location = self.location_annotations[idx]
+                location_labels.append(location)
+                location_indices.append(location_to_index[location])
+            if use_pose:
+                pose_targets.append(pose_value)
+            if use_history:
+                pose_history.append(self._location_pose_history_measured(
+                    idx, history_steps, history_interval, pose_source))
+            if use_lidar:
+                lidar_scans.append(scans)
+            image_paths.append(paths[0])
+            grouped_paths.append(paths)
+
         return {
             'image_paths': image_paths,
+            'grouped_paths': grouped_paths,
             'location_labels': location_labels,
             'location_indices': location_indices,
-            'location_to_index': location_to_index
+            'lidar_scans': lidar_scans,
+            'lidar_num_beams_raw': int(len(lidar_scans[0][0])) if lidar_scans else None,
+            'skipped_no_lidar': skipped_no_lidar,
+            'location_to_index': location_to_index,
+            'pose_targets': pose_targets,
+            'pose_history': pose_history,
+            'skipped_no_pose': skipped_no_pose,
+            'skipped_no_source': skipped_no_source,
+            'skipped_no_attitude': skipped_no_attitude,
+            'skipped_no_pose_heading': skipped_no_pose_heading,
         }
 
-    def _train_location_model_internal(self, model_type, train_loader, val_loader, num_classes, training_config, progress_callback):
-        """位置モデル学習の内部実装（外部依存を排除）"""
-        
-        # デバイスの設定
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        # モデルのロード（get_model関数を使用）
-        if progress_callback:
-            progress_callback(0, training_config['num_epochs'], "モデルをロード中...")
-        
-        model = self._initialize_location_model(model_type, num_classes, device)
-        
-        # 損失関数と最適化アルゴリズム
-        criterion = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(model.parameters(), lr=training_config['learning_rate'], weight_decay=1e-4)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
-        
-        # トレーニングループ
-        train_losses = []
-        val_losses = []
-        train_accuracies = []
-        val_accuracies = []
-        best_val_loss = float('inf')
-        best_val_acc = 0.0
-        
-        # Early Stopping用の変数
-        early_stopping_counter = 0
-        early_stopped = False
-        stopped_epoch = 0
-        
-        # 保存ディレクトリとファイル名
+    def _train_location_model_internal(self, model_type, train_loader, val_loader, num_classes,
+                                       training_config, progress_callback, dataset_info=None):
+        """位置モデル学習（model_training.train_location_model へ委譲）
+
+        クラス分類 / 座標・姿勢回帰 / 両方、および複数画像入力に対応する。
+        """
+        dataset_info = dataset_info or {}
+        output_mode = training_config.get('output_mode', 'class')
+        heads = str(output_mode).split('_')
+        use_pose = 'pose' in heads
+        use_grid = 'grid' in heads
+        use_history = bool(training_config.get('use_pose_history'))
+        use_lidar = bool(training_config.get('use_lidar'))
+        needs_pose = use_pose or use_grid or use_history
+
+        # 保存ディレクトリとファイル名（モデルタイプを必ず含める）
         models_dir = os.path.join(APP_DIR_PATH, MODELS_DIR_NAME)
         os.makedirs(models_dir, exist_ok=True)
-
-        # カスタムモデル名が指定されていればそれを使用、ただしモデルタイプを必ず含める
-        custom_name = training_config.get('model_name', '').strip()
-        if custom_name:
-            # カスタム名がある場合: モデルタイプ_カスタム名 の形式
-            save_name = f"{model_type}_{custom_name}"
+        custom_name = (training_config.get('model_name') or '').strip()
+        if not custom_name:
+            save_name = f"{model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        elif custom_name.startswith(model_type):
+            save_name = custom_name
         else:
-            # カスタム名がない場合: モデルタイプのみ
-            save_name = model_type
+            save_name = f"{model_type}_{custom_name}"
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_path = os.path.join(models_dir, f'{save_name}.pth')
-        best_model_path = os.path.join(models_dir, f'{save_name}_best.pth')
-        
-        completed_epochs = 0
-        for epoch in range(training_config['num_epochs']):
-            # 進捗コールバック - エポック開始
-            if progress_callback:
-                message = f"エポック {epoch+1}/{training_config['num_epochs']} 開始"
-                should_continue = progress_callback(epoch, training_config['num_epochs'], message)
-                if not should_continue:
-                    break
-            
-            # トレーニングフェーズ
-            model.train()
-            epoch_loss = 0.0
-            correct = 0
-            total = 0
-            
-            for i, (inputs, targets) in enumerate(train_loader):
-                inputs, targets = inputs.to(device), targets.to(device)
-                
-                optimizer.zero_grad()
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                loss.backward()
-                optimizer.step()
-                
-                # 統計情報を更新
-                epoch_loss += loss.item() * inputs.size(0)
-                _, predicted = torch.max(outputs, 1)
-                total += targets.size(0)
-                correct += (predicted == targets).sum().item()
-            
-            # エポック損失と精度の計算
-            epoch_loss /= len(train_loader.dataset)
-            epoch_accuracy = 100 * correct / total
-            train_losses.append(epoch_loss)
-            train_accuracies.append(epoch_accuracy)
-            
-            # 検証フェーズ
-            model.eval()
-            val_loss = 0.0
-            correct = 0
-            total = 0
-            with torch.no_grad():
-                for inputs, targets in val_loader:
-                    inputs, targets = inputs.to(device), targets.to(device)
-                    
-                    outputs = model(inputs)
-                    loss = criterion(outputs, targets)
-                    
-                    val_loss += loss.item() * inputs.size(0)
-                    _, predicted = torch.max(outputs, 1)
-                    total += targets.size(0)
-                    correct += (predicted == targets).sum().item()
-            
-            val_loss /= len(val_loader.dataset)
-            val_accuracy = 100 * correct / total
-            val_losses.append(val_loss)
-            val_accuracies.append(val_accuracy)
-            
-            # 学習率の調整
-            scheduler.step(val_loss)
-            
-            completed_epochs = epoch + 1
-            
-            # 進捗コールバック - エポック終了
-            if progress_callback:
-                message = f"エポック {epoch+1}/{training_config['num_epochs']}, 学習損失: {epoch_loss:.4f}, 検証損失: {val_loss:.4f}, "
-                message += f"学習精度: {epoch_accuracy:.2f}%, 検証精度: {val_accuracy:.2f}%"
-                should_continue = progress_callback(epoch + 1, training_config['num_epochs'], message)
-                if not should_continue:
-                    break
-            
-            # 最良モデルの保存
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                early_stopping_counter = 0
-                
-                if val_accuracy > best_val_acc:
-                    best_val_acc = val_accuracy
-                
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': best_val_loss,
-                    'accuracy': best_val_acc,
-                    'num_classes': num_classes
-                }, best_model_path)
-                
-            elif val_accuracy > best_val_acc:
-                best_val_acc = val_accuracy
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': val_loss,
-                    'accuracy': best_val_acc,
-                    'num_classes': num_classes
-                }, best_model_path)
-            else:
-                # Early Stopping判定
-                if training_config['use_early_stopping']:
-                    early_stopping_counter += 1
-                    if early_stopping_counter >= training_config['patience']:
-                        early_stopped = True
-                        stopped_epoch = epoch + 1
-                        break
-        
-        # 最終モデルの保存
-        torch.save({
-            'epoch': completed_epochs,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'train_losses': train_losses,
-            'val_losses': val_losses,
-            'train_accuracies': train_accuracies,
-            'val_accuracies': val_accuracies,
-            'best_val_loss': best_val_loss,
-            'best_val_acc': best_val_acc,
-            'early_stopped': early_stopped,
-            'stopped_epoch': stopped_epoch if early_stopped else completed_epochs,
-            'num_classes': num_classes
-        }, model_path)
-        
-        return {
-            'model_name': model_type,
-            'train_losses': train_losses,
-            'val_losses': val_losses,
-            'train_accuracies': train_accuracies,
-            'val_accuracies': val_accuracies,
-            'best_val_loss': best_val_loss,
-            'best_val_acc': best_val_acc,
-            'model_path': model_path,
-            'best_model_path': best_model_path,
-            'completed_epochs': completed_epochs,
-            'early_stopped': early_stopped,
-            'stopped_epoch': stopped_epoch if early_stopped else completed_epochs
+        # チェックポイントへ保存する入出力構成（推論時に同じ入力構成を再現するため）
+        location_config = {
+            'selected_sources': training_config.get('selected_sources'),
+            'virtual_source_type': training_config.get('virtual_source_type'),
+            'temporal_interval': training_config.get('temporal_interval', 10),
+            'pose_source': training_config.get('pose_source') if needs_pose else None,
+            'pose_norm': dataset_info.get('pose_norm') if use_pose else None,
+            'include_heading': bool(dataset_info.get('include_heading')) if use_pose else False,
+            'heading_from_pose': bool(training_config.get('heading_from_pose')) if use_pose else False,
+            'include_attitude': bool(dataset_info.get('include_attitude')) if use_pose else False,
+            'downscale_factor': float(training_config.get('downscale_factor', 1.0)),
+            'downscale_mode': training_config.get('downscale_mode', 'resize'),
+            'grid_config': dataset_info.get('grid_config') if use_grid else None,
+            'num_grid_classes': int(dataset_info.get('num_grid_classes') or 0) if use_grid else 0,
+            # 過去の座標・姿勢の履歴入力（推論時に同じ間隔で履歴を組み立てる）
+            'pose_history_steps': int(training_config.get('pose_history_steps', 0) or 0) if use_history else 0,
+            'pose_history_interval': int(training_config.get('pose_history_interval', 10) or 10),
+            # LiDAR 点群入力（推論時に同じ前処理設定・積層間隔でスキャンを組み立てるための情報。
+            # interval は ScanPreprocessor が扱わないため lidar_config とは別に保持する）
+            'lidar_config': dataset_info.get('lidar_config') if use_lidar else None,
+            'lidar_interval': int(training_config.get('lidar_interval', 10) or 10) if use_lidar else None,
         }
+        if use_history:
+            # pose ヘッドが無くても履歴の正規化に pose_norm が必要
+            location_config['pose_norm'] = dataset_info.get('pose_norm')
+
+        return train_location_model(
+            model_name=model_type,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            num_classes=num_classes,
+            num_epochs=training_config['num_epochs'],
+            learning_rate=training_config['learning_rate'],
+            weight_decay=1e-4,
+            save_dir=models_dir,
+            progress_callback=progress_callback,
+            pretrained=True,
+            use_early_stopping=training_config['use_early_stopping'],
+            patience=training_config['patience'],
+            custom_model_name=save_name,
+            num_sources=training_config.get('num_sources', 1),
+            fusion_method=training_config.get('fusion_method', 'concat'),
+            output_mode=output_mode,
+            pose_dim=int(dataset_info.get('pose_dim') or 4),
+            pose_loss_weight=training_config.get('pose_loss_weight', 1.0),
+            location_config=location_config,
+            input_size=dataset_info.get('actual_image_size'),
+            num_grid_classes=int(dataset_info.get('num_grid_classes') or 0) if use_grid else 0,
+            grid_loss_weight=training_config.get('grid_loss_weight', 1.0),
+            grid_top_n=int(getattr(self, 'location_topn', 3)),
+            grid_label_sigma=float(training_config.get('grid_label_sigma', 1.0)),
+            grid_class_balance=bool(training_config.get('grid_class_balance', True)),
+            pose_history_steps=int(training_config.get('pose_history_steps', 0) or 0) if use_history else 0,
+            history_noise_xy_m=float(training_config.get('history_noise_xy_m', 0.1)),
+            history_noise_theta_deg=float(training_config.get('history_noise_theta_deg', 5.0)),
+            history_drop_prob=float(training_config.get('history_drop_prob', 0.1)),
+            lidar_drop_prob=0.1 if use_lidar else 0.0,
+        )
 
     def _initialize_location_model(self, model_type, num_classes, device):
         """位置モデルの初期化"""
@@ -29566,13 +35488,13 @@ class ImageAnnotationTool(QMainWindow):
         if 'donkey_location' in model_type:
             model = get_model(model_type, pretrained=True)
             model.classifier = nn.Linear(50, num_classes)  # 出力層を置き換え
-        elif 'resnet18_location' in model_type:
+        else:
+            # TIMMバックボーン系の位置モデル（resnet18_location含む）は
+            # 共通してregressorヘッドを持つため、クラス数に合わせて置き換える
             model = get_model(model_type, pretrained=True)
             if hasattr(model, 'regressor'):
                 in_features = model.regressor.in_features if hasattr(model.regressor, 'in_features') else model.regressor[0].in_features
                 model.regressor = nn.Linear(in_features, num_classes)
-        else:
-            model = get_model(model_type, pretrained=True)
         
         return model.to(device)
 
@@ -29607,10 +35529,33 @@ class ImageAnnotationTool(QMainWindow):
                 "val_accuracies": training_results.get('val_accuracies', []),
                 "status": "early_stopped" if training_results.get('early_stopped', False) else "completed"
             }
-            
+            output_mode = training_config.get('output_mode', 'class')
+            heads = str(output_mode).split('_')
+            if 'pose' in heads:
+                metrics["best_val_pos_error_m"] = training_results.get('best_val_pos_error') or 0.0
+                metrics["best_val_heading_error_deg"] = training_results.get('best_val_heading_error') or 0.0
+                metrics["position_error_mean"] = training_results.get('best_val_pos_error') or 0.0
+                metrics["train_pos_errors"] = training_results.get('train_pos_errors', [])
+                metrics["val_pos_errors"] = training_results.get('val_pos_errors', [])
+                if training_config.get('include_attitude'):
+                    metrics["best_val_attitude_error_deg"] = training_results.get('best_val_attitude_error') or 0.0
+            if 'grid' in heads:
+                metrics["best_val_grid_acc"] = training_results.get('best_val_grid_acc') or 0.0
+                metrics["best_val_grid_top1_error_m"] = training_results.get('best_val_grid_error') or 0.0
+                metrics["best_val_grid_weighted_error_m"] = training_results.get('best_val_grid_weighted_error') or 0.0
+                metrics["val_grid_accuracies"] = training_results.get('val_grid_accuracies', [])
+                metrics["val_grid_errors"] = training_results.get('val_grid_errors', [])
+
+            _cs = {'class': 'classification', 'pose': 'map_xy_theta', 'grid': 'map_grid_cell'}
+            _em = {'class': 'cnn_classification', 'pose': 'cnn_pose_regression', 'grid': 'cnn_grid_classification'}
+            coordinate_system = '+'.join(_cs[h] for h in heads if h in _cs)
+            estimation_method = 'cnn_multitask' if len(heads) > 1 else _em.get(heads[0], 'cnn_classification')
+
             # 学習パラメータを準備
             training_params = {
                 "model_type": model_type,
+                "model_name": training_config.get('model_name', ''),
+                "comment": training_config.get('comment', ''),
                 "num_epochs": training_config['num_epochs'],
                 "completed_epochs": training_results.get('completed_epochs', training_config['num_epochs']),
                 "learning_rate": training_config['learning_rate'],
@@ -29619,10 +35564,37 @@ class ImageAnnotationTool(QMainWindow):
                 "patience": training_config['patience'],
                 "early_stopped": training_results.get('early_stopped', False),
                 "augmentation_enabled": training_config['use_augmentation'],
-                "coordinate_system": "classification",  # 位置推論特有
-                "estimation_method": "cnn_classification",  # 位置推論特有
+                "coordinate_system": coordinate_system,  # 位置推論特有
+                "estimation_method": estimation_method,  # 位置推論特有
                 "fixed_classes": dataset_info['num_classes'],
                 "actual_classes": dataset_info['actual_classes'],
+                "output_mode": output_mode,
+                "num_sources": training_config.get('num_sources', 1),
+                "fusion_method": training_config.get('fusion_method') if training_config.get('num_sources', 1) > 1 else None,
+                "selected_sources": ",".join(training_config.get('selected_sources') or []),
+                "virtual_source_type": training_config.get('virtual_source_type') or "none",
+                "temporal_interval": training_config.get('temporal_interval', 10),
+                "pose_source": training_config.get('pose_source') or "none",
+                "include_heading": training_config.get('include_heading', False),
+                "heading_from_pose": training_config.get('heading_from_pose', False),
+                "include_attitude": training_config.get('include_attitude', False),
+                "pose_loss_weight": training_config.get('pose_loss_weight', 1.0),
+                "grid_cell_size": training_config.get('grid_cell_size') if 'grid' in heads else None,
+                "num_grid_classes": dataset_info.get('num_grid_classes') if 'grid' in heads else None,
+                "grid_loss_weight": training_config.get('grid_loss_weight') if 'grid' in heads else None,
+                "grid_label_sigma": training_config.get('grid_label_sigma') if 'grid' in heads else None,
+                "grid_class_balance": training_config.get('grid_class_balance') if 'grid' in heads else None,
+                "pose_history_steps": training_config.get('pose_history_steps', 0) if training_config.get('use_pose_history') else 0,
+                "pose_history_interval": training_config.get('pose_history_interval') if training_config.get('use_pose_history') else None,
+                "history_noise_xy_m": training_config.get('history_noise_xy_m') if training_config.get('use_pose_history') else None,
+                "history_noise_theta_deg": training_config.get('history_noise_theta_deg') if training_config.get('use_pose_history') else None,
+                "history_drop_prob": training_config.get('history_drop_prob') if training_config.get('use_pose_history') else None,
+                "use_lidar": training_config.get('use_lidar', False),
+                "lidar_num_bins": training_config.get('lidar_num_bins') if training_config.get('use_lidar') else None,
+                "lidar_downsample_mode": training_config.get('lidar_downsample_mode') if training_config.get('use_lidar') else None,
+                "lidar_stack_frames": training_config.get('lidar_stack_frames') if training_config.get('use_lidar') else None,
+                "lidar_interval": training_config.get('lidar_interval') if training_config.get('use_lidar') else None,
+                "lidar_max_range_mm": training_config.get('lidar_max_range_mm') if training_config.get('use_lidar') else None,
                 "data_folder": self.folder_path if hasattr(self, 'folder_path') and self.folder_path else "unknown"
             }
 
@@ -29676,23 +35648,107 @@ class ImageAnnotationTool(QMainWindow):
 
         columns_layout = QHBoxLayout()
 
+        output_mode = training_config.get('output_mode', 'class')
+        heads = str(output_mode).split('_')
+        use_class = 'class' in heads
+        use_pose = 'pose' in heads
+        use_grid = 'grid' in heads
+
         # 左カラム: 学習結果
         left_group = QGroupBox("学習結果")
         left_layout = QVBoxLayout(left_group)
         left_layout.addWidget(QLabel(f"最良検証損失: {training_results['best_val_loss']:.6f}"))
-        left_layout.addWidget(QLabel(f"最良検証精度: {training_results['best_val_acc']:.2f}%"))
+        if use_class:
+            left_layout.addWidget(QLabel(f"最良検証精度: {training_results['best_val_acc']:.2f}%"))
+        if use_pose:
+            pos_err = training_results.get('best_val_pos_error')
+            if pos_err is not None:
+                left_layout.addWidget(QLabel(get_text('label_location_result_pos_error', f"{pos_err:.3f}")))
+            head_err = training_results.get('best_val_heading_error')
+            if head_err is not None and training_config.get('include_heading'):
+                left_layout.addWidget(QLabel(get_text('label_location_result_heading_error', f"{head_err:.1f}")))
+            att_err = training_results.get('best_val_attitude_error')
+            if att_err is not None and training_config.get('include_attitude'):
+                left_layout.addWidget(QLabel(get_text('label_location_result_attitude_error', f"{att_err:.1f}")))
+        if use_grid:
+            g_acc = training_results.get('best_val_grid_acc')
+            g_err = training_results.get('best_val_grid_error')
+            g_werr = training_results.get('best_val_grid_weighted_error')
+            if g_acc is not None:
+                left_layout.addWidget(QLabel(get_text('label_location_result_grid_acc', f"{g_acc:.1f}")))
+            if g_err is not None and g_werr is not None:
+                left_layout.addWidget(QLabel(get_text('label_location_result_grid_error',
+                                                      f"{g_err:.3f}", training_results.get('grid_top_n', 3),
+                                                      f"{g_werr:.3f}")))
         left_layout.addWidget(QLabel(f"実施エポック数: {training_results['completed_epochs']}/{training_config['num_epochs']}"))
         if early_stopping_info:
             left_layout.addWidget(QLabel(early_stopping_info.strip()))
         if time_info:
             left_layout.addWidget(QLabel(time_info.strip()))
         left_layout.addWidget(QLabel(f"学習データ数: {dataset_info['image_paths_count']}枚"))
+        skipped = dataset_info.get('skipped_no_pose', 0) + dataset_info.get('skipped_no_source', 0)
+        if skipped:
+            left_layout.addWidget(QLabel(get_text('label_location_result_skipped',
+                                                  dataset_info.get('skipped_no_pose', 0),
+                                                  dataset_info.get('skipped_no_source', 0))))
+        if dataset_info.get('skipped_no_attitude'):
+            left_layout.addWidget(QLabel(get_text('label_location_result_skipped_attitude',
+                                                  dataset_info['skipped_no_attitude'])))
+        if dataset_info.get('skipped_no_pose_heading'):
+            left_layout.addWidget(QLabel(get_text('label_location_result_skipped_heading',
+                                                  dataset_info['skipped_no_pose_heading'])))
+        if dataset_info.get('skipped_no_lidar'):
+            left_layout.addWidget(QLabel(get_text('label_location_result_skipped_lidar',
+                                                  dataset_info['skipped_no_lidar'])))
         left_layout.addStretch()
 
         # 右カラム: 学習設定
         right_group = QGroupBox("学習設定")
         right_layout = QVBoxLayout(right_group)
-        right_layout.addWidget(QLabel(f"出力クラス数: {dataset_info['num_classes']} (実際の位置クラス数: {dataset_info['actual_classes']})"))
+        mode_desc = " + ".join(get_text(f'opt_location_head_{h}') for h in heads)
+        right_layout.addWidget(QLabel(get_text('label_location_result_output_mode', mode_desc)))
+        if use_grid:
+            gcfg = training_results.get('grid_config') or {}
+            right_layout.addWidget(QLabel(get_text('label_location_result_grid',
+                                                   training_config.get('grid_cell_size') or '-',
+                                                   gcfg.get('nx', '-'), gcfg.get('ny', '-'),
+                                                   gcfg.get('num_cells', '-'))))
+        if use_class:
+            right_layout.addWidget(QLabel(f"出力クラス数: {dataset_info['num_classes']} (実際の位置クラス数: {dataset_info['actual_classes']})"))
+        if use_pose:
+            right_layout.addWidget(QLabel(get_text('label_location_result_pose_source',
+                                                   training_config.get('pose_source') or '-',
+                                                   'ON' if training_config.get('include_heading') else 'OFF')))
+            if training_config.get('include_heading') and training_config.get('heading_from_pose'):
+                right_layout.addWidget(QLabel(get_text('label_location_result_heading_from_pose')))
+            if training_config.get('include_attitude'):
+                right_layout.addWidget(QLabel(get_text('label_location_result_attitude_on')))
+        n_src = training_config.get('num_sources', 1)
+        src_desc = ", ".join(training_config.get('selected_sources') or [])
+        if training_config.get('virtual_source_type'):
+            src_desc += f" / {training_config['virtual_source_type']} x{n_src}"
+        elif n_src > 1:
+            src_desc += f" / {training_config.get('fusion_method', 'concat')}"
+        right_layout.addWidget(QLabel(get_text('label_location_result_inputs', n_src, src_desc)))
+        if training_config.get('use_pose_history'):
+            right_layout.addWidget(QLabel(get_text('label_location_result_history',
+                                                   training_config.get('pose_history_steps', 0),
+                                                   training_config.get('pose_history_interval', 10),
+                                                   training_config.get('history_noise_xy_m', 0.0),
+                                                   training_config.get('history_noise_theta_deg', 0.0),
+                                                   training_config.get('history_drop_prob', 0.0))))
+        if training_config.get('use_lidar'):
+            right_layout.addWidget(QLabel(get_text('label_location_result_lidar',
+                                                   training_config.get('lidar_num_bins', '-'),
+                                                   training_config.get('lidar_stack_frames', 1),
+                                                   training_config.get('lidar_interval', 10))))
+        in_size = dataset_info.get('input_size')
+        if in_size:
+            mode = training_config.get('downscale_mode', 'resize')
+            factor = training_config.get('downscale_factor', 1.0)
+            res_desc = f"{int(factor * 100)}% / {mode}" if factor < 1.0 else "100%"
+            right_layout.addWidget(QLabel(get_text('label_location_result_input_size',
+                                                   in_size[1], in_size[0], res_desc)))
         right_layout.addWidget(QLabel(f"学習率: {training_config['learning_rate']}"))
         right_layout.addWidget(QLabel(f"バッチサイズ: {training_config['batch_size']}"))
         right_layout.addWidget(QLabel(f"データオーグメンテーション: {'有効' if training_config['use_augmentation'] else '無効'}"))
@@ -30327,23 +36383,121 @@ class ImageAnnotationTool(QMainWindow):
             if current_index in self.location_inference_results:
                 # 推論結果を取得
                 result = self.location_inference_results[current_index]
-                pred_class = result['pred_class']
-                confidence = result['confidence']
+                pred_class = result.get('pred_class')
+                confidence = result.get('confidence', 0.0)
                 all_probs = result.get('all_probs', [])
-                
+                pose_result = result.get('pose')
+
                 # 情報テキストを構築（インライン表示）
                 inference_text = f"<b>{get_text('label_location_inference_result')}</b> "
-                
-                # 一番高いクラスは背景色付きで表示
-                loc_color = get_location_color(pred_class)
-                
-                # 予測クラスを背景色付きで表示
-                inference_text += f"<div style='background-color: {loc_color.name()};'>"
-                #inference_text += f"<div style='background-color: {loc_color.name()}; color: white; font-weight: bold; padding: 5px; border-radius: 5px; margin: 5px 0;'>"
-                #inference_text += f"予測位置: {pred_class} (確信度: {confidence:.4f})</div>"
-                
+
+                if pred_class is not None:
+                    # 一番高いクラスは背景色付きで表示
+                    loc_color = get_location_color(pred_class)
+                    inference_text += f"<div style='background-color: {loc_color.name()};'>"
+                else:
+                    # 座標・姿勢のみのモデルは背景色なし
+                    inference_text += "<div>"
+
+                # 座標・姿勢推定結果（学習時の pose ソースと同じ map 座標系 [m] / [deg]）
+                if pose_result:
+                    theta = pose_result.get('theta')
+                    theta_text = f"{math.degrees(theta):.1f}°" if theta is not None else "-"
+                    x_text = f"{pose_result['x']:.2f}"
+                    y_text = f"{pose_result['y']:.2f}"
+                    pose_text = get_text('label_location_pose_result', x_text, y_text, theta_text)
+                    inference_text += f"<span style='font-weight: bold;'>{pose_text}</span><br>"
+                    # 実測の自己位置があれば誤差も表示（方位は heading_from_pose のとき
+                    # 座標(x,y)のソースとは別に 'pose' センサーの実測 theta と比較する）
+                    pm = getattr(self, 'pose_manager', None)
+                    if pm is not None and pm.has_any_pose():
+                        cfg = getattr(self.location_model_manager, 'location_config', {}) or {}
+                        gt = pm.get_pose(current_index, prefer=cfg.get('pose_source'))
+                        if gt is not None:
+                            pos_err = math.hypot(pose_result['x'] - gt.x, pose_result['y'] - gt.y)
+                            if theta is not None:
+                                gt_theta = gt.theta
+                                if cfg.get('heading_from_pose'):
+                                    gt_pose_sensor = pm.get_source_pose(current_index, 'pose')
+                                    if gt_pose_sensor is not None:
+                                        gt_theta = gt_pose_sensor.theta
+                                d = (theta - gt_theta + math.pi) % (2 * math.pi) - math.pi
+                                err_text = get_text('label_location_pose_error', f'{pos_err:.2f}', f'{abs(math.degrees(d)):.1f}')
+                            else:
+                                err_text = get_text('label_location_pose_error_pos_only', f'{pos_err:.2f}')
+                            inference_text += f"<span style='color: {theme_color('strong')};'>{err_text}</span><br>"
+
+                    # 車体姿勢角（roll, pitch）: pose センサー特有。実測は選択ソースに関わらず
+                    # 'pose'（IMU）から取得し、推定との誤差もそちらと比較する
+                    roll = pose_result.get('roll')
+                    pitch = pose_result.get('pitch')
+                    if roll is not None and pitch is not None:
+                        att_text = get_text('label_location_attitude_result',
+                                            f'{math.degrees(roll):.1f}', f'{math.degrees(pitch):.1f}')
+                        inference_text += f"<span style='font-weight: bold;'>{att_text}</span><br>"
+                        pm2 = getattr(self, 'pose_manager', None)
+                        att_gt = pm2.get_source_pose(current_index, 'pose', require_ok=True) if pm2 is not None else None
+                        if att_gt is not None and 'roll' in att_gt.extra and 'pitch' in att_gt.extra:
+                            roll_err = abs(math.degrees(roll - att_gt.extra['roll']))
+                            pitch_err = abs(math.degrees(pitch - att_gt.extra['pitch']))
+                            att_err_text = get_text('label_location_attitude_error',
+                                                    f'{roll_err:.1f}', f'{pitch_err:.1f}')
+                            inference_text += f"<span style='color: {theme_color('strong')};'>{att_err_text}</span><br>"
+
+                # 履歴入力ありのモデル: 履歴のソースと有効ステップ数
+                if 'history_valid_steps' in result:
+                    cfg = getattr(self.location_model_manager, 'location_config', {}) or {}
+                    src_text = (get_text('label_location_history_src_inference')
+                                if getattr(self, 'location_history_from_inference', False)
+                                else get_text('label_location_history_src_measured'))
+                    inference_text += (f"<span style='color: {theme_color('strong')};'>"
+                                       f"{get_text('label_location_history_info', src_text, result['history_valid_steps'], cfg.get('pose_history_steps', 0))}"
+                                       f"</span><br>")
+
+                # LiDAR入力ありのモデル: 積層フレームのうち実際にスキャンがあった数
+                if 'lidar_valid_frames' in result:
+                    lidar_cfg = (getattr(self.location_model_manager, 'location_config', {}) or {}).get('lidar_config') or {}
+                    inference_text += (f"<span style='color: {theme_color('strong')};'>"
+                                       f"{get_text('label_location_lidar_info', result['lidar_valid_frames'], lidar_cfg.get('stack_frames', 1))}"
+                                       f"</span><br>")
+
+                # 格子分類の結果: Top1 セル / Top1〜N の重み付き位置と Top-N 一覧
+                grid_result = result.get('grid')
+                if grid_result and grid_result.get('top'):
+                    from model_catalog import grid_weighted_position
+                    top_n = int(getattr(self, 'location_topn', 3))
+                    mode = getattr(self, 'location_grid_display', 'weighted')
+                    top = grid_result['top']
+                    t1 = top[0]
+                    wx, wy = grid_weighted_position(top, n=top_n)
+                    ex, ey = (t1['x'], t1['y']) if mode == 'top1' else (wx, wy)
+                    mode_text = (get_text('opt_location_grid_top1') if mode == 'top1'
+                                 else get_text('label_location_grid_weighted_n', top_n))
+                    inference_text += (f"<span style='font-weight: bold;'>"
+                                       f"{get_text('label_location_grid_result', mode_text, f'{ex:.2f}', f'{ey:.2f}')}"
+                                       f"</span><br>")
+                    inference_text += (f"<span style='color: {theme_color('strong')};'>"
+                                       f"{get_text('label_location_grid_top1', t1['ix'], t1['iy'], f'{t1['prob']:.3f}', f'{t1['x']:.2f}', f'{t1['y']:.2f}')}"
+                                       f"</span><br>")
+                    # 実測との誤差
+                    pm = getattr(self, 'pose_manager', None)
+                    if pm is not None and pm.has_any_pose():
+                        cfg = getattr(self.location_model_manager, 'location_config', {}) or {}
+                        gt = pm.get_pose(current_index, prefer=cfg.get('pose_source'))
+                        if gt is not None:
+                            e_top1 = math.hypot(t1['x'] - gt.x, t1['y'] - gt.y)
+                            e_w = math.hypot(wx - gt.x, wy - gt.y)
+                            inference_text += (f"<span style='color: {theme_color('strong')};'>"
+                                               f"{get_text('label_location_grid_error', f'{e_top1:.2f}', top_n, f'{e_w:.2f}')}"
+                                               f"</span><br>")
+                    # Top-N 一覧（確率降順）
+                    for rank, it in enumerate(top[:top_n], start=1):
+                        inference_text += (f"<span style='color: {theme_color('muted')};'>"
+                                           f"{get_text('label_location_grid_rank', rank, it['ix'], it['iy'], f'{it['prob']:.3f}')}"
+                                           f"</span><br>")
+
                 # 上位3クラスの予測結果を表示（すでに確率でソートされている前提）
-                if all_probs:
+                if pred_class is not None and all_probs:
                     # 確率が高い順にインデックスをソート
                     sorted_indices = sorted(range(len(all_probs)), key=lambda i: all_probs[i], reverse=True)
                     
@@ -30423,16 +36577,19 @@ class ImageAnnotationTool(QMainWindow):
             self.image_slider.setDownsampledIndexes(self.downsampled_indexes, len(self.images))
 
     ###
-    def _export_segmentation_subset(self, indices, output_dir, class_to_index):
-        """セグメンテーションサブセットのエクスポート - クラス名修正版"""
+    def _export_segmentation_subset(self, items, output_dir, class_to_index):
+        """セグメンテーションサブセットのエクスポート - クラス名修正版
+
+        items は (画像パス, セグメント群) の一覧。画像ソースをまたぐとフレーム
+        番号が重複するため、インデックスではなく画像パスで受け取る。
+        """
         
         success_count = 0
         
-        for idx in indices:
-            if idx in self.segmentation_annotations:
+        for source_image_path, segments in items:
+            if segments:
                 try:
                     # 画像をコピー
-                    source_image_path = self.images[idx]
                     image_filename = os.path.basename(source_image_path)
                     dest_image_path = os.path.join(output_dir, "images", image_filename)
                     
@@ -30454,7 +36611,7 @@ class ImageAnnotationTool(QMainWindow):
                     label_lines = []
                     valid_segments = 0
                     
-                    for seg_idx, seg in enumerate(self.segmentation_annotations[idx]):
+                    for seg_idx, seg in enumerate(segments):
                         # クラス名を取得 - 複数のキーを試す
                         class_name = None
                         if isinstance(seg, dict):
@@ -30537,7 +36694,7 @@ class ImageAnnotationTool(QMainWindow):
                     success_count += 1
                     
                 except Exception as e:
-                    print(f"セグメンテーション インデックス {idx} の処理中にエラー: {e}")
+                    print(f"セグメンテーション エクスポートエラー {source_image_path}: {e}")
                     import traceback
                     traceback.print_exc()
         
@@ -30589,31 +36746,29 @@ class ImageAnnotationTool(QMainWindow):
         """YOLOアノテーションの検証 - クラス名確認強化版（削除マーク除外対応）"""
         
         if task_type == "detect":
-            if not hasattr(self, 'bbox_annotations') or not self.bbox_annotations:
+            # 学習対象は設定に応じて「表示中のソースのみ」か「全画像ソース」。
+            # ソースをまたぐとフレーム番号が重複するので画像パスをキーにする。
+            items = self.collect_annotation_items('bbox_annotations')
+            source_counts = self.count_annotation_sources('bbox_annotations')
+            all_images = sum(
+                1 for _key, _imgs, store in self.iter_source_annotation_stores(
+                    'bbox_annotations', all_sources=None)
+                for boxes in store.values() if boxes)
+            excluded_count = max(all_images - len(items), 0)
+
+            if not items:
                 QMessageBox.warning(self, get_text('dialog_warning'), get_text('msg_no_detection_annotations'))
                 return None, None
-            
-            # 削除マークされていないアノテーションのみ抽出
-            valid_annotations = {}
-            excluded_count = 0
-            
-            for idx, boxes in self.bbox_annotations.items():
-                # 削除マークされていないかチェック（actual_indexで判定）
-                if hasattr(self, 'deleted_indexes') and idx in self.deleted_indexes:
-                    excluded_count += 1
-                    continue
-                
-                # 有効なアノテーションのみ追加
-                if boxes:
-                    valid_annotations[idx] = boxes
-            
-            if not valid_annotations:
-                QMessageBox.warning(self, get_text('dlg_warning'), get_text('msg_no_valid_bbox_annotations', excluded_count))
-                return None, None
-            
-            annotations = valid_annotations
+
+            annotations = {img_path: boxes for img_path, boxes in items}
             total_boxes = sum(len(boxes) for boxes in annotations.values())
-            return annotations, {"total_count": total_boxes, "image_count": len(annotations), "excluded_count": excluded_count}
+            return annotations, {
+                "total_count": total_boxes,
+                "image_count": len(annotations),
+                "excluded_count": excluded_count,
+                "source_counts": source_counts,
+                "all_sources": bool(getattr(self, 'use_all_sources_for_training', False)),
+            }
         
         if task_type == "segment":
             if not self.segmentation_annotations:

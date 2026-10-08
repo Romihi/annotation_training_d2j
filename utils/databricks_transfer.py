@@ -488,7 +488,9 @@ class DatabricksTransferManager:
     def submit_training_workflow(self, zip_remote_path: str, notebook_base_path: str,
                                  cluster_id: str = "", model_type: str = "basic",
                                  train_params: Optional[Dict[str, Any]] = None,
-                                 use_serverless: bool = False) -> dict:
+                                 use_serverless: bool = False,
+                                 serverless_env_version: str = "",
+                                 serverless_base_environment: str = "") -> dict:
         """
         Databricks Runs Submit APIで extract→load→train の3タスクをチェーン実行
 
@@ -503,6 +505,11 @@ class DatabricksTransferManager:
             use_serverless: True または cluster_id が空の場合、クラスターを指定せず
                             サーバーレスコンピュートで実行する（フリープラン対応）。
                             各ノートブックは冒頭の %pip install で依存を導入する。
+            serverless_env_version: サーバーレス環境のバージョン（例 "2", "3"）。
+                            指定するとノートブックに紐づく環境を上書きするため、
+                            GPU/CPU不整合（GPUベース環境×CPUアクセラレータ）を回避できる。
+            serverless_base_environment: GPUベース環境名。GPUアクセラレータで
+                            実行する場合のみ指定（空＝CPU既定環境）。
 
         Returns:
             {"run_id": int, "run_url": str}
@@ -510,7 +517,9 @@ class DatabricksTransferManager:
         Raises:
             Exception: ジョブ送信に失敗した場合
         """
-        from databricks.sdk.service.jobs import SubmitTask, NotebookTask, TaskDependency
+        from databricks.sdk.service.jobs import (SubmitTask, NotebookTask,
+                                                 TaskDependency, JobEnvironment)
+        from databricks.sdk.service.compute import Environment
 
         base_path = self._resolve_notebook_path(notebook_base_path)
         extract_path = zip_remote_path.replace(".zip", "")
@@ -518,8 +527,27 @@ class DatabricksTransferManager:
                                                   self.TRAIN_NOTEBOOKS["basic"])
 
         serverless = bool(use_serverless or not cluster_id)
-        # クラスター実行時のみ existing_cluster_id を付与（サーバーレスは無指定）
-        compute_kwargs = {} if serverless else {"existing_cluster_id": cluster_id}
+
+        # コンピュート指定:
+        #   クラスター実行 → existing_cluster_id
+        #   サーバーレス   → environment_key で明示環境を割当（ノートブック側の
+        #                    保存環境を上書き。GPU/CPU不整合の回避に必須）
+        environments = None
+        if serverless:
+            spec_kwargs = {}
+            if serverless_env_version:
+                spec_kwargs["environment_version"] = str(serverless_env_version)
+            if serverless_base_environment:
+                spec_kwargs["base_environment"] = serverless_base_environment
+            if spec_kwargs:
+                env_key = "training_env"
+                environments = [JobEnvironment(environment_key=env_key,
+                                               spec=Environment(**spec_kwargs))]
+                compute_kwargs = {"environment_key": env_key}
+            else:
+                compute_kwargs = {}
+        else:
+            compute_kwargs = {"existing_cluster_id": cluster_id}
 
         # widgetsへ渡すパラメータは文字列化する（data_pathは必ず付与）
         train_base_params = {"data_path": extract_path}
@@ -529,8 +557,14 @@ class DatabricksTransferManager:
 
         debug_print(f"ワークフロー送信: zip={zip_remote_path}, notebooks={base_path}, "
                     f"compute={'serverless' if serverless else cluster_id}, "
+                    f"env_version={serverless_env_version}, "
+                    f"base_env={serverless_base_environment or '(CPU既定)'}, "
                     f"model_type={model_type}, train={train_notebook}, "
                     f"params={train_base_params}")
+
+        submit_kwargs = {}
+        if environments is not None:
+            submit_kwargs["environments"] = environments
 
         wait = self.client.jobs.submit(
             run_name=f"auto_train_{model_type}_{os.path.basename(zip_remote_path)}",
@@ -561,7 +595,8 @@ class DatabricksTransferManager:
                     ),
                     **compute_kwargs
                 ),
-            ]
+            ],
+            **submit_kwargs
         )
 
         run_id = wait.response.run_id

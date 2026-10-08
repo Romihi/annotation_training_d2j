@@ -24,6 +24,105 @@ from io import StringIO
 # 物体カテゴリ定義
 DEFAULT_CLASSES = ["traffic_cone", "person", "car", "bicycle", "motorcycle", "truck", "bus", "stop_sign", "parking_meter"]
 
+# 学習済みYOLOで「他車(opponent)」とみなす既定の元クラス（COCO想定）。
+# 自動アノテーションでこれらを target_class（既定 'opponent'）へ写像する。
+DEFAULT_VEHICLE_CLASSES = ["car", "truck", "bus", "motorcycle"]
+
+# 自車除外領域（正規化 x0,y0,x1,y1）。魚眼前方カメラでは画像下部中央に自車の
+# 車体/ハンドルが常に写り YOLO が car/bicycle 等と誤検知するため、中心がこの
+# 矩形に入る検出は捨てる（前方の他車は上部にあり除外されない）。
+DEFAULT_EGO_REGION = (0.12, 0.66, 0.88, 1.0)
+
+
+def _class_name(names, cid):
+    """ultralytics の names（dict or list）からクラス名を安全に引く。"""
+    cid = int(cid)
+    if isinstance(names, dict):
+        return names.get(cid, f"class_{cid}")
+    if names is not None and 0 <= cid < len(names):
+        return names[cid]
+    return f"class_{cid}"
+
+
+def dets_to_bboxes(dets_np, names, img_wh, class_map=None, conf_min=0.0,
+                   ego_region=None):
+    """YOLO検出 (N,6)=[x1,y1,x2,y2,conf,cls] → bbox_annotation 辞書のリスト。
+
+    アノテーションツールの矩形形式 {x1,y1,x2,y2(0-1正規化), class, confidence} に
+    変換する。run_single_yolo_inference と自動アノテーションで**同一コード**を共有。
+
+    class_map: {元クラス名: 変換後クラス名}。指定時は map にあるクラスのみ採用し、
+      名前を写像する（例 {'car':'opponent'} で車→他車ラベル）。None なら全クラス素通し。
+    conf_min: この信頼度未満は捨てる。
+    ego_region: (x0,y0,x1,y1) 正規化。中心がこの矩形内の検出は**自車**として捨てる。
+    """
+    W, H = img_wh
+    out = []
+    for det in np.asarray(dets_np):
+        if len(det) < 6:
+            continue
+        x1, y1, x2, y2, conf, cid = det[:6]
+        if float(conf) < conf_min:
+            continue
+        if ego_region is not None:                # 自車領域の検出は除外
+            cx = (float(x1) + float(x2)) * 0.5 / W
+            cy = (float(y1) + float(y2)) * 0.5 / H
+            ex0, ey0, ex1, ey1 = ego_region
+            if ex0 <= cx <= ex1 and ey0 <= cy <= ey1:
+                continue
+        cname = _class_name(names, cid)
+        if class_map is not None:
+            if cname not in class_map:
+                continue
+            cname = class_map[cname]
+        out.append({
+            'x1': float(x1) / W, 'y1': float(y1) / H,
+            'x2': float(x2) / W, 'y2': float(y2) / H,
+            'class': cname, 'confidence': float(conf),
+        })
+    return out
+
+
+def masks_to_segments(masks_np, classes, confs, class_map=None, conf_min=0.0,
+                      ego_region=None):
+    """YOLOセグメンテーションのマスク → segmentation_annotation のリスト。
+
+    各マスクを輪郭抽出→ポリライン簡略化し {class, points(0-1正規化), confidence} に。
+    masks_np: (N, mh, mw)。classes/confs: 長さ N のクラス名・信頼度。
+    class_map: dets_to_bboxes と同じ意味。cv2 は呼び出し時に import。
+    ego_region: (x0,y0,x1,y1) 正規化。重心がこの矩形内のマスクは自車として捨てる。
+    """
+    import cv2
+    segs = []
+    for i, mask in enumerate(np.asarray(masks_np)):
+        conf = float(confs[i]) if i < len(confs) else 0.0
+        if conf < conf_min:
+            continue
+        cname = classes[i] if i < len(classes) else "unknown"
+        if class_map is not None:
+            if cname not in class_map:
+                continue
+            cname = class_map[cname]
+        m = (np.asarray(mask) > 0.5).astype(np.uint8) * 255
+        mh, mw = m.shape[:2]
+        contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+        c = max(contours, key=cv2.contourArea)
+        approx = cv2.approxPolyDP(c, 0.02 * cv2.arcLength(c, True), True)
+        pts = [[float(min(max(p[0][0] / mw, 0.0), 1.0)),
+                float(min(max(p[0][1] / mh, 0.0), 1.0))] for p in approx]
+        if len(pts) < 3:
+            continue
+        if ego_region is not None:                # 自車領域のマスクは除外
+            cx = sum(p[0] for p in pts) / len(pts)
+            cy = sum(p[1] for p in pts) / len(pts)
+            ex0, ey0, ex1, ey1 = ego_region
+            if ex0 <= cx <= ex1 and ey0 <= cy <= ey1:
+                continue
+        segs.append({'class': cname, 'points': pts, 'confidence': conf})
+    return segs
+
 # YOLO学習ワーカークラス
 class YOLOTrainingWorker(QThread):
     """YOLO学習をバックグラウンドで実行し、出力をリアルタイムで通知"""
