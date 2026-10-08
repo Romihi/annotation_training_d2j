@@ -41,6 +41,33 @@ from model_info import (
 #         print("Loaded state_dict format model")
 #     return model
 
+def detect_num_outputs_from_state_dict(state_dict, default=2, verbose=True):
+    """state_dict の regressor の形から出力数を判定する
+
+    出力の並び（学習側 model_training.calculate_individual_losses と同じ）:
+        2 : angle, throttle
+        3 : angle, throttle, speed
+        6 : angle, throttle, t+5_angle, t+5_throttle, t+10_angle, t+10_throttle
+        9 : angle, throttle, speed, t+5(angle,throttle,speed), t+10(angle,throttle,speed)
+
+    Args:
+        state_dict: モデルの state_dict（'model_state_dict' を取り出した後のもの）
+        default: 判定できないときの値
+        verbose: True なら検出結果を print する
+
+    Returns:
+        int: 出力数（regressor が無ければ default）
+    """
+    if isinstance(state_dict, dict):
+        for key in ('regressor.bias', 'regressor.weight'):
+            if key in state_dict:
+                n = int(state_dict[key].shape[0])
+                if verbose:
+                    print(f"チェックポイントから出力数を検出 ({key}): {n}")
+                return n
+    return default
+
+
 def detect_num_outputs_from_checkpoint(weights_path, device='cpu'):
     """
     チェックポイントファイルから出力数を検出する
